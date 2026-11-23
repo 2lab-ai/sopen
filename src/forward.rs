@@ -17,7 +17,7 @@ use std::process::{Command, ExitStatus};
 /// Receipt hooks (AGENTS.md "Receipts") a forwarded run carries to HOST. Settings that name local
 /// paths — `SOPEN_CODE`, `SOPEN_ZED`, `SOPEN_FFMPEG`, `SOPEN_FFPROBE`, `SOPEN_CACHE_DIR`, `SOPEN_STATE_DIR`,
 /// `SOPEN_CONFIG` — mean nothing on HOST and stay here.
-pub const FORWARDED_ENV: [&str; 19] = [
+pub const FORWARDED_ENV: [&str; 21] = [
     "SOPEN_STATE",
     "SOPEN_SCREENSHOT",
     "SOPEN_WATCHDOG",
@@ -39,6 +39,10 @@ pub const FORWARDED_ENV: [&str; 19] = [
     // 06 §11: the stream's stats lines and its throttle, read where the file is viewed.
     "SOPEN_STREAM_STATS",
     "SOPEN_STREAM_THROTTLE",
+    // `sopen URL`: what opens the address, and the listener table the tunnel's port is checked
+    // in, on the machine that shows it.
+    "SOPEN_BROWSER",
+    "SOPEN_LISTENERS",
 ];
 
 /// Where HOST's sopen is looked for when the non-interactive ssh session's PATH does not have it
@@ -160,7 +164,7 @@ const LOOPBACK_ALIASES: [&str; 5] = [
 /// Loopback, so whoever resolves it means itself: exactly `localhost`, a name under
 /// `.localhost` (RFC 6761) or one of [`LOOPBACK_ALIASES`], `127.0.0.0/8`, or `::1`.
 /// `localhost.example.com` is not.
-fn is_loopback(name: &str) -> bool {
+pub(crate) fn is_loopback(name: &str) -> bool {
     let name = bare(name);
     match name.parse::<std::net::IpAddr>() {
         Ok(ip) => ip.is_loopback(),
@@ -342,6 +346,33 @@ pub fn remote_words(
     env: &[String],
     install_paths: &str,
 ) -> Vec<String> {
+    let mut flags: Vec<String> = Vec::new();
+    if let Some(app) = app {
+        flags.extend(["--app".to_string(), app.to_string()]);
+    }
+    if hex {
+        flags.push("--hex".to_string());
+    }
+    words(host, &flags, source, env, install_paths)
+}
+
+/// [`remote_words`] for an address held open through a tunnel ([`tunnel`]): HOST's sopen gets
+/// `--here --hold-until-eof -- URL` — it opens the browser, then waits for its input's end.
+pub fn tunnel_words(host: &str, url: &str, env: &[String], install_paths: &str) -> Vec<String> {
+    words(host, &[HOLD_FLAG.to_string()], url, env, install_paths)
+}
+
+/// HOST's sopen flag that keeps it (and the ssh session, and the tunnel) until its input ends.
+pub const HOLD_FLAG: &str = "--hold-until-eof";
+
+/// `exec [env K=V…] sh -c <script> sopen <flags…> -- SOURCE`, every word but `exec` quoted.
+fn words(
+    host: &str,
+    flags: &[String],
+    source: &str,
+    env: &[String],
+    install_paths: &str,
+) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
     if !env.is_empty() {
         words.push("env".to_string());
@@ -353,12 +384,7 @@ pub fn remote_words(
         script(host, install_paths),
         "sopen".to_string(),
     ]);
-    if let Some(app) = app {
-        words.extend(["--app".to_string(), app.to_string()]);
-    }
-    if hex {
-        words.push("--hex".to_string());
-    }
+    words.extend(flags.iter().cloned());
     words.extend(["--".to_string(), source.to_string()]);
     std::iter::once("exec".to_string())
         .chain(words.iter().map(|w| quote(w)))
@@ -405,16 +431,573 @@ pub fn run(host: &str, source: &str, app: Option<&str>, hex: bool, state_dir: &P
     let words = remote_words(host, source, app, hex, &env, INSTALL_PATHS);
     let connection = crate::remote::connection_args(host, state_dir)?;
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let args = ssh_args(connection, tty, app.is_some(), host, words);
+    // An address is logged as sopen prints it, never whole (`url::redacted`).
+    let logged = match crate::url::parse(source) {
+        Some(_) => remote_words(host, &crate::url::redacted(source), app, hex, &env, ""),
+        None => words.clone(),
+    };
     crate::debug!(
         "{}",
-        crate::render_command(std::ffi::OsStr::new("ssh"), &args)
+        crate::render_command(
+            std::ffi::OsStr::new("ssh"),
+            &ssh_args(connection.clone(), tty, app.is_some(), host, logged)
+        )
     );
+    let args = ssh_args(connection, tty, app.is_some(), host, words);
     let status = Command::new("ssh")
         .args(&args)
         .status()
         .context("cannot run ssh (is OpenSSH installed?)")?;
     exit_code(host, status)
+}
+
+// ---------------------------------------------------------------------------------------------
+// `sopen URL` on another machine (spec §4a): a loopback address there would mean that machine,
+// so it is served from here through an ssh tunnel that lives exactly as long as this sopen.
+
+/// The tunnel's own connection: never sopen's multiplexed master (a `-R` asked through a master
+/// belongs to the master and would outlive this sopen), with its keepalives and connect bound
+/// (`ServerAlive*`, `ConnectTimeout` from `connection`, [`crate::remote::connection_args`]), and
+/// `ExitOnForwardFailure`, so a remote port that is taken ends ssh at once.
+pub fn tunnel_connection(connection: &[OsString]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
+        "-S",
+        "none",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ExitOnForwardFailure=yes",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    for pair in connection.windows(2) {
+        let value = pair[1].to_string_lossy();
+        if pair[0] == "-o"
+            && (value.starts_with("ServerAlive") || value.starts_with("ConnectTimeout="))
+        {
+            args.extend(pair.iter().cloned());
+        }
+    }
+    args
+}
+
+/// `ssh <connection> -T -R <forward> <run options> HOST -- <words>`: no terminal there, and this
+/// side's input (no `-n`) — HOST's sopen holds until it ends.
+pub fn tunnel_args(
+    connection: Vec<OsString>,
+    host: &str,
+    forward: &str,
+    words: Vec<String>,
+) -> Vec<OsString> {
+    let mut args = connection;
+    args.extend(["-T", "-R", forward].map(OsString::from));
+    args.extend(RUN_OPTIONS.iter().map(OsString::from));
+    args.push(host.into());
+    args.push("--".into());
+    args.extend(words.into_iter().map(OsString::from));
+    args
+}
+
+/// The first of the dynamic ports (IANA): a fallback port is one of 49152–65535.
+const DYNAMIC_PORTS: std::ops::RangeInclusive<u16> = 49152..=65535;
+
+/// The remote ports a tunnel tries: the address's own first (its origin unchanged), then
+/// `tries` others from the dynamic range 49152–65535, each different, picked by `random`.
+pub fn tunnel_ports(first: u16, tries: usize, mut random: impl FnMut(usize) -> u64) -> Vec<u16> {
+    let span = u64::from(DYNAMIC_PORTS.end() - DYNAMIC_PORTS.start()) + 1;
+    let mut ports = vec![first];
+    for i in 0..tries {
+        let mut port = DYNAMIC_PORTS.start() + (random(i) % span) as u16;
+        // A port already on the list: the next one up, wrapping in the range.
+        while ports.contains(&port) {
+            port = if port == *DYNAMIC_PORTS.end() {
+                *DYNAMIC_PORTS.start()
+            } else {
+                port + 1
+            };
+        }
+        ports.push(port);
+    }
+    ports
+}
+
+/// ssh's line when the remote port is taken (with `ExitOnForwardFailure`, then exit 255).
+fn forward_failed(line: &str) -> bool {
+    line.contains("remote port forwarding failed for listen port")
+}
+
+/// How many other ports a tunnel tries after the address's own: ssh's failure line is the same
+/// for a port that is taken and for a server that refuses forwarding, so the tries stay few.
+const TUNNEL_TRIES: usize = 2;
+
+/// The tunnel's ssh runs under this `sh` guard, given the ssh command line as its arguments.
+/// ssh reads the guard's input — the pipe this sopen holds — and a watcher reading the same
+/// input kills ssh at its end: when this sopen closes the pipe, or dies, SIGKILL included. ssh
+/// alone does not end there: once HOST's command ends it waits for the forwarded connections a
+/// browser keeps open (ssh(1), `~&`), and new ones would still be served. The input goes
+/// through fd 3: a shell without job control gives an asynchronous command `/dev/null` as its
+/// input, and dash does so before the command's own redirections, so `<&0` would be `/dev/null`
+/// there. ssh's output goes through fd 4 and the guard keeps none of it, so that output ends
+/// when ssh's session does (OpenSSH hands its stdout to the session channel), which is how this
+/// side sees HOST's command end. The guard reaps its watcher and exits with ssh's status.
+const GUARD: &str = r#"exec 3<&0 4>&1 >/dev/null; "$@" <&3 >&4 3<&- 4>&- & ssh=$!; exec 4>&-; (read -r _ <&3; kill "$ssh" 2>/dev/null) 2>/dev/null & watch=$!; exec 3<&-; wait "$ssh"; code=$?; kill "$watch" 2>/dev/null; wait "$watch" 2>/dev/null; exit "$code""#;
+
+/// What a tunnel runs: the ssh program, its connection, HOST, the address, the hooks and the
+/// install paths HOST's script looks in.
+pub(crate) struct Tunnel<'a> {
+    pub ssh: &'a std::ffi::OsStr,
+    pub connection: Vec<OsString>,
+    pub host: &'a str,
+    pub url: &'a crate::url::Url,
+    pub env: &'a [String],
+    pub install_paths: &'a str,
+}
+
+/// How one ssh run of a tunnel ended.
+enum Attempt {
+    /// The remote port was taken: try the next.
+    Taken,
+    /// The run's result: HOST's exit code, or 0 once stopped after the address opened.
+    Done(Result<u8>),
+}
+
+/// Runs the tunnel on `ports` in turn until one is not taken on HOST; `say` gets the one line
+/// that says the address is open there, `stop` is polled for a signal that ends it.
+pub(crate) fn run_tunnel(
+    t: &Tunnel,
+    ports: &[u16],
+    stop: &dyn Fn() -> Option<i32>,
+    say: &mut dyn FnMut(&str),
+) -> Result<u8> {
+    for (i, &port) in ports.iter().enumerate() {
+        if let Attempt::Done(result) = attempt(t, port, stop, say)? {
+            return result;
+        }
+        if let Some(next) = ports.get(i + 1) {
+            eprintln!(
+                "sopen: port {port} could not be forwarded on {} (taken there, or forwarding \
+                 refused) — trying {next}",
+                t.host
+            );
+        }
+    }
+    bail!(
+        "{} refused the tunnel: forwarding is off there, or no port was free \
+         (AllowTcpForwarding?)",
+        t.host
+    )
+}
+
+/// How long ssh may take to exit by itself once its session's output has ended (HOST's command
+/// is over) before the tunnel is closed under it.
+const SESSION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One ssh run of the tunnel on remote port `port`.
+fn attempt(
+    t: &Tunnel,
+    port: u16,
+    stop: &dyn Fn() -> Option<i32>,
+    say: &mut dyn FnMut(&str),
+) -> Result<Attempt> {
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let there = t.url.with_port(port);
+    let forward = t.url.remote_forward(port);
+    let words = tunnel_words(t.host, &there, t.env, t.install_paths);
+    let args = tunnel_args(t.connection.clone(), t.host, &forward, words);
+    // Logged as sopen prints the address, never whole.
+    let logged = tunnel_words(t.host, &crate::url::redacted(&there), t.env, "");
+    crate::debug!(
+        "{}",
+        crate::render_command(
+            t.ssh,
+            &tunnel_args(t.connection.clone(), t.host, &forward, logged)
+        )
+    );
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(GUARD)
+        .arg("sopen-tunnel")
+        .arg(t.ssh)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("cannot run ssh (is OpenSSH installed?)")?;
+    // Held, never written: its end is HOST's (and the guard's) cue.
+    let mut input = child.stdin.take();
+    let (opened_tx, opened) = std::sync::mpsc::channel();
+    let out = relay(child.stdout.take(), std::io::stdout, move |line| {
+        let open = line.trim_end() == crate::url::TUNNEL_OPEN;
+        if open {
+            let _ = opened_tx.send(());
+        }
+        !open
+    });
+    let taken = Arc::new(AtomicBool::new(false));
+    let seen = taken.clone();
+    let err = relay(child.stderr.take(), std::io::stderr, move |line| {
+        let failed = forward_failed(line);
+        if failed {
+            seen.store(true, Ordering::SeqCst);
+        }
+        !failed
+    });
+    let shown = t.url.shown();
+    let mut is_open = false;
+    let mut say_open = |is_open: &mut bool| {
+        if !*is_open && opened.try_recv().is_ok() {
+            *is_open = true;
+            let line = match port == t.url.port() {
+                true => format!(
+                    "{shown} is open on {} through a tunnel — Ctrl-C closes it",
+                    t.host
+                ),
+                false => format!(
+                    "{shown} is open on {} as {} through a tunnel (port {} could not be \
+                     forwarded there) — Ctrl-C closes it",
+                    t.host,
+                    crate::url::redacted(&there),
+                    t.url.port()
+                ),
+            };
+            say(&line);
+        }
+    };
+    let stopped = |signal: i32, is_open: bool| -> Attempt {
+        if is_open {
+            Attempt::Done(Ok(0))
+        } else {
+            eprintln!("sopen: stopped before {shown} opened on {}", t.host);
+            Attempt::Done(Ok(128u8.saturating_add(u8::try_from(signal).unwrap_or(0))))
+        }
+    };
+    let mut out = Some(out);
+    // When ssh's output ended (HOST's command is over), and ssh still runs.
+    let mut session_over: Option<std::time::Instant> = None;
+    loop {
+        if let Some(signal) = stop() {
+            input.take();
+            end(&mut child);
+            ended(out.take(), err);
+            return Ok(stopped(signal, is_open));
+        }
+        say_open(&mut is_open);
+        if let Some(status) = child.try_wait()? {
+            // A watcher left behind (the guard killed by a signal) ends ssh at this end.
+            input.take();
+            ended(out.take(), err);
+            if let Some(signal) = stop() {
+                return Ok(stopped(signal, is_open));
+            }
+            say_open(&mut is_open);
+            if !is_open && taken.load(Ordering::SeqCst) && status.code() == Some(255) {
+                return Ok(Attempt::Taken);
+            }
+            return Ok(Attempt::Done(exit_code(t.host, status)));
+        }
+        if out.as_ref().is_some_and(|o| o.try_recv().is_ok()) {
+            out = None;
+            session_over = Some(std::time::Instant::now());
+        }
+        // HOST's command is over but ssh stays — for the browser's forwarded connections, which
+        // would keep serving the address: the tunnel is closed under it.
+        if session_over.is_some_and(|at| at.elapsed() >= SESSION_GRACE) {
+            input.take();
+            end(&mut child);
+            ended(None, err);
+            say_open(&mut is_open);
+            bail!(
+                "sopen on {} ended while ssh stayed for the browser's connections; the tunnel \
+                 to {shown} is closed",
+                t.host
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Ends the guard whose input was just closed: its watcher kills ssh and it exits with ssh;
+/// one that has not within 3 s is killed (its watcher still ends ssh at the input's end).
+fn end(child: &mut std::process::Child) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Waits at most 2 s for each relay still running to reach its pipe's end (a descendant of ssh,
+/// such as a ProxyCommand, may still hold it).
+fn ended(out: Option<std::sync::mpsc::Receiver<()>>, err: std::sync::mpsc::Receiver<()>) {
+    for done in out.into_iter().chain([err]) {
+        let _ = done.recv_timeout(std::time::Duration::from_secs(2));
+    }
+}
+
+/// Copies `pipe` to `sink()` line by line, each line `keep` lets through; the receiver gets
+/// `()` at the pipe's end.
+fn relay<W: std::io::Write + 'static>(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+    sink: fn() -> W,
+    mut keep: impl FnMut(&str) -> bool + Send + 'static,
+) -> std::sync::mpsc::Receiver<()> {
+    use std::io::BufRead;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Some(pipe) = pipe {
+            let mut pipe = std::io::BufReader::new(pipe);
+            let mut line = Vec::new();
+            while matches!(pipe.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+                if keep(&String::from_utf8_lossy(&line)) {
+                    let mut sink = sink();
+                    let _ = sink.write_all(&line);
+                    let _ = sink.flush();
+                }
+                line.clear();
+            }
+        }
+        let _ = tx.send(());
+    });
+    rx
+}
+
+// HOST's half: the tunnel's port must be loopback only there. sshd binds the `-R` to the
+// loopback address asked for, unless its `GatewayPorts yes` binds it to every interface —
+// then anyone who reaches HOST would reach this machine's page. HOST's sopen checks what
+// listens on the port before it opens the browser, and refuses.
+
+/// The address of each listening TCP socket on `port` in `table` — rows of Linux's
+/// `/proc/net/tcp` / `tcp6`, or lines of macOS's `netstat -anv -p tcp`; anything else is
+/// skipped. `*` (netstat's any address) is `0.0.0.0`.
+pub fn listeners_on(table: &str, port: u16) -> Vec<std::net::IpAddr> {
+    table
+        .lines()
+        .filter_map(|line| proc_listener(line).or_else(|| netstat_listener(line)))
+        .filter(|&(_, p)| p == port)
+        .map(|(ip, _)| ip)
+        .collect()
+}
+
+/// A `/proc/net/tcp{,6}` row in state LISTEN (`0A`): its local address and port. The address
+/// is the kernel's 32-bit words as hex, each in this machine's byte order.
+fn proc_listener(line: &str) -> Option<(std::net::IpAddr, u16)> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let [slot, local, _, state, ..] = fields.as_slice() else {
+        return None;
+    };
+    if !slot.ends_with(':') || *state != "0A" {
+        return None;
+    }
+    let (addr, port) = local.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let words: Vec<[u8; 4]> = (0..addr.len() / 8)
+        .map(|i| u32::from_str_radix(addr.get(i * 8..i * 8 + 8)?, 16).ok())
+        .collect::<Option<Vec<u32>>>()?
+        .into_iter()
+        .map(u32::to_ne_bytes)
+        .collect();
+    let ip = match (addr.len(), words.as_slice()) {
+        (8, [w]) => std::net::IpAddr::from(*w),
+        (32, [a, b, c, d]) => {
+            let mut bytes = [0u8; 16];
+            for (i, w) in [a, b, c, d].iter().enumerate() {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&w[..]);
+            }
+            std::net::IpAddr::from(bytes)
+        }
+        _ => return None,
+    };
+    Some((ip, port))
+}
+
+/// A `netstat -anv -p tcp` line (macOS) in state LISTEN: its local address (`addr.port`, `*`
+/// for any, an IPv6 one maybe with `%zone`) and port.
+fn netstat_listener(line: &str) -> Option<(std::net::IpAddr, u16)> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let [proto, _, _, local, _, state, ..] = fields.as_slice() else {
+        return None;
+    };
+    if !proto.starts_with("tcp") || *state != "LISTEN" {
+        return None;
+    }
+    let (addr, port) = local.rsplit_once('.')?;
+    let port = port.parse().ok()?;
+    let ip = match addr {
+        "*" => std::net::IpAddr::from([0u8; 4]),
+        addr => addr.split('%').next()?.parse().ok()?,
+    };
+    Some((ip, port))
+}
+
+/// Whether an address a socket listens on is one the tunnel's own bind can be: `127.0.0.1`,
+/// `::1`, or `::ffff:127.0.0.1`.
+fn loopback_only(ip: std::net::IpAddr) -> bool {
+    let v4 = std::net::Ipv4Addr::LOCALHOST;
+    match ip {
+        std::net::IpAddr::V4(ip) => ip == v4,
+        std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.to_ipv4_mapped() == Some(v4),
+    }
+}
+
+/// `Ok` only on positive evidence that the tunnel's port `port` is private on `here` (this
+/// machine's name, for the message): `table` has at least one listener on it — the tunnel's
+/// own, which sshd opened before this command started — and every one is `127.0.0.1`, `::1` or
+/// `::ffff:127.0.0.1`. No listener seen (an empty table, none on the port, output that does not
+/// parse) refuses as well: it cannot confirm the port is private.
+pub fn private_in(table: &str, port: u16, here: &str) -> Result<()> {
+    let listeners = listeners_on(table, port);
+    if listeners.is_empty() {
+        bail!(
+            "cannot confirm the tunnel is private on {here} (no listener seen on port {port}); \
+             refused, nothing was opened"
+        );
+    }
+    match listeners.into_iter().find(|&ip| !loopback_only(ip)) {
+        None => Ok(()),
+        Some(ip) => bail!(
+            "the tunnel's port {port} listens on {ip} on {here}, open to the network (sshd's \
+             GatewayPorts yes binds a forward to every interface, or another program holds the \
+             port); refused, nothing was opened"
+        ),
+    }
+}
+
+/// This machine's listening TCP sockets: `SOPEN_LISTENERS` (a receipt hook: a file holding such
+/// a table) when set and not empty; else `/proc/net/tcp` and `/proc/net/tcp6` on Linux,
+/// `netstat -anv -p tcp` elsewhere. Both list every user's sockets — the tunnel's belongs to
+/// sshd: `/proc/net/tcp*` is the network namespace's whole table, with a uid column (proc(5)),
+/// and macOS's netstat shows root's too (launchd's `*.22`). A table that cannot be read is an
+/// error: the check fails closed.
+fn listener_table() -> Result<String> {
+    if let Some(file) = std::env::var_os("SOPEN_LISTENERS").filter(|f| !f.is_empty()) {
+        return std::fs::read_to_string(&file).with_context(|| {
+            format!(
+                "cannot read SOPEN_LISTENERS ({})",
+                Path::new(&file).display()
+            )
+        });
+    }
+    if cfg!(target_os = "linux") {
+        let mut table = std::fs::read_to_string("/proc/net/tcp")
+            .context("cannot read /proc/net/tcp to check the tunnel's port")?;
+        match std::fs::read_to_string("/proc/net/tcp6") {
+            Ok(v6) => table.push_str(&v6),
+            // No IPv6 here: nothing listens on it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).context("cannot read /proc/net/tcp6 to check the tunnel's port")
+            }
+        }
+        return Ok(table);
+    }
+    let out = Command::new("/usr/sbin/netstat")
+        .args(["-anv", "-p", "tcp"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .context("cannot run netstat to check the tunnel's port")?;
+    if !out.status.success() {
+        bail!("netstat failed ({}) checking the tunnel's port", out.status);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// HOST's half of a tunnel, before the browser opens: `Ok` only when the tunnel's port `port`
+/// is seen listening here on loopback alone ([`private_in`]); `Err` (refused) otherwise, or when
+/// the table cannot be read.
+pub fn tunnel_port_is_private(port: u16) -> Result<()> {
+    let here = hostname().unwrap_or_else(|| "this machine".to_string());
+    private_in(&listener_table()?, port, &here)
+}
+
+/// `sopen URL` with HOST: serves the loopback address `url` from this machine on HOST through a
+/// tunnel and opens it in HOST's browser; returns once Ctrl-C or SIGTERM ends it (0), or ssh
+/// ends (HOST's exit code, as [`run`]).
+pub fn tunnel(host: &str, url: &crate::url::Url, state_dir: &Path) -> Result<u8> {
+    use std::hash::BuildHasher;
+    let env = forwarded_env(|key| std::env::var_os(key))?;
+    let tunnel = Tunnel {
+        ssh: std::ffi::OsStr::new("ssh"),
+        connection: tunnel_connection(&crate::remote::connection_args(host, state_dir)?),
+        host,
+        url,
+        env: &env,
+        install_paths: INSTALL_PATHS,
+    };
+    let seed = std::collections::hash_map::RandomState::new();
+    let ports = tunnel_ports(url.port(), TUNNEL_TRIES, |i| seed.hash_one(i));
+    let watch = signals::Watch::start();
+    run_tunnel(&tunnel, &ports, &|| watch.signal(), &mut |line| {
+        println!("{line}")
+    })
+}
+
+/// Ctrl-C and SIGTERM while a tunnel runs: the handler only records the signal, and the tunnel
+/// closes on its next poll. Installed for one delivery (`SA_RESETHAND`): the same signal again
+/// ends sopen at once — its pipe closes, and the guard ends ssh. Put back when the watch ends.
+mod signals {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static SIGNAL: AtomicI32 = AtomicI32::new(0);
+    const SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
+
+    extern "C" fn record(signal: libc::c_int) {
+        let _ = SIGNAL.compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    pub(super) struct Watch {
+        before: [Option<libc::sigaction>; 2],
+    }
+
+    impl Watch {
+        pub(super) fn start() -> Self {
+            SIGNAL.store(0, Ordering::SeqCst);
+            let mut before = [None; 2];
+            for (signal, before) in SIGNALS.into_iter().zip(&mut before) {
+                // SAFETY: whole `sigaction`s; the handler only stores into an atomic. An
+                // ignored signal (`nohup`, a background job without job control) stays ignored.
+                unsafe {
+                    let mut old: libc::sigaction = std::mem::zeroed();
+                    if libc::sigaction(signal, std::ptr::null(), &mut old) != 0
+                        || old.sa_sigaction == libc::SIG_IGN
+                    {
+                        continue;
+                    }
+                    let mut new: libc::sigaction = std::mem::zeroed();
+                    new.sa_sigaction = record as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                    libc::sigemptyset(&mut new.sa_mask);
+                    new.sa_flags = libc::SA_RESTART | libc::SA_RESETHAND;
+                    if libc::sigaction(signal, &new, std::ptr::null_mut()) == 0 {
+                        *before = Some(old);
+                    }
+                }
+            }
+            Self { before }
+        }
+
+        /// The first signal since the start, if any.
+        pub(super) fn signal(&self) -> Option<i32> {
+            Some(SIGNAL.load(Ordering::SeqCst)).filter(|&s| s != 0)
+        }
+    }
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            for (signal, before) in SIGNALS.into_iter().zip(&self.before) {
+                if let Some(before) = before {
+                    // SAFETY: the disposition found at the start.
+                    unsafe { libc::sigaction(signal, before, std::ptr::null_mut()) };
+                }
+            }
+        }
+    }
 }
 
 /// HOST's exit code is ours: 0, 1 and 3 from sopen, 2 from an older sopen that does not know
@@ -438,6 +1021,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn hosts() {
@@ -802,6 +1386,608 @@ mod tests {
             "sopen on box ended with status 143 (signal 15?)"
         );
         assert!(exit_code("box", ExitStatus::from_raw(9)).is_err());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `sopen URL` through a tunnel. The ssh run is a stand-in: a script that records its
+    // arguments, plays "port taken" for one port, and stands for HOST's sopen by printing the
+    // opened line.
+
+    fn address(arg: &str) -> crate::url::Url {
+        crate::url::parse(arg).unwrap().unwrap()
+    }
+
+    #[test]
+    fn the_tunnel_has_its_own_connection_and_holds_this_sides_input() {
+        let master: Vec<OsString> = [
+            "-S",
+            "/s/cm-x",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=60s",
+            "-o",
+            "ServerAliveInterval=10",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "ConnectTimeout=15",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        let connection = tunnel_connection(&master);
+        assert_eq!(
+            connection,
+            [
+                "-S",
+                "none",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "ServerAliveInterval=10",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "ConnectTimeout=15",
+            ]
+            .map(OsString::from)
+        );
+        // A ConnectTimeout from ~/.ssh/config: the master's options leave it to the config.
+        assert!(!tunnel_connection(&master[..master.len() - 2])
+            .iter()
+            .any(|a| a.to_string_lossy().starts_with("ConnectTimeout")));
+
+        let url = address("http://127.0.0.1:1234/a b?x#y".replace(' ', "%20").as_str());
+        let words = tunnel_words("box", url.as_str(), &[], INSTALL_PATHS);
+        let args = tunnel_args(
+            connection.clone(),
+            "box",
+            &url.remote_forward(1234),
+            words.clone(),
+        );
+        let mut want = connection.clone();
+        want.extend(
+            [
+                "-T",
+                "-R",
+                "127.0.0.1:1234:127.0.0.1:1234",
+                "-o",
+                "RemoteCommand=none",
+                "-o",
+                "LogLevel=ERROR",
+                "box",
+                "--",
+            ]
+            .map(OsString::from),
+        );
+        want.extend(words.iter().map(OsString::from));
+        assert_eq!(args, want);
+        // This side's input reaches HOST's sopen: no `-n`, and no terminal.
+        assert!(!args.iter().any(|a| a == "-n" || a == "-t"), "{args:?}");
+        // HOST's sopen holds the address open until its input ends.
+        assert_eq!(
+            words[words.len() - 4..],
+            [
+                "'sopen'",
+                "'--hold-until-eof'",
+                "'--'",
+                "'http://127.0.0.1:1234/a%20b?x#y'"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_tunnel_tries_the_addresss_port_first_then_high_ones() {
+        let mut next = 0u64;
+        let ports = tunnel_ports(1234, 4, |_| {
+            next += 1;
+            next * 7919
+        });
+        assert_eq!(ports.len(), 5);
+        assert_eq!(ports[0], 1234);
+        for (i, port) in ports[1..].iter().enumerate() {
+            assert!((49152..=65535).contains(port), "{port}");
+            assert!(!ports[..i + 1].contains(port), "{port} twice in {ports:?}");
+        }
+        // A random source that repeats itself still gives different ports, bounded.
+        let ports = tunnel_ports(50000, 3, |_| 50000 - 49152);
+        assert_eq!(ports.len(), 4);
+        assert_eq!(ports[0], 50000);
+        let mut sorted = ports.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 4, "{ports:?}");
+        assert!(forward_failed(
+            "Error: remote port forwarding failed for listen port 1234"
+        ));
+        assert!(!forward_failed(
+            "ssh: connect to host box port 22: Connection refused"
+        ));
+    }
+
+    /// A stand-in for the tunnel's ssh in `dir`: it appends its arguments to `calls` (one call
+    /// a block, ended by `---`) and `<its pid> <its parent's, the guard's>` to `pids`; a `-R` on
+    /// port `taken` fails as ssh does (`ExitOnForwardFailure`: the error line, exit 255);
+    /// otherwise it prints [`crate::url::TUNNEL_OPEN`], as HOST's sopen does, and then runs
+    /// `then`.
+    fn stand_in_ssh(dir: &Path, taken: u16, then: &str) -> PathBuf {
+        let ssh = dir.join("ssh");
+        let file = |name: &str| quote(dir.join(name).to_str().unwrap());
+        executable(
+            &ssh,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s %s\\n' \"$$\" \"$PPID\" >> {pids}\n\
+                 for a in \"$@\"; do printf '%s\\n' \"$a\"; done >> {calls}\n\
+                 echo --- >> {calls}\n\
+                 fwd=; prev=; for a in \"$@\"; do if [ \"$prev\" = -R ]; then fwd=$a; fi; prev=$a; done\n\
+                 case $fwd in 127.0.0.1:{taken}:*) echo 'Error: remote port forwarding failed for listen port {taken}' >&2; exit 255;; esac\n\
+                 echo {open}\n\
+                 {then}\n",
+                open = crate::url::TUNNEL_OPEN,
+                pids = file("pids"),
+                calls = file("calls"),
+            ),
+        );
+        ssh
+    }
+
+    /// The calls the stand-in recorded, each its arguments.
+    fn calls(dir: &Path) -> Vec<Vec<String>> {
+        let text = std::fs::read_to_string(dir.join("calls")).unwrap_or_default();
+        text.split("---\n")
+            .filter(|c| !c.is_empty())
+            .map(|c| c.lines().map(str::to_string).collect())
+            .collect()
+    }
+
+    /// The `-R` value of a call.
+    fn forward_of(call: &[String]) -> &str {
+        let at = call.iter().position(|a| a == "-R").expect("a -R");
+        &call[at + 1]
+    }
+
+    fn tunnel_for<'a>(ssh: &'a Path, url: &'a crate::url::Url) -> Tunnel<'a> {
+        Tunnel {
+            ssh: ssh.as_os_str(),
+            connection: tunnel_connection(&[]),
+            host: "box",
+            url,
+            env: &[],
+            install_paths: INSTALL_PATHS,
+        }
+    }
+
+    #[test]
+    fn a_taken_port_is_tried_again_on_a_high_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = stand_in_ssh(tmp.path(), 1234, "exit 0");
+        let url = address("http://127.0.0.1:1234/a?b#c");
+        let mut said = Vec::new();
+        let code = run_tunnel(
+            &tunnel_for(&ssh, &url),
+            &[1234, 50001, 50002],
+            &|| None,
+            &mut |line| said.push(line.to_string()),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        let made = calls(tmp.path());
+        assert_eq!(made.len(), 2, "{made:#?}");
+        assert_eq!(forward_of(&made[0]), "127.0.0.1:1234:127.0.0.1:1234");
+        assert_eq!(made[0].last().unwrap(), "'http://127.0.0.1:1234/a?b#c'");
+        // The next port, the address rewritten to it, the origin's path kept.
+        assert_eq!(forward_of(&made[1]), "127.0.0.1:50001:127.0.0.1:1234");
+        assert_eq!(made[1].last().unwrap(), "'http://127.0.0.1:50001/a?b#c'");
+        // Said without the query or fragment (they can be secrets).
+        assert_eq!(
+            said,
+            [
+                "http://127.0.0.1:1234/a?…#… is open on box as http://127.0.0.1:50001/a?…#… \
+              through a tunnel (port 1234 could not be forwarded there) — Ctrl-C closes it"
+            ]
+        );
+
+        // Its own port free: the address as written, said so.
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = stand_in_ssh(tmp.path(), 1, "exit 0");
+        let mut said = Vec::new();
+        let code = run_tunnel(
+            &tunnel_for(&ssh, &url),
+            &[1234, 50001],
+            &|| None,
+            &mut |l| said.push(l.to_string()),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(calls(tmp.path()).len(), 1);
+        assert_eq!(
+            said,
+            ["http://127.0.0.1:1234/a?…#… is open on box through a tunnel — Ctrl-C closes it"]
+        );
+    }
+
+    #[test]
+    fn only_a_taken_port_is_retried_and_the_tries_are_bounded() {
+        let url = address("http://localhost:1234/");
+        // ssh failing for any other reason: once, as "could not reach".
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = stand_in_ssh(tmp.path(), 1, "exit 0");
+        executable(
+            &ssh,
+            &format!(
+                "#!/bin/sh\necho --- >> {}\necho 'ssh: connect to host box port 22: refused' >&2\nexit 255\n",
+                quote(tmp.path().join("calls").to_str().unwrap())
+            ),
+        );
+        let e = run_tunnel(
+            &tunnel_for(&ssh, &url),
+            &[1234, 50001],
+            &|| None,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(e.to_string(), "could not reach box");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("calls")).unwrap(),
+            "---\n"
+        );
+        // Every port refused (taken, or forwarding off there — ssh says the same): each tried
+        // once, then the server's refusal, said as such. The production list is 1 + 2.
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = stand_in_ssh(tmp.path(), 1234, "exit 0");
+        let e = run_tunnel(
+            &tunnel_for(&ssh, &url),
+            &[1234, 1234],
+            &|| None,
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(calls(tmp.path()).len(), 2);
+        assert_eq!(
+            e,
+            "box refused the tunnel: forwarding is off there, or no port was free \
+             (AllowTcpForwarding?)"
+        );
+        assert_eq!(TUNNEL_TRIES, 2);
+        // HOST's own exit code comes back as a forwarded run's does.
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = stand_in_ssh(tmp.path(), 1, "exit 3");
+        let code = run_tunnel(&tunnel_for(&ssh, &url), &[1234], &|| None, &mut |_| {}).unwrap();
+        assert_eq!(code, 3);
+    }
+
+    /// A pid that is gone: reaped, not even a zombie.
+    fn reaped(pid: i32) -> bool {
+        // SAFETY: signal 0 only asks whether the process (a zombie included) exists.
+        unsafe { libc::kill(pid, 0) != 0 }
+    }
+
+    /// The children of `pid` now.
+    fn children(pid: i32) -> Vec<i32> {
+        let out = Command::new("ps")
+            .args(["-A", "-o", "pid=", "-o", "ppid="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace().map(|n| n.parse::<i32>());
+                match (f.next(), f.next()) {
+                    (Some(Ok(child)), Some(Ok(parent))) if parent == pid => Some(child),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Every pid in `pids` is reaped within 10 s (else they are all killed, and it fails).
+    fn all_reaped(pids: &[i32]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        for &pid in pids {
+            while !reaped(pid) {
+                if std::time::Instant::now() >= deadline {
+                    for &pid in pids {
+                        // SAFETY: processes this test started (the stand-ins, the guard).
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                    panic!("{pid} is still there (running, or a zombie no one reaped)");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// The `<ssh> <guard>` pids the stand-in recorded, and the guard's children (its watcher)
+    /// as they are now.
+    fn tunnel_pids(dir: &Path) -> Vec<i32> {
+        let text = std::fs::read_to_string(dir.join("pids")).unwrap();
+        let mut pids: Vec<i32> = text
+            .split_whitespace()
+            .map(|p| p.parse().unwrap())
+            .collect();
+        let guards: Vec<i32> = pids.iter().skip(1).step_by(2).copied().collect();
+        for guard in guards {
+            pids.extend(children(guard));
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+
+    /// Stopped (Ctrl-C, SIGTERM), the tunnel's ssh is ended even when it would stay: once
+    /// HOST's command ends, a real ssh waits for the forwarded connections a browser keeps open
+    /// (ssh(1), `~&`). Here it ignores its input's end and SIGINT and lingers, its output open
+    /// (HOST's command still runs); the stop is seen once the address is open, and the run
+    /// says 0. ssh, the guard and its watcher are all reaped, none left a zombie.
+    #[test]
+    fn a_stop_ends_a_lingering_ssh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = stand_in_ssh(tmp.path(), 1, "trap '' INT HUP; exec sleep 60");
+        let url = address("http://127.0.0.1:1234/");
+        let opened = std::sync::atomic::AtomicBool::new(false);
+        let pids = std::sync::Mutex::new(Vec::new());
+        let started = std::time::Instant::now();
+        let code = run_tunnel(
+            &tunnel_for(&ssh, &url),
+            &[1234],
+            &|| {
+                opened
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then_some(15)
+            },
+            &mut |_| {
+                *pids.lock().unwrap() = tunnel_pids(tmp.path());
+                opened.store(true, std::sync::atomic::Ordering::SeqCst)
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(started.elapsed() < Duration::from_secs(20));
+        let pids = pids.into_inner().unwrap();
+        // ssh, the guard and the watcher.
+        assert!(pids.len() >= 3, "{pids:?}");
+        all_reaped(&pids);
+    }
+
+    /// HOST's command ends (ssh's output ends, as OpenSSH's does with the session) while ssh
+    /// stays for the browser's forwarded connections: the tunnel is closed under it within the
+    /// grace, and the run is an error (no exit code came from HOST).
+    #[test]
+    fn hosts_end_closes_a_tunnel_ssh_would_keep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = stand_in_ssh(
+            tmp.path(),
+            1,
+            "exec >/dev/null; trap '' INT HUP; exec sleep 60",
+        );
+        let url = address("http://me:s3cret@127.0.0.1:1234/?token=abc");
+        let pids = std::sync::Mutex::new(Vec::new());
+        let mut said = Vec::new();
+        let started = std::time::Instant::now();
+        let e = run_tunnel(&tunnel_for(&ssh, &url), &[1234], &|| None, &mut |line| {
+            *pids.lock().unwrap() = tunnel_pids(tmp.path());
+            said.push(line.to_string())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(
+            e,
+            "sopen on box ended while ssh stayed for the browser's connections; the tunnel to \
+             http://me:***@127.0.0.1:1234/?… is closed"
+        );
+        let pids = pids.into_inner().unwrap();
+        assert!(pids.len() >= 3, "{pids:?}");
+        all_reaped(&pids);
+        // ssh ending by itself in the grace gives HOST's code, as before.
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = stand_in_ssh(tmp.path(), 1, "exec >/dev/null; sleep 0.3; exit 4");
+        let code = run_tunnel(&tunnel_for(&ssh, &url), &[1234], &|| None, &mut |_| {}).unwrap();
+        assert_eq!(code, 4);
+    }
+
+    /// The listener tables HOST's sopen reads: Linux's `/proc/net/tcp{,6}` rows (this machine's
+    /// byte order: little-endian, as every runner is) and macOS's `netstat -anv -p tcp` lines.
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn listeners_are_read_from_proc_and_netstat() {
+        let table = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:04D2 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1 1
+   1: 00000000:04D2 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 2 1
+   2: 0100007F:04D2 0100007F:C000 01 00000000:00000000 00:00000000 00000000  1000        0 3 1
+   3: 126433C6:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4 1
+  sl  local_address                         remote_address                        st
+   0: 00000000000000000000000001000000:04D2 00000000000000000000000000000000:0000 0A 0 0
+   1: 00000000000000000000000000000000:04D2 00000000000000000000000000000000:0000 0A 0 0
+   2: 0000000000000000FFFF00000100007F:04D2 00000000000000000000000000000000:0000 0A 0 0
+Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rxbytes
+tcp4       0      0  127.0.0.1.4321         *.*                    LISTEN            0
+tcp4       0      0  *.4321                 *.*                    LISTEN            0
+tcp6       0      0  ::1.4321               *.*                    LISTEN            0
+tcp6       0      0  fe80::1%lo0.4321       *.*                    LISTEN            0
+tcp46      0      0  *.4322                 *.*                    LISTEN            0
+tcp4       0      0  198.51.100.18.4321      192.0.2.7.443          ESTABLISHED       0
+tcp4       0      0  198.51.100.18.4323      *.*                    LISTEN            0
+";
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(
+            listeners_on(table, 1234),
+            [
+                ip("127.0.0.1"),
+                ip("0.0.0.0"),
+                ip("::1"),
+                ip("::"),
+                ip("::ffff:127.0.0.1")
+            ]
+        );
+        assert_eq!(listeners_on(table, 8080), [ip("198.51.100.18")]);
+        assert_eq!(
+            listeners_on(table, 4321),
+            [ip("127.0.0.1"), ip("0.0.0.0"), ip("::1"), ip("fe80::1")]
+        );
+        assert_eq!(listeners_on(table, 4322), [ip("0.0.0.0")]);
+        assert!(listeners_on(table, 9).is_empty());
+        // Only on positive evidence: the tunnel's listener seen, on 127.0.0.1, ::1 or
+        // ::ffff:127.0.0.1 alone.
+        let only_loopback = "\
+   0: 0100007F:04D2 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1 1
+   0: 00000000000000000000000001000000:04D2 00000000000000000000000000000000:0000 0A 0 0
+   0: 0000000000000000FFFF00000100007F:04D2 00000000000000000000000000000000:0000 0A 0 0
+tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN            0
+";
+        assert!(private_in(only_loopback, 1234, "box").is_ok());
+        assert!(private_in("tcp6 0 0 ::1.1234 *.* LISTEN 0", 1234, "box").is_ok());
+        // Nothing seen on the port — an empty table, none on it, only a connection on it,
+        // output that does not parse — cannot confirm it: refused.
+        for unseen in [
+            "",
+            only_loopback
+                .replace("04D2", "04D3")
+                .replace(".1234", ".1235")
+                .as_str(),
+            "tcp4 0 0 127.0.0.1.1234 192.0.2.7.443 ESTABLISHED 0",
+            "   2: 0100007F:04D2 0100007F:C000 01 00000000:00000000 00:00000000 0 1000 0 3 1",
+            "netstat: sysctl: net.inet.tcp.pcblist_n: Operation not permitted",
+            "garbage 127.0.0.1:1234 LISTEN",
+        ] {
+            let e = private_in(unseen, 1234, "box").unwrap_err().to_string();
+            assert!(
+                e.starts_with(
+                    "cannot confirm the tunnel is private on box (no listener seen on port 1234)"
+                ),
+                "{unseen:?}: {e}"
+            );
+        }
+        // Anything else listening on the port — the network, or another loopback address
+        // than the tunnel binds — refuses, said.
+        let e = private_in(table, 1234, "box").unwrap_err().to_string();
+        assert!(e.contains("port 1234 listens on 0.0.0.0 on box"), "{e}");
+        assert!(e.contains("GatewayPorts"), "{e}");
+        assert!(private_in(table, 4321, "box").is_err());
+        assert!(private_in(table, 8080, "box").is_err());
+        let other_loopback = "tcp4 0 0 127.0.0.2.1234 *.* LISTEN 0";
+        assert!(private_in(other_loopback, 1234, "box")
+            .unwrap_err()
+            .to_string()
+            .contains("listens on 127.0.0.2"));
+    }
+
+    /// The live table: this machine's own (`/proc` on Linux, netstat on macOS) is read and
+    /// parsed — a socket listening on loopback here is found in it.
+    #[test]
+    fn this_machines_listener_table_is_read() {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let table = listener_table().unwrap();
+        assert!(
+            listeners_on(&table, port).contains(&"127.0.0.1".parse().unwrap()),
+            "port {port} not found"
+        );
+        assert!(private_in(&table, port, "here").is_ok());
+    }
+
+    /// The shells `/bin/sh` may be where the guard runs: this machine's, dash (Debian's and
+    /// Ubuntu's `/bin/sh`; where it is not `/bin/sh` already) and bash (macOS's) — as
+    /// [`login_shells`] picks them: a missing bash is skipped with a note, or fails under
+    /// SOPEN_REQUIRE_SHELLS=1.
+    fn sh_lanes() -> Vec<PathBuf> {
+        login_shells()
+            .into_iter()
+            .map(|sh| sh.path)
+            .filter(|p| p.file_name().is_some_and(|n| n != "zsh" && n != "fish"))
+            .collect()
+    }
+
+    /// The guard alone, as a SIGKILL of this sopen leaves it: nothing kills it, only its input
+    /// ends. The ssh under it ignores that end (a real one waits for the browser's forwarded
+    /// connections, ssh(1) `~&`), and still goes, and the guard exits with its status. Before
+    /// that, with the input open, ssh runs on and reads that input, not `/dev/null` (which a
+    /// shell gives an asynchronous command first — dash before its redirections).
+    #[test]
+    fn the_guard_ends_ssh_when_its_input_ends() {
+        for sh in sh_lanes() {
+            let tmp = tempfile::tempdir().unwrap();
+            let pidfile = tmp.path().join("pid");
+            let ssh = tmp.path().join("ssh");
+            // It reads its input to the end (marking `eof`), then lingers.
+            let eof = tmp.path().join("eof");
+            executable(
+                &ssh,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$$\" > {pid}\ncat > /dev/null\n: > {eof}\n\
+                     trap '' INT HUP\nexec sleep 60\n",
+                    pid = quote(pidfile.to_str().unwrap()),
+                    eof = quote(eof.to_str().unwrap()),
+                ),
+            );
+            let mut guard = Command::new(&sh)
+                .arg("-c")
+                .arg(GUARD)
+                .arg("sopen-tunnel")
+                .arg(&ssh)
+                .arg("-T")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let pid: i32 = loop {
+                if let Some(pid) = std::fs::read_to_string(&pidfile)
+                    .ok()
+                    .and_then(|p| p.trim().parse().ok())
+                {
+                    break pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{sh:?}: ssh did not start"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            // Running, input open: it stays, and its input is the guard's, still open.
+            std::thread::sleep(Duration::from_millis(300));
+            let alive = !reaped(pid);
+            let early_eof = eof.exists();
+            // ssh and the watcher, the guard's children.
+            let kids = children(guard.id() as i32);
+            drop(guard.stdin.take());
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = guard.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let left = !reaped(pid);
+            if status.is_none() || left {
+                let _ = guard.kill();
+                let _ = guard.wait();
+                // SAFETY: the stand-in this test started (its pid was read from it).
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            assert!(alive, "{sh:?}: ssh ended while its input was open");
+            assert!(
+                !early_eof,
+                "{sh:?}: ssh's input was not the guard's (it ended at once)"
+            );
+            assert!(!left, "{sh:?}: ssh {pid} outlived its input's end");
+            // ssh's status: SIGTERM, as `wait` reports it.
+            assert_eq!(status.and_then(|s| s.code()), Some(143), "{sh:?}");
+            // The guard reaped ssh and its watcher: neither is left, not even as a zombie.
+            assert_eq!(kids.len(), 2, "{sh:?}: {kids:?}");
+            all_reaped(&kids);
+        }
     }
 
     // -----------------------------------------------------------------------------------------
