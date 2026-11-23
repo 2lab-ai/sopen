@@ -2806,7 +2806,7 @@ mod tests {
         assert!(tmp.path().join(fnkeys::STATE).exists());
         pass(&mut sh, &ctx, &[win(false)]);
         wait_until(|| hid.writes(), vec![1, 0]);
-        assert!(!tmp.path().join(fnkeys::STATE).exists());
+        wait_until(|| tmp.path().join(fnkeys::STATE).exists(), false);
         pass(&mut sh, &ctx, &[win(true)]);
         wait_until(|| hid.writes(), vec![1, 0, 1]);
         let covered = egui::ViewportInfo {
@@ -3256,7 +3256,7 @@ mod tests {
         pass(&mut sh, &ctx, &[win(false)]);
         wait_until(|| hid.writes(), vec![1, 0, 0]);
         assert_eq!(hid.value(), 0);
-        assert!(!tmp.path().join(fnkeys::STATE).exists());
+        wait_until(|| tmp.path().join(fnkeys::STATE).exists(), false);
         // In front, the set refused and its undo failed: a release is due, but not while a
         // window is in front.
         hid.with(|h| {
@@ -3276,7 +3276,7 @@ mod tests {
         pass(&mut sh, &ctx, &[win(false)]);
         wait_until(|| hid.writes(), vec![1, 0, 0, 1, 0, 0]);
         assert_eq!(hid.value(), 0);
-        assert!(!tmp.path().join(fnkeys::STATE).exists());
+        wait_until(|| tmp.path().join(fnkeys::STATE).exists(), false);
         assert!(feed.closed(Duration::from_secs(10)));
     }
 
