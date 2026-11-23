@@ -31,6 +31,9 @@ brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64
 ## Requirements
 
 - Media needs `ffmpeg` and `ffprobe` (the formula installs them).
+- The git panel needs git 2.20 or newer where the repository is (`SOPEN_GIT` names this machine's;
+  on macOS `/usr/bin/git` counts only when the developer tools are installed). Without it the
+  folder simply shows its list.
 - `sopen stems` needs its model, which the formula installs too (67 MB), and memory: about
   6.5 GB at its peak, whatever the length of the track.
 - Text (and F4 in the file browser): local files open in VS Code (`code`) when it is installed;
@@ -51,7 +54,8 @@ Only sshd with its SFTP subsystem (the default). sopen installs and runs nothing
 a text file (or press F4 in the file browser), VS Code Remote - SSH or Zed installs its own remote server on first use — that is the editor's behaviour,
 not sopen's. Folders are listed over SFTP. What sopen shows itself — text in the file browser, images,
 video, audio, the hex editor — is read over SFTP a piece at a time and handled on this machine; video
-and audio are decoded here by ffmpeg from that stream. (A `--target` machine is
+and audio are decoded here by ffmpeg from that stream. The git panel runs the remote's own `git`, when
+it has one, over the same ssh connection — nothing is uploaded. (A `--target` machine is
 different: it shows the file, so it needs sopen installed — see below.)
 
 ## Open on another machine's screen: `--target`
@@ -117,9 +121,21 @@ folders, then the files (Name · Ext · Size · Date · Time; hidden files dimme
 The window opens in **preview mode**: rest the bar on a file and the other side shows it — text
 (wrapped, highlighted), an image, a video's first frame, a sound's waveform (its first 10
 minutes), or the hex rows of anything else, whatever the file's size. On a folder the other side is
-its own list again. `F9` switches
+its own list again — or, inside a git work tree, the **git panel** (below). `F9` switches
 to two plain lists (**dual mode**) and back. A preview is only looked at: `Enter` makes it the
 viewer.
+
+In a folder inside a git work tree, rest the bar on `..` (or any folder) and the other side shows
+the repository's **git panel**: every commit and branch as a graph — lanes, branch and tag labels
+(`►main↔origin`, `v1.0`, `stash@{0}`), subject, date, author, hash, the uncommitted changes on
+top — read 500 commits at a time, more as you scroll. `Tab` gives it the keyboard; `Enter` on a
+commit opens its details below the graph (summary, message, changed files with `+adds -dels`),
+`Enter` on a file shows its diff and `Shift+F3` the file as it was at that commit, each in its
+viewer and read-only. Mark a commit (`Space`) and `F3` on another to compare them. A typed letter
+finds in the loaded rows, `⌘⇧F` searches the whole history, `⌘K` filters it (branches, remotes,
+tags, stashes, first parent, order), `⌘R` refreshes. `⌘G` pins the panel to its side: it stays
+while you move over files or go elsewhere; `Esc` unpins. It runs the host's own `git` (on a remote
+over the same ssh connection, nothing installed) and changes nothing in the repository yet.
 
 `F10` shows the **directory tree** in place of the list: rooted at your home when the folder is
 under it, else at `/`, the bar on the folder you were in. Folders with few subfolders open by
@@ -149,6 +165,8 @@ keys that work there are labelled), cyan dialogs with a shadow.
 | `F4` | open the folder or file in VS Code / Zed |
 | `F5` / `F6` | copy / move the selection (or the entry) to the other panel's folder — asks first; the target can be any folder, `host:/path` too |
 | `F9` | preview mode ↔ dual mode |
+| `⌘G` | pin the git panel to the other side (again, or `Esc`: unpin) |
+| in the git panel | `Enter` / `F3` details (one marked row: compare) · `Shift+F3` the file at that commit · a letter / `⌘F` find · `⌘⇧F` history search · `⌘K` filters · `⌘R` refresh · `⌘J` to HEAD · `⌘⇧G` over both sides · `Tab` back to the list · `Esc` closes the innermost thing |
 | `F10` (or `Alt+F10`) | the directory tree; in it `→` / `←` open and close a folder, `Space` sizes a row now (`Esc` stops that), `⌘R` reads a row again, `Enter` lists the folder in the panel, `Esc` / `F10` close the tree |
 | `⌘R` · `⌘U` · `⌘←` / `⌘→` | re-read · swap the panels · this folder in the left / right panel |
 | `⌘1`…`⌘0`, or a click on the bottom row | `F1`…`F10` (Ctrl on Linux) |

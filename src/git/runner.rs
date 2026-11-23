@@ -752,11 +752,38 @@ impl SshGit {
 
 /// `exec 'kill' '<signal>' '--' '-<pid>'`: the stop's words (03 §3.5).
 pub fn kill_words(pid: u32, signal: &str) -> Vec<OsString> {
-    let pgid = format!("-{pid}");
+    kill_groups_words(&[pid], signal)
+}
+
+/// The groups still there, asked in one session (S2-F): `kill -0` per group in a loop, each
+/// group's own answer — one `kill -0` for several fails when any is gone, so it cannot say which
+/// survived. It runs the program `kill` through `env` (dash's builtin refuses `--`, measured; the
+/// program is what `exec 'kill'` runs under every login shell, E5), and prints the pids alive.
+const ALIVE: &str = r#"for p do env kill -0 -- "-$p" 2>/dev/null && echo "$p"; done; exit 0"#;
+
+/// `exec 'sh' '-c' '<ALIVE>' 'sopen-stop' '<pid1>' '<pid2>' …`: the one session that asks
+/// several groups whether they are still there.
+pub fn alive_words(pids: &[u32]) -> Vec<OsString> {
+    let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
     std::iter::once(OsString::from("exec"))
         .chain(
-            ["kill", signal, "--", &pgid]
-                .iter()
+            ["sh", "-c", ALIVE, "sopen-stop"]
+                .into_iter()
+                .chain(pids.iter().map(String::as_str))
+                .map(|w| OsString::from_vec(quote(w.as_bytes()))),
+        )
+        .collect()
+}
+
+/// `exec 'kill' '<signal>' '--' '-<pid1>' '-<pid2>' …`: one stop session for several groups of a
+/// host (S2-F: a handle's commands stopped together signal all their groups in one session).
+pub fn kill_groups_words(pids: &[u32], signal: &str) -> Vec<OsString> {
+    let groups: Vec<String> = pids.iter().map(|pid| format!("-{pid}")).collect();
+    std::iter::once(OsString::from("exec"))
+        .chain(
+            ["kill", signal, "--"]
+                .into_iter()
+                .chain(groups.iter().map(String::as_str))
                 .map(|w| OsString::from_vec(quote(w.as_bytes()))),
         )
         .collect()
@@ -799,8 +826,14 @@ pub struct Faults {
     pub master_gone: std::sync::atomic::AtomicBool,
     /// Commands dispatched (a stop's `kill` is not one).
     pub dispatched: std::sync::atomic::AtomicU32,
-    /// The signals sent to the "remote" group over the master, in order (`-TERM`, `-0`, …).
+    /// The signals sent to the "remote" group over the master, in order (`-TERM`, `-0`, …):
+    /// one entry per stop session.
     pub signals: Mutex<Vec<String>>,
+    /// Every stop session's words after `kill`: the signal and the groups (`-<pid>`), in order.
+    pub sessions: Mutex<Vec<Vec<String>>>,
+    /// Stop sessions open now, and the most ever open at once.
+    pub open: std::sync::atomic::AtomicU32,
+    pub most_open: std::sync::atomic::AtomicU32,
 }
 
 #[cfg(test)]
@@ -933,7 +966,42 @@ impl Via {
     /// `kill <signal> -- -<pid>` on the host, over the master: `kill`'s exit code (0: signalled,
     /// 1: no such group), or `None` when it did not run there.
     fn kill(&self, pid: u32, signal: &str) -> Option<i32> {
-        let words = kill_words(pid, signal);
+        self.kill_groups(&[pid], signal)
+    }
+
+    /// Which of `pids`' groups are still there, asked in one session ([`ALIVE`]); `None` when
+    /// it did not run there. The host's stop lane is held by the caller.
+    fn alive_groups(&self, pids: &[u32]) -> Option<Vec<u32>> {
+        let words = alive_words(pids);
+        let c = match self {
+            Via::Local(_) => return None,
+            Via::Ssh(g) => {
+                let mut c = Command::new("ssh");
+                c.args(g.argv(words));
+                c
+            }
+            #[cfg(test)]
+            Via::Shell(g) => {
+                lock(&g.faults.signals).push("-0".to_string());
+                let session = std::iter::once("-0".to_string())
+                    .chain(pids.iter().map(|p| format!("-{p}")))
+                    .collect();
+                lock(&g.faults.sessions).push(session);
+                let open = g.faults.open.fetch_add(1, Ordering::SeqCst) + 1;
+                g.faults.most_open.fetch_max(open, Ordering::SeqCst);
+                let out = bounded_output(g.login(&line_of(&words)));
+                g.faults.open.fetch_sub(1, Ordering::SeqCst);
+                return alive_of(out, pids);
+            }
+        };
+        alive_of(bounded_output(c), pids)
+    }
+
+    /// `kill <signal> -- -<pid1> -<pid2> …` in one session on the host (0: every group
+    /// signalled; 1: at least one is gone), or `None` when it did not run there. The host's stop
+    /// lane is held by the caller: never two at once.
+    fn kill_groups(&self, pids: &[u32], signal: &str) -> Option<i32> {
+        let words = kill_groups_words(pids, signal);
         let c = match self {
             Via::Local(_) => return None,
             Via::Ssh(g) => {
@@ -944,11 +1012,61 @@ impl Via {
             #[cfg(test)]
             Via::Shell(g) => {
                 lock(&g.faults.signals).push(signal.to_string());
-                g.login(&line_of(&words))
+                let session = std::iter::once(signal.to_string())
+                    .chain(pids.iter().map(|p| format!("-{p}")))
+                    .collect();
+                lock(&g.faults.sessions).push(session);
+                let open = g.faults.open.fetch_add(1, Ordering::SeqCst) + 1;
+                g.faults.most_open.fetch_max(open, Ordering::SeqCst);
+                let code = bounded(g.login(&line_of(&words)));
+                g.faults.open.fetch_sub(1, Ordering::SeqCst);
+                return code.filter(|code| matches!(code, 0 | 1));
             }
         };
         bounded(c).filter(|code| matches!(code, 0 | 1))
     }
+}
+
+/// [`ALIVE`]'s answer: the asked pids it printed, `None` when it did not run (or not to its
+/// end).
+fn alive_of(out: Option<(i32, Vec<u8>)>, asked: &[u32]) -> Option<Vec<u32>> {
+    let (code, stdout) = out.filter(|(code, _)| *code == 0)?;
+    let _ = code;
+    Some(
+        String::from_utf8_lossy(&stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .filter(|p| asked.contains(p))
+            .collect(),
+    )
+}
+
+/// [`bounded`], with what the command printed on stdout (at most 64 KiB kept).
+fn bounded_output(mut c: Command) -> Option<(i32, Vec<u8>)> {
+    c.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = c.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = (&mut stdout).take(64 * 1024).read_to_end(&mut out);
+        out
+    });
+    let deadline = Instant::now() + CONTROL_LIMIT;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let out = reader.join().unwrap_or_default();
+    code.map(|code| (code, out))
 }
 
 /// Runs a short control command (no input, output dropped) for at most [`CONTROL_LIMIT`]: its
@@ -990,6 +1108,10 @@ struct Inner {
     revive: Option<Revive>,
     busy: Mutex<usize>,
     freed: Condvar,
+    /// The host's stop lane (S2-F, 02 §6): a remote stop — its `kill` sessions, all its waits —
+    /// runs while it holds this, so the host never has two stop sessions open at once (sshd's
+    /// `MaxSessions`: git's worst case is 3 commands and 1 stop); a second stop waits behind.
+    stop_lane: Mutex<()>,
 }
 
 impl GitRunner {
@@ -1002,6 +1124,7 @@ impl GitRunner {
                 revive: None,
                 busy: Mutex::new(0),
                 freed: Condvar::new(),
+                stop_lane: Mutex::new(()),
             }),
         }
     }
@@ -1478,9 +1601,8 @@ impl Handle {
             state.stopped = true;
             state.attached.iter().filter_map(Weak::upgrade).collect()
         };
-        for shared in attached {
-            shared.request_stop(StopBy::Asked);
-        }
+        // Together: a host's commands are stopped in one stop session (S2-F).
+        Shared::request_stops(&attached, StopBy::Asked);
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -1598,19 +1720,59 @@ impl Shared {
 
     /// Starts the stop, once, on a thread of its own.
     fn request_stop(self: &Arc<Self>, by: StopBy) {
-        {
-            let mut stop = lock(&self.stop);
-            if stop.by.is_some() {
-                return;
+        Self::request_stops(std::slice::from_ref(self), by);
+    }
+
+    /// Starts the stop of each of `all` not stopping yet, on threads of their own: locally each
+    /// its own (signals are no sessions); remotely one stop for all of a host's, in the host's
+    /// stop lane ([`Shared::stop_remote_all`]).
+    fn request_stops(all: &[Arc<Self>], by: StopBy) {
+        let fresh: Vec<Arc<Self>> = all
+            .iter()
+            .filter(|s| {
+                let mut stop = lock(&s.stop);
+                let first = stop.by.is_none();
+                if first {
+                    stop.by = Some(by);
+                }
+                first
+            })
+            .cloned()
+            .collect();
+        let mut hosts: Vec<Vec<Arc<Self>>> = Vec::new();
+        for shared in fresh {
+            if !shared.runner.via.remote() {
+                std::thread::spawn(move || {
+                    let outcome = shared.stop_local();
+                    shared.stopped_with(outcome);
+                });
+                continue;
             }
-            stop.by = Some(by);
+            match hosts
+                .iter_mut()
+                .find(|h| Arc::ptr_eq(&h[0].runner, &shared.runner))
+            {
+                Some(host) => host.push(shared),
+                None => hosts.push(vec![shared]),
+            }
         }
-        let shared = self.clone();
-        std::thread::spawn(move || {
-            let outcome = shared.stop_sequence();
-            lock(&shared.stop).outcome = Some(outcome);
-            shared.stop_changed.notify_all();
-        });
+        for group in hosts {
+            std::thread::spawn(move || {
+                let outcomes = {
+                    let _lane = lock(&group[0].runner.stop_lane);
+                    Shared::stop_remote_all(&group)
+                };
+                for (shared, outcome) in group.iter().zip(outcomes) {
+                    shared.stopped_with(outcome);
+                }
+            });
+        }
+    }
+
+    /// The stop came to `outcome`: said to whoever waits for it.
+    fn stopped_with(&self, outcome: StopOutcome) {
+        lock(&self.stop).outcome = Some(outcome);
+        self.stop_changed.notify_all();
     }
 
     fn stop_requested(&self) -> Option<StopBy> {
@@ -1634,14 +1796,6 @@ impl Shared {
         }
     }
 
-    fn stop_sequence(&self) -> StopOutcome {
-        if self.runner.via.remote() {
-            self.stop_remote()
-        } else {
-            self.stop_local()
-        }
-    }
-
     /// 03 §3.5, local: `SIGTERM` to the command's process group (it leads a session of its
     /// own); after the grace, `SIGKILL` to the group.
     fn stop_local(&self) -> StopOutcome {
@@ -1657,57 +1811,129 @@ impl Shared {
         StopOutcome::Stopped { killed }
     }
 
-    /// 03 §3.5, remote, over the same master, the pid from the `sopen-pid` line: the group is
-    /// asked first (`kill -0`) when the channel has already ended — a child that ignores
-    /// `SIGTERM` and closed its descriptors outlives it — then `kill -TERM -- -<pid>`; then the
-    /// grace: the channel's end, then the group's, asked every half second; `kill -KILL` only if
-    /// the last asking found it alive; then the channel is closed. Without the line, or with the
-    /// master gone, it may still be running.
-    fn stop_remote(&self) -> StopOutcome {
-        let via = &self.runner.via;
-        let Some(pid) = self.wait_remote_pid() else {
-            if self.exit().is_some() {
-                return StopOutcome::Ended;
-            }
-            self.close_channel();
-            return StopOutcome::Sent;
-        };
-        if !via.check() {
-            self.close_channel();
-            return StopOutcome::Sent;
-        }
-        if self.exit().is_some() {
-            match via.kill(pid, "-0") {
-                Some(0) => {}
-                Some(_) => return StopOutcome::Ended,
-                None => return StopOutcome::Sent,
+    /// 03 §3.5, remote, over the same master, for one host's commands stopped together (S2-F:
+    /// one stop session at a time per host, run in its stop lane), each by the pid of its
+    /// `sopen-pid` line: a group whose channel has already ended is asked first (`kill -0`) — a
+    /// child that ignores `SIGTERM` and closed its descriptors outlives it — then one `kill -TERM
+    /// -- -<pid>…` for all; then the grace: the channels' end, then the groups', asked every half
+    /// second; one `kill -KILL` for those the last asking found alive; then the channels are
+    /// closed. Without the line, or with the master gone, a command may still be running. Its
+    /// output is read and dropped meanwhile by its own reader (`Running`'s finish or drop): a
+    /// channel cannot end while the master holds output nobody reads (E5).
+    fn stop_remote_all(group: &[Arc<Self>]) -> Vec<StopOutcome> {
+        let via = &group[0].runner.via;
+        let limits = group[0].runner.limits;
+        let mut outcome: Vec<Option<StopOutcome>> = vec![None; group.len()];
+        let pids: Vec<Option<u32>> = group.iter().map(|s| s.wait_remote_pid()).collect();
+        for (i, s) in group.iter().enumerate() {
+            if pids[i].is_none() {
+                outcome[i] = Some(if s.exit().is_some() {
+                    StopOutcome::Ended
+                } else {
+                    s.close_channel();
+                    StopOutcome::Sent
+                });
             }
         }
-        if via.kill(pid, "-TERM").is_none() {
-            self.close_channel();
-            return StopOutcome::Sent;
+        let live: Vec<usize> = (0..group.len()).filter(|&i| outcome[i].is_none()).collect();
+        if !live.is_empty() && !via.check() {
+            for &i in &live {
+                group[i].close_channel();
+                outcome[i] = Some(StopOutcome::Sent);
+            }
         }
-        let deadline = Instant::now() + self.runner.limits.stop_grace;
-        self.wait_exit(self.runner.limits.stop_grace);
-        // Asked until it is gone or the grace is over; any answer but "still there" ends it.
-        let last = loop {
-            let answer = via.kill(pid, "-0");
+        let pid = |i: usize| pids[i].unwrap_or(0);
+        // A channel already ended: its group is asked first.
+        let open: Vec<usize> = (0..group.len()).filter(|&i| outcome[i].is_none()).collect();
+        let (ended, mut todo): (Vec<usize>, Vec<usize>) =
+            open.into_iter().partition(|&i| group[i].exit().is_some());
+        for (i, answer) in Self::still_there(via, &ended, &pid) {
+            match answer {
+                Some(0) => todo.push(i),
+                Some(_) => outcome[i] = Some(StopOutcome::Ended),
+                None => outcome[i] = Some(StopOutcome::Sent),
+            }
+        }
+        if !todo.is_empty() {
+            let all: Vec<u32> = todo.iter().map(|&i| pid(i)).collect();
+            if via.kill_groups(&all, "-TERM").is_none() {
+                for &i in &todo {
+                    group[i].close_channel();
+                    outcome[i] = Some(StopOutcome::Sent);
+                }
+                todo.clear();
+            }
+        }
+        let deadline = Instant::now() + limits.stop_grace;
+        for &i in &todo {
+            group[i].wait_exit(deadline.saturating_duration_since(Instant::now()));
+        }
+        // Asked until each is gone or the grace is over; any answer but "still there" ends the
+        // asking for that group.
+        let mut alive = todo.clone();
+        loop {
+            let still = Self::still_there(via, &alive, &pid);
+            for &(i, answer) in &still {
+                match answer {
+                    Some(0) => {}
+                    Some(_) => outcome[i] = Some(StopOutcome::Stopped { killed: false }),
+                    None => outcome[i] = Some(StopOutcome::Sent),
+                }
+            }
+            alive = still
+                .into_iter()
+                .filter(|(_, a)| *a == Some(0))
+                .map(|(i, _)| i)
+                .collect();
             let left = deadline.saturating_duration_since(Instant::now());
-            if answer != Some(0) || left.is_zero() {
-                break answer;
+            if alive.is_empty() || left.is_zero() {
+                break;
             }
             std::thread::sleep(REMOTE_PROBE.min(left));
-        };
-        let outcome = match last {
-            Some(0) => match via.kill(pid, "-KILL") {
-                Some(code) => StopOutcome::Stopped { killed: code == 0 },
-                None => StopOutcome::Sent,
-            },
-            Some(_) => StopOutcome::Stopped { killed: false },
-            None => StopOutcome::Sent,
-        };
-        self.close_channel();
+        }
+        if !alive.is_empty() {
+            let all: Vec<u32> = alive.iter().map(|&i| pid(i)).collect();
+            let killed = via.kill_groups(&all, "-KILL");
+            for &i in &alive {
+                outcome[i] = Some(match killed {
+                    Some(code) => StopOutcome::Stopped {
+                        killed: code == 0 || alive.len() > 1,
+                    },
+                    None => StopOutcome::Sent,
+                });
+            }
+        }
+        for &i in &todo {
+            group[i].close_channel();
+        }
         outcome
+            .into_iter()
+            .map(|o| o.unwrap_or(StopOutcome::Stopped { killed: false }))
+            .collect()
+    }
+
+    /// Whether each of `which` is still there, in one session (`kill -0`'s answer: `Some(0)`
+    /// there, `Some(1)` gone, `None` not asked): one group as 03 §3.5 asks it, several by a loop
+    /// that asks each ([`ALIVE`]).
+    fn still_there(
+        via: &Via,
+        which: &[usize],
+        pid: &dyn Fn(usize) -> u32,
+    ) -> Vec<(usize, Option<i32>)> {
+        match which {
+            [] => Vec::new(),
+            [one] => vec![(*one, via.kill(pid(*one), "-0"))],
+            many => {
+                let all: Vec<u32> = many.iter().map(|&i| pid(i)).collect();
+                match via.alive_groups(&all) {
+                    Some(alive) => many
+                        .iter()
+                        .map(|&i| (i, Some(if alive.contains(&pid(i)) { 0 } else { 1 })))
+                        .collect(),
+                    None => many.iter().map(|&i| (i, None)).collect(),
+                }
+            }
+        }
     }
 
     /// The `sopen-pid` line's pid, waited for up to [`PID_WAIT`]; `None` without it or once
@@ -1805,6 +2031,8 @@ impl Shared {
         // Over the same master only, as a stop is: with it gone, what is left may still run.
         // `SIGKILL` only to a group just found alive.
         if let Some(pid) = pid.filter(|_| via.check()) {
+            // In the host's stop lane: never two stop sessions at once.
+            let _lane = lock(&self.runner.stop_lane);
             if via.kill(pid, "-0") == Some(0) {
                 let _ = via.kill(pid, "-KILL");
             }
@@ -2054,6 +2282,25 @@ impl Running {
         self.reading.as_mut()?.record(delim)
     }
 
+    /// stdout's next bytes into `buf`, as `std::io::Read::read` gives them (S2-F: the log
+    /// stream's pipe, `history::Pipe`): `Ok(0)` at its end. Waiting here is what the read and
+    /// network limits count, as in [`Running::read_record`]: once a limit, a stop (Esc, a
+    /// superseded load) or too much output has ended the command, the end is an error that says
+    /// so, never a quiet end of the output.
+    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.reading.as_mut() {
+            Some(reading) => reading.read(buf),
+            None => Ok(0),
+        }
+    }
+
+    /// The process has not exited yet (a parked stream: git blocked on the full pipe).
+    pub fn running(&self) -> bool {
+        self.reading
+            .as_ref()
+            .is_some_and(|r| r.shared.exit().is_none())
+    }
+
     /// Reads the rest of stdout, waits for the end and logs it.
     pub fn finish(mut self) -> Done {
         let reading = self.reading.take().expect("not finished yet");
@@ -2134,6 +2381,40 @@ impl Reading {
             if self.buf.len() > self.max_record {
                 self.overflow(self.max_record);
                 return None;
+            }
+            self.fill(wait_start);
+        }
+    }
+
+    /// [`Running::read`].
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let wait_start = Instant::now();
+        loop {
+            if self.pos < self.buf.len() && !self.overflowed {
+                let n = out.len().min(self.buf.len() - self.pos);
+                out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+                self.pos += n;
+                if self.pos == self.buf.len() {
+                    self.buf.clear();
+                    self.pos = 0;
+                }
+                return Ok(n);
+            }
+            if self.eof || self.overflowed {
+                return match self.shared.stop_requested() {
+                    None => Ok(0),
+                    Some(StopBy::Limit(limit)) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("git did not answer in {} s", limit.as_secs()),
+                    )),
+                    Some(StopBy::Asked) => Err(io::Error::other("stopped")),
+                    Some(StopBy::Overflow(bytes)) => Err(io::Error::other(format!(
+                        "stopped: more than {bytes} bytes of output"
+                    ))),
+                };
+            }
+            if out.is_empty() {
+                return Ok(0);
             }
             self.fill(wait_start);
         }
@@ -2366,5 +2647,214 @@ impl Reading {
             (None, Some(signal)) => Ending::Signal(signal),
             (None, None) => Ending::Exit(-1),
         }
+    }
+}
+
+/// The host's stop lane (S2-F; 02 §6: git's worst case on a host is 3 commands and 1 stop
+/// session): a handle's commands stopped together share one stop session at a time; two
+/// stops never have two sessions open at once; a group that ignores `SIGTERM` still gets the
+/// `SIGKILL`, and only it.
+#[cfg(test)]
+mod stop_lane_tests {
+    use super::*;
+    use crate::git::history::fixture::{self, Repo};
+
+    /// A `ShellGit` runner on the fixture with a 1 s grace, and its fault switch (which records
+    /// every stop session).
+    fn shell(repo: &Repo) -> (GitRunner, Arc<Faults>) {
+        let sh = fixture::env(&repo.home())
+            .into_iter()
+            .fold(ShellGit::new("/bin/sh", "box"), |g, (k, v)| {
+                g.with_env(k, v)
+            })
+            .with_env("PATH", std::env::var_os("PATH").unwrap_or_default());
+        let faults = sh.faults();
+        let limits = Limits {
+            stop_grace: Duration::from_secs(1),
+            ..Limits::default()
+        };
+        (GitRunner::shell(sh).with_limits(limits), faults)
+    }
+
+    /// A git alias that runs `script` (no file written for it).
+    fn alias(repo: &Repo, script: &str) -> GitCommand {
+        let set = format!("alias.hang=!{script}");
+        GitCommand::new(Class::Read, repo.top(), ["-c", set.as_str(), "hang"])
+    }
+
+    /// A child that ignores `SIGTERM` keeps the group alive past the grace; it says `ready` on
+    /// stderr once it ignores it (a stop before that would end it).
+    const STUBBORN: &str =
+        "(trap '' TERM; echo ready >&2; exec >/dev/null 2>&1 </dev/null; sleep 30) & sleep 30";
+
+    /// Waits until the stubborn child of `handle`'s newest command ignores `SIGTERM`.
+    fn stubborn_ready(handle: &Handle) {
+        wait_for("the child ignoring TERM", Duration::from_secs(5), || {
+            handle.progress().as_deref() == Some("ready")
+        });
+    }
+
+    fn group_alive(pid: u32) -> bool {
+        // SAFETY: kill(2) with signal 0 only asks.
+        unsafe { libc::kill(-(pid as libc::pid_t), 0) == 0 }
+    }
+
+    fn wait_for(what: &str, limit: Duration, done: impl Fn() -> bool) {
+        let t = Instant::now();
+        while !done() {
+            assert!(t.elapsed() < limit, "{what}: not within {limit:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Starts `cmds` on `handle` and waits for their `sopen-pid` lines.
+    fn started(runner: &GitRunner, cmds: &[GitCommand], handle: &Handle) -> Vec<Running> {
+        let runs: Vec<Running> = cmds
+            .iter()
+            .map(|c| {
+                runner
+                    .start(c, handle)
+                    .unwrap_or_else(|d| panic!("{}", d.ending))
+            })
+            .collect();
+        wait_for("the sopen-pid lines", Duration::from_secs(5), || {
+            runs.iter().all(|r| r.remote_pid().is_some())
+        });
+        runs
+    }
+
+    /// Three commands of one handle stopped together: one `-TERM` session names all three
+    /// groups, and never more than one stop session is open.
+    #[test]
+    fn three_attached_commands_are_stopped_in_one_session() {
+        let Some(git) = fixture::git() else {
+            return;
+        };
+        let repo = Repo::new(&git);
+        let (runner, faults) = shell(&repo);
+        let handle = Handle::new();
+        let cmd = alias(&repo, "sleep 30");
+        let runs = started(&runner, &[cmd.clone(), cmd.clone(), cmd], &handle);
+        let pids: Vec<u32> = runs.iter().filter_map(Running::remote_pid).collect();
+        handle.stop();
+        for run in runs {
+            let done = run.finish();
+            assert!(
+                matches!(&done.ending, Ending::Stopped(s) if !s.killed),
+                "{}",
+                done.ending
+            );
+        }
+        let sessions = lock(&faults.sessions).clone();
+        let terms: Vec<&Vec<String>> = sessions.iter().filter(|s| s[0] == "-TERM").collect();
+        assert_eq!(terms.len(), 1, "{sessions:?}");
+        let mut named: Vec<String> = terms[0][1..].to_vec();
+        named.sort();
+        let mut want: Vec<String> = pids.iter().map(|p| format!("-{p}")).collect();
+        want.sort();
+        assert_eq!(named, want, "{sessions:?}");
+        assert!(!sessions.iter().any(|s| s[0] == "-KILL"), "{sessions:?}");
+        assert_eq!(faults.most_open.load(Ordering::SeqCst), 1, "{sessions:?}");
+        for pid in pids {
+            wait_for("the group gone", Duration::from_secs(2), || {
+                !group_alive(pid)
+            });
+        }
+    }
+
+    /// Two stops at once (two handles): the second waits behind the first — at no moment are
+    /// two stop sessions open — and both end their commands.
+    #[test]
+    fn two_overlapping_stops_never_open_two_sessions() {
+        let Some(git) = fixture::git() else {
+            return;
+        };
+        let repo = Repo::new(&git);
+        let (runner, faults) = shell(&repo);
+        let (first, second) = (Handle::new(), Handle::new());
+        let a = started(&runner, &[alias(&repo, STUBBORN)], &first);
+        stubborn_ready(&first);
+        let b = started(&runner, &[alias(&repo, "sleep 30")], &second);
+        let pids: Vec<u32> = a.iter().chain(&b).filter_map(Running::remote_pid).collect();
+        first.stop();
+        second.stop();
+        for run in a.into_iter().chain(b) {
+            let done = run.finish();
+            assert!(matches!(done.ending, Ending::Stopped(_)), "{}", done.ending);
+        }
+        let sessions = lock(&faults.sessions).clone();
+        assert_eq!(faults.most_open.load(Ordering::SeqCst), 1, "{sessions:?}");
+        assert_eq!(
+            sessions.iter().filter(|s| s[0] == "-TERM").count(),
+            2,
+            "one stop each: {sessions:?}"
+        );
+        for pid in pids {
+            wait_for("the group gone", Duration::from_secs(3), || {
+                !group_alive(pid)
+            });
+        }
+    }
+
+    /// A group that ignores `SIGTERM`, stopped with one that does not: both get the one
+    /// `-TERM`; the liveness asking finds only the stubborn one, and the `-KILL` goes to it alone.
+    #[test]
+    fn a_group_that_ignores_term_still_gets_the_kill() {
+        let Some(git) = fixture::git() else {
+            return;
+        };
+        let repo = Repo::new(&git);
+        let (runner, faults) = shell(&repo);
+        let handle = Handle::new();
+        let runs = started(
+            &runner,
+            &[alias(&repo, "sleep 30"), alias(&repo, STUBBORN)],
+            &handle,
+        );
+        stubborn_ready(&handle);
+        let pids: Vec<u32> = runs.iter().filter_map(Running::remote_pid).collect();
+        handle.stop();
+        let endings: Vec<Ending> = runs.into_iter().map(|r| r.finish().ending).collect();
+        assert!(
+            matches!(&endings[0], Ending::Stopped(s) if !s.killed),
+            "{endings:?}"
+        );
+        let sessions = lock(&faults.sessions).clone();
+        assert!(
+            matches!(&endings[1], Ending::Stopped(s) if s.killed),
+            "{endings:?} {sessions:?} {pids:?}"
+        );
+        let kills: Vec<&Vec<String>> = sessions.iter().filter(|s| s[0] == "-KILL").collect();
+        assert_eq!(kills.len(), 1, "{sessions:?}");
+        assert_eq!(kills[0][1..], [format!("-{}", pids[1])], "{sessions:?}");
+        assert_eq!(faults.most_open.load(Ordering::SeqCst), 1, "{sessions:?}");
+        for pid in pids {
+            wait_for("the group gone", Duration::from_secs(3), || {
+                !group_alive(pid)
+            });
+        }
+    }
+
+    /// The liveness loop's words: one `sh -c` whose arguments are the pids, `kill` the program.
+    #[test]
+    fn the_liveness_words() {
+        assert_eq!(
+            alive_words(&[12, 34]),
+            [
+                "exec",
+                "'sh'",
+                "'-c'",
+                r#"'for p do env kill -0 -- "-$p" 2>/dev/null && echo "$p"; done; exit 0'"#,
+                "'sopen-stop'",
+                "'12'",
+                "'34'"
+            ]
+            .map(OsString::from)
+        );
+        assert_eq!(
+            kill_groups_words(&[12, 34], "-TERM"),
+            ["exec", "'kill'", "'-TERM'", "'--'", "'-12'", "'-34'"].map(OsString::from)
+        );
+        assert_eq!(kill_words(12, "-KILL"), kill_groups_words(&[12], "-KILL"));
     }
 }

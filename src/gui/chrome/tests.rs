@@ -203,6 +203,15 @@ fn the_f_key_tables() {
     assert_eq!(LIST_KEYS, row(Context::List, Mode::Preview).as_slice());
     assert_eq!(pairs(VIEWER_KEYS), [(1, "Help"), (3, "Exit"), (4, "Edit")]);
     assert_eq!(VIEWER_KEYS, row(Context::Viewer, Mode::Preview).as_slice());
+    // The git panel's row (03 §9.1), S2's slots: the actions' (2, 5–8, 10) come with S3.
+    assert_eq!(
+        pairs(&row(Context::Git, Mode::Preview)),
+        [(1, "Help"), (3, "View"), (4, "Edit"), (9, "Dual")]
+    );
+    assert_eq!(
+        pairs(&row(Context::Git, Mode::Dual)),
+        [(1, "Help"), (3, "View"), (4, "Edit"), (9, "Prevw")]
+    );
     assert_eq!(pairs(&[HELP_KEY, EXIT_KEY]), [(1, "Help"), (3, "Exit")]);
     assert_eq!(
         pairs(HEX_KEYS),

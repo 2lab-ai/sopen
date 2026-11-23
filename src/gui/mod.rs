@@ -331,6 +331,16 @@ pub struct State {
     /// the first frame drawn with content from the stream — rows still loading, a partial picture,
     /// a sound's first peaks — shot as they are (`loading=1`, 06 §11).
     pub loading: bool,
+    /// File browser: the git panel of the folder's repository is pinned to the other side once
+    /// detection answers, and has the keyboard (`git=pin`, 02 §9).
+    pub git_pin: bool,
+    /// File browser, with `git=pin`: the bar on this revision (any git accepts) once its page is
+    /// loaded (`select=REV`).
+    pub select: Option<String>,
+    /// File browser, with `git=pin`: the details pane of the bar's row opens (`details=1`).
+    pub details: bool,
+    /// File browser, with `git=pin`: the label cursor on the bar's row's Nth label (`label=N`).
+    pub label: Option<usize>,
 }
 
 impl State {
@@ -413,6 +423,23 @@ impl State {
                     "1" => state.loading = true,
                     other => bail!("SOPEN_STATE: loading must be 1 (got '{other}')"),
                 },
+                "git" => match value {
+                    "pin" => state.git_pin = true,
+                    other => bail!("SOPEN_STATE: git must be 'pin' (got '{other}')"),
+                },
+                "select" if value.is_empty() => bail!("SOPEN_STATE: select needs a revision"),
+                "select" => state.select = Some(value.to_string()),
+                "details" => match value {
+                    "1" => state.details = true,
+                    other => bail!("SOPEN_STATE: details must be 1 (got '{other}')"),
+                },
+                "label" => {
+                    let n = value
+                        .parse()
+                        .map_err(|_| anyhow!("SOPEN_STATE label must be a whole number"))?;
+                    state.label = Some(n);
+                }
+                "dialog" => bail!("SOPEN_STATE: dialog= comes with the git panel's actions (S3)"),
                 "patch" => {
                     for one in value.split(',').map(str::trim) {
                         let (at, bytes) = one.split_once(':').ok_or_else(|| {
@@ -486,6 +513,9 @@ pub struct Hooks {
     pub save_to: Option<PathBuf>,
     /// `SOPEN_LIST=1`: a folder prints what the file browser lists for it, without a window.
     pub list: bool,
+    /// `SOPEN_LIST=git`: a folder in a work tree prints its git panel's first page, without a
+    /// window (02 §9); any other folder its listing and why there is no panel.
+    pub list_git: bool,
 }
 
 impl Hooks {
@@ -549,6 +579,7 @@ impl Hooks {
                 .filter(|p| !p.is_empty())
                 .map(PathBuf::from),
             list: flag("SOPEN_LIST"),
+            list_git: std::env::var("SOPEN_LIST").is_ok_and(|v| v == "git"),
         })
     }
 
@@ -2094,6 +2125,7 @@ mod tests {
                     record.lock().unwrap().push(abs.to_string());
                     Ok(format!("opened {abs}"))
                 }),
+                git: None,
             });
             let mut fx = Self {
                 _tmp: tmp,

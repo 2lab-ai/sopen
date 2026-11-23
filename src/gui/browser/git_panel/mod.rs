@@ -13,8 +13,9 @@
 //! marks, the label cursor, Find, the filters' choices and the details pane's keyboard are the
 //! view's own.
 //!
-//! Nothing uses it until S2-F; the `dead_code` allowance below goes then, as a hand-over declared
-//! with it (this file is S2-D's).
+//! S2-F wires it into the browser (`gui::browser`'s git section). What S2 does not call yet —
+//! S3's label menu (`only_branch`, `all_branches`, `bar_label`, `BranchChoice`) and the readers
+//! the tests use — keeps the `dead_code` allowance until S3's integration uses it.
 #![allow(dead_code)]
 
 mod backups;
@@ -31,8 +32,6 @@ mod tests;
 #[cfg(test)]
 mod tests_s3;
 
-// The integration's inputs (S2-F); the allowance goes with `dead_code`'s.
-#[allow(unused_imports)]
 pub use details::{Details, FileGroup, FileRow, Group, Summary};
 #[allow(unused_imports)]
 pub use filters::{BranchChoice, Filters, Order};
@@ -693,6 +692,12 @@ impl GitView {
         })
     }
 
+    /// The paging line as the foot says it (`N commits · M more`, the shallow note, an
+    /// error): `SOPEN_LIST=git`'s last line (02 §9).
+    pub fn paging_line(&self) -> String {
+        graph_view::paging_text(&self.paging, self.commits, "commits").0
+    }
+
     /// Find's text while its field is open.
     pub fn find_text(&self) -> Option<&str> {
         self.find.as_ref().map(|f| f.text.as_str())
@@ -702,6 +707,15 @@ impl GitView {
     pub fn set_find_case(&mut self, case: bool) {
         if let Some(find) = &mut self.find {
             find.case = case;
+        }
+    }
+
+    /// The file row under the details pane's bar (S2-F's tests and receipts).
+    pub fn pane_file(&self) -> Option<&FileRow> {
+        let pane = self.pane.as_ref()?;
+        match pane.line()? {
+            details::Line::File { group, file } => pane.file(*group, *file).map(|(_, f)| f),
+            _ => None,
         }
     }
 
@@ -830,6 +844,11 @@ impl GitView {
             Command::Wide => return vec![A::Wide],
             Command::HistorySearch => {
                 self.search_dialog = Some(find::SearchDialog::default());
+                return Vec::new();
+            }
+            // Cmd/Ctrl+K (03 §9.2): the filters' dialog, in S2 before S3's menu offers it.
+            Command::Filters => {
+                self.open_filters();
                 return Vec::new();
             }
             _ => {}
@@ -1063,16 +1082,9 @@ impl GitView {
     }
 }
 
-/// The slice the read-only git panel lands with (02 §8.1).
-const SLICE: u8 = 2;
-
-/// The key table's rows the panel reads: up to its own slice whatever [`keys::LANDED`] says yet;
+/// The key table's rows the panel reads: the landed slices' (S2's own among them since S2-F);
 /// later slices' rows (actions, the planner) only once they land.
-const UPTO: u8 = if keys::LANDED > SLICE {
-    keys::LANDED
-} else {
-    SLICE
-};
+const UPTO: keys::Slices = keys::LANDED_SLICES;
 
 /// What the status row says while nothing else is to be said.
 const HINT: &str =

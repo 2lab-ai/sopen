@@ -401,8 +401,14 @@ mod tests {
             Some("The directory tree in place of this list"),
             "{page:#?}"
         );
-        // Not yet: F7, F8, Cmd/Ctrl+G.
-        for later in ["F7", "F8", &format!("{cmd}+G")] {
+        // S2 has landed: Cmd/Ctrl+G pins the git panel.
+        assert_eq!(
+            line(&page, &format!("{cmd}+G")).map(|l| l.what.as_str()),
+            Some("Pin the git panel to the other side; again: unpin"),
+            "{page:#?}"
+        );
+        // Not yet: F7, F8 (S6).
+        for later in ["F7", "F8"] {
             assert!(
                 !all.iter().any(|keys| keys.split(", ").any(|k| k == later)),
                 "{later} lands later: {all:?}"
@@ -433,6 +439,81 @@ mod tests {
                 line(&page, keys).map(|l| l.what.as_str()),
                 Some(what),
                 "{keys}: {page:#?}"
+            );
+        }
+        assert_eq!(page.lines.last(), Some(&aliases()));
+    }
+
+    /// F1 in the git panel (03 §9, landed with S2): its S2 keys, each on one line — the
+    /// details, a file at a revision, the editor, the mode, the bar, the label cursor, marks,
+    /// Tab back, Esc, Find, history search, refresh, the filters (Cmd/Ctrl+K), HEAD, wide, the
+    /// pin — and none of S3's actions (Reword, Pick, Rebase, Branch, Delete, Menu) or S4's
+    /// planner.
+    #[test]
+    fn the_git_page_lists_the_git_panels_keys() {
+        let page = for_context(Context::Git, Mode::Preview, &[]);
+        assert_eq!(page.title, "Keys in the git panel");
+        let cmd = keys::command_name();
+        for (keys, what) in [
+            ("F1", "This screen"),
+            ("Shift+F3", "The file at this revision"),
+            (
+                "F3, Enter",
+                "The row's details (with one marked row: compare the two)",
+            ),
+            (
+                "F4",
+                "The repository (uncommitted row: the file) in the editor",
+            ),
+            ("↑, ↓, PgUp, PgDn, Home, End", "Move the bar"),
+            ("←", "The label cursor to the previous label"),
+            ("→", "The label cursor to the next label"),
+            (
+                "Space, Ins",
+                "Mark or unmark the row, then step down (files: stage, unstage)",
+            ),
+            ("Tab, Shift+Tab", "Back to the list"),
+            ("Esc", "Close the innermost open thing; with none, unpin"),
+            ("a letter", "Find, starting with it"),
+            (&format!("{cmd}+Shift+F"), "History search"),
+            (&format!("{cmd}+F"), "Find"),
+            (&format!("{cmd}+R"), "Refresh (hard)"),
+            (&format!("{cmd}+J"), "The bar to HEAD"),
+            (
+                &format!("{cmd}+Shift+G"),
+                "The git panel over both sides, and back",
+            ),
+            (&format!("{cmd}+G"), "Pin this git panel; again: unpin"),
+            (&format!("{cmd}+K"), "The filters"),
+        ] {
+            assert_eq!(
+                line(&page, keys).map(|l| l.what.as_str()),
+                Some(what),
+                "{keys}: {page:#?}"
+            );
+        }
+        assert!(line(&page, "F9")
+            .unwrap()
+            .what
+            .starts_with("Switch to dual mode"));
+        let all: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
+        for later in [
+            "F2",
+            "F5",
+            "F6",
+            "F7",
+            "F8",
+            "F10",
+            "Shift+F10",
+            &format!("{cmd}+Z"),
+            &format!("{cmd}+B"),
+            &format!("{cmd}+L"),
+            &format!("{cmd}+E"),
+            &format!("{cmd}+Shift+R"),
+        ] {
+            assert!(
+                !all.iter().any(|keys| keys.split(", ").any(|k| k == later)),
+                "{later} lands later: {all:?}"
             );
         }
         assert_eq!(page.lines.last(), Some(&aliases()));

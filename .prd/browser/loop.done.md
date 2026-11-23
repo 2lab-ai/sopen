@@ -163,3 +163,26 @@ changes. Rows here are snapshots taken when they were moved.
   (an estimate); git's worst case in sopen is 6 by reading the code. Not tested: a channel that
   ends while its group survives, the `stop sent` paths, bash or zsh as the real account shell,
   more than 3 sessions at once.
+
+## R2 (part) — S2-0 to S2-E, closed 2026-11-23
+
+- merged S2-0 (PR #64), S2-C (#67), S2-E (#68), S2-B (#69), S2-A (#70), S2-D (#72) ✅ · result: the git panel's
+  parts — scaffold, runner, read model, lane layout, panel UI, the viewers' read-only flag and `.revisions` root — on
+  main; S2-F wires them · closed rows: S2-0, S2-A, S2-B, S2-C, S2-D, S2-E · PRs: S2-F's (this block)
+
+### Closed rows
+
+| ID | Status | Branch | Scope | Owner files (02 §5) | After |
+|---|---|---|---|---|---|
+| S2-0 | ✅ done: merged (#64) | `feat/browser-s2-scaffold` | `mod` lines and stubs for S2's files (the git tests' `mod` lines too); the shared types `Oid`, `Detection`, `CommitRow`, `RefLabel`, `StashRow`, `StatusEntry`, `InProgress`, `Backup`; `pub(crate)` on `sftp.rs`'s `ssh_config` and its `SshConfig`; no dependency, no `keys.rs` row; E4's result in 02 §8.2 | `src/lib.rs`, `src/git/{mod,model}.rs`, `src/git/tests/model.rs`, `src/remote/{mod,sftp}.rs`, `src/gui/browser.rs` (`mod git_panel;`), `src/gui/chrome.rs` (`pub mod git;`), stubs | S1, E4 |
+| S2-A | ✅ done: merged (#70) | `feat/browser-s2-runner` | `GitRunner`; `LocalGit`, `SshGit`, `ShellGit`; quoting, `<locate>`, limits, stop, progress, the command log; `exec_args(dest, state_dir)`; CI's `SOPEN_REQUIRE_GIT=1` (03 §3) | `src/git/runner.rs`, `src/remote/exec.rs`, `.github/workflows/ci.yml`, `src/git/tests/runner.rs` | S2-0 |
+| S2-B | ✅ done: merged (#69) | `feat/browser-s2-read-model` | detection and its cache, the parsers, the log stream and its pages (03 §2, §4.1, §4.5); the shared types (adds only). S2-B adds: a path or name that is not UTF-8 (the model's paths are `String`; `remote::Entry` carries `lossy`), the HEAD read's result (03 §4.1), the status read's ahead/behind (`# branch.ab`), a copy (`C`) status letter | `src/git/{model,detect,parse,history}.rs`, `src/git/tests/{model,detect,parse,history}.rs` | S2-0 |
+| S2-C | ✅ done: merged (#67) | `feat/browser-s2-lanes` | the lane layout, pure and deterministic, with its table tests and properties (03 §4.3, G-G2) | `src/git/graph.rs`, `src/git/tests/graph.rs` | S2-0 |
+| S2-D | ✅ done: merged (#72) | `feat/browser-s2-panel-ui` | the read-only panel: the graph, the details pane, find, filters, and its look (03 §4.2–§4.7, §6) | `src/gui/browser/git_panel/{mod,graph_view,details,find,filters}.rs`, `src/gui/browser/git_panel/tests*.rs`, `src/gui/chrome/git.rs` | S2-0 |
+| S2-E | ✅ done: merged (#68) | `feat/browser-s2-read-only` | the viewers' `read_only` flag (Save and Save copy off, the reason on hover) and the `.revisions` cache root (03 §6.2–§6.3) | `src/gui/{text,image,hex,media}.rs` and their tests (or only the `Window` trait's default, 02 §8.1), `src/cache.rs` | S2-0 |
+
+### Round section
+
+- S2-0 to S2-E each passed its module gate and review rounds; their hand-overs to S2-F (the production
+  `LogStream` pipe, the runner's stop for a waiting page, Cmd/Ctrl+K, `set_remotes`, the read-only flag before a
+  window's first pass, the `.revisions` root in 01 §5, `SOPEN_REQUIRE_GIT` in AGENTS.md) are S2-F's row.

@@ -1911,14 +1911,20 @@ fn the_status_row_names_the_item_a_question_is_about() {
     fx.key(Key::Enter);
 }
 
-/// S1's key help says what Esc does in S1: nothing of the pin (S2).
+/// The key help says what Esc does now S2 has landed (02 §3.2: stop, else unpin) and names no
+/// key of a slice that has not: nothing of F7 or F8 (S6).
 #[test]
 fn the_key_help_names_no_key_of_a_later_slice() {
     let page = help::for_context(Context::List, view::Mode::Preview, &[]);
     let esc = page.lines.iter().find(|l| l.keys == "Esc").expect("Esc");
-    assert_eq!(esc.what, "Stop a fetch or a file operation");
+    assert_eq!(
+        esc.what,
+        "Stop a fetch or a file operation; else unpin the git panel"
+    );
     assert!(
-        page.lines.iter().all(|l| !l.what.contains("pin")),
+        page.lines
+            .iter()
+            .all(|l| !l.keys.split(", ").any(|k| k == "F7" || k == "F8")),
         "{page:?}"
     );
 }

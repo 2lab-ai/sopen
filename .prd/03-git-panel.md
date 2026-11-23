@@ -1131,7 +1131,10 @@ under the remote `/tmp/sopen-receipts/`. A window receipt is a screenshot someon
   check out each branch, stage and diff each file → every name comes back byte for byte, each file
   stages only itself, and `SshGit`'s argv for the same commands equals the expected words. The New
   branch dialog refuses `x\y`, `a b`, `a..b`, `-x` and `x.lock` as git's `check-ref-format --branch`
-  does (*verified, git 2.56.1*), before running anything.
+  does (*verified, git 2.56.1*), before running anything. A branch named `@` cannot be checked out
+  by its plain name: git reads `checkout @` as HEAD and `switch refs/heads/@` says a branch is
+  expected (*verified, git 2.56.1*); until S3's Check out spells it another way, the runner's test
+  checks `@` by name (`show-ref --verify refs/heads/@`).
 - G-R2. Fetch from `http://localhost:<port>/x.git` served by the test with `401` and a Basic
   challenge → the fetch fails within 5 s with git's "terminal prompts disabled" message in the log
   entry; no window or terminal prompt appears.

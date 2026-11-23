@@ -588,7 +588,7 @@ enum FolderRun {
 }
 
 fn folder_run(hooks: &gui::Hooks, display: bool) -> FolderRun {
-    if hooks.list {
+    if hooks.list || hooks.list_git {
         FolderRun::List
     } else if hooks.autosave || hooks.autoexport {
         FolderRun::Refuse
@@ -611,7 +611,36 @@ fn open_in_browser(mut place: Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
                 Place::Remote(spec, _) => Some(spec.label()),
                 Place::Local(_) => None,
             };
-            for line in gui::browser::listing(place.fs(), label.as_deref(), abs)? {
+            let lines = if hooks.list_git {
+                // 02 §9: the git panel's first page as text (local and remote).
+                let (destination, connect) = match &place {
+                    Place::Remote(spec, _) => {
+                        let destination = spec.destination();
+                        let (spec, state) = (spec.clone(), dirs.state.clone());
+                        let connect: gui::browser::Connect = std::sync::Arc::new(move || {
+                            let fs = SftpRemote::connect(&spec, &state)?;
+                            Ok(Box::new(fs) as Box<dyn RemoteFs + Send>)
+                        });
+                        (Some(destination), connect)
+                    }
+                    Place::Local(_) => {
+                        let connect: gui::browser::Connect = std::sync::Arc::new(|| {
+                            Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)
+                        });
+                        (None, connect)
+                    }
+                };
+                let git = gui::browser::git_connect(
+                    destination,
+                    label.clone(),
+                    dirs.state.clone(),
+                    connect,
+                );
+                gui::browser::git_listing(place.fs(), label.as_deref(), abs, &git)?
+            } else {
+                gui::browser::listing(place.fs(), label.as_deref(), abs)?
+            };
+            for line in lines {
                 println!("{line}");
             }
             return Ok(());
@@ -697,12 +726,18 @@ fn browser_start(
 ) -> gui::browser::Start {
     gui::browser::Start {
         fs,
-        connect,
         label: remote.map(RemoteSpec::label),
         destination: remote.map(RemoteSpec::destination),
         abs: abs.to_string(),
         cache: dirs.cache.clone(),
         state_dir: dirs.state.clone(),
+        git: Some(gui::browser::git_connect(
+            remote.map(RemoteSpec::destination),
+            remote.map(RemoteSpec::label),
+            dirs.state.clone(),
+            connect.clone(),
+        )),
+        connect,
         launch,
     }
 }
@@ -1560,6 +1595,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(folder_run(&list, true), FolderRun::List);
+        let list_git = gui::Hooks {
+            list_git: true,
+            ..Default::default()
+        };
+        assert_eq!(folder_run(&list_git, true), FolderRun::List);
+        assert_eq!(folder_run(&list_git, false), FolderRun::List);
         let autosave = gui::Hooks {
             autosave: true,
             ..Default::default()
