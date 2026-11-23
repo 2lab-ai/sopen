@@ -1,7 +1,8 @@
 //! Local paths: the fetch cache `<cache>/<host>/<abs path>`, edits kept aside as
 //! `<copy>.conflict-<UTC stamp>`, image and hex backups
 //! `<cache>/.backup/<host>/<abs path>.<UTC stamp>`, image and hex edits under `<cache>/.edits`,
-//! exports under `<cache>/.exports`, session copies under `<cache>/.sessions` (spec §5), and the
+//! exports under `<cache>/.exports`, session copies under `<cache>/.sessions` (spec §5), files at
+//! a revision and diffs under `<cache>/.revisions` ([`RevisionSpace`], 03 §6.2–§6.3), and the
 //! state dir (ssh control sockets, `usage.jsonl`). What
 //! sopen knows about a copy lives apart from the mirrored tree, under `<cache>/.meta` (see
 //! [`Claim`]): the record of what the copy held when fetched or saved, and the session lock. `SOPEN_CACHE_DIR` /
@@ -102,9 +103,17 @@ const EXPORTS: &str = ".exports";
 /// stream (06 §13 W8b): `<cache>/.preview/<window>/<n>`, with `<window>.lock` held by a live
 /// window. Nothing makes it now; [`sweep_legacy_previews`] removes what an older sopen left.
 const LEGACY_PREVIEW: &str = ".preview";
+/// Files at a revision and diffs (03 §6.2–§6.3): `<cache>/.revisions/<window>/<n>/<name>`, with
+/// `<window>.lock` held by a live window (see [`RevisionSpace`]).
+const REVISIONS: &str = ".revisions";
 
 pub fn cache_path(cache: &Path, host: &str, abs: &str) -> PathBuf {
     under(cache, host, abs)
+}
+
+/// Where the file browser's windows keep files at a revision and diffs ([`RevisionSpace`]).
+pub fn revisions_root(cache: &Path) -> PathBuf {
+    cache.join(REVISIONS)
 }
 
 /// Where image and hex edits are staged and refused ones kept.
@@ -561,11 +570,21 @@ const LONE_LOCK_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 /// [`sweep_legacy_previews`] as of `now` (tests: a lock's age without waiting).
 fn sweep_legacy_previews_at(cache: &Path, now: SystemTime) {
     let root = cache.join(LEGACY_PREVIEW);
-    if !std::fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir()) {
-        return;
+    if sweep_windows(&root, now) {
+        // Removed only empty: a live window's folder keeps it.
+        let _ = std::fs::remove_dir(&root);
     }
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return;
+}
+
+/// Under `root` (the legacy preview root, the revisions root), the folder of every window that
+/// is gone and its lock, and an old free lock without its folder, by [`sweep_legacy_previews`]'s
+/// rule, as of `now`. Whether `root` was a real folder that was looked into.
+fn sweep_windows(root: &Path, now: SystemTime) -> bool {
+    if !std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
     };
     let lock_of = |dir: &Path| {
         let mut lock = dir.as_os_str().to_owned();
@@ -579,10 +598,7 @@ fn sweep_legacy_previews_at(cache: &Path, now: SystemTime) {
         Err(_) => None,
         Ok(file) => file.try_lock().is_ok().then_some(Some(file)),
     };
-    // A window's name as an older sopen made it (`PreviewSpace`: 12 of `random_hex`'s digits).
-    let window = |name: &str| {
-        name.len() == 12 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    };
+    let window = window_name;
     let mut lone = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -611,8 +627,148 @@ fn sweep_legacy_previews_at(cache: &Path, now: SystemTime) {
             let _ = std::fs::remove_file(&lock);
         }
     }
-    // Removed only empty: a live window's folder keeps it.
-    let _ = std::fs::remove_dir(&root);
+    true
+}
+
+/// A window's name, as an older sopen made its preview windows' (`PreviewSpace`) and as
+/// [`RevisionSpace`] makes its own: 12 of `random_hex`'s lowercase digits.
+fn window_name(name: &str) -> bool {
+    name.len() == 12 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Where one browser window keeps the files at a revision and the diffs its git panel opens
+/// (03 §6.2–§6.3): `<cache>/.revisions/<window>/`, a folder of its own (0700) under a random
+/// name, with the window's lock `<window>.lock` beside it, held for as long as this lives —
+/// never a mirrored host's folder (no host label starts with a dot). Each file is
+/// [`RevisionSpace::create`]'s `<n>/<name>`. Dropping it — the window closes — removes the
+/// folder with whatever is still in it, its lock, and the root once it is empty. Making one
+/// first sweeps the root by the preview root's rule ([`sweep_legacy_previews`]): the folders of
+/// windows that are gone (their lock is free, or missing) and old free locks without a folder,
+/// so a crashed window's files do not stay. Where the lock cannot be taken (a filesystem
+/// without working locks) there is no space: its folder would look like a crashed window's.
+pub struct RevisionSpace {
+    dir: PathBuf,
+    lock: PathBuf,
+    _held: File,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl RevisionSpace {
+    pub fn new(cache: &Path) -> Result<Self> {
+        Self::new_with(cache, &mut |file| file.try_lock())
+    }
+
+    /// [`RevisionSpace::new`], with `try_lock` standing in for `File::try_lock` (tests: a
+    /// filesystem whose locks fail).
+    fn new_with(
+        cache: &Path,
+        try_lock: &mut dyn FnMut(&File) -> std::result::Result<(), std::fs::TryLockError>,
+    ) -> Result<Self> {
+        let root = revisions_root(cache);
+        let lock_name = || root.join(format!("{}.lock", &crate::remote::random_hex()[..12]));
+        let mut made = None;
+        // The root goes with its last window's folder: one that went between the root being
+        // made here and the lock being made in it took the root along — made again, then.
+        for _ in 0..3 {
+            private_dir(&root)?;
+            sweep_windows(&root, SystemTime::now());
+            match create_unique(|_| lock_name()) {
+                Err(_) if !root.exists() => continue,
+                done => {
+                    made = Some(done?);
+                    break;
+                }
+            }
+        }
+        let (lock, held) = match made {
+            Some(made) => made,
+            None => create_unique(|_| lock_name())?,
+        };
+        // Without its lock held the folder would look like a crashed window's, and the next
+        // window's sweep would remove it under this one: no space, then.
+        if let Err(e) = try_lock(&held) {
+            let _ = std::fs::remove_file(&lock);
+            let _ = std::fs::remove_dir(&root);
+            let why = match e {
+                std::fs::TryLockError::Error(e) => e.to_string(),
+                std::fs::TryLockError::WouldBlock => "it is held".to_string(),
+            };
+            anyhow::bail!(
+                "{} cannot be locked ({why}): no files at a revision",
+                lock.display()
+            );
+        }
+        let dir = lock.with_extension("");
+        if let Err(e) = DirBuilder::new().mode(0o700).create(&dir) {
+            let _ = std::fs::remove_file(&lock);
+            return Err(e).with_context(|| format!("cannot create {}", dir.display()));
+        }
+        Ok(Self {
+            dir,
+            lock,
+            _held: held,
+            next: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// The window's folder.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// A new file for one endpoint's bytes or one diff (03 §6.2–§6.3): `<window>/<n>/<name>`,
+    /// in a folder `<n>` no file of this window had (0700), created new (0600) and returned open
+    /// for writing. `name` is the file's own name — the viewer for its kind is chosen by it (01
+    /// §3) — and must be one plain path component: anything else (empty, `.`, `..`, a `/`, a
+    /// NUL) is refused and nothing is made.
+    pub fn create(&self, name: &str) -> Result<(PathBuf, File)> {
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+            anyhow::bail!("{name:?} is not a file name");
+        }
+        const TRIES: u32 = 32;
+        for _ in 0..TRIES {
+            let n = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let folder = self.dir.join(n.to_string());
+            match DirBuilder::new().mode(0o700).create(&folder) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot create {}", folder.display()));
+                }
+            }
+            let path = folder.join(name);
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("cannot create {}", path.display()));
+            return match file {
+                Ok(file) => Ok((path, file)),
+                Err(e) => {
+                    let _ = std::fs::remove_dir(&folder);
+                    Err(e)
+                }
+            };
+        }
+        anyhow::bail!(
+            "no free folder in {} after {TRIES} tries",
+            self.dir.display()
+        )
+    }
+}
+
+impl Drop for RevisionSpace {
+    fn drop(&mut self) {
+        // The folder first, while the lock is still held: no sweep takes it meanwhile.
+        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_file(&self.lock);
+        // The root too, when this was the last window's folder in it (it is removed only
+        // empty): a closed window leaves nothing of its revisions in the cache.
+        if let Some(root) = self.dir.parent() {
+            let _ = std::fs::remove_dir(root);
+        }
+    }
 }
 
 /// Tests: an earlier session's cached copy of `abs` on `host`, left as a session leaves it — its
@@ -1386,6 +1542,167 @@ mod tests {
             .file_type()
             .is_symlink());
         assert!(elsewhere.path().join(dead).exists());
+    }
+
+    /// 03 §6.2–§6.3: a window's revisions are a private folder of its own under `.revisions`,
+    /// named as the old preview windows were (12 hex characters), with its lock beside it. Each
+    /// file is `<window>/<n>/<name>` — the file's own name, so the viewer for its kind is
+    /// chosen by it; two revisions of one name get two folders — the folders 0700 and the files
+    /// 0600 from sopen's own modes (under umask 022), created new, never over anything. A name
+    /// that is not one plain component is refused and makes nothing. Dropped (the window
+    /// closes), the folder goes with what is in it, its lock too, and the root with the last
+    /// window's folder: nothing is left in the cache.
+    #[test]
+    fn a_revision_space_is_private_and_goes_with_its_window() {
+        if crate::testutil::rerun_under_umask_022(
+            "cache::tests::a_revision_space_is_private_and_goes_with_its_window",
+        ) {
+            return;
+        }
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let space = RevisionSpace::new(tmp.path()).unwrap();
+        let dir = space.dir().to_path_buf();
+        let root = revisions_root(tmp.path());
+        assert_eq!(root, tmp.path().join(".revisions"));
+        assert_eq!(dir.parent(), Some(root.as_path()));
+        let window = dir.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(
+            window.len() == 12 && window.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{window}"
+        );
+        assert!(root.join(format!("{window}.lock")).exists());
+        assert_eq!(mode(&dir), 0o700);
+        let (shot, mut file) = space.create("shot.png").unwrap();
+        file.write_all(b"the picture at abc12345").unwrap();
+        assert_eq!(shot, dir.join("0").join("shot.png"));
+        assert_eq!((mode(&dir.join("0")), mode(&shot)), (0o700, 0o600));
+        let (again, _) = space.create("shot.png").unwrap();
+        assert_eq!(again, dir.join("1").join("shot.png"), "a folder of its own");
+        let (diff, _) = space.create("main.rs.diff").unwrap();
+        assert_eq!(diff, dir.join("2").join("main.rs.diff"));
+        for bad in ["", ".", "..", "a/b", "/etc/passwd", "../x", "x/", "a\0b"] {
+            assert!(space.create(bad).is_err(), "{bad:?} accepted");
+        }
+        let mut made: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        made.sort();
+        assert_eq!(made, ["0", "1", "2"], "a refused name makes nothing");
+        assert_eq!(
+            std::fs::read(&shot).unwrap(),
+            b"the picture at abc12345",
+            "never over anything"
+        );
+        drop(space);
+        assert!(!dir.exists(), "the folder goes with the window");
+        assert!(
+            !root.exists(),
+            "and the root with the last window's folder: nothing is left in the cache"
+        );
+    }
+
+    /// The revisions root stays for as long as another window's folder is in it, and goes with
+    /// the last one; a window that comes after makes it again.
+    #[test]
+    fn the_revisions_root_goes_with_the_last_windows_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = revisions_root(tmp.path());
+        let (one, two) = (
+            RevisionSpace::new(tmp.path()).unwrap(),
+            RevisionSpace::new(tmp.path()).unwrap(),
+        );
+        assert_ne!(one.dir(), two.dir());
+        drop(one);
+        assert!(
+            two.dir().exists() && root.exists(),
+            "another window's stays"
+        );
+        drop(two);
+        assert!(!root.exists(), "empty: removed");
+        let again = RevisionSpace::new(tmp.path()).unwrap();
+        assert!(again.dir().exists());
+    }
+
+    /// A new window sweeps the revisions root by the preview root's rule (W8b): the folder of
+    /// a window that is gone (its lock free, or none) and an old free lock without its folder;
+    /// a live window's folder, a fresh lone lock (a window being made) and anything not named
+    /// as a window — a folder `keep/` with files, a `foo.lock` — stay.
+    #[test]
+    fn a_new_revision_space_sweeps_the_folders_of_windows_that_are_gone() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = revisions_root(tmp.path());
+        let live = RevisionSpace::new(tmp.path()).unwrap();
+        let (kept, mut file) = live.create("a.txt").unwrap();
+        file.write_all(b"live").unwrap();
+        let (dead, orphan, lonely, fresh) = (
+            "0a1b2c3d4e01",
+            "0a1b2c3d4e02",
+            "0a1b2c3d4e03",
+            "0a1b2c3d4e04",
+        );
+        std::fs::create_dir_all(root.join(dead).join("0")).unwrap();
+        std::fs::write(root.join(dead).join("0/a.png"), "left behind").unwrap();
+        std::fs::write(root.join(format!("{dead}.lock")), "").unwrap();
+        std::fs::create_dir(root.join(orphan)).unwrap();
+        std::fs::write(root.join(format!("{lonely}.lock")), "").unwrap();
+        std::fs::write(root.join(format!("{fresh}.lock")), "").unwrap();
+        std::fs::create_dir(root.join("keep")).unwrap();
+        std::fs::write(root.join("keep/mine.txt"), "not sopen's").unwrap();
+        std::fs::write(root.join("foo.lock"), "").unwrap();
+        let old = SystemTime::now() - 2 * LONE_LOCK_AGE;
+        for aged in [format!("{lonely}.lock"), "foo.lock".to_string()] {
+            File::options()
+                .write(true)
+                .open(root.join(aged))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let next = RevisionSpace::new(tmp.path()).unwrap();
+        for gone in [
+            dead.to_string(),
+            format!("{dead}.lock"),
+            orphan.to_string(),
+            format!("{lonely}.lock"),
+        ] {
+            assert!(!root.join(&gone).exists(), "{gone} stayed");
+        }
+        for stays in [
+            format!("{fresh}.lock"),
+            "keep/mine.txt".into(),
+            "foo.lock".into(),
+        ] {
+            assert!(root.join(&stays).exists(), "{stays} went");
+        }
+        assert_eq!(std::fs::read(&kept).unwrap(), b"live");
+        assert!(next.dir().exists());
+    }
+
+    /// A window that cannot take its lock makes no folder: a folder whose lock is free looks
+    /// like a crashed window's, and the next window's sweep would remove it under the live one.
+    /// Its lock file goes too, and nothing is left for a sweep to find.
+    #[test]
+    fn a_revision_space_whose_lock_fails_is_refused_and_leaves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unsupported =
+            || std::fs::TryLockError::Error(std::io::Error::from(std::io::ErrorKind::Unsupported));
+        let refused = RevisionSpace::new_with(tmp.path(), &mut |_| Err(unsupported()));
+        let err = format!("{:#}", refused.err().expect("refused"));
+        assert!(err.contains("cannot be locked"), "{err}");
+        let left: Vec<_> = std::fs::read_dir(revisions_root(tmp.path()))
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "nothing left: {left:?}");
+        assert!(
+            RevisionSpace::new(tmp.path()).is_ok(),
+            "the next one starts"
+        );
     }
 
     #[test]

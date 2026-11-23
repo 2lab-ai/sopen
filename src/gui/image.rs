@@ -16,6 +16,10 @@
 //! without toolbars, rows or prompt, and takes no input; [`dimensions`] and
 //! [`Doc::decode_checked`] are the preview's budget checks (the header before the decode, a stop
 //! at every read of it), [`fitted`] the picture it shows, made off the window's thread.
+//!
+//! A file at a revision (03 §6.3, [`super::Window::set_read_only`]) is shown as any other, but
+//! read-only: the picture's own read-only reason is [`AT_A_REVISION`] then, so no edit, Save,
+//! Save copy or Save As starts, and no journal is kept or looked for.
 
 pub mod clip;
 mod file;
@@ -46,6 +50,10 @@ use std::time::{Duration, SystemTime};
 
 /// Default pixelize block, in image pixels.
 pub const DEFAULT_BLOCK: u32 = 16;
+/// Why a window that shows a file at a revision saves nothing (03 §6.3, 03:578): what its Save,
+/// Save copy, Save As and Export say, on hover and when asked for — the image, hex and media
+/// windows' ([`super::Window::set_read_only`]).
+pub const AT_A_REVISION: &str = "a file at a revision has no place to be saved";
 /// The window's title in its frame, in the manner of PC Shell's `File Edit`.
 const TITLE: &str = "Image Edit";
 /// Undo history bound: whichever of these is hit first drops the oldest step.
@@ -2008,6 +2016,11 @@ struct ImageWindow {
     /// The picture a preview shows when the image is larger ([`fitted`], made off this thread);
     /// the hand-over shows the image itself again.
     shown: Option<image::RgbaImage>,
+    /// A file at a revision ([`super::Window::set_read_only`]): the picture's own read-only
+    /// reason (an animated image's), set aside while [`AT_A_REVISION`] stands for it. Nothing
+    /// is edited or saved then, no journal is written and none of an earlier session's is
+    /// looked for (that look may reconcile a cut-off Save on the file).
+    at_revision: Option<Option<String>>,
     /// The journal of this session's edits (07 §3).
     keeper: file::Keeper,
     /// The revision last handed to the journal's schedule.
@@ -2154,6 +2167,7 @@ impl ImageWindow {
             restore_first: false,
             preview: false,
             shown: None,
+            at_revision: None,
             keeper,
             kept_rev: 0,
             rows: Vec::new(),
@@ -2237,8 +2251,13 @@ impl ImageWindow {
     fn keep(&mut self, ctx: &egui::Context) {
         self.keeper.poll();
         // Nothing while a Save runs, nor while the look for earlier sessions' journals is out:
-        // it would take a journal this session is making for an earlier one's.
-        if self.job.is_some() || self.saving_as.is_some() || self.recovering.is_some() {
+        // it would take a journal this session is making for an earlier one's. Nothing for a
+        // file at a revision: it is never written.
+        if self.job.is_some()
+            || self.saving_as.is_some()
+            || self.recovering.is_some()
+            || self.at_revision.is_some()
+        {
             return;
         }
         // A generation asked for at once while that look was out (focus loss, closing, a Save).
@@ -2291,6 +2310,9 @@ impl ImageWindow {
     /// sessions' journals is out, it is asked for once that is back.
     fn keep_now(&mut self) {
         self.keeper.poll();
+        if self.at_revision.is_some() {
+            return;
+        }
         if self.recovering.is_some() {
             self.flush_wanted = true;
             return;
@@ -2318,9 +2340,10 @@ impl ImageWindow {
     }
 
     /// The journals earlier sessions left (07 §3 Recovery), looked for once, as the image
-    /// window (never as a preview).
+    /// window (never as a preview), and never for a file at a revision: the look may reconcile
+    /// a cut-off Save on the file — a write — and nothing of another session is restored there.
     fn list_journals(&mut self, ctx: &egui::Context) {
-        if std::mem::replace(&mut self.listed, true) {
+        if self.at_revision.is_some() || std::mem::replace(&mut self.listed, true) {
             return;
         }
         // The whole hash the journal keeps as evidence, taken off this thread before an edit
@@ -3740,8 +3763,32 @@ impl super::Window for ImageWindow {
         self.preview = on;
     }
 
+    /// A file at a revision (03 §6.3): its read-only reason is [`AT_A_REVISION`] — the toolbar's
+    /// Save and Save copy are off with it on hover, every save and every edit refused with it —
+    /// and no journal is kept or looked for. `false` gives the picture its own reason back.
+    fn set_read_only(&mut self, read_only: bool) {
+        match (read_only, self.at_revision.take()) {
+            (true, None) => {
+                let own = self.doc.read_only.replace(AT_A_REVISION.to_string());
+                self.at_revision = Some(own);
+                // Told late (its opener says so before the first pass): an earlier session's
+                // rows go unanswered — their Restore, Discard and Remove all write.
+                self.rows.clear();
+                self.recovering = None;
+            }
+            (true, kept) => self.at_revision = kept,
+            (false, Some(own)) => self.doc.read_only = own,
+            (false, None) => {}
+        }
+    }
+
     fn close_requested(&mut self) -> bool {
         if self.close_ok || self.preview {
+            return true;
+        }
+        // A file at a revision has nothing to ask about: nothing of it can be saved anywhere.
+        let busy = self.job.is_some() || self.queued.is_some() || self.saving_as.is_some();
+        if self.at_revision.is_some() && !busy {
             return true;
         }
         if let Some(open) = &self.saving_as {
@@ -4382,6 +4429,9 @@ struct Streaming {
     failed: Arc<Mutex<Option<String>>>,
     tex: Option<(Sketch, TextureHandle)>,
     preview: bool,
+    /// A file at a revision ([`super::Window::set_read_only`]): the image window, once made,
+    /// is told so before its first pass.
+    read_only: bool,
     drawn: Drawn,
     /// The memory line was on screen in the last pass.
     asked: bool,
@@ -4451,6 +4501,7 @@ impl Streaming {
             failed: Arc::default(),
             tex: None,
             preview: false,
+            read_only: false,
             drawn: Drawn::Nothing,
             asked: false,
             first: false,
@@ -4643,6 +4694,7 @@ impl Streaming {
         window.leftover = self.leftover.clone();
         window.preview = self.preview;
         window.shown = loaded.shown.filter(|_| self.preview);
+        super::Window::set_read_only(&mut window, self.read_only);
         self.tex = None;
         self.image = Some(Box::new(window));
     }
@@ -4864,6 +4916,15 @@ impl super::Window for Streaming {
         }
     }
 
+    /// A file at a revision: the image window it becomes is told so (it has no save of its
+    /// own before that). Where it gives way to the hex window, that window's host tells it.
+    fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+        if let Some(image) = &mut self.image {
+            image.set_read_only(read_only);
+        }
+    }
+
     fn set_shown(&mut self, shown: bool) {
         if let Some(source) = &self.source {
             source.set_visible(shown);
@@ -4973,6 +5034,8 @@ impl Switching {
         let Some((file, notices)) = self.switch.as_ref().and_then(HexSwitch::take) else {
             return;
         };
+        // A file at a revision stays one in the hex window.
+        let read_only = self.image.as_ref().is_some_and(|image| image.read_only);
         self.image = None;
         let made = super::hex::embedded(
             file,
@@ -4982,7 +5045,8 @@ impl Switching {
             self.hex_leftover.clone(),
         );
         match made {
-            Ok(window) => {
+            Ok(mut window) => {
+                super::Window::set_read_only(&mut window, read_only);
                 if self.hooks.window_size.is_none() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
                         super::hex::WINDOW.into(),
@@ -5026,6 +5090,15 @@ impl super::Window for Switching {
 
     fn keys(&self) -> &'static [super::chrome::FKey] {
         self.window().map_or(&[], super::Window::keys)
+    }
+
+    fn set_read_only(&mut self, read_only: bool) {
+        if let Some(image) = &mut self.image {
+            image.set_read_only(read_only);
+        }
+        if let Some(hex) = &mut self.hex {
+            hex.set_read_only(read_only);
+        }
     }
 
     fn close_requested(&mut self) -> bool {

@@ -583,6 +583,15 @@ pub trait Window {
         let _ = on;
     }
 
+    /// The window shows a file that has no place to be saved (`true`): a file at a revision or
+    /// a diff, written to the cache's `.revisions` root (03 §6.2, §6.3). Its opener says so
+    /// before the first pass. Save, Save copy, Save As and Export are off, the reason on hover
+    /// (03 §6.3: `a file at a revision has no place to be saved`); no edit starts, nothing is
+    /// kept in a journal and no earlier session's journal is looked for. `false` lifts it. The
+    /// default does nothing (S2-E implements it for the viewers that save; the text viewer has
+    /// nothing to save).
+    fn set_read_only(&mut self, _read_only: bool) {}
+
     /// The window is on screen (`true`), or held without being drawn (`false`: the file
     /// browser keeps a preview it does not show while a viewer covers the panels). A window
     /// that reads through a stream passes it on (`Source::set_visible`): a hidden one does

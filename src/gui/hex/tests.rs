@@ -1062,6 +1062,158 @@ fn without_one_step_replace_save_is_off_and_save_copy_works() {
     );
 }
 
+/// 03 §6.3's reason, word for word (03:578).
+const NO_PLACE: &str = "a file at a revision has no place to be saved";
+
+/// Every file and folder under `dir`, with each file's bytes: what a window that writes
+/// nothing leaves exactly as it was.
+fn files_under(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut out = BTreeMap::new();
+    let mut walk = vec![dir.to_path_buf()];
+    while let Some(at) = walk.pop() {
+        for entry in std::fs::read_dir(&at).unwrap().flatten() {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                walk.push(path.clone());
+                out.insert(path, None);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                out.insert(path, Some(bytes));
+            }
+        }
+    }
+    out
+}
+
+/// Hovers the control labelled `label` highest in the window (the toolbar's, not the F-key
+/// row's) until `tip` shows; the pointer is taken to `away` first, so no earlier tip is up.
+fn hover_says<W: Window>(drv: &mut Driver, win: &mut W, label: &str, tip: &str, away: Pos2) {
+    drv.move_to(win, away);
+    for _ in 0..90 {
+        if drv.find_text(tip).is_none() {
+            break;
+        }
+        drv.idle(win, 1);
+    }
+    assert!(drv.find_text(tip).is_none(), "{tip:?} up before the hover");
+    let at = drv
+        .texts()
+        .into_iter()
+        .filter(|(_, _, t)| t == label)
+        .map(|(r, _, _)| r)
+        .min_by(|a, b| a.top().total_cmp(&b.top()))
+        .unwrap_or_else(|| panic!("no {label:?} on screen"));
+    drv.move_to(win, at.center());
+    for _ in 0..90 {
+        drv.idle(win, 1);
+        if drv.find_text(tip).is_some() {
+            return;
+        }
+    }
+    let shown: Vec<String> = drv.texts().into_iter().map(|(_, _, t)| t).collect();
+    panic!("{label:?} never said {tip:?} on hover: {shown:?}");
+}
+
+/// G-T2 (03:1161) at the hex window: told before its first pass that it shows a file at a
+/// revision (`set_read_only(true)`, 03 §6.3), it is a viewer still — the cursor moves, Go to
+/// goes — but no byte typed in either column, no undo or redo edits; Save, Save copy and Save
+/// As are off with 03:578's reason on hover, and none of their keys (Cmd/Ctrl+S,
+/// Shift+Cmd/Ctrl+S, Alt+Cmd/Ctrl+S, F5, F7) or buttons starts one: each says why. An earlier
+/// session's journal of the same file is neither looked for nor touched; it closes without
+/// asking; and gone, it leaves the folder and the cache exactly as they were.
+#[test]
+fn a_file_at_a_revision_moves_and_goes_to_but_edits_and_saves_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("rev.bin");
+    std::fs::write(&path, FIXTURE).unwrap();
+    let cache = tmp.path().join("cache");
+    // An earlier session left a journal of the file: an edit kept, then a kill.
+    let mut fx = in_place(&path, tmp, 1000.0, 600.0);
+    fx.typed("00");
+    fx.drv
+        .until(&mut fx.win, 20, |w| w.schedule.status() == Keep::Kept);
+    assert_eq!(journal_dirs_in(&cache).len(), 1, "the earlier session's");
+    let abs = path.to_str().unwrap().to_string();
+    let at = LocalFs::new().stat(&abs).unwrap();
+    let origin = Origin::new(Box::new(LocalFs::new()), None, None, abs, at);
+    let at_revision = window_for(HexFile::open(origin, &path, None, &cache).unwrap());
+    std::mem::replace(&mut fx.win, at_revision).crash();
+    let before = files_under(fx.tmp.path());
+    fx.win.set_read_only(true);
+    fx.drv = Driver::new(1000.0, 600.0);
+    fx.drv.until(&mut fx.win, 20, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 2);
+    assert!(
+        fx.win.rows.is_empty() && fx.win.recovering.is_none(),
+        "no earlier session's journal is looked for"
+    );
+    assert!(fx.drv.find_text("Restore").is_none());
+    assert!(
+        fx.win.painted && fx.win.rows_painted > 0,
+        "the rows are shown"
+    );
+    // A viewer still: the cursor moves, Go to goes.
+    let none = Modifiers::NONE;
+    fx.key(Key::ArrowRight, none);
+    fx.key(Key::ArrowDown, none);
+    assert_eq!(fx.at(), 17);
+    fx.key(Key::G, command(false));
+    fx.typed("0x5");
+    fx.key(Key::Enter, none);
+    assert_eq!(fx.at(), 5);
+    // No edit: digits, a character in the ASCII column, undo, redo.
+    fx.win.status = Status::default();
+    fx.typed("41");
+    assert!(
+        fx.win.status.text.ends_with(NO_PLACE),
+        "{}",
+        fx.win.status.text
+    );
+    fx.key(Key::Tab, none);
+    fx.typed("Z");
+    fx.key(Key::Z, command(false));
+    fx.key(Key::Z, command(true));
+    assert_eq!(fx.win.doc.changed_count(), 0, "nothing edited");
+    assert!(!fx.win.doc.unsaved() && fx.win.doc.undo_len() == 0);
+    // No save, whichever key or button; each key says why.
+    for (key, mods) in [
+        (Key::S, command(false)),
+        (Key::S, command(true)),
+        (Key::S, Modifiers::ALT | Modifiers::COMMAND),
+        (Key::F5, none),
+        (Key::F7, none),
+    ] {
+        fx.win.status = Status::default();
+        fx.key(key, mods);
+        assert!(
+            fx.win.job.is_none() && fx.win.save_as.is_none() && fx.win.save_starts == 0,
+            "{key:?} {mods:?} started a save"
+        );
+        assert!(
+            fx.win.status.text.ends_with(NO_PLACE),
+            "{key:?} {mods:?}: {}",
+            fx.win.status.text
+        );
+    }
+    let away = Pos2::new(500.0, 400.0);
+    for label in ["Save", "Save copy", "Save As…"] {
+        hover_says(&mut fx.drv, &mut fx.win, label, NO_PLACE, away);
+    }
+    fx.drv.click_text(&mut fx.win, "Save copy");
+    fx.drv.click_text(&mut fx.win, "Save As…");
+    assert!(fx.win.job.is_none() && fx.win.save_as.is_none() && fx.win.save_starts == 0);
+    fx.drv.idle(&mut fx.win, 30);
+    assert!(fx.win.journal_dir.is_none(), "nothing kept");
+    assert!(fx.win.close_requested(), "nothing to ask");
+    let Fx { tmp, win, .. } = fx;
+    drop(win);
+    assert_eq!(
+        files_under(tmp.path()),
+        before,
+        "nothing written, nothing removed"
+    );
+}
+
 /// `SOPEN_STATE` patches (each byte an undo step) and places the cursor; `SOPEN_AUTOSAVE`
 /// saves them without a window, or reports the refusal (exit 3 in the CLI).
 #[test]
