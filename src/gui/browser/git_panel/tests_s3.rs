@@ -1684,3 +1684,140 @@ fn a_url_without_credentials_behaves_as_before() {
     assert_eq!(now.url, "https://example.com/y.git");
     assert_eq!(now.push_url, None);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1 (PR #81).
+
+/// Move tag keeps the chosen tag's own message (03 §7.4): switching from annotated `alpha` to
+/// annotated `beta` loads beta's, never alpha's; an annotated tag whose message is not loaded is
+/// refused; a lightweight tag moves lightweight; an edit stays with its tag.
+#[test]
+fn move_tag_keeps_the_chosen_tags_own_message() {
+    let mut r = repo();
+    r.refs.retain(|l| l.kind != RefKind::Tag);
+    r.refs.extend([
+        tag("alpha", 'a', true),
+        tag("beta", 'b', true),
+        tag("gamma", 'a', true),
+        tag("light", 'a', false),
+    ]);
+    let prefill = Prefill {
+        tag_messages: [("alpha", "release alpha"), ("beta", "release beta")]
+            .into_iter()
+            .map(|(t, m)| (t.to_string(), m.to_string()))
+            .collect(),
+        // A commit message meant for another dialog is never a tag's.
+        message: Some("a commit message".into()),
+        ..Prefill::default()
+    };
+    let bar = Target::Commit {
+        commit: commit('c', &['b'], "c"),
+        marked: Vec::new(),
+    };
+    let open = || dialog(ActionDialog::open(A::MoveTag, &bar, &r, &prefill, fake));
+    let move_tag = |tag: &str, message: Option<&str>| Action::MoveTag {
+        tag: tag.into(),
+        to: oid('c'),
+        message: message.map(str::to_string),
+    };
+    let d = open();
+    assert_eq!(d.draft(), &move_tag("alpha", Some("release alpha")));
+
+    // alpha → beta: Run carries beta's message.
+    let mut fx = with_dialog(open(), fake);
+    fx.assert_shows("release alpha");
+    fx.click("beta");
+    fx.assert_shows("release beta");
+    assert!(!fx.shows("release alpha"));
+    fx.press(Key::Enter);
+    assert_eq!(
+        fx.host.dialog_ends,
+        [DialogEnd::Run {
+            action: move_tag("beta", Some("release beta")),
+            dont_ask_again: false
+        }]
+    );
+
+    // gamma's message is not loaded: refused, never alpha's text.
+    let mut fx = with_dialog(open(), fake);
+    fx.click("gamma");
+    let why = format!("gamma: {}", dialogs::NOT_LOADED);
+    fx.assert_shows(&why);
+    assert_eq!(
+        fx.drv.painted_colors_of(&why),
+        Some(vec![PALETTE.dialog_error])
+    );
+    fx.press(Key::Enter);
+    assert!(fx.host.dialog_ends.is_empty(), "Run is off");
+    assert_eq!(
+        fx.host.dialog.as_ref().unwrap().draft(),
+        &move_tag("gamma", Some(""))
+    );
+    // Moving it lightweight instead is not refused.
+    fx.click("Keep it annotated with its message");
+    assert!(!fx.shows(&why));
+    fx.press(Key::Enter);
+    assert_eq!(
+        fx.host.dialog_ends,
+        [DialogEnd::Run {
+            action: move_tag("gamma", None),
+            dont_ask_again: false
+        }]
+    );
+
+    // A lightweight tag moves lightweight; an edit to alpha stays alpha's across a switch.
+    let mut fx = with_dialog(open(), fake);
+    let field = fx.drv.find_text("release alpha").unwrap().right_center();
+    fx.drv.click(&mut fx.host, field + egui::vec2(-1.0, 0.0));
+    type_text(&mut fx, " v2");
+    fx.click("light");
+    assert_eq!(
+        fx.host.dialog.as_ref().unwrap().draft(),
+        &move_tag("light", None)
+    );
+    fx.click("alpha");
+    fx.press(Key::Enter);
+    assert_eq!(
+        fx.host.dialog_ends,
+        [DialogEnd::Run {
+            action: move_tag("alpha", Some("release alpha v2")),
+            dont_ask_again: false
+        }]
+    );
+
+    // A new tag starts with an empty message, not the prefill's commit message.
+    let d = dialog(ActionDialog::open(A::Tag, &bar, &r, &prefill, fake));
+    assert!(matches!(d.draft(), Action::Tag { message: Some(m), .. } if m.is_empty()));
+}
+
+/// The result dialog masks whatever it shows (03 §3.7), a URL the owner typed included.
+#[test]
+fn the_result_dialog_masks_credentials() {
+    let secret = "https://ada:s3cret@example.com/x.git";
+    let masked = "https://ada:***@example.com/x.git";
+    let mut failed = outcome(true);
+    failed.steps[1].line = format!("git remote add origin {secret}");
+    failed.steps[1].ran[0].entry.line = format!("git remote add origin {secret}");
+    failed.steps[1].ran[0].stderr = format!("fatal: remote origin already exists: {secret}");
+    let fx = Fx::new(Host {
+        result: Some(ResultDialog::of("Add a remote", &failed).unwrap()),
+        ..Host::default()
+    });
+    fx.assert_shows(&format!("git remote add origin {masked}"));
+    fx.assert_shows(&format!("fatal: remote origin already exists: {masked}"));
+    let texts = fx.drv.texts_starting_with("");
+    assert!(
+        !texts.iter().any(|(_, t)| t.contains("s3cret")),
+        "{texts:?}"
+    );
+    let fx = Fx::new(Host {
+        result: Some(ResultDialog::error(
+            "Edit a remote",
+            &format!("fatal: could not read {secret}"),
+            Some(&format!("git remote set-url origin {secret}")),
+        )),
+        ..Host::default()
+    });
+    fx.assert_shows(&format!("fatal: could not read {masked}"));
+    fx.assert_shows(&format!("git remote set-url origin {masked}"));
+}

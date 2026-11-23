@@ -18,6 +18,8 @@
 //! - **The result dialog** ([`ResultDialog`], §3.8): each step's outcome, the failed command's
 //!   text whole and its command line, and the backup line; [`status_text`] is the status row's
 //!   `<what was done> · backup <stamp> · Cmd/Ctrl+Z undoes` (§8.3).
+//! - **Masking** (03 §3.7) is for what sopen shows from git: a URL the owner types (Add remote, a
+//!   retyped Edit remote field) shows as typed, while the result dialog and the log mask it.
 
 // Nothing uses these screens until S3-C wires them into the panel (as `mod.rs`'s own
 // allowance says of S2-F); S3-C removes this line when it does.
@@ -31,9 +33,11 @@ use crate::git::actions::{
 };
 use crate::git::backup::{RestoreEntry, Subject, Value};
 use crate::git::model::{ObjectType, RefKind, RefLabel, StatusEntry};
+use crate::git::runner::mask_credentials;
 use crate::gui::browser::keys::{self, Mods};
 use crate::gui::chrome;
 use eframe::egui::{self, Key, RichText};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// What plans an action for a dialog: `git::actions::plan`, pure (it reads and runs nothing).
@@ -48,9 +52,12 @@ pub const PLAN: Planner = actions::plan;
 pub struct Prefill {
     /// 01 §6a's download folder: `archive`'s path field starts there.
     pub save_dir: PathBuf,
-    /// A message to start from: `move-tag`'s tag message, `amend`'s last commit message,
-    /// `commit`'s message (git's prepared squash message after `merge --squash`), `tag`'s.
+    /// A commit message to start from: `amend`'s last commit message, `commit`'s (git's
+    /// prepared squash message after `merge --squash`).
     pub message: Option<String>,
+    /// The annotated tags' messages, by tag name (`move-tag` keeps the chosen tag's, 03 §7.4): a
+    /// tag missing here has its message not loaded, and keeping it annotated is refused.
+    pub tag_messages: BTreeMap<String, String>,
     /// The remotes' URLs (`edit-remote`'s prefill, 03 §7.7).
     pub remotes: Vec<Remote>,
     /// `user`'s name and email now, and where they are set (03 §7.7).
@@ -109,8 +116,8 @@ struct Form {
     locals: Vec<String>,
     /// `pick`, `revert`: the most parents among the commits (a merge offers its parent).
     parents: usize,
-    /// The repository's annotated tags (`move-tag` keeps one annotated).
-    annotated: Vec<String>,
+    /// `move-tag`'s annotated tags and their messages.
+    tags: TagMessages,
     /// `rebase`'s `--update-refs` is offered (git ≥ 2.38).
     update_refs: bool,
     /// A message kept while its option is off (a lightweight tag, an amend keeping its own), so
@@ -144,7 +151,7 @@ impl Form {
             names: Vec::new(),
             locals: Vec::new(),
             parents: 1,
-            annotated: Vec::new(),
+            tags: TagMessages::default(),
             update_refs: false,
             kept: String::new(),
             text: String::new(),
@@ -189,7 +196,7 @@ impl Form {
             (A::Tag, Target::Commit { commit, .. }) => Action::Tag {
                 at: commit.oid.clone(),
                 name: String::new(),
-                message: Some(message),
+                message: Some(String::new()),
                 push: None,
             },
             (A::Branch, Target::Commit { commit, .. }) => Action::Branch {
@@ -330,15 +337,19 @@ impl Form {
             },
             (A::MoveTag, Target::Commit { commit, .. }) => {
                 f.names = menu::tags(repo);
-                f.annotated = repo
-                    .refs
-                    .iter()
-                    .filter(|r| r.kind == RefKind::Tag && r.object_type == ObjectType::Tag)
-                    .map(|r| r.name().to_string())
-                    .collect();
+                f.tags = TagMessages {
+                    annotated: repo
+                        .refs
+                        .iter()
+                        .filter(|r| r.kind == RefKind::Tag && r.object_type == ObjectType::Tag)
+                        .map(|r| r.name().to_string())
+                        .collect(),
+                    read: prefill.tag_messages.clone(),
+                    edited: BTreeMap::new(),
+                };
                 let tag = f.names.first()?.clone();
                 Action::MoveTag {
-                    message: f.annotated.contains(&tag).then_some(message),
+                    message: f.tags.annotated_message(&tag),
                     tag,
                     to: commit.oid.clone(),
                 }
@@ -458,13 +469,67 @@ pub fn hides_password(url: &str) -> bool {
         .is_some_and(|user_end| authority[..user_end].contains("***"))
 }
 
+/// What the dialog refuses before any plan: `move-tag` keeping an annotated tag annotated when
+/// its message was not read and the owner typed none, rather than another tag's (03 §7.4).
+pub const NOT_LOADED: &str = "its message is not loaded";
+
+/// `move-tag`'s tags (03 §7.4): which are annotated, and each one's message as read and as the
+/// owner edited it in this dialog — the chosen tag's own, never another's.
+#[derive(Debug, Clone, Default)]
+struct TagMessages {
+    annotated: Vec<String>,
+    /// [`Prefill::tag_messages`].
+    read: BTreeMap<String, String>,
+    edited: BTreeMap<String, String>,
+}
+
+impl TagMessages {
+    /// `tag`'s message: the owner's edit, else as read, else empty (not loaded, refused by
+    /// [`Form::refusal`]).
+    fn message_of(&self, tag: &str) -> String {
+        self.edited
+            .get(tag)
+            .or(self.read.get(tag))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The message `tag` is moved with when chosen: an annotated tag stays annotated with its
+    /// own message by default, another is moved lightweight.
+    fn annotated_message(&self, tag: &str) -> Option<String> {
+        self.annotated
+            .iter()
+            .any(|t| t == tag)
+            .then(|| self.message_of(tag))
+    }
+
+    /// An annotated tag whose message was neither read nor typed.
+    fn not_loaded(&self, tag: &str) -> bool {
+        self.annotated.iter().any(|t| t == tag)
+            && !self.read.contains_key(tag)
+            && !self.edited.contains_key(tag)
+    }
+}
+
 impl Form {
-    /// The dialog's own refusal of the draft ([`RETYPE`]), before any plan.
-    fn refusal(&self) -> Option<&'static str> {
-        let masked = matches!(self.draft, Action::EditRemote { .. })
-            && ((self.url_touched && hides_password(&self.url))
-                || (self.push_touched && hides_password(&self.text)));
-        masked.then_some(RETYPE)
+    /// The dialog's own refusal of the draft ([`RETYPE`], [`NOT_LOADED`]), before any plan.
+    fn refusal(&self) -> Option<String> {
+        match &self.draft {
+            Action::EditRemote { .. } => {
+                let masked = (self.url_touched && hides_password(&self.url))
+                    || (self.push_touched && hides_password(&self.text));
+                masked.then(|| RETYPE.to_string())
+            }
+            Action::MoveTag {
+                tag,
+                message: Some(_),
+                ..
+            } => self
+                .tags
+                .not_loaded(tag)
+                .then(|| format!("{tag}: {NOT_LOADED}")),
+            _ => None,
+        }
     }
 }
 
@@ -966,7 +1031,8 @@ fn url_field(ui: &mut egui::Ui, heading: &str, text: &mut String, n: usize) -> b
     .inner
 }
 
-/// A message field: several lines, Shift+Enter a new line (Enter runs the dialog).
+/// A message field: several lines, Shift+Enter a new line (Enter runs the dialog). Whether the
+/// owner changed it this pass.
 fn message(ui: &mut egui::Ui, heading: &str, text: &mut String, n: usize) -> bool {
     ui.label(heading);
     ui.add(
@@ -979,8 +1045,8 @@ fn message(ui: &mut egui::Ui, heading: &str, text: &mut String, n: usize) -> boo
                 egui::Modifiers::SHIFT,
                 Key::Enter,
             )),
-    );
-    true
+    )
+    .changed()
 }
 
 /// One name among `names`.
@@ -1160,7 +1226,7 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form) -> bool {
         names,
         locals,
         parents,
-        annotated,
+        tags,
         update_refs,
         kept,
         text,
@@ -1331,26 +1397,20 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form) -> bool {
         Action::MoveTag {
             tag, message: m, ..
         } => {
+            // Each tag keeps its own message (03 §7.4): a choice loads the chosen tag's.
             if pick_name(ui, "Tag", tag, names) {
-                // A tag annotated before stays annotated by default.
-                if annotated.contains(tag) {
-                    *m = Some(m.take().unwrap_or_else(|| std::mem::take(kept)));
-                } else if let Some(was) = m.take() {
-                    *kept = was;
-                }
+                *m = tags.annotated_message(tag);
             }
             let mut on = m.is_some();
-            let before = on;
             toggle(ui, &mut on, "Keep it annotated with its message");
-            if on != before {
-                if on {
-                    *m = Some(std::mem::take(kept));
-                } else {
-                    *kept = m.take().unwrap_or_default();
-                }
+            if on != m.is_some() {
+                *m = on.then(|| tags.message_of(tag));
             }
-            if let Some(m) = m {
-                typing = message(ui, "Message", m, 0);
+            if let Some(text) = m {
+                if message(ui, "Message", text, 0) {
+                    tags.edited.insert(tag.clone(), text.clone());
+                }
+                typing = true;
             }
         }
         Action::StashApply { index, .. } | Action::StashPop { index, .. } => {
@@ -1362,7 +1422,8 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form) -> bool {
             amend,
             no_verify,
         } => {
-            typing = message(ui, "Message", m, 0);
+            message(ui, "Message", m, 0);
+            typing = true;
             ui.horizontal_wrapped(|ui| {
                 toggle(ui, amend, "Amend the last commit instead");
                 toggle(ui, no_verify, "Skip hooks");
@@ -1383,7 +1444,8 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form) -> bool {
                 }
             }
             if let Some(m) = m {
-                typing = message(ui, "New message", m, 0);
+                message(ui, "New message", m, 0);
+                typing = true;
             }
         }
         Action::Stash {
@@ -1517,7 +1579,8 @@ pub fn status_text(what: &str, outcome: &Outcome) -> String {
     }
 }
 
-/// The error dialog of a run that failed (03 §3.8).
+/// The error dialog of a run that failed (03 §3.8). Everything it shows is masked (03 §3.7),
+/// whoever made the text: a URL the owner typed is masked here as in the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultDialog {
     /// The action.
@@ -1554,9 +1617,12 @@ impl ResultDialog {
             steps: outcome
                 .steps
                 .iter()
-                .map(|s| (s.outcome, s.line.clone()))
+                .map(|s| (s.outcome, mask_credentials(&s.line)))
                 .collect(),
-            error: done.map(|d| (d.error_text(), Some(d.entry.line.clone()))),
+            error: done.map(|d| {
+                let line = mask_credentials(&d.entry.line);
+                (mask_credentials(&d.error_text()), Some(line))
+            }),
             backup: outcome.backup.clone(),
         })
     }
@@ -1567,7 +1633,7 @@ impl ResultDialog {
         ResultDialog {
             title: title.to_string(),
             steps: Vec::new(),
-            error: Some((text.to_string(), command_line.map(str::to_string))),
+            error: Some((mask_credentials(text), command_line.map(mask_credentials))),
             backup: None,
         }
     }
