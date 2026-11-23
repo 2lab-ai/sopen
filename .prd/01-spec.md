@@ -190,7 +190,8 @@ frame drawn heavier; the status row (an opening's or an operation's progress, th
 the bottom row lists the F-keys that work there and nothing else (the list, since slices S1 and S5
 of the browser workstream: 1 Help, 2 Rename, 3 View, 4 Edit, 5 Copy, 6 Move, 9 Dual — `Prevw` in
 dual mode — and 10 Tree; the directory tree: 1 Help, 10 Tree; the git panel, since S2: 1 Help, 3 View,
-4 Edit, 9 Dual; a viewer: 1 Help, 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
+4 Edit, 9 Dual, and since S3 the slots that act on the object under the bar — 2 Reword (a branch's
+label: rename), 5 Pick, 6 Rebase, 7 Branch (Commit on the uncommitted row), 8 Delete, 10 Menu; a viewer: 1 Help, 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
 an alias of W; the hex window's 5 Save, 6 Goto, 7 SaveAs, 8 Asc/hx, aliases of ⌘S, ⌘G, ⌥⌘S and
 Tab; and the image and media windows' 5 Save and 7 SaveAs; a plain F-key never acts while a text
 field has the typing). The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
@@ -252,7 +253,7 @@ too, where F3 closes it as ⌘W does.
   link's target, resolved; a link whose target is gone says so) and closes the tree; Esc or F10
   closes it with the panel as it was; Esc first stops an owner's whole listing or Space's scan.
   Remotely the tree has an SFTP connection of its own.
-- **The git panel** (msg 14; [03](03-git-panel.md), read-only since slice S2) is the other side's
+- **The git panel** (msg 14; [03](03-git-panel.md); read-only in slice S2, its actions since S3) is the other side's
   content when the bar rests on a folder, `..` or an empty list and the active folder is inside a
   git work tree (detected once per folder with git's own `rev-parse`, locally or over the ssh
   master; a bare repository, the inside of `.git`, a folder git refuses or a host without git
@@ -266,7 +267,20 @@ too, where F3 closes it as ⌘W does.
   (Cmd/Ctrl+Shift+F), the filters (Cmd/Ctrl+K) and Cmd/Ctrl+R (refresh) act in it. **Tab**
   gives it the keyboard and back; **Cmd/Ctrl+G** pins it to that side, so it stays while the bar
   moves over files and while the list goes elsewhere (titled with its repository); Esc unpins.
-  It writes nothing to the repository until S3's actions.
+  Since S3 it acts (03 §7–§8): F10, Shift+F10 or a right click opens the menu of the object under
+  the bar (a commit and its marked commits, the label under the label cursor, a stash, the
+  uncommitted row or a file of it, the repository), and the F-keys act on it (03 §9.1); Space on a
+  changed file stages or unstages it. Every action with an effect beyond the view opens its dialog
+  first — what changes, the backup refs written before anything is rewritten or deleted, the exact
+  command lines — and runs on a worker holding the repository's write lock (one write at a time;
+  a second waits, and the status row says so); the panel refreshes after it. Esc stops a read or a
+  network command; a write after 10 s, asking "Stop git?". A run's failure shows each step's
+  outcome and git's text; a run that wrote a backup says `… · backup <stamp> · Cmd/Ctrl+Z undoes`.
+  Cmd/Ctrl+Z restores the newest group this window wrote (again: redo), Cmd/Ctrl+B lists the
+  backups (Restore, Show, Delete), Cmd/Ctrl+L the command log, Cmd/Ctrl+Shift+R fetches all. While
+  git has an operation in progress — whoever started it — the panel's top rows say so (`MERGE of
+  feature · 1 conflict`, `BISECT · Reset`), with its Continue, Skip, Abort (Cmd/Ctrl+Shift+C, S,
+  A) and bisect's Reset (Cmd/Ctrl+Shift+B), each through its dialog.
 - **Selection and file operations** (msg 15; [04](04-file-keys.md) §3–§5, S1's and S6's parts). Space or
   Ins selects the bar's entry and steps down; `+` and `-` select and unselect by a pattern, `*`
   inverts, Cmd/Ctrl+A selects all; selected entries are yellow and the foot counts them first.

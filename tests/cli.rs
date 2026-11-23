@@ -3151,6 +3151,45 @@ fn sopen_list_git_prints_the_first_page() {
     assert_eq!(lines[1..], golden[..], "{listed}");
 }
 
+/// `SOPEN_STATE dialog=<id>` (02 §9, S3): an id of 03 §7 is taken — the run goes on, here to
+/// `SOPEN_LIST=git`'s first page (whose load runs the in-progress probe too); any other word
+/// ends the run with the reason, before anything is listed.
+#[test]
+fn sopen_state_dialog_takes_an_action_id() {
+    if test_git().is_none() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    g_g1_fixture(&root);
+    let repo = root.join("repo");
+    let home = root.join("home");
+    let run = |state: &str| {
+        sopen(
+            tmp.path(),
+            &["--here", repo.to_str().unwrap()],
+            &[
+                ("SOPEN_LIST", "git"),
+                ("SOPEN_STATE", state),
+                ("TZ", "UTC"),
+                ("HOME", home.to_str().unwrap()),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ],
+        )
+    };
+    let out = run("git=pin;select=v1.0;dialog=reset");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("9 commits · all loaded"));
+    let out = run("git=pin;dialog=nonsense");
+    let err = text(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("'nonsense' is not an action id"),
+        "{err}"
+    );
+    assert!(text(&out.stdout).is_empty(), "nothing listed");
+}
+
 /// 03 G-D1's other half: a bare repository, the inside of `.git`, a plain folder, and
 /// `SOPEN_GIT=/nonexistent` → the directory listing (as `SOPEN_LIST=1`) and one line saying why.
 #[test]

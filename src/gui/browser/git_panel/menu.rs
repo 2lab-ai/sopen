@@ -12,10 +12,6 @@
 //! the id and its target back; [`super::dialogs::ActionDialog::open`] makes the dialog of it, and
 //! the views among the ids ([`is_view`]) are the panel's to carry out.
 
-// Nothing uses these screens until S3-C wires them into the panel (as `mod.rs`'s own
-// allowance says of S2-F); S3-C removes this line when it does.
-#![allow(dead_code)]
-
 use super::filters::split_remote;
 use crate::git::actions::{ActionId, Repo};
 use crate::git::model::{

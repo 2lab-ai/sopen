@@ -376,6 +376,20 @@ pub struct InProgress {
     pub rebase: Option<RebaseProgress>,
     /// The first line of `sequencer/todo`.
     pub todo_first: Option<String>,
+    /// What a merge, a cherry-pick or a revert applies, for the banner's `MERGE of feature`,
+    /// `CHERRY-PICK abc12345`, `REVERT abc12345` (03 §8.5; S3-C): `None` when none of their
+    /// head files exists.
+    pub head: Option<OperationHead>,
+}
+
+/// The head file of the operation in progress (03 §8.5's banner detail), as the probe read it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OperationHead {
+    /// The first line of `MERGE_HEAD`, `CHERRY_PICK_HEAD` or `REVERT_HEAD` — the first of them
+    /// that exists: the commit merged, picked or reverted.
+    pub commit: String,
+    /// A merge's `MERGE_MSG`, its first line (`Merge branch 'feature'`), when it exists.
+    pub merge_msg: Option<String>,
 }
 
 /// The states of 03 §8.5's table, by row.

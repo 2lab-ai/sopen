@@ -13,10 +13,14 @@
 //! marks, the label cursor, Find, the filters' choices and the details pane's keyboard are the
 //! view's own.
 //!
-//! S2-F wires it into the browser (`gui::browser`'s git section). What S2 does not call yet —
-//! S3's label menu (`only_branch`, `all_branches`, `bar_label`, `BranchChoice`) and the readers
-//! the tests use — keeps the `dead_code` allowance until S3's integration uses it.
-#![allow(dead_code)]
+//! S2-F wires it into the browser (`gui::browser::git_host`). S3-C adds the actions: given the
+//! repository's snapshot ([`GitView::set_repo`]: a `git::actions::Repo` from the refresh, the
+//! probe's state among it) the F-keys (03 §9.1), the menu, the banner's keys, Cmd/Ctrl+Z, B, L and
+//! Shift+R act on the object under the bar — the label under the label cursor, the details pane's
+//! file, else the bar's row — through S3-B's screens (`menu`, `dialogs`, `backups`, `log_view`,
+//! `in_progress`): what runs git is a [`GitAction`] again (a dialog's prefill to read, an action
+//! to run, a restore's entries, the Backups list, the log). A view with no snapshot offers no
+//! action: its keys do what S2's do.
 
 mod backups;
 mod details;
@@ -36,14 +40,19 @@ mod tests_s3;
 mod tests_s4;
 
 pub use details::{Details, FileGroup, FileRow, Group, Summary};
+pub use dialogs::Prefill;
 #[allow(unused_imports)]
 pub use filters::{BranchChoice, Filters, Order};
 pub use find::SearchQuery;
+pub use menu::{label as action_label, Target};
 
 use super::keys::{self, Command, Context, Mods, Step, Trigger};
 use super::view::Mode;
+use crate::git::actions::{self, Action, ActionId, Outcome, Plan, Proceed, Repo};
+use crate::git::backup::{Record, RestoreEntry};
 use crate::git::graph::{Graph, Row};
-use crate::git::model::{CommitRow, Oid, RefLabel};
+use crate::git::model::{BackupRef, CommitRow, ObjectType, Oid, RefKind, RefLabel, StatusEntry};
+use crate::git::runner::LogEntry;
 use crate::gui::chrome::{self, FKey};
 use crate::gui::Status;
 use eframe::egui::{self, Key, Rect};
@@ -178,6 +187,27 @@ pub enum GitAction {
     Unpin,
     /// Cmd/Ctrl+Shift+G: the git panel over both sides, and back.
     Wide,
+    // S3 (03 §7–§8; S3-C).
+    /// An action's dialog, once what it starts from is read: the integration reads the
+    /// [`Prefill`] `id` needs ([`prefilled`]) and gives it to [`GitView::open_action`].
+    Open { id: ActionId, target: Target },
+    /// Run the action on a worker under the repository's write lock (02 §6), then refresh (03
+    /// §5): the plan its confirmation showed is [`GitView::take_plan`]'s, else plan it there.
+    Run(Action),
+    /// Cmd/Ctrl+Z (the window's newest group of this repository), or the Backups list's Restore:
+    /// group `stamp`'s entries read now, then [`GitView::open_restore`] (03 §8.3); `only` names
+    /// one backup ref.
+    Restore { stamp: String, only: Option<String> },
+    /// Cmd/Ctrl+B: the Backups list read, then [`GitView::open_backups`] (03 §8.2).
+    Backups,
+    /// Cmd/Ctrl+L: the command log, then [`GitView::open_log`] (03 §3.7).
+    Log,
+    /// The Backups list's Show: these refs into the graph's revisions until the next refresh.
+    ShowBackup(Vec<BackupRef>),
+    /// `tag-details` (03 §7.4): `cat-file -p <t>` read, then [`GitView::show_text`].
+    TagDetails(String),
+    /// Yes to "Stop git?" (03 §3.4): the write running in this panel is stopped.
+    StopWrite,
 }
 
 /// A label of a row, as drawn (03 §4.4).
@@ -335,6 +365,37 @@ pub struct GitView {
     /// The row the bar goes to once it is loaded, and its place on screen: the bar's row across a
     /// load that reads its pages again (03 §4.5), or a row asked for ([`GitView::select`]).
     pending: Option<(RowKey, usize)>,
+    /// `pending` was asked for ([`GitView::select`]), not kept across a reload: it waits for the
+    /// history's end and says so there; a kept bar's row that the history no longer holds (a
+    /// dropped stash, a deleted branch's commit) is given up once the stream ends (S3-C).
+    pending_asked: bool,
+    // S3 (S3-C): the actions.
+    /// The repository as the last refresh read it ([`GitView::set_repo`]), with the reads a
+    /// dialog asked for since ([`GitView::seen`]); `None` until then: no action is offered.
+    repo: Option<Repo>,
+    /// Counts [`GitView::set_repo`]: reads made for an older snapshot are dropped.
+    repo_generation: u64,
+    /// The in-progress banner of the last refresh (03 §8.5).
+    banner: Option<in_progress::BannerView>,
+    /// The newest backup group this window wrote for this repository: Cmd/Ctrl+Z's (03 §8.3).
+    undo: Option<String>,
+    /// Window state the dialogs start from: "Don't ask again in this window" (03 §7.1).
+    unasked: bool,
+    menu: Option<menu::Menu>,
+    dialog: Option<Box<dialogs::ActionDialog>>,
+    /// The plan the dialog showed for the action it returned: what runs (S3-A: its backup
+    /// verifies the values the owner confirmed).
+    confirmed: Option<(Action, Plan)>,
+    /// A run's error dialog, a read's failure, a tag's details (03 §3.8, §7.4).
+    result: Option<dialogs::ResultDialog>,
+    /// "Stop git?" over a write running for 10 s (03 §3.4): the action's words.
+    stop_question: Option<String>,
+    /// The Backups list in the body (Cmd/Ctrl+B, 03 §8.2).
+    backups: Option<backups::BackupsView>,
+    /// The command log in the body (Cmd/Ctrl+L, 03 §3.7).
+    log: Option<log_view::LogView>,
+    /// Text for the clipboard (the menu's Copy items), handed to egui on the next pass.
+    to_copy: Option<String>,
 }
 
 impl RowKey {
@@ -394,6 +455,20 @@ impl GitView {
             said: None,
             geometry: None,
             pending: None,
+            pending_asked: false,
+            repo: None,
+            repo_generation: 0,
+            banner: None,
+            undo: None,
+            unasked: false,
+            menu: None,
+            dialog: None,
+            confirmed: None,
+            result: None,
+            stop_question: None,
+            backups: None,
+            log: None,
+            to_copy: None,
         }
     }
 
@@ -425,6 +500,7 @@ impl GitView {
     /// of changed paths (`Uncommitted changes (N)`). The bar stays on its commit, where it was on
     /// screen, when it is still there (03 §4.5).
     pub fn set_rows(&mut self, rows: Vec<Row>, first_parent: bool, uncommitted: usize) {
+        let asked = std::mem::take(&mut self.pending_asked);
         let (kept, offset) = match self.pending.take() {
             Some((key, offset)) => (Some(key), offset),
             None => (
@@ -463,6 +539,7 @@ impl GitView {
                 self.label_cursor = 0;
                 // It may come with a later page of the same load.
                 self.pending = kept.map(|key| (key, offset));
+                self.pending_asked = asked && self.pending.is_some();
             }
         }
         self.more_asked = false;
@@ -493,6 +570,7 @@ impl GitView {
         });
         if let Some((at, offset)) = found {
             self.pending = None;
+            self.pending_asked = false;
             self.graph_scroll.bar = at;
             self.graph_scroll.top = at.saturating_sub(offset);
         }
@@ -504,6 +582,7 @@ impl GitView {
         match self.rows.iter().position(|r| key.is(r)) {
             Some(at) => {
                 self.pending = None;
+                self.pending_asked = false;
                 self.label_cursor = 0;
                 self.graph_scroll.to(at);
                 true
@@ -511,6 +590,7 @@ impl GitView {
             None => {
                 let offset = self.graph_scroll.visible / 2;
                 self.pending = Some((key, offset));
+                self.pending_asked = true;
                 false
             }
         }
@@ -534,8 +614,14 @@ impl GitView {
         self.details_of_bar()
     }
 
-    /// Where the stream stands (the paging line).
+    /// Where the stream stands (the paging line). Once it has ended, a bar's row kept across
+    /// the reload that never came is given up (the bar stays where it fell); a row asked for
+    /// stays asked, for its asker to say it is not in the graph.
     pub fn set_paging(&mut self, paging: Paging) {
+        let ended = !matches!(paging, Paging::Loading | Paging::More(_));
+        if ended && !self.pending_asked {
+            self.pending = None;
+        }
         self.paging = paging;
         self.more_asked = false;
     }
@@ -599,6 +685,20 @@ impl GitView {
         self.search.as_ref().map_or(0, |s| s.rows.len())
     }
 
+    /// The commits of the history search's results, in order (tests).
+    #[cfg(test)]
+    pub fn search_commits(&self) -> Vec<Oid> {
+        self.search.as_ref().map_or_else(Vec::new, |s| {
+            s.rows
+                .iter()
+                .filter_map(|r| match r {
+                    Row::Commit { commit, .. } => Some(commit.oid.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
     /// The history search shown, if any.
     pub fn search(&self) -> Option<&SearchQuery> {
         self.search.as_ref().map(|s| &s.query)
@@ -658,17 +758,20 @@ impl GitView {
     }
 
     /// The graph's bar's row and its place on screen (rows below the first one shown).
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn bar_place(&self) -> (usize, usize) {
         let s = &self.graph_scroll;
         (s.bar, s.bar.saturating_sub(s.top))
     }
 
     /// The rows the last pass drew.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn on_screen(&self) -> std::ops::Range<usize> {
         self.graph_scroll.range(self.rows.len())
     }
 
     /// Whether `row` is marked.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn marked(&self, row: &RowKey) -> bool {
         self.marks.contains(row)
     }
@@ -676,11 +779,23 @@ impl GitView {
     /// The status row while the git panel has the keyboard: the view's own word, else the
     /// integration's, else what the keys do.
     pub fn status_line(&self) -> Status {
+        if let Some(menu) = &self.menu {
+            return Status::info(menu_hint(menu));
+        }
         if let Some(said) = self.said.as_ref().or(self.status.as_ref()) {
             return said.clone();
         }
         if self.find.is_some() {
             return Status::info(FIND_HINT);
+        }
+        // The banner's keys (03 §8.5: "then its keys"), while it shows.
+        if let Some(banner) = &self.banner {
+            let steps: Vec<String> = banner
+                .offers()
+                .iter()
+                .map(|&p| format!("{} {}", in_progress::key_text(p), in_progress::word(p)))
+                .collect();
+            return Status::info(format!("{} · {HINT}", steps.join(" · ")));
         }
         Status::info(HINT)
     }
@@ -708,11 +823,13 @@ impl GitView {
     }
 
     /// Find's text while its field is open.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn find_text(&self) -> Option<&str> {
         self.find.as_ref().map(|f| f.text.as_str())
     }
 
     /// Find's case toggle: case-sensitive or not (03 §4.7).
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn set_find_case(&mut self, case: bool) {
         if let Some(find) = &mut self.find {
             find.case = case;
@@ -720,6 +837,7 @@ impl GitView {
     }
 
     /// The file row under the details pane's bar (S2-F's tests and receipts).
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn pane_file(&self) -> Option<&FileRow> {
         let pane = self.pane.as_ref()?;
         match pane.line()? {
@@ -729,6 +847,7 @@ impl GitView {
     }
 
     /// Whether the details pane is open.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn details_open(&self) -> bool {
         self.pane.is_some()
     }
@@ -751,6 +870,7 @@ impl GitView {
         let last = self.rows.len().checked_sub(1)?;
         // The owner moved it: no row waited for takes it back.
         self.pending = None;
+        self.pending_asked = false;
         let to = to.min(last);
         if to != self.graph_scroll.bar {
             self.label_cursor = 0;
@@ -851,6 +971,15 @@ impl GitView {
             Command::Reread => return vec![A::Refresh],
             Command::Pin => return vec![A::Pin],
             Command::Wide => return vec![A::Wide],
+            _ => {}
+        }
+        // The log or the Backups list in the body takes the keyboard (review 1): its own keys,
+        // Cmd/Ctrl+L and B to switch or close it; every other key does nothing — the graph under
+        // it, and so its bar's object, is not on screen.
+        if self.log.is_some() || self.backups.is_some() {
+            return self.run_list(command);
+        }
+        match command {
             Command::HistorySearch => {
                 self.search_dialog = Some(find::SearchDialog::default());
                 return Vec::new();
@@ -861,6 +990,9 @@ impl GitView {
                 return Vec::new();
             }
             _ => {}
+        }
+        if let Some(asked) = self.run_actions(command) {
+            return asked;
         }
         if self.pane.as_ref().is_some_and(|p| p.keyboard) {
             return self.run_pane(command);
@@ -1085,10 +1217,795 @@ impl GitView {
         None
     }
 
-    /// A dialog (the filters', history search's) is up: it has the keyboard.
-    fn dialog_up(&self) -> bool {
-        self.filters_dialog.is_some() || self.search_dialog.is_some()
+    /// A dialog is up — the filters', history search's, S3's menu, action dialog, result, "Stop
+    /// git?", the log's whole entry: it has the keyboard (its own Enter and Esc), and Esc is its.
+    pub fn dialog_up(&self) -> bool {
+        self.filters_dialog.is_some()
+            || self.search_dialog.is_some()
+            || self.menu.is_some()
+            || self.dialog.is_some()
+            || self.result.is_some()
+            || self.stop_question.is_some()
+            || self.log.as_ref().is_some_and(|l| l.whole().is_some())
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// S3: the actions (03 §7–§9; S3-C wires S3-B's screens).
+
+/// The ids whose dialog starts from reads the integration makes ([`Prefill`], 03 §7): `amend`'s
+/// last message, `commit`'s prepared squash message (after `merge --squash`), `move-tag`'s tag
+/// messages, `edit-remote`'s URLs (masked, 03 §3.7), `user`'s name
+/// and email, `push`'s push remote, `archive`'s download folder.
+pub fn prefilled(id: ActionId) -> bool {
+    use ActionId as A;
+    matches!(
+        id,
+        A::Amend | A::Commit | A::MoveTag | A::EditRemote | A::User | A::Push | A::Archive
+    )
+}
+
+/// The F-key slots whose action depends on the object under the bar (03 §9.1).
+const ACTION_SLOTS: [Command; 6] = [
+    Command::Reword,
+    Command::Pick,
+    Command::Rebase,
+    Command::Branch,
+    Command::Remove,
+    Command::Menu,
+];
+
+impl GitView {
+    /// The repository as a refresh read it (03 §5): the actions' snapshot and the banner (§8.5);
+    /// an open dialog plans again against it. Its `seen` is the refresh's, empty (S3-A: reads
+    /// beyond the refresh are made again after one).
+    pub fn set_repo(&mut self, repo: Repo) {
+        self.banner = in_progress::BannerView::probe(&repo.in_progress, &repo.status);
+        if let Some(dialog) = &mut self.dialog {
+            dialog.set_repo(repo.clone());
+        }
+        self.repo = Some(repo);
+        self.repo_generation += 1;
+    }
+
+    /// The snapshot the actions plan against, and its generation ([`GitView::seen`]).
+    pub fn repo(&self) -> Option<(&Repo, u64)> {
+        self.repo.as_ref().map(|r| (r, self.repo_generation))
+    }
+
+    /// The reads made for snapshot `generation` (`git::actions::inspect`): kept with it, and the
+    /// open dialog plans again with them. Dropped when a refresh replaced the snapshot meanwhile.
+    pub fn seen(&mut self, generation: u64, seen: actions::Seen) {
+        if generation != self.repo_generation {
+            return;
+        }
+        let Some(repo) = &mut self.repo else {
+            return;
+        };
+        for (need, stdout) in seen.reads {
+            repo.seen.put(need, stdout);
+        }
+        if let Some(dialog) = &mut self.dialog {
+            dialog.set_repo(repo.clone());
+        }
+    }
+
+    /// The open dialog's draft: what `git::actions::needs` reads for.
+    pub fn draft(&self) -> Option<&Action> {
+        self.dialog.as_ref().map(|d| d.draft())
+    }
+
+    /// The newest group this window wrote for this repository (Cmd/Ctrl+Z, 03 §8.3).
+    pub fn set_undo(&mut self, stamp: Option<String>) {
+        self.undo = stamp;
+    }
+
+    /// An action's dialog with what the integration read for it ([`GitAction::Open`]), or the
+    /// action at once (03 §8.1's "No confirmation"), or a view.
+    pub fn open_action(&mut self, id: ActionId, target: Target, read: Prefill) -> Vec<GitAction> {
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        let prefill = Prefill {
+            checkout_unasked: self.unasked,
+            ..read
+        };
+        let opened = dialogs::ActionDialog::open(id, &target, repo, &prefill, dialogs::PLAN);
+        self.opened(opened, target)
+    }
+
+    /// Group `stamp`'s restore dialog (03 §8.3), its entries read now; `only`: one backup ref.
+    pub fn open_restore(
+        &mut self,
+        stamp: String,
+        entries: Vec<RestoreEntry>,
+        only: Option<&str>,
+    ) -> Vec<GitAction> {
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        let opened = dialogs::ActionDialog::restore(stamp, entries, only, repo, dialogs::PLAN);
+        self.opened(opened, Target::Repository)
+    }
+
+    /// The Backups list (03 §8.2) in the body, or read again while it shows (the bar stays).
+    pub fn open_backups(&mut self, records: Vec<Record>) {
+        match &mut self.backups {
+            Some(list) => list.set_records(records),
+            None => self.backups = Some(backups::BackupsView::new(records)),
+        }
+        self.log = None;
+    }
+
+    /// The Backups list's groups as it shows them (`None` while it is closed).
+    pub fn backups(&self) -> Option<&[Record]> {
+        self.backups.as_ref().map(|b| b.records())
+    }
+
+    /// The command log (03 §3.7) in the body, newest first.
+    pub fn open_log(&mut self, entries: Vec<LogEntry>) {
+        self.log = Some(log_view::LogView::new(entries));
+        self.backups = None;
+    }
+
+    /// The log's newest entry as it shows (`None` while it is closed): the integration hands the
+    /// entries again only when the runner's log has a newer one.
+    pub fn log_newest(&self) -> Option<Option<&LogEntry>> {
+        self.log.as_ref().map(|l| l.entries().first())
+    }
+
+    /// The log's entries again, while it shows (its bar stays on its entry).
+    pub fn set_log(&mut self, entries: Vec<LogEntry>) {
+        if let Some(log) = &mut self.log {
+            log.set_entries(entries);
+        }
+    }
+
+    /// A run ended (03 §3.8, §8.3): the error dialog when a step failed or the backup is
+    /// incomplete (S3-A's `Outcome::warning`, said there in place of the undo line); the status
+    /// row's words — `<what> · backup <stamp> · Cmd/Ctrl+Z undoes`, or the warning in the error
+    /// colour.
+    pub fn show_outcome(&mut self, title: &str, what: &str, outcome: &Outcome) -> Status {
+        self.result = dialogs::ResultDialog::of(title, outcome);
+        let failed = outcome
+            .steps
+            .iter()
+            .any(|s| s.outcome == actions::StepOutcome::Failed);
+        match (failed, outcome.warning()) {
+            (true, _) => Status::error(format!("{title}: failed")),
+            (false, Some(warning)) => Status::error(format!("{what} · {warning}")),
+            (false, None) => Status::info(dialogs::status_text(what, outcome)),
+        }
+    }
+
+    /// A text in a dialog of its own: a read's failure, a tag's details (03 §3.8, §7.4).
+    pub fn show_text(&mut self, title: &str, text: &str, command_line: Option<&str>) {
+        self.result = Some(dialogs::ResultDialog::error(title, text, command_line));
+    }
+
+    /// "Stop git?" (03 §3.4) over the write `what`, running for 10 s.
+    pub fn ask_stop(&mut self, what: String) {
+        self.stop_question = Some(what);
+    }
+
+    /// The confirmation of `action` again, as a dialog (review 1: a run whose shown plan was lost
+    /// and whose plan now asks for a confirmation). Never a run from here: a plan that asks for
+    /// none says so on the status row instead.
+    pub fn reconfirm(&mut self, action: Action) -> Vec<GitAction> {
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        match dialogs::ActionDialog::confirm(action, repo, dialogs::PLAN) {
+            dialogs::Opened::Dialog(dialog) => self.dialog = Some(dialog),
+            dialogs::Opened::Run(action) => {
+                let what = menu::label(action.id()).trim_end_matches('…');
+                self.said = Some(Status::info(format!("{what}: run it again")));
+            }
+            dialogs::Opened::View(_) | dialogs::Opened::NotHere(_) => {}
+        }
+        Vec::new()
+    }
+
+    /// A second dialog for an action git refused (03 §7.2: `delete-branch`'s "not fully merged":
+    /// the same action, forced), in place of the error dialog.
+    pub fn confirm_again(&mut self, action: Action) -> Vec<GitAction> {
+        self.result = None;
+        self.confirm(action)
+    }
+
+    /// `SOPEN_STATE dialog=<id>` (02 §9): `id` on the object under the bar, else on the first of
+    /// the repository, the uncommitted row and its changed files whose menu offers it; the
+    /// banner's steps through the banner. An id offered on none of them is said on the status row.
+    pub fn open_by_id(&mut self, id: ActionId) -> Vec<GitAction> {
+        use ActionId as A;
+        self.said = None;
+        let step = match id {
+            A::Continue => Some(Proceed::Continue),
+            A::Skip => Some(Proceed::Skip),
+            A::Abort => Some(Proceed::Abort),
+            A::BisectReset => Some(Proceed::BisectReset),
+            _ => None,
+        };
+        if let Some(p) = step {
+            return self.proceed(p);
+        }
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        let files: Vec<StatusEntry> = repo
+            .status
+            .entries
+            .iter()
+            .filter(|e| !e.lossy)
+            .cloned()
+            .collect();
+        let mut targets: Vec<Target> = self.object().into_iter().collect();
+        targets.extend([
+            Target::Repository,
+            Target::Uncommitted,
+            Target::Files(files),
+        ]);
+        let offered = targets
+            .into_iter()
+            .find(|t| menu::items(t, repo).iter().any(|item| item.id == id));
+        match offered {
+            Some(target) => self.act(id, target),
+            None => {
+                self.said = Some(Status::error(format!(
+                    "SOPEN_STATE dialog={}: not offered on the row under the bar",
+                    id.as_str()
+                )));
+                Vec::new()
+            }
+        }
+    }
+
+    /// The plan the confirmation showed for `action` (taken once), when it showed one.
+    pub fn take_plan(&mut self, action: &Action) -> Option<Plan> {
+        let (shown, plan) = self.confirmed.take()?;
+        (shown == *action).then_some(plan)
+    }
+
+    /// The details pane's subject, while it is open.
+    pub fn pane_subject(&self) -> Option<&Subject> {
+        self.pane.as_ref().map(|p| &p.subject)
+    }
+
+    /// The ref under the label cursor (03 §9.2): the label's `RefLabel` on the bar's commit.
+    fn bar_ref(&self) -> Option<RefLabel> {
+        let label = self.bar_label()?;
+        let Row::Commit { commit, .. } = self.bar_row()? else {
+            return None;
+        };
+        let kind = match label.kind {
+            LabelKind::Local | LabelKind::CheckedOut => RefKind::LocalBranch,
+            LabelKind::Remote => RefKind::RemoteBranch,
+            LabelKind::Tag => RefKind::Tag,
+            LabelKind::Head | LabelKind::Stash => return None,
+        };
+        let text = label.text.trim_start_matches(chrome::git::CURRENT);
+        let name = text.split(chrome::git::BOTH).next().unwrap_or(text);
+        self.refs
+            .iter()
+            .filter(|r| r.peeled.as_ref().unwrap_or(&r.object) == &commit.oid)
+            .find(|r| r.kind == kind && filters::short_name(&r.refname) == name)
+            .cloned()
+    }
+
+    /// What the F-keys and the menu act on (03 §9.1): a history search's commit; the details
+    /// pane's file of the uncommitted row while the pane has the keyboard; the label under the
+    /// label cursor; else the bar's row — a commit with the marked commits, newest first.
+    fn object(&self) -> Option<Target> {
+        let repo = self.repo.as_ref()?;
+        if let Some(results) = &self.search {
+            return match results.rows.get(results.scroll.bar)? {
+                Row::Commit { commit, .. } => Some(Target::Commit {
+                    commit: commit.clone(),
+                    marked: Vec::new(),
+                }),
+                _ => None,
+            };
+        }
+        let pane = self.pane.as_ref().filter(|p| p.keyboard);
+        if let Some(pane) = pane.filter(|p| p.subject == Subject::Row(RowKey::Uncommitted)) {
+            if let Some(details::Line::File { group, file }) = pane.line() {
+                let (_, f) = pane.file(*group, *file)?;
+                let entry = repo.status.entries.iter().find(|e| e.path == f.path)?;
+                return Some(Target::Files(vec![entry.clone()]));
+            }
+            return Some(Target::Uncommitted);
+        }
+        match self.bar_row()? {
+            Row::Uncommitted { .. } => Some(Target::Uncommitted),
+            Row::Stash(stash) => Some(Target::Stash(stash.clone())),
+            Row::Commit { commit, .. } => {
+                if let Some(r) = self.bar_ref() {
+                    return Some(Target::Label(r));
+                }
+                let marked = self
+                    .rows
+                    .iter()
+                    .filter_map(|r| match r {
+                        Row::Commit { commit, .. }
+                            if self.marks.contains(&RowKey::Commit(commit.oid.clone())) =>
+                        {
+                            Some(commit.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                Some(Target::Commit {
+                    commit: commit.clone(),
+                    marked,
+                })
+            }
+        }
+    }
+
+    /// The action an F-key's slot gives on `object` and the target it acts on (03 §9.1's table);
+    /// `None` where the slot does nothing.
+    fn slot(&self, command: Command, object: &Target) -> Option<(ActionId, Target)> {
+        use ActionId as A;
+        let here = |id| Some((id, object.clone()));
+        let local = |r: &RefLabel| r.kind == RefKind::LocalBranch;
+        match (command, object) {
+            (Command::Reword, Target::Label(r)) if local(r) => here(A::Rename),
+            (Command::Pick, Target::Commit { .. }) => here(A::Pick),
+            // A label: the pick of its commit.
+            (Command::Pick, Target::Label(_)) => match self.bar_row()? {
+                Row::Commit { commit, .. } => Some((
+                    A::Pick,
+                    Target::Commit {
+                        commit: commit.clone(),
+                        marked: Vec::new(),
+                    },
+                )),
+                _ => None,
+            },
+            (Command::Pick, Target::Stash(_)) => here(A::StashApply),
+            (Command::Rebase, Target::Commit { .. }) => here(A::Rebase),
+            (Command::Rebase, Target::Label(r)) if local(r) => here(A::Rebase),
+            (Command::Branch, Target::Commit { .. }) => here(A::Branch),
+            (Command::Branch, Target::Uncommitted | Target::Files(_)) => {
+                Some((A::Commit, Target::Uncommitted))
+            }
+            (Command::Branch, Target::Stash(_)) => here(A::StashBranch),
+            (Command::Remove, Target::Label(r)) => here(match r.kind {
+                RefKind::LocalBranch => A::DeleteBranch,
+                RefKind::RemoteBranch => A::DeleteRemoteBranch,
+                RefKind::Tag => A::DeleteTag,
+            }),
+            (Command::Remove, Target::Uncommitted) => here(A::ResetChanges),
+            (Command::Remove, Target::Files(_)) => here(A::Discard),
+            (Command::Remove, Target::Stash(_)) => here(A::StashDrop),
+            _ => None,
+        }
+    }
+
+    /// The F-key row while this panel has the keyboard (03 §9.1): [`fkeys`]' slots, and the
+    /// action slots that do something on the object under the bar — F7 says `Commit` on the
+    /// uncommitted row; a slot that does nothing there is left empty (02 §7: the row lists what
+    /// works). Without a snapshot, [`fkeys`]' alone.
+    pub fn fkeys(&self, mode: Mode) -> Vec<FKey> {
+        let mut row = fkeys(mode);
+        // The log or the Backups list: what it does (F3 shows; the Backups list's F8 deletes).
+        if self.log.is_some() || self.backups.is_some() {
+            if self.backups.is_some() {
+                row.push(FKey {
+                    n: 8,
+                    label: "Delete",
+                });
+                row.sort_by_key(|k| k.n);
+            }
+            return row;
+        }
+        let Some(object) = self.object() else {
+            return row;
+        };
+        for r in keys::rows(Context::Git, UPTO) {
+            let Trigger::Key(key, Mods::None) = r.trigger else {
+                continue;
+            };
+            if r.label.is_empty() || !ACTION_SLOTS.contains(&r.command) {
+                continue;
+            }
+            if r.command != Command::Menu && self.slot(r.command, &object).is_none() {
+                continue;
+            }
+            let label = match (r.command, &object) {
+                (Command::Branch, Target::Uncommitted | Target::Files(_)) => "Commit",
+                _ => r.label,
+            };
+            row.extend(chrome::fkey_number(key).map(|n| FKey { n, label }));
+        }
+        row.sort_by_key(|k| k.n);
+        row
+    }
+
+    /// `id` on `target`: its dialog — through the integration first when it starts from reads
+    /// ([`prefilled`]) — the action at once, or a view.
+    fn act(&mut self, id: ActionId, target: Target) -> Vec<GitAction> {
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        if prefilled(id) && menu::items(&target, repo).iter().any(|i| i.id == id) {
+            return vec![GitAction::Open { id, target }];
+        }
+        let prefill = Prefill {
+            checkout_unasked: self.unasked,
+            ..Prefill::default()
+        };
+        let opened = dialogs::ActionDialog::open(id, &target, repo, &prefill, dialogs::PLAN);
+        self.opened(opened, target)
+    }
+
+    /// An action built elsewhere, through its confirmation (`ActionDialog::confirm`): the
+    /// banner's steps, the Backups list's Delete, Fetch all.
+    fn confirm(&mut self, action: Action) -> Vec<GitAction> {
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        let opened = dialogs::ActionDialog::confirm(action, repo, dialogs::PLAN);
+        self.opened(opened, Target::Repository)
+    }
+
+    fn opened(&mut self, opened: dialogs::Opened, target: Target) -> Vec<GitAction> {
+        match opened {
+            dialogs::Opened::View(id) => self.view_id(id, target),
+            dialogs::Opened::NotHere(id) => {
+                let what = menu::label(id).trim_end_matches('…');
+                self.said = Some(Status::info(format!("{what}: not offered here")));
+                Vec::new()
+            }
+            dialogs::Opened::Run(action) => vec![GitAction::Run(action)],
+            dialogs::Opened::Dialog(dialog) => {
+                self.dialog = Some(dialog);
+                Vec::new()
+            }
+        }
+    }
+
+    /// A view id of the menu (`menu::is_view`): the panel's own, no plan (03 §8.1).
+    fn view_id(&mut self, id: ActionId, target: Target) -> Vec<GitAction> {
+        use ActionId as A;
+        match (id, &target) {
+            (A::Compare, _) => self.details_of_bar(),
+            (A::CopyHash, Target::Commit { commit, .. }) => self.copy(commit.oid.as_str()),
+            (A::CopyHash, Target::Stash(s)) => self.copy(s.oid.as_str()),
+            (A::CopySubject, Target::Commit { commit, .. }) => self.copy(&commit.subject.clone()),
+            (A::CopyName, Target::Label(r)) => self.copy(r.name()),
+            (A::CopyName, Target::Stash(s)) => self.copy(&s.selector.clone()),
+            (A::OnlyBranch, Target::Label(r)) => vec![self.only_branch(&r.refname.clone())],
+            (A::AllBranches, _) => vec![self.all_branches()],
+            (A::TagDetails, Target::Label(r)) => vec![GitAction::TagDetails(r.refname.clone())],
+            (A::Editor, Target::Files(files)) if files.len() == 1 => {
+                vec![GitAction::Edit(Some(files[0].path.clone()))]
+            }
+            (A::Editor, _) => vec![GitAction::Edit(None)],
+            (A::RemoteVisibility | A::Filters, _) => {
+                self.open_filters();
+                Vec::new()
+            }
+            (A::Refresh, _) => vec![GitAction::Refresh],
+            (A::Find, _) => {
+                self.find = Some(find::Find::new(String::new(), self.graph_scroll.bar));
+                Vec::new()
+            }
+            (A::Search, _) => {
+                self.search_dialog = Some(find::SearchDialog::default());
+                Vec::new()
+            }
+            (A::Log, _) => vec![GitAction::Log],
+            (A::Backups, _) => vec![GitAction::Backups],
+            (A::Undo, _) => self.undo_newest(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `text` to the clipboard on the next pass, and said.
+    fn copy(&mut self, text: &str) -> Vec<GitAction> {
+        let shown: String = text.chars().take(40).collect();
+        self.said = Some(Status::info(format!("copied {shown}")));
+        self.to_copy = Some(text.to_string());
+        Vec::new()
+    }
+
+    /// Cmd/Ctrl+Z (03 §8.3): the restore of the newest group this window wrote here.
+    fn undo_newest(&mut self) -> Vec<GitAction> {
+        match &self.undo {
+            Some(stamp) => vec![GitAction::Restore {
+                stamp: stamp.clone(),
+                only: None,
+            }],
+            None => {
+                if self.repo.is_some() {
+                    self.said = Some(Status::info(
+                        "nothing to undo: this window wrote no backup here (Cmd/Ctrl+B lists them all)"
+                            .replace("Cmd/Ctrl+", &Mods::Command.prefix()),
+                    ));
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// A banner step (03 §8.5, §9.2): through its dialog, or the status row's words.
+    fn proceed(&mut self, p: Proceed) -> Vec<GitAction> {
+        match &self.banner {
+            Some(banner) => {
+                let pressed = banner.press(p);
+                self.pressed(pressed)
+            }
+            None => {
+                if self.repo.is_some() {
+                    let step = in_progress::word(p);
+                    self.said = Some(Status::info(format!("{step}: nothing is in progress")));
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    fn pressed(&mut self, pressed: in_progress::Pressed) -> Vec<GitAction> {
+        match pressed {
+            in_progress::Pressed::Proceed(action) => self.confirm(action),
+            in_progress::Pressed::NotOffered(text) => {
+                self.said = Some(Status::info(text));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Space on a file of the uncommitted row (03 §7.6, §9.2): a staged file is unstaged, any
+    /// other staged, then the bar steps down; a conflict says where its steps are.
+    fn stage_toggle(&mut self, target: Target) -> Vec<GitAction> {
+        let group = self.pane.as_ref().and_then(|p| match p.line()? {
+            details::Line::File { group, file } => p.file(*group, *file).map(|(g, _)| g),
+            _ => None,
+        });
+        let id = match group {
+            Some(Group::Staged) => ActionId::Unstage,
+            Some(Group::Conflicts) => {
+                self.said = Some(Status::info(
+                    "a conflict: Take ours, Take theirs and Mark resolved are in its menu (F10)",
+                ));
+                return Vec::new();
+            }
+            _ => ActionId::Stage,
+        };
+        let asked = self.act(id, target);
+        if let Some(pane) = &mut self.pane {
+            let len = pane.lines.len();
+            pane.scroll.step(1, len);
+        }
+        asked
+    }
+
+    /// The F-keys' actions (03 §9.1) on the object under the bar; a slot with nothing there says
+    /// why when it is a commit's history edit (S4).
+    fn fkey(&mut self, command: Command) -> Vec<GitAction> {
+        let Some(object) = self.object() else {
+            return Vec::new();
+        };
+        match self.slot(command, &object) {
+            Some((id, target)) => self.act(id, target),
+            None => {
+                let later = match (command, &object) {
+                    (Command::Reword, Target::Commit { .. }) => Some("Reword"),
+                    (Command::Remove, Target::Commit { .. }) => Some("Drop"),
+                    _ => None,
+                };
+                if let Some(what) = later {
+                    self.said = Some(Status::info(format!(
+                        "{what} of a commit comes with the history edits, not in this version"
+                    )));
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// The menu of the object under the bar (03 §7, §9: F10, Shift+F10, a right click).
+    fn open_menu(&mut self) {
+        if let (Some(repo), Some(target)) = (&self.repo, self.object()) {
+            self.menu = Some(menu::Menu::new(target, repo));
+        }
+    }
+
+    /// What the Backups list asks for (03 §8.2–§8.3).
+    fn backups_end(&mut self, end: Option<backups::BackupsEnd>) -> Vec<GitAction> {
+        use backups::BackupsEnd as E;
+        match end {
+            None => Vec::new(),
+            Some(E::Close) => {
+                self.backups = None;
+                Vec::new()
+            }
+            Some(E::Restore { stamp, only }) => vec![GitAction::Restore {
+                stamp,
+                only: only.map(|r| r.refname),
+            }],
+            Some(E::Show(refs)) => {
+                self.backups = None;
+                vec![GitAction::ShowBackup(refs)]
+            }
+            Some(E::Delete(action)) => self.confirm(action),
+        }
+    }
+
+    /// A command while the log or the Backups list shows in the body (03 §9.2): the list's own
+    /// rows (the log: the bar, Enter or F3 to show an entry whole, Esc; the Backups list: also
+    /// Cmd/Ctrl+Z and F8 on the line under its bar); Cmd/Ctrl+L or B closes its list or opens the
+    /// other; anything else is taken and does nothing.
+    fn run_list(&mut self, command: Command) -> Vec<GitAction> {
+        if let Some(log) = &mut self.log {
+            return match command {
+                Command::Bar(_) | Command::Details | Command::Back => {
+                    if log.run(command) == Some(log_view::LogEnd::Close) {
+                        self.log = None;
+                    }
+                    Vec::new()
+                }
+                Command::Log => {
+                    self.log = None;
+                    Vec::new()
+                }
+                Command::Backups => vec![GitAction::Backups],
+                _ => Vec::new(),
+            };
+        }
+        if let Some(list) = &mut self.backups {
+            return match command {
+                Command::Bar(_)
+                | Command::Details
+                | Command::Undo
+                | Command::Remove
+                | Command::Back => {
+                    let end = list.run(command);
+                    self.backups_end(end)
+                }
+                Command::Backups => {
+                    self.backups = None;
+                    Vec::new()
+                }
+                Command::Log => vec![GitAction::Log],
+                _ => Vec::new(),
+            };
+        }
+        Vec::new()
+    }
+
+    /// S3's commands (03 §9) on the graph: the F-keys' actions, the menu, a tag's details, Space
+    /// on a file of the uncommitted row, Cmd/Ctrl+Z, B, L, Shift+R and the banner's keys. `None`
+    /// for a command left to S2's keys. (The log and the Backups list take theirs first,
+    /// [`GitView::run_list`].)
+    fn run_actions(&mut self, command: Command) -> Option<Vec<GitAction>> {
+        let asked = match command {
+            Command::Menu => {
+                self.open_menu();
+                Vec::new()
+            }
+            Command::Reword
+            | Command::Pick
+            | Command::Rebase
+            | Command::Branch
+            | Command::Remove => self.fkey(command),
+            Command::Details => match self.object() {
+                Some(Target::Label(r))
+                    if r.kind == RefKind::Tag && r.object_type == ObjectType::Tag =>
+                {
+                    vec![GitAction::TagDetails(r.refname)]
+                }
+                _ => return None,
+            },
+            Command::Mark => match self.object() {
+                Some(target @ Target::Files(_)) => self.stage_toggle(target),
+                _ => return None,
+            },
+            Command::Undo => self.undo_newest(),
+            Command::Backups => vec![GitAction::Backups],
+            Command::Log => vec![GitAction::Log],
+            Command::FetchAll => self.confirm(Action::Fetch {
+                prune: false,
+                prune_tags: false,
+            }),
+            Command::Continue => self.proceed(Proceed::Continue),
+            Command::Skip => self.proceed(Proceed::Skip),
+            Command::Abort => self.proceed(Proceed::Abort),
+            Command::BisectReset => self.proceed(Proceed::BisectReset),
+            _ => return None,
+        };
+        Some(asked)
+    }
+
+    /// S3's modals for one pass (each takes its keys before anything else sees them): the menu,
+    /// the action dialog, the result, "Stop git?"; the clipboard's text.
+    fn modals(&mut self, ctx: &egui::Context) -> Vec<GitAction> {
+        if let Some(text) = self.to_copy.take() {
+            ctx.copy_text(text);
+        }
+        if let Some(menu) = &mut self.menu {
+            return match menu.ui(ctx) {
+                Some(menu::MenuEnd::Chose { id, target }) => {
+                    self.menu = None;
+                    self.act(id, target)
+                }
+                Some(menu::MenuEnd::Cancel) => {
+                    self.menu = None;
+                    Vec::new()
+                }
+                None => Vec::new(),
+            };
+        }
+        if let Some(dialog) = &mut self.dialog {
+            return match dialog.ui(ctx, dialogs::PLAN) {
+                Some(dialogs::DialogEnd::Run {
+                    action,
+                    dont_ask_again,
+                }) => {
+                    self.unasked |= dont_ask_again;
+                    let shown = match dialog.planned() {
+                        Some(Ok(plan)) if *dialog.draft() == action => Some(plan.clone()),
+                        _ => None,
+                    };
+                    self.dialog = None;
+                    self.confirmed = shown.map(|plan| (action.clone(), plan));
+                    vec![GitAction::Run(action)]
+                }
+                Some(dialogs::DialogEnd::Cancel) => {
+                    self.dialog = None;
+                    Vec::new()
+                }
+                None => Vec::new(),
+            };
+        }
+        if let Some(result) = &mut self.result {
+            if result.ui(ctx) {
+                self.result = None;
+            }
+            return Vec::new();
+        }
+        if let Some(what) = self.stop_question.clone() {
+            return match stop_question(ctx, &what) {
+                Some(true) => {
+                    self.stop_question = None;
+                    vec![GitAction::StopWrite]
+                }
+                Some(false) => {
+                    self.stop_question = None;
+                    Vec::new()
+                }
+                None => Vec::new(),
+            };
+        }
+        Vec::new()
+    }
+}
+
+/// "Stop git?" (03 §3.4) over the write `what`: `Some(true)` on Enter or Yes, `Some(false)` on
+/// Esc, No or a click outside.
+fn stop_question(ctx: &egui::Context, what: &str) -> Option<bool> {
+    if ctx.input_mut(|i| keys::take(i, Key::Escape, Mods::None)) {
+        return Some(false);
+    }
+    let mut answer = ctx
+        .input_mut(|i| keys::take(i, Key::Enter, Mods::None))
+        .then_some(true);
+    let id = egui::Id::unique("sopen-git-stop");
+    let response = chrome::dialog(ctx, id, "Stop git?", |ui| {
+        ui.label(format!("{what} is still running."));
+        ui.label("It may stop between steps; the panel then shows the state it left.");
+        ui.add_space(chrome::CELL.y / 2.0);
+        ui.horizontal(|ui| {
+            if ui.button("Yes, stop it").clicked() {
+                answer = Some(true);
+            }
+            if ui.button("No").clicked() {
+                answer = Some(false);
+            }
+        });
+    });
+    answer.or_else(|| response.should_close().then_some(false))
 }
 
 /// The key table's rows the panel reads: the landed slices' (S2's own among them since S2-F);
@@ -1098,6 +2015,28 @@ const UPTO: keys::Slices = keys::LANDED_SLICES;
 /// What the status row says while nothing else is to be said.
 const HINT: &str =
     "Enter details · Space mark · a letter finds · ← → labels · Tab the list · Esc back · F1 the keys";
+
+/// What the status row says while the menu is open: what it is the menu of, and its keys.
+fn menu_hint(menu: &menu::Menu) -> String {
+    let of = match menu.target() {
+        Target::Commit { commit, marked } if marked.len() > 1 => {
+            format!("{} and {} marked commits", commit.oid.short(), marked.len())
+        }
+        Target::Commit { commit, .. } => format!("commit {}", commit.oid.short()),
+        Target::Label(r) => r.name().to_string(),
+        Target::Stash(s) => s.selector.clone(),
+        Target::Uncommitted => "the uncommitted changes".to_string(),
+        Target::Files(files) => match &files[..] {
+            [one] => one.path.clone(),
+            many => format!("{} files", many.len()),
+        },
+        Target::Repository => "the repository".to_string(),
+    };
+    match menu.items().len() {
+        0 => format!("Menu of {of}: nothing to do · Esc closes"),
+        n => format!("Menu of {of}: {n} items · ↑ ↓ choose · Enter runs · Esc closes"),
+    }
+}
 
 /// What the status row says while Find is open.
 const FIND_HINT: &str = "Enter next · Shift+Enter previous · Esc closes Find";
@@ -1124,6 +2063,14 @@ pub fn keys(ctx: &egui::Context, view: &mut GitView) -> Vec<GitAction> {
                 Some(Command::Cancel) => view.find = None,
                 _ => break,
             }
+            continue;
+        }
+        // The banner's keys while it shows (03 §9.2: Cmd/Ctrl+Shift+C, S, A, B), before the
+        // table's rows of the same keys (which say "nothing is in progress" without it).
+        let pressed = view.banner.as_ref().and_then(|b| in_progress::keys(ctx, b));
+        if let Some(pressed) = pressed {
+            view.said = None;
+            asked.extend(view.pressed(pressed));
             continue;
         }
         let Some(command) = ctx.input_mut(|i| keys::find(&mut i.events, Context::Git, UPTO)) else {
@@ -1153,7 +2100,18 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut GitView, active: bool) -> 
     let font = chrome::mono(ui);
     let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
     let row_h = text_h.ceil();
-    let head = Rect::from_min_size(inner.min, egui::vec2(inner.width(), row_h));
+    // The banner's rows at the panel's top while git has an operation in progress (03 §8.5).
+    let banner_h = view
+        .banner
+        .as_ref()
+        .map_or(0.0, |b| row_h * b.rows() as f32);
+    let banner = Rect::from_min_size(inner.min, egui::vec2(inner.width(), banner_h));
+    let head = Rect::from_min_size(
+        egui::pos2(inner.left(), inner.top() + banner_h),
+        egui::vec2(inner.width(), row_h),
+    );
+    // The log or the Backups list in the body, in place of the graph (03 §3.7, §8.2).
+    let listing = view.log.is_some() || view.backups.is_some();
     let foot_y = inner.bottom() - row_h;
     let rule_y = (foot_y - row_h).max(head.bottom());
     let body = Rect::from_min_max(
@@ -1163,7 +2121,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut GitView, active: bool) -> 
     let total = (body.height() / row_h).floor().max(0.0) as usize;
     let half = chrome::CELL / 2.0;
     // The pane below the graph, the graph keeping at least 8 rows (03 §6.1), a rule between.
-    let (list_area, pane_area) = match view.pane.is_some() {
+    let (list_area, pane_area) = match view.pane.is_some() && !listing {
         true if total > 10 => {
             let graph_rows = (total / 2).max(8).min(total - 2);
             let list = Rect::from_min_size(
@@ -1186,87 +2144,123 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut GitView, active: bool) -> 
     let list_active = active && !pane_keyboard && !view.dialog_up();
     // Find's field over the graph, in the heads' row; its text changed, the bar jumps.
     let dialog = view.dialog_up();
-    let heads = match &mut view.find {
-        Some(find) if view.search.is_none() => {
-            find::field(ui, head, find, cw, !dialog);
-            None
-        }
-        _ => Some(head),
-    };
-    if view.find.is_some() && view.refresh_find() {
-        if let Some(at) = view.find.as_ref().and_then(find::Find::first) {
-            asked.extend(view.move_bar(at));
-        }
+    if let Some(pressed) = view
+        .banner
+        .as_ref()
+        .and_then(|b| in_progress::draw(ui, banner, b))
+        .filter(|_| !dialog)
+    {
+        view.said = None;
+        asked.extend(view.pressed(pressed));
     }
-    let no_marks = HashSet::new();
-    let drawn = match &mut view.search {
-        Some(results) => graph_view::draw(
-            ui,
-            heads,
-            list_area,
-            &mut results.scroll,
-            &graph_view::List {
-                rows: &results.rows,
-                graph: None,
-                labels: &view.labels,
-                marks: &no_marks,
-                uncommitted: view.uncommitted,
-                label_cursor: 0,
-                active: list_active,
-                salt: "sopen-git-results",
-            },
-        ),
-        None => graph_view::draw(
-            ui,
-            heads,
-            list_area,
-            &mut view.graph_scroll,
-            &graph_view::List {
-                rows: &view.rows,
-                graph: Some(&view.graph),
-                labels: &view.labels,
-                marks: &view.marks,
-                uncommitted: view.uncommitted,
-                label_cursor: view.label_cursor,
-                active: list_active,
-                salt: "sopen-git-rows",
-            },
-        ),
-    };
-    view.geometry = drawn.geometry;
-    if let Some((at, twice)) = drawn.clicked.filter(|_| !dialog) {
-        if let Some(pane) = &mut view.pane {
-            pane.keyboard = false;
-        }
-        match &mut view.search {
-            Some(results) => {
-                results.scroll.to(at);
-                asked.extend(view.follow());
+    let list_rect = Rect::from_min_max(head.min, egui::pos2(inner.right(), rule_y));
+    if let Some(log) = &mut view.log {
+        log_view::draw(ui, list_rect, log, active && !dialog);
+        view.geometry = None;
+    } else if let Some(list) = &mut view.backups {
+        let end = backups::draw(ui, list_rect, list, active && !dialog);
+        view.geometry = None;
+        let end = end.filter(|_| !dialog);
+        asked.extend(view.backups_end(end));
+    } else {
+        let heads = match &mut view.find {
+            Some(find) if view.search.is_none() => {
+                find::field(ui, head, find, cw, !dialog);
+                None
             }
-            None => asked.extend(view.move_bar(at)),
+            _ => Some(head),
+        };
+        if view.find.is_some() && view.refresh_find() {
+            if let Some(at) = view.find.as_ref().and_then(find::Find::first) {
+                asked.extend(view.move_bar(at));
+            }
         }
-        if twice {
-            let details = match view.search.is_some() {
-                true => view.run_results(Command::Details),
-                false => view.details_of_bar(),
-            };
-            asked.extend(details);
+        let no_marks = HashSet::new();
+        let drawn = match &mut view.search {
+            Some(results) => graph_view::draw(
+                ui,
+                heads,
+                list_area,
+                &mut results.scroll,
+                &graph_view::List {
+                    rows: &results.rows,
+                    graph: None,
+                    labels: &view.labels,
+                    marks: &no_marks,
+                    uncommitted: view.uncommitted,
+                    label_cursor: 0,
+                    active: list_active,
+                    salt: "sopen-git-results",
+                },
+            ),
+            None => graph_view::draw(
+                ui,
+                heads,
+                list_area,
+                &mut view.graph_scroll,
+                &graph_view::List {
+                    rows: &view.rows,
+                    graph: Some(&view.graph),
+                    labels: &view.labels,
+                    marks: &view.marks,
+                    uncommitted: view.uncommitted,
+                    label_cursor: view.label_cursor,
+                    active: list_active,
+                    salt: "sopen-git-rows",
+                },
+            ),
+        };
+        view.geometry = drawn.geometry;
+        // A right click on a row of the graph: the bar on it, then its menu (03 §9.2).
+        let right = ui.input(|i| {
+            i.pointer
+                .secondary_clicked()
+                .then(|| i.pointer.interact_pos())
+                .flatten()
+        });
+        if let (Some(pos), Some(g)) = (right.filter(|_| !dialog), view.geometry()) {
+            if list_area.contains(pos) && view.search.is_none() && g.row_h > 0.0 {
+                let row = g.first + ((pos.y - g.rows_top) / g.row_h).floor().max(0.0) as usize;
+                if row < view.rows.len() {
+                    asked.extend(view.move_bar(row));
+                    view.open_menu();
+                }
+            }
         }
-    }
-    if let (Some(area), Some(pane)) = (pane_area, view.pane.as_mut()) {
-        let subject = pane.subject.clone();
-        let viewed = &view.viewed;
-        let seen = |f: &FileRow| viewed.contains(&(subject.clone(), f.path.clone()));
-        let pane_active = active && pane.keyboard && !dialog;
-        if let Some((line, twice)) = details::draw(ui, area, pane, &seen, pane_active) {
-            pane.keyboard = true;
-            pane.scroll.to(line);
+        if let Some((at, twice)) = drawn.clicked.filter(|_| !dialog) {
+            if let Some(pane) = &mut view.pane {
+                pane.keyboard = false;
+            }
+            match &mut view.search {
+                Some(results) => {
+                    results.scroll.to(at);
+                    asked.extend(view.follow());
+                }
+                None => asked.extend(view.move_bar(at)),
+            }
             if twice {
-                asked.extend(view.run_pane(Command::Details));
+                let details = match view.search.is_some() {
+                    true => view.run_results(Command::Details),
+                    false => view.details_of_bar(),
+                };
+                asked.extend(details);
             }
         }
+        if let (Some(area), Some(pane)) = (pane_area, view.pane.as_mut()) {
+            let subject = pane.subject.clone();
+            let viewed = &view.viewed;
+            let seen = |f: &FileRow| viewed.contains(&(subject.clone(), f.path.clone()));
+            let pane_active = active && pane.keyboard && !dialog;
+            if let Some((line, twice)) = details::draw(ui, area, pane, &seen, pane_active) {
+                pane.keyboard = true;
+                pane.scroll.to(line);
+                if twice {
+                    asked.extend(view.run_pane(Command::Details));
+                }
+            }
+        }
+        asked.extend(view.ask_more());
     }
-    asked.extend(view.ask_more());
     // The paging line: the line across the window, then what the stream says (Find's `k of n`
     // while it is open) and the branch's ahead / behind at the right when it fits.
     chrome::rule(
@@ -1360,13 +2354,16 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut GitView, active: bool) -> 
             None => {}
         }
     }
+    asked.extend(view.modals(&ctx));
     asked
 }
 
-/// The git panel's F-key row in `mode` (03 §9.1): the landed plain F-keys of the git context, by
-/// number — `1Help 3View 4Edit 9Dual` in S2.
+/// The slots of the git panel's F-key row in `mode` that act on every row (03 §9.1): the landed
+/// plain F-keys of the git context but the action slots, by number — `1Help 3View 4Edit 9Dual`.
+/// [`GitView::fkeys`] adds the action slots of the object under the bar.
 pub fn fkeys(mode: Mode) -> Vec<FKey> {
     let mut row: Vec<FKey> = keys::rows(Context::Git, UPTO)
+        .filter(|r| !ACTION_SLOTS.contains(&r.command))
         .filter_map(|r| match r.trigger {
             Trigger::Key(key, Mods::None) if !r.label.is_empty() => {
                 chrome::fkey_number(key).map(|n| FKey {

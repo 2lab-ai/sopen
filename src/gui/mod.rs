@@ -341,6 +341,9 @@ pub struct State {
     pub details: bool,
     /// File browser, with `git=pin`: the label cursor on the bar's row's Nth label (`label=N`).
     pub label: Option<usize>,
+    /// File browser, with `git=pin`: that action's dialog on the object under the bar, once the
+    /// rest is done (`dialog=ID`, 03 §7's ids, 02 §9) — a confirmation's receipt.
+    pub dialog: Option<crate::git::actions::ActionId>,
 }
 
 impl State {
@@ -439,7 +442,12 @@ impl State {
                         .map_err(|_| anyhow!("SOPEN_STATE label must be a whole number"))?;
                     state.label = Some(n);
                 }
-                "dialog" => bail!("SOPEN_STATE: dialog= comes with the git panel's actions (S3)"),
+                "dialog" => {
+                    let id = crate::git::actions::ActionId::parse(value).ok_or_else(|| {
+                        anyhow!("SOPEN_STATE dialog: '{value}' is not an action id of 03 §7")
+                    })?;
+                    state.dialog = Some(id);
+                }
                 "patch" => {
                     for one in value.split(',').map(str::trim) {
                         let (at, bytes) = one.split_once(':').ok_or_else(|| {

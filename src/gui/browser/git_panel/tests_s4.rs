@@ -1625,6 +1625,7 @@ fn stopped_at(stopped: &str, named: &str) -> Banner {
             done_last: Some(format!("edit {named} third")),
         }),
         todo_first: None,
+        head: None,
     };
     Banner::of(
         &in_progress,

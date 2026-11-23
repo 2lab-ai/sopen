@@ -217,3 +217,28 @@ changes. Rows here are snapshots taken when they were moved.
   open.
 - The rows are as they were in loop.md except their Status. S6-C's row stays there (in progress), and so do
   S2-F and S3's rows.
+
+## R2 (part) — S2-F, S3-0, S3-A, S3-B, closed 2026-11-23
+
+- merged S2-F (PR #80), S3-0 (#79), S3-B (#81), S3-A (#83) ✅ · result: all of S2 (the read-only git panel) on
+  main; S3's scaffold, every action as a plan with its executor, backups, restore and the probe (S3-A), and the
+  menu, dialogs, Backups list, command log and banner (S3-B) on main, which S3-C wires · closed rows: S2-F, S3-0,
+  S3-A, S3-B · PRs: S3-C's (this block)
+
+### Closed rows
+
+| ID | Status | Branch | Scope | Owner files (02 §5) | After |
+|---|---|---|---|---|---|
+| S2-F | ✅ merged: PR #80 (bfb75b4), 2026-11-23 | `feat/browser-s2-integration` | O6, the pin, refresh, `SOPEN_LIST=git` and the S2 receipt keys; slice 2 added to `keys.rs`'s `LANDED_SLICES` (the git panel reads the set; `LANDED: u8` gone), Cmd/Ctrl+K the filters; the production `LogStream` pipe (E5: its stop reads while it waits) and one stop session per host; S2's scenarios (02 §8.1's table), receipts, AGENTS.md, README, 01 | `src/gui/browser.rs`, `src/gui/browser/{view,keys}.rs`, `src/gui/browser/tests/s2.rs`, `src/gui/browser/git_panel/mod.rs` (the set, the Cmd/Ctrl+K hook, two readers), `src/gui/{mod,help,binary}.rs`, `src/gui/chrome/tests.rs`, `src/git/{history,runner}.rs`, `src/main.rs`, `tests/cli.rs`, `src/forward.rs`, `AGENTS.md`, `README.md`, `.prd/01-spec.md`, `.prd/03-git-panel.md` (one line) | S2-A, S2-B, S2-C, S2-D, S2-E |
+| S3-0 | ✅ merged: PR #79 (136260d), 2026-11-23 | `feat/browser-s3-scaffold` | `mod` lines and stubs for S3's files (the git tests' and `git_panel/tests_s3.rs` too); the shared types of `git::actions` (`ActionId`, `Action`, `Repo`, `Plan`, `Step`, `Confirmation`, `RemoteChange`, `Outcome`, `Banner`) and `git::backup` (`Take`, `Manifest`, `Record`, `RestoreEntry`, `Undo`); `plan`, `backup::write` and `backup::list` as `todo!()`; no `keys.rs` row (S2-F is changing that file): the rows S3 needs from 03 §9 are listed for S3-C; E5's result in 02 §8.2, 03 §3.5 and §4.5; one stop session per host (02 §6, 03 §3.5), `git_panel/mod.rs`'s S3 owner (02 §5), the banner's keys and the Backups list's (03 §9.2), G-R3's live receipt to S3-C (03 §11) | `src/git/{mod,actions,backup}.rs`, `src/git/tests/{actions,backup}.rs`, `src/gui/browser/git_panel/mod.rs` (mod lines), the stubs; `.prd/02-architecture.md`, `.prd/03-git-panel.md`, `.prd/browser/loop*.md` | S2-0–S2-E, E5 |
+| S3-A | ✅ merged: PR #83 (081b6d7), 2026-11-23 | `feat/browser-s3-actions` | every action of 03 §7.1–§7.7 as a pure plan — steps, confirmation (§8.1), backups (§8.2), §8.4's lease, files in the way (§8.6) — and its executor; the §8.5 in-progress probe `Snippet` and its parser into `model::InProgress`, and the banner; backups, manifests, the files snapshot and restore snippets, restore and undo (§8.2–§8.3); G-R5, G-A1–G-A9, G-S1–G-S3, G-S5–G-S8 through `LocalGit` and `ShellGit` | `src/git/{actions,backup}.rs`, `src/git/tests/{actions,backup}.rs` | S3-0 |
+| S3-B | ✅ merged: PR #81 (826d375), 2026-11-23 | `feat/browser-s3-dialogs` | the action menu (F10, Shift+F10, a right click), each action's dialog and confirmation (§8.1), the result dialog with each step's outcome (§3.8), the Backups list (§8.2), the command log (§3.7), the banner (§8.5), in the PC Shell look | `src/gui/browser/git_panel/{menu,dialogs,backups,log_view,in_progress}.rs`, `src/gui/browser/git_panel/tests_s3.rs` | S3-0 |
+
+### Round section
+
+- Merge commits and their dates are main's (+0900; the same day in UTC). S3-0 (#79) merged before S3-B (#81),
+  S3-B before S2-F (#80), and S3-A (#83) last: the rows keep their IDs' order.
+- The rows are as they were in loop.md except their Status. S3-C's row stays there (in progress).
+- Found while wiring them (S3-C's report): the redo of a hard reset's undo is refused by git (`reset --keep` runs
+  before the work-tree item of the undo's own group); S3-B's restore dialog offered "replace" only for a path
+  whose value is `occupied`, never for a file of other bytes (S3-C offers it wherever `backup::blocked` says so).

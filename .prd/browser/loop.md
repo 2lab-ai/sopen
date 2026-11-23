@@ -33,27 +33,20 @@ All of S5 is merged — S5-0 (PR #63), S5-B (#66), S5-A (#71), S5-C (#77), 2026-
 
 ## Round 2 — slice S2
 
-The read-only git panel (02 §8.1 S2; contract `../03-git-panel.md`). S2-0 first, then S2-A to S2-E in parallel on
-disjoint files, then S2-F. E4's result is in 02 §8.2 and its row in [`loop.done.md`](loop.done.md); S2-0 to S2-E
-are merged and their rows are there too.
-
-| ID | Status | Branch | Scope | Owner files (02 §5) | After |
-|---|---|---|---|---|---|
-| S2-F | 🟡 in progress | `feat/browser-s2-integration` | O6, the pin, refresh, `SOPEN_LIST=git` and the S2 receipt keys; slice 2 added to `keys.rs`'s `LANDED_SLICES` (the git panel reads the set; `LANDED: u8` gone), Cmd/Ctrl+K the filters; the production `LogStream` pipe (E5: its stop reads while it waits) and one stop session per host; S2's scenarios (02 §8.1's table), receipts, AGENTS.md, README, 01 | `src/gui/browser.rs`, `src/gui/browser/{view,keys}.rs`, `src/gui/browser/tests/s2.rs`, `src/gui/browser/git_panel/mod.rs` (the set, the Cmd/Ctrl+K hook, two readers), `src/gui/{mod,help,binary}.rs`, `src/gui/chrome/tests.rs`, `src/git/{history,runner}.rs`, `src/main.rs`, `tests/cli.rs`, `src/forward.rs`, `AGENTS.md`, `README.md`, `.prd/01-spec.md`, `.prd/03-git-panel.md` (one line) | S2-A, S2-B, S2-C, S2-D, S2-E |
+All of S2 is merged — S2-0 (PR #64), S2-C (#67), S2-E (#68), S2-B (#69), S2-A (#70), S2-D (#72), S2-F (#80),
+2026-11-23 — and its rows are in [`loop.done.md`](loop.done.md). Contract: 03.
 
 ## Round 2 — slice S3 (git actions, staging and commit, backups, restore and undo, the banner, the log)
 
 Every action of 03 §7.1–§7.7 with 03 §8's safety (02 §8.1 S3; contract `../03-git-panel.md`). E5 is closed
 (2026-11-23): its result is in 02 §8.2, 03 §3.5 and §4.5, its row in [`loop.done.md`](loop.done.md). S3-0 first,
 then S3-A and S3-B in parallel on disjoint files; those three need S2-0–S2-E merged and E5, not S2-F. S3-C waits for
-S2-F too: two integration WUs never run together (02 §8.1 "Schedule").
+S2-F too: two integration WUs never run together (02 §8.1 "Schedule"). S3-0 (PR #79), S3-B (#81) and S3-A (#83)
+are merged (2026-11-23), their rows in [`loop.done.md`](loop.done.md); S3-C wires them.
 
 | ID | Status | Branch | Scope | Owner files (02 §5) | After |
 |---|---|---|---|---|---|
-| S3-0 | 🟡 in progress | `feat/browser-s3-scaffold` | `mod` lines and stubs for S3's files (the git tests' and `git_panel/tests_s3.rs` too); the shared types of `git::actions` (`ActionId`, `Action`, `Repo`, `Plan`, `Step`, `Confirmation`, `RemoteChange`, `Outcome`, `Banner`) and `git::backup` (`Take`, `Manifest`, `Record`, `RestoreEntry`, `Undo`); `plan`, `backup::write` and `backup::list` as `todo!()`; no `keys.rs` row (S2-F is changing that file): the rows S3 needs from 03 §9 are listed for S3-C; E5's result in 02 §8.2, 03 §3.5 and §4.5; one stop session per host (02 §6, 03 §3.5), `git_panel/mod.rs`'s S3 owner (02 §5), the banner's keys and the Backups list's (03 §9.2), G-R3's live receipt to S3-C (03 §11) | `src/git/{mod,actions,backup}.rs`, `src/git/tests/{actions,backup}.rs`, `src/gui/browser/git_panel/mod.rs` (mod lines), the stubs; `.prd/02-architecture.md`, `.prd/03-git-panel.md`, `.prd/browser/loop*.md` | S2-0–S2-E, E5 |
-| S3-A | 🔴 open | `feat/browser-s3-actions` | every action of 03 §7.1–§7.7 as a pure plan — steps, confirmation (§8.1), backups (§8.2), §8.4's lease, files in the way (§8.6) — and its executor; the §8.5 in-progress probe `Snippet` and its parser into `model::InProgress`, and the banner; backups, manifests, the files snapshot and restore snippets, restore and undo (§8.2–§8.3); G-R5, G-A1–G-A9, G-S1–G-S3, G-S5–G-S8 through `LocalGit` and `ShellGit` | `src/git/{actions,backup}.rs`, `src/git/tests/{actions,backup}.rs` | S3-0 |
-| S3-B | 🔴 open | `feat/browser-s3-dialogs` | the action menu (F10, Shift+F10, a right click), each action's dialog and confirmation (§8.1), the result dialog with each step's outcome (§3.8), the Backups list (§8.2), the command log (§3.7), the banner (§8.5), in the PC Shell look | `src/gui/browser/git_panel/{menu,dialogs,backups,log_view,in_progress}.rs`, `src/gui/browser/git_panel/tests_s3.rs` | S3-0 |
-| S3-C | 🔴 open | `feat/browser-s3-integration` | wiring S3-A and S3-B: actions on a worker under the repository's write lock (02 §6), the refresh after (03 §5), `GitEvent::WorkTreeChanged`, the window's undo; S3-A's in-progress probe in the load and every refresh (02 §6.1, 03 §5); S3's key rows landed, and the rows 03 §9 needs added or changed — the banner's Cmd/Ctrl+Shift+C, S, A, B (03 §9.2) among them (hand-over); `SOPEN_STATE dialog=` (02 §9); S3's scenarios (02 §8.1's table: G-R5, G-A1–G-A9, G-S1–G-S8, G-K1, G-K2, G-W1 banner, backups, log), receipts; G-R3's live receipt on sopen's own binary against a real ssh host under zsh, bash and fish login shells, the master killed before Esc included (03 §11); AGENTS.md | `src/gui/browser.rs`, `src/gui/browser/{view,tests}.rs`, `src/gui/browser/git_panel/mod.rs` (hand-over), `src/gui/browser/keys.rs` and `src/gui/help.rs` (hand-over), `src/gui/mod.rs` (receipt keys), `src/main.rs`, `tests/cli.rs`, `AGENTS.md`, `README.md` | S3-A, S3-B, S2-F |
+| S3-C | 🟡 in progress | `feat/browser-s3-integration` | wiring S3-A and S3-B: actions on a worker under the repository's write lock (02 §6), the refresh after (03 §5), `GitEvent::WorkTreeChanged`, the window's undo; S3-A's in-progress probe in the load and every refresh (02 §6.1, 03 §5); S3's key rows landed, and the rows 03 §9 needs added or changed — the banner's Cmd/Ctrl+Shift+C, S, A, B (03 §9.2) among them (hand-over); `SOPEN_STATE dialog=` (02 §9); S3's scenarios (02 §8.1's table: G-R5, G-A1–G-A9, G-S1–G-S8, G-K1, G-K2, G-W1 banner, backups, log), receipts; G-R3's live receipt on sopen's own binary against a real ssh host under zsh, bash and fish login shells, the master killed before Esc included (03 §11); AGENTS.md | `src/gui/browser.rs`, `src/gui/browser/{view,tests}.rs`, `src/gui/browser/git_panel/mod.rs` (hand-over), `src/gui/browser/keys.rs` and `src/gui/help.rs` (hand-over), `src/gui/mod.rs` (receipt keys), `src/main.rs`, `tests/cli.rs`, `AGENTS.md`, `README.md` | S3-A, S3-B, S2-F |
 
 ## Round 2 — slice S4 (history edits: the quick edits and the planner)
 
