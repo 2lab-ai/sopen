@@ -1448,7 +1448,8 @@ fn media_autoexport_writes_a_sibling() {
 // hands its output to the session, which has ended). As sshd does, it opens the forward's
 // listener before the target's command starts: a loopback LISTEN row for the `-R` port goes into
 // the `SOPEN_LISTENERS` table, if one is set (`FAKE_SSH_NO_BIND=1`: no row, a listener HOST
-// cannot see). The target's stand-in sopen prints `FAKE_SOPEN_SAY` (its lines), if set, and with
+// cannot see). The target's stand-in sopen prints `FAKE_SOPEN_SAY` (its lines), if set — with
+// `FAKE_SOPEN_PACE=<seconds>`, one at a time, that long after each — and with
 // `FAKE_SOPEN_HOLD=1` then reads its input to the end, as HOST's half of a tunnel holds, before
 // it exits — so it plays a HOST sopen of any version, cues included (09 §7).
 
@@ -1566,15 +1567,20 @@ impl FakeSsh {
             &format!("#!/bin/sh\n: > '{}/decoy-ran'\n", dir.display()),
         );
         let sopen = dir.join("target-sopen");
+        // The target's PATH has no `sleep`: the pace runs this machine's, by its path.
+        let sleep = which("sleep").expect("sleep is not on PATH");
         executable(
             &sopen,
             &format!(
                 "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{dir}/sopen-argv'\n\
                  if [ -n \"${{FAKE_SOPEN_SIGNAL:-}}\" ]; then kill -\"$FAKE_SOPEN_SIGNAL\" $$; fi\n\
-                 if [ -n \"${{FAKE_SOPEN_SAY:-}}\" ]; then printf '%s\\n' \"$FAKE_SOPEN_SAY\"; fi\n\
+                 if [ -n \"${{FAKE_SOPEN_PACE:-}}\" ]; then printf '%s\\n' \"$FAKE_SOPEN_SAY\" | \
+                 while IFS= read -r l; do printf '%s\\n' \"$l\"; '{sleep}' \"$FAKE_SOPEN_PACE\"; done\n\
+                 elif [ -n \"${{FAKE_SOPEN_SAY:-}}\" ]; then printf '%s\\n' \"$FAKE_SOPEN_SAY\"; fi\n\
                  if [ -n \"${{FAKE_SOPEN_HOLD:-}}\" ]; then while read -r _; do :; done; fi\n\
                  exit \"${{FAKE_SOPEN_EXIT:-0}}\"\n",
-                dir = dir.display()
+                dir = dir.display(),
+                sleep = sleep.display()
             ),
         );
         let path = format!(
@@ -3650,6 +3656,32 @@ fn hold_until_eof_refuses_a_port_open_to_the_network() {
     assert!(browser_calls(&calls).is_empty(), "the browser was called");
 }
 
+/// `sopen --target HOST <args>` through the fake ssh, HOST's half the real binary (unless `env`
+/// names another `SOPEN_TARGET_BIN`), its input none and its stderr piped; the caller sets its
+/// stdout.
+fn tunnelled_command(
+    home: &Path,
+    ssh: &FakeSsh,
+    browser: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Command {
+    let mut cmd = sopen_command(home);
+    cmd.args(["--target", HOST])
+        .args(args)
+        .env("PATH", &ssh.path)
+        .env("SOPEN_TARGET_BIN", env!("CARGO_BIN_EXE_sopen"))
+        .env("SOPEN_BROWSER", browser)
+        .env("SOPEN_EDITOR_WAIT", "60")
+        .env("SOPEN_LISTENERS", no_listeners(home))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
 /// A run of `sopen --target HOST --browser URL` through the fake ssh, HOST's half the real
 /// binary (unless `env` names another `SOPEN_TARGET_BIN`): its stdout lines as they come, its
 /// stderr at its end.
@@ -3661,19 +3693,23 @@ struct Tunnelled {
 
 impl Tunnelled {
     fn start(home: &Path, ssh: &FakeSsh, browser: &Path, url: &str, env: &[(&str, &str)]) -> Self {
-        let mut cmd = sopen_command(home);
-        cmd.args(["--target", HOST, "--browser", url])
-            .env("PATH", &ssh.path)
-            .env("SOPEN_TARGET_BIN", env!("CARGO_BIN_EXE_sopen"))
-            .env("SOPEN_BROWSER", browser)
-            .env("SOPEN_EDITOR_WAIT", "60")
-            .env("SOPEN_LISTENERS", no_listeners(home))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
+        let cmd = tunnelled_command(home, ssh, browser, &["--browser", url], env);
+        Self::spawn(cmd)
+    }
+
+    /// [`Tunnelled::start`] with `args` after `--target HOST` (no `--browser` unless given).
+    fn start_with(
+        home: &Path,
+        ssh: &FakeSsh,
+        browser: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Self {
+        Self::spawn(tunnelled_command(home, ssh, browser, args, env))
+    }
+
+    fn spawn(mut cmd: Command) -> Self {
+        cmd.stdout(std::process::Stdio::piped());
         let mut guard = Reaped(Some(cmd.spawn().unwrap()));
         let child = guard.0.as_mut().unwrap();
         let out = child.stdout.take().unwrap();
@@ -4219,8 +4255,9 @@ fn the_open_line_names_hosts_window_only_after_its_cue() {
 }
 
 /// Cues are matched exactly (09 §7, version skew): a line that is not one of the three — a cue
-/// of a later sopen, a cue with more on its line or before it — is HOST's plain output, passed
-/// on in its place and never acted on; the real cues beside them are still read.
+/// of a later sopen, a cue with more on its line, before it or after it (a space, a tab) — is
+/// HOST's plain output, passed on in its place and never acted on; the real cues beside them
+/// are still read.
 #[test]
 fn a_line_that_is_not_a_cue_passes_as_a_plain_line() {
     use sopen::url::{TUNNEL_OPEN, TUNNEL_WINDOW};
@@ -4232,6 +4269,12 @@ fn a_line_that_is_not_a_cue_passes_as_a_plain_line() {
         "sopen-tunnel-closed now",
         " sopen-tunnel-window",
         "SOPEN-TUNNEL-CLOSED",
+        "sopen-tunnel-window ",
+        "sopen-tunnel-window\t",
+        "sopen-tunnel-open ",
+        "sopen-tunnel-open\t",
+        "sopen-tunnel-closed ",
+        "sopen-tunnel-closed\t",
     ];
     let mut say = plain.to_vec();
     say.extend([TUNNEL_WINDOW, TUNNEL_OPEN]);
@@ -4373,4 +4416,165 @@ fn hosts_end_without_the_closed_cue_keeps_todays_rule() {
         );
         all_gone(&pids);
     }
+}
+
+/// This side's own lines are written as HOST's plain ones are, a write error ignored: with its
+/// output gone (`sopen … | head -1`), the open and closed lines are no panic — HOST's window
+/// closed still ends the run with 0 (09 §7, as HOST's cues).
+#[test]
+fn the_tunnels_lines_on_a_closed_output_are_no_panic() {
+    use sopen::url::{TUNNEL_CLOSED, TUNNEL_OPEN, TUNNEL_WINDOW};
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, _) = stand_in_browser(tmp.path());
+    let ssh = FakeSsh::new(tmp.path());
+    let say = [TUNNEL_WINDOW, TUNNEL_OPEN, TUNNEL_CLOSED].join("\n");
+    let mut cmd = tunnelled_command(
+        tmp.path(),
+        &ssh,
+        &browser,
+        &["--browser", SECRET_URL],
+        &[
+            ("SOPEN_TARGET_BIN", ssh.sopen.to_str().unwrap()),
+            ("FAKE_SOPEN_SAY", &say),
+            ("FAKE_SOPEN_HOLD", "1"),
+        ],
+    );
+    // A pipe whose reader is gone before sopen starts: every write to it fails (EPIPE).
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    cmd.stdout(writer);
+    let mut guard = Reaped(Some(cmd.spawn().unwrap()));
+    drop(cmd);
+    let stderr = collected(guard.0.as_mut().unwrap().stderr.take());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = guard.0.as_mut().unwrap().try_wait().unwrap() {
+            break status;
+        }
+        assert!(std::time::Instant::now() < deadline, "sopen did not end");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    guard.0 = None;
+    let err = text(
+        &stderr
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap_or_default(),
+    );
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+    all_gone(&tunnel_pids(&ssh));
+}
+
+/// What this side prints keeps HOST's order (09 §7): HOST's lines coming apart in time, the open
+/// line stands where the open cue was, HOST's plain line after it, the closed line last. In one
+/// burst a plain line after the open cue may come out before the open line — the relay writes
+/// it at once, the open line waits for the next 20 ms poll, as before 09 — so there only what is
+/// ordered is held: a plain line before the open cue comes before the open line, and the closed
+/// line comes last, after every plain line.
+#[test]
+fn the_tunnels_output_keeps_hosts_order() {
+    use sopen::url::{TUNNEL_CLOSED, TUNNEL_OPEN, TUNNEL_WINDOW};
+    let url = "http://127.0.0.1:1234/";
+    let said = "a plain line of HOST's own";
+    let before = "a plain line before the cues";
+    for (say, pace) in [
+        (
+            vec![TUNNEL_WINDOW, TUNNEL_OPEN, said, TUNNEL_CLOSED],
+            Some("0.3"),
+        ),
+        (
+            vec![before, TUNNEL_WINDOW, TUNNEL_OPEN, said, TUNNEL_CLOSED],
+            None,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (browser, _) = stand_in_browser(tmp.path());
+        let ssh = FakeSsh::new(tmp.path());
+        let mut env = vec![("FAKE_SOPEN_HOLD", "1")];
+        env.extend(pace.map(|p| ("FAKE_SOPEN_PACE", p)));
+        let mut run = host_saying(tmp.path(), &ssh, &browser, url, &say, &env);
+        let first = run.first_line();
+        let pids = tunnel_pids(&ssh);
+        run.exited_after(std::time::Instant::now());
+        let (status, err) = run.ended();
+        let mut lines = vec![first];
+        lines.extend(run.to_end());
+        assert_eq!(status.code(), Some(0), "{say:?}: {err}");
+        match pace {
+            Some(_) => assert_eq!(
+                lines,
+                [window_line(url), said.to_string(), closed_line(url)],
+                "{say:?}"
+            ),
+            None => {
+                assert_eq!(lines.len(), 4, "{lines:?}");
+                assert_eq!(lines[0], before, "{lines:?}");
+                assert_eq!(lines[3], closed_line(url), "{lines:?}");
+                let mut middle = lines[1..3].to_vec();
+                middle.sort();
+                let mut want = vec![window_line(url), said.to_string()];
+                want.sort();
+                assert_eq!(middle, want, "{lines:?}");
+            }
+        }
+        all_gone(&pids);
+    }
+}
+
+/// Without `--browser`: HOST's half is given none (`--here --hold-until-eof -- URL`) and a HOST
+/// that says only the open cue gets today's line, Ctrl-C ending it with 0; an address passed as
+/// it is goes as `--here -- URL`.
+#[test]
+fn without_browser_host_is_given_no_browser_flag() {
+    use sopen::url::TUNNEL_OPEN;
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, calls) = stand_in_browser(tmp.path());
+    let ssh = FakeSsh::new(tmp.path());
+    let bin = ssh.sopen.to_str().unwrap();
+    let mut run = Tunnelled::start_with(
+        tmp.path(),
+        &ssh,
+        &browser,
+        &[SECRET_URL],
+        &[
+            ("SOPEN_TARGET_BIN", bin),
+            ("FAKE_SOPEN_SAY", TUNNEL_OPEN),
+            ("FAKE_SOPEN_HOLD", "1"),
+        ],
+    );
+    assert_eq!(
+        run.first_line(),
+        format!("{SECRET_SHOWN} is open on {HOST} through a tunnel — Ctrl-C closes it")
+    );
+    let pids = tunnel_pids(&ssh);
+    assert_eq!(
+        ssh.sopen_argv().unwrap(),
+        ["--here", "--hold-until-eof", "--", SECRET_URL]
+    );
+    run.signal(libc::SIGTERM);
+    let (status, err) = run.ended();
+    assert_eq!(status.code(), Some(0), "{err}");
+    all_gone(&pids);
+
+    ssh.forget();
+    let url = "https://example.com/a?b";
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, url],
+        &[
+            ("PATH", ssh.path.as_str()),
+            ("SOPEN_TARGET_BIN", bin),
+            ("SOPEN_BROWSER", browser.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(ssh.sopen_argv().unwrap(), ["--here", "--", url]);
+    let argv = ssh.argv().unwrap();
+    assert_eq!(
+        argv[argv.len() - 3..],
+        [q("sopen"), q("--"), q(url)],
+        "{argv:#?}"
+    );
+    // The stand-in HOST opened nothing.
+    assert!(browser_calls(&calls).is_empty());
 }

@@ -68,7 +68,9 @@ struct Cli {
     #[arg(long, conflicts_with = "app")]
     hex: bool,
     /// Open the http(s):// address in the default browser of the machine it opens on
-    #[arg(long)]
+    // Refused beside the modes that open no address (they would ignore it); with a file SOURCE,
+    // a usage error past clap (run_source).
+    #[arg(long, conflicts_with_all = ["selftest_audio", "raise_window", "fkeys_watchdog"])]
     browser: bool,
     /// Internal (HOST's half of `sopen URL` through a tunnel, spec §4a): once the address is
     /// open, wait for the input's end — the other machine's sopen ending — then exit 0.
@@ -1608,6 +1610,21 @@ mod tests {
         let cli = Cli::try_parse_from(std::iter::once("sopen").chain(held)).unwrap();
         assert!(cli.browser && cli.hold_until_eof && cli.here);
         assert_eq!(cli.source.as_deref(), Some("http://x/"));
+        // Not beside a mode that opens no address: refused, never ignored.
+        for mode in [
+            &["--selftest-audio", "a.wav"][..],
+            &["--raise-window", "code", "--raise-caption", "x"],
+            &["--fkeys-watchdog", "1:2", "--fkeys-dir", "/s"],
+        ] {
+            let args = ["sopen", "--browser"]
+                .into_iter()
+                .chain(mode.iter().copied());
+            assert!(Cli::try_parse_from(args).is_err(), "{mode:?}");
+            // The mode alone parses.
+            let args = std::iter::once("sopen").chain(mode.iter().copied());
+            assert!(Cli::try_parse_from(args).is_ok(), "{mode:?}");
+        }
+        assert!(Cli::try_parse_from(["sopen", "--browser", "cut", "a", "1", "2"]).is_err());
         // What HOST's sopen is given: after `--`, even a subcommand's name or a leading `-` is
         // SOURCE, and so is an empty SOURCE (HOST's home).
         for source in ["cut", "config", "-x.png", ""] {

@@ -594,9 +594,9 @@ enum Attempt {
     Done(Result<u8>),
 }
 
-/// A line of HOST's sopen that is a cue for this side (09 §7). Matched exactly, as written
-/// (only the line's end trimmed): any other line — a later sopen's cue among them — is HOST's
-/// plain output, passed on.
+/// A line of HOST's sopen that is a cue for this side (09 §7). Matched exactly, as HOST writes
+/// it — only its end (`\n` or `\r\n`) taken off, never a space or a tab before it: any other
+/// line — a later sopen's cue among them — is HOST's plain output, passed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cue {
     /// [`crate::url::TUNNEL_WINDOW`]: the address is in a window there.
@@ -609,7 +609,11 @@ enum Cue {
 
 impl Cue {
     fn of(line: &str) -> Option<Cue> {
-        match line.trim_end() {
+        let line = match line.strip_suffix('\n') {
+            Some(line) => line.strip_suffix('\r').unwrap_or(line),
+            None => line,
+        };
+        match line {
             crate::url::TUNNEL_WINDOW => Some(Cue::Window),
             crate::url::TUNNEL_OPEN => Some(Cue::Open),
             crate::url::TUNNEL_CLOSED => Some(Cue::Closed),
@@ -785,13 +789,14 @@ fn attempt(
             // A watcher left behind (the guard killed by a signal) ends ssh at this end.
             input.take();
             ended(out.take(), err);
-            // Only now, the relay drained, are HOST's last cues all in: an open cue that came
-            // with ssh's exit counts for a stop, and a closed cue counts whether it came before
-            // ssh's exit or with it.
-            heard.take(&cues, &open_line, say);
+            // A stop during the drain comes first, as before 09: an open cue not read yet is
+            // not said, and the run was stopped before the address opened.
             if let Some(signal) = stop() {
                 return Ok(stopped(signal, heard.open));
             }
+            // Only now, the relay drained, are HOST's last cues all in: a closed cue counts
+            // whether it came before ssh's exit or with it.
+            heard.take(&cues, &open_line, say);
             if heard.closed {
                 return Ok(window_closed(say));
             }
@@ -1047,8 +1052,14 @@ pub fn tunnel(host: &str, url: &crate::url::Url, browser: bool, state_dir: &Path
     let seed = std::collections::hash_map::RandomState::new();
     let ports = tunnel_ports(url.port(), TUNNEL_TRIES, |i| seed.hash_one(i));
     let watch = signals::Watch::start();
+    // This side's lines go out as HOST's plain ones do ([`relay`]), a write error ignored —
+    // never `println!`, which panics once the output is gone (`| head -1`): the tunnel then
+    // lives on until Ctrl-C or HOST's end, as HOST's half does with its cues (09 §7).
     run_tunnel(&tunnel, &ports, &|| watch.signal(), &mut |line| {
-        println!("{line}")
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
     })
 }
 
@@ -2017,6 +2028,64 @@ mod tests {
         let pids = pids.into_inner().unwrap();
         assert!(pids.len() >= 3, "{pids:?}");
         all_reaped(&pids);
+    }
+
+    /// A cue is the whole line but its end (`\n`, `\r\n`, or none at the output's end): a space
+    /// or a tab after it, or anything before it, makes it HOST's plain output (09 §7).
+    #[test]
+    fn cues_are_matched_exactly() {
+        use crate::url::{TUNNEL_CLOSED, TUNNEL_OPEN, TUNNEL_WINDOW};
+        for (cue, want) in [
+            (TUNNEL_WINDOW, Cue::Window),
+            (TUNNEL_OPEN, Cue::Open),
+            (TUNNEL_CLOSED, Cue::Closed),
+        ] {
+            for line in [format!("{cue}\n"), format!("{cue}\r\n"), cue.to_string()] {
+                assert_eq!(Cue::of(&line), Some(want), "{line:?}");
+            }
+            for line in [
+                format!("{cue} \n"),
+                format!("{cue}\t\n"),
+                format!("{cue} \r\n"),
+                format!("{cue}\r\r\n"),
+                format!(" {cue}\n"),
+                format!("{cue}x\n"),
+                cue.to_uppercase(),
+            ] {
+                assert_eq!(Cue::of(&line), None, "{line:?}");
+            }
+        }
+    }
+
+    /// A stop (Ctrl-C, SIGTERM) that comes while this side drains HOST's output after ssh's
+    /// exit, an open cue in that output not yet read: stopped before the address opened — the
+    /// stop is checked before the cues are, as before 09; the open line is not said.
+    #[test]
+    fn a_stop_during_the_drain_comes_before_an_open_cue_in_it() {
+        use crate::url::{TUNNEL_OPEN, TUNNEL_WINDOW};
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("stopped");
+        // ssh ends at once; what it left running says the cues later, once this side drains,
+        // and the stop comes before that drain is over.
+        let ssh = stand_in_host(
+            tmp.path(),
+            1,
+            &format!(
+                "(sleep 0.3; echo {TUNNEL_WINDOW}; echo {TUNNEL_OPEN}; : > {}) &\nexit 0",
+                quote(marker.to_str().unwrap())
+            ),
+        );
+        let url = address("http://127.0.0.1:1234/");
+        let mut said = Vec::new();
+        let code = run_tunnel(
+            &tunnel_for(&ssh, &url),
+            &[1234],
+            &|| marker.exists().then_some(15),
+            &mut |l| said.push(l.to_string()),
+        )
+        .unwrap();
+        assert_eq!(code, 128 + 15);
+        assert_eq!(said, Vec::<String>::new());
     }
 
     /// The listener tables HOST's sopen reads: Linux's `/proc/net/tcp{,6}` rows (this machine's
