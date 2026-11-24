@@ -589,11 +589,15 @@ fn v16_a_render_input_that_waits_past_60_s_is_not_cut() {
         let mut media = Media::served(&tools, served.clone(), "v.mp4", "v.mp4").unwrap();
         let (kind, plan) = planned(&mut media);
         // The second piece's input is opened with the first, and waits while the first plays.
-        let spec = spec_of(&media, &[(70.0, 40.0), (10.0, 40.0)]);
+        // 150 s pieces: the first is still being read well after the first progress report
+        // (ffmpeg 9.1 renders 80 s of this in under a second, its AAC encoder 4× 9.0's).
+        let spec = spec_of(&media, &[(200.0, 150.0), (10.0, 150.0)]);
         assert_eq!(spec.groups_from(&media.input).len(), 2);
         let out = dir.path().join("out.mp4");
-        // The render's first progress report holds it — ffmpeg blocks on its progress pipe, and
-        // its inputs' connections stop being read — until the clock has gone past the rule.
+        // The render's first progress report holds it, and its ffmpeg is stopped there (SIGSTOP)
+        // until the clock has gone past the rule: its inputs' connections are not read. The
+        // progress pipe alone would not stop it — the reader's queue and the pipe take far more
+        // reports than a render makes, and ffmpeg renders on to its end unread.
         let (begun, hold) = (mpsc::channel(), mpsc::channel::<()>());
         let (begun_tx, begun_rx) = begun;
         let (hold_tx, hold_rx) = hold;
@@ -620,6 +624,15 @@ fn v16_a_render_input_that_waits_past_60_s_is_not_cut() {
         begun_rx
             .recv_timeout(Duration::from_secs(60))
             .expect("the render begins");
+        // The one process that names the output: the render's ffmpeg, both of its inputs open.
+        let ffmpeg = super::child::log::pids_naming(&out);
+        assert_eq!(ffmpeg.len(), 1, "the render's ffmpeg: {ffmpeg:?}");
+        let signal = |sig: libc::c_int| {
+            // SAFETY: a signal to a pid this test just found as its render's ffmpeg.
+            let sent = unsafe { libc::kill(ffmpeg[0] as libc::pid_t, sig) };
+            assert_eq!(sent, 0, "signal {sig} to the render's ffmpeg");
+        };
+        signal(libc::SIGSTOP);
         // Both inputs are open; their connections fill and their writes wait.
         // The render bodies waiting now: those whose blocked writes look at the clock from
         // here on (a connection ffmpeg closed earlier looks no more).
@@ -666,12 +679,13 @@ fn v16_a_render_input_that_waits_past_60_s_is_not_cut() {
                 );
             }
         }
+        signal(libc::SIGCONT);
         hold_tx.send(()).unwrap();
         render.join().unwrap().unwrap();
         for kind in Kind::ALL {
             assert_eq!(served.server().cuts(kind), 0, "a waiting input was cut");
         }
-        assert_eq!(entry(&tools, &out, "v", "nb_frames"), "2000");
+        assert_eq!(entry(&tools, &out, "v", "nb_frames"), "7500");
         none_reading(&media);
         drop(media);
         none_left(dir.path()).unwrap();

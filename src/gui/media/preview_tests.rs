@@ -834,9 +834,31 @@ fn on_the_real_clock_a_two_hour_sound_previews_ten_minutes_within_each_budget() 
         let fx = shown(tmp, path, made);
         assert_eq!(wave::starts(&fx.path), [(0.0, Some(600.0))]);
         let said = fx.drv.text_starting_with("audio · mono").expect("the line");
+        // The whole duration as the file declares it, by ffprobe alone: two hours, and from
+        // ffmpeg 9.1 529 samples more (its libmp3lame below 32 kHz declares 529 samples less
+        // encoder delay than it gave, so the decode keeps them).
+        let declared = std::process::Command::new(&tools.ffprobe)
+            .args(["-v", "error", "-show_entries", "format=duration"])
+            .args(["-of", "csv=p=0"])
+            .arg(&fx.path)
+            .output()
+            .unwrap();
+        let secs: f64 = String::from_utf8_lossy(&declared.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        assert!((7200.0..7200.1).contains(&secs), "{secs}");
+        let cs = (secs * 100.0).round() as u64;
+        let whole = format!(
+            "{}:{:02}:{:02}.{:02}",
+            cs / 360_000,
+            cs / 6_000 % 60,
+            cs / 100 % 60,
+            cs % 100
+        );
         assert!(
-            said.contains("2:00:00.00") && said.contains("preview of the first 10 minutes"),
-            "{said}"
+            said.contains(&whole) && said.contains("preview of the first 10 minutes"),
+            "{said} (the file: {whole})"
         );
         let (peaks, cut) = fx.win.peaks.clone().expect("peaks");
         assert_eq!(cut, Some(600.0));
