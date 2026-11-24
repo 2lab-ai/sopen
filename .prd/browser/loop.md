@@ -11,6 +11,13 @@ WU row is in [`loop.done.md`](loop.done.md). Target: [`ssot.md`](ssot.md). Contr
 | K-F3 | 🚪 owner | 04 §8: a plain F5 on the Mac's built-in keyboard opens the Copy dialog with sopen in front; another app gets dictation back; `kill -9` of sopen restores the key mode within a second. Until it exists, the key half of 04 §6.2 is unproven. | the owner, at the Mac |
 | G-R3-bash | 🔴 open | 03 §11: the live Esc-stop of a remote fetch under a bash login shell (zsh and fish are measured). | needs a host account whose login shell is bash |
 
+## Round 3 — message 19 (opened 2026-11-24)
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| K-L1 | 🟡 running | Feasibility gate for message 19 on Linux (KDE Plasma 6 Wayland): with a keyboard-shortcuts inhibitor on a focused sopen-like surface, does a globally bound top-row key (screen brightness) reach the client, can it be read under eframe, what else stops while sopen is focused, and is the inhibitor dropped when the client dies. A prototype in a private headless compositor, never on the owner's display. It reverses 04 §6.4 only if it passes; the owner decides any side effect (e.g. Alt+Tab inside sopen). | research unit |
+| K-L2 | 🔴 open | The owner-assisted receipt K-L1 designs: the owner presses F1…F12 in a logging mode on the Linux laptop, so the top row's real codes are measured, not recalled (this account cannot read input devices). Batched with K-F3. | the owner, at the Linux laptop |
+
 ## Build facts
 
 - Gate, per WU and before every merge: `just check` (`cargo fmt --check`, `cargo clippy --all-targets --locked
