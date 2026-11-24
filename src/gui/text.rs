@@ -666,6 +666,8 @@ impl TextDoc {
         // How far past a read a Bulk reader's readahead goes.
         let (ahead, _) = crate::stream::limits(ReaderKind::Bulk);
         let mut failed = None;
+        // A read came back empty before the size the Source opened the file at.
+        let mut ended = false;
         while stream.scan.at < end && stream.scan.at - from < budget {
             let at = stream.scan.at;
             let block = crate::stream::BLOCK;
@@ -702,7 +704,10 @@ impl TextDoc {
                 (None, None) => &mut stream.reader,
             };
             match reader.try_read(at, want) {
-                Poll::Ready(Ok(bytes)) if bytes.is_empty() => break,
+                Poll::Ready(Ok(bytes)) if bytes.is_empty() => {
+                    ended = true;
+                    break;
+                }
                 Poll::Ready(Ok(bytes)) => stream.scan.feed(&bytes, stream.total),
                 Poll::Ready(Err(e)) => {
                     failed = Some(anyhow::Error::new(e));
@@ -718,11 +723,10 @@ impl TextDoc {
                 break;
             }
         }
-        if stream.scan.at >= end {
-            // (A cap below the default's sample: it is picked from what was read.)
-            stream.scan.settle(stream.total);
-        }
-        if stream.scan.at == from {
+        // A pass at its end — its cap, or reads that came back empty — short of the default's
+        // sample picks it from what it read, and indexes that.
+        let picked = (ended || stream.scan.at >= end) && stream.scan.settle(stream.total);
+        if stream.scan.at == from && !picked {
             return match failed {
                 Some(e) => Err(e),
                 None => Ok(false),
@@ -1941,10 +1945,13 @@ impl Scan {
 
     /// A pass that ends before the default's sample is whole (the file ended sooner than its
     /// size said, or a cap below 8 KiB) picks from what it read.
-    fn settle(&mut self, size: u64) {
-        if self.pick.is_none() && !self.sample.is_empty() {
+    /// Whether it picked now.
+    fn settle(&mut self, size: u64) -> bool {
+        let short = self.pick.is_none() && !self.sample.is_empty();
+        if short {
             self.begin(size);
         }
+        short
     }
 
     /// The bytes the index covers: none while the default's sample is still coming in.
@@ -4242,24 +4249,27 @@ impl TextWindow {
     /// encoding it had. Wrap's memos and the highlighter's states go either way, and the place
     /// on screen is kept by its byte (§7.3's jump rule).
     fn choose(&mut self, ctx: &egui::Context, enc: Encoding) {
-        if self.doc.chosen == Some(enc) {
-            return;
+        let rebuilding = self.reindex.as_ref().and_then(|r| r.rebuild.as_ref());
+        let kept = rebuilding.and_then(|b| b.place);
+        match rebuilding.map(|b| b.enc) {
+            // The file is being indexed in it already: that pass goes on.
+            Some(out) if out == enc => return,
+            // Being indexed in another: this choice is the newest, and that pass is dropped.
+            Some(_) => self.reindex = None,
+            None if self.doc.chosen == Some(enc) => return,
+            None => {}
         }
         let place = self
             .page
             .as_ref()
             .map(|p| p.top + if p.wrapped { p.top_off } else { 0 })
-            .filter(|&at| at > 0);
-        // A pass still out — a re-read in the encoding chosen before, a rebuild — would land
-        // over a change made in place: the file is indexed again in the newest choice instead
-        // (the pass out is dropped), at the place an earlier rebuild was keeping.
-        let out = self
-            .reindex
-            .as_ref()
-            .map(|r| r.rebuild.as_ref().and_then(|b| b.place));
-        let place = place.or(out.flatten());
+            .filter(|&at| at > 0)
+            .or(kept);
+        // A re-read still out (in the encoding chosen before) would land over a change made in
+        // place: the file is indexed again in this one instead, the re-read dropped.
+        let busy = self.reindex.is_some();
         let fresh = self.doc.is_stream() && self.doc.size() == 0;
-        if out.is_none() && (fresh || !self.doc.needs_index_for(enc)) {
+        if !busy && (fresh || !self.doc.needs_index_for(enc)) {
             self.doc.reencode(enc);
         } else if let Some(source) = self.doc.source().cloned() {
             // Its first 16 MiB are read again (from the block cache where they still are).
@@ -4311,6 +4321,8 @@ impl TextWindow {
         let exited = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicU64::new(0));
         let total = self.doc.opened.2;
+        // A re-read it supersedes, of a file viewed at its end, still follows the end.
+        let at_end = self.reindex.as_ref().is_some_and(|r| r.at_end);
         let (stop, ex, counted, waker) =
             (cancel.clone(), exited.clone(), done.clone(), ctx.clone());
         #[cfg(test)]
@@ -4333,7 +4345,7 @@ impl TextWindow {
         self.reindex = Some(Reindex {
             cancel,
             rx,
-            at_end: false,
+            at_end,
             resume: None,
             rebuild: Some(Rebuild {
                 enc,
@@ -4892,7 +4904,12 @@ impl TextWindow {
             }
         };
         let (mut got, mut at_end) = read(&mut w, pos)?;
-        if got.len() < rows && pos != Pos::default() {
+        // (The file's start is line 1's: after a BOM skipped.)
+        let start = Pos {
+            at: w.doc.first_start(),
+            ..Pos::default()
+        };
+        if got.len() < rows && pos != Pos::default() && pos != start {
             // Short of the window: the last page instead, no blank rows under the end — the
             // end of the lines known, while the pass is on its way.
             pos = if wrap {
@@ -5193,7 +5210,8 @@ impl TextWindow {
         let whole = self.doc.whole();
         match &self.page {
             Some(p) if p.wrapped || !whole => {
-                let at_start = p.top == 0 && p.top_off == 0;
+                // (The file's start is line 1's: after a BOM skipped.)
+                let at_start = p.top <= self.doc.first_start() && p.top_off == 0;
                 // The end of what is indexed is the file's end only once the index is whole.
                 match (p.at_end && whole, at_start) {
                     (true, true) => None,

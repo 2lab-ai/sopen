@@ -5039,9 +5039,143 @@ fn the_top_of_a_file_with_a_bom_is_line_1s_start() {
     drv.until(&mut win, 10, |w| w.ready());
     assert_eq!(rows_of(&win)[..2], ["one", "two"]);
     assert_eq!(win.top, 3);
+    assert_eq!(win.thumb(), None, "it fits: nothing to scroll");
+    // Its page is read once, as the same lines without a BOM are.
+    let mut plain = TextWindow::new(
+        TextDoc::open(&write(tmp.path(), "plain.txt", b"one\ntwo\n")).unwrap(),
+        "box:p".into(),
+        "plain.txt",
+        vec![],
+    );
+    drv.until(&mut plain, 10, |w| w.ready());
+    assert_eq!(win.doc.page_reads(), plain.doc.page_reads(), "read once");
     drv.key(&mut win, Key::End, crate::gui::testkit::command(false));
     drv.until(&mut win, 10, |w| w.ready());
     drv.key(&mut win, Key::Home, crate::gui::testkit::command(false));
     drv.until(&mut win, 10, |w| w.ready());
     assert_eq!(win.top, 3);
+}
+
+/// The re-read or rebuild out, if one is: its `cancel`, which tells one pass from another.
+fn pass_out(win: &TextWindow) -> Option<Arc<AtomicBool>> {
+    win.reindex.as_ref().map(|r| r.cancel.clone())
+}
+
+/// A file of `n` lines of Latin text with an `é`, and a viewer on it at a clock the test moves.
+fn notes(
+    dir: &Path,
+    n: usize,
+) -> (
+    std::path::PathBuf,
+    TextWindow,
+    Arc<Mutex<std::time::Instant>>,
+) {
+    let text: String = (0..n).map(|i| format!("line {i:04} é\n")).collect();
+    let path = write(dir, "notes.txt", text.as_bytes());
+    let doc = TextDoc::open(&path).unwrap();
+    let mut win = TextWindow::new(doc, "box:n".into(), "notes.txt", vec![]);
+    let clock = on_clock(&mut win);
+    (path, win, clock)
+}
+
+/// A choice while the file is indexed in another encoding: the same one again changes nothing
+/// (the pass out goes on); the encoding the lines are read in now drops the pass out and costs
+/// no pass of its own.
+#[test]
+fn choosing_while_a_rebuild_is_out_restarts_nothing_it_need_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (path, mut win, _clock) = notes(tmp.path(), 200);
+    let mut drv = Driver::new(800.0, 400.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    let go = held_worker(&mut win);
+    win.enc_wanted = Some(Utf16Le);
+    drv.idle(&mut win, 1);
+    let out = pass_out(&win).expect("a rebuild out");
+    win.enc_wanted = Some(Utf16Le);
+    drv.idle(&mut win, 1);
+    let still = pass_out(&win).expect("still out");
+    assert!(Arc::ptr_eq(&out, &still), "the same pass goes on");
+    let passes = index_reads(&path).len();
+    win.enc_wanted = Some(Utf8);
+    drv.idle(&mut win, 1);
+    assert!(out.load(Ordering::Relaxed), "the pass out is dropped");
+    assert!(win.reindex.is_none(), "no pass of its own");
+    drop(go);
+    drv.until(&mut win, 10, |w| w.ready());
+    drv.idle(&mut win, 3);
+    assert_eq!(win.doc.encoding(), Utf8);
+    assert_eq!(index_reads(&path).len(), passes);
+    assert_eq!(rows_of(&win)[0], "line 0000 é");
+}
+
+/// A choice made while a re-read of a grown file is out, the view at its end, keeps it at the
+/// end: the file is read in the new encoding and its new last line shown.
+#[test]
+fn a_choice_that_supersedes_a_reread_at_the_end_follows_the_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (path, mut win, clock) = notes(tmp.path(), 300);
+    let go = held_worker(&mut win);
+    let mut drv = Driver::new(800.0, 400.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    drv.key(&mut win, Key::End, crate::gui::testkit::command(false));
+    drv.until(&mut win, 10, |w| w.ready());
+    append(&path, "added at the end\n");
+    later(&clock, 2.0);
+    drv.idle(&mut win, 2);
+    assert!(win
+        .reindex
+        .as_ref()
+        .is_some_and(|r| r.rebuild.is_none() && r.at_end));
+    win.enc_wanted = Some(Latin1);
+    drv.idle(&mut win, 1);
+    drop(go);
+    drv.until(&mut win, 10, |w| {
+        w.ready() && w.reindex.is_none() && !w.waiting
+    });
+    drv.idle(&mut win, 3);
+    assert_eq!(win.doc.encoding(), Latin1);
+    assert_eq!(win.doc.line_count(), 301);
+    assert_eq!(
+        rows_of(&win).last().map(String::as_str),
+        Some("added at the end")
+    );
+}
+
+/// A rebuild overtaken by a change to the file (it lands as `Changed`): the file is read again
+/// in the encoding that was being indexed, back at the byte the view was at.
+#[test]
+fn a_rebuild_overtaken_by_a_change_comes_back_to_its_place_by_byte() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (path, mut win, clock) = notes(tmp.path(), 2000);
+    let mut drv = Driver::new(800.0, 400.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+    drv.until(&mut win, 10, |w| w.ready());
+    let row = &win.page.as_ref().unwrap().rows[0];
+    let place = row.at + row.start;
+    let go = held_worker(&mut win);
+    win.enc_wanted = Some(Utf16Le);
+    drv.idle(&mut win, 1);
+    drop(go);
+    let exited = win.reindex.as_ref().unwrap().exited.clone();
+    let started = std::time::Instant::now();
+    while !exited.load(Ordering::Relaxed) {
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // Rewritten in place, shorter, before the window takes the pass: it lands `Changed`.
+    let text: String = (0..1900).map(|i| format!("line {i:04} é\n")).collect();
+    std::fs::write(&path, text.as_bytes()).unwrap();
+    drv.idle(&mut win, 1);
+    assert!(win.waiting, "the pass landed on a changed file");
+    later(&clock, 5.0);
+    drv.until(&mut win, 10, |w| {
+        w.ready() && w.reindex.is_none() && !w.waiting && w.doc.encoding() == Utf16Le
+    });
+    let row = &win.page.as_ref().unwrap().rows[0];
+    let (from, to) = (
+        row.at + row.start,
+        row.at + row.start + row.cut.bytes as u64,
+    );
+    assert!(from <= place && place < to, "{place} on top: {from}..{to}");
 }

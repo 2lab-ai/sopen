@@ -2891,3 +2891,64 @@ fn a_pass_read_a_byte_at_a_time_picks_as_a_whole_block_does() {
         assert_eq!(rows(&win)[0], lines[0]);
     });
 }
+
+/// A `Bytes` whose file ends at `end` though the Source's size says more (a file cut short on
+/// the remote): reads there come back empty.
+struct Short {
+    inner: Box<dyn Bytes + Send>,
+    end: u64,
+}
+
+impl Bytes for Short {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+
+    fn try_read(&mut self, off: u64, len: usize) -> Poll<crate::stream::Result<bytes::Bytes>> {
+        let len = self.end.saturating_sub(off).min(len as u64) as usize;
+        if len == 0 {
+            return Poll::Ready(Ok(bytes::Bytes::new()));
+        }
+        self.inner.try_read(off, len)
+    }
+
+    fn read_at(
+        &mut self,
+        off: u64,
+        buf: &mut [u8],
+        cancel: &AtomicBool,
+    ) -> crate::stream::Result<usize> {
+        self.inner.read_at(off, buf, cancel)
+    }
+}
+
+/// A pass whose reads come back empty before the size the Source opened the file at, short of
+/// the default's 8 KiB sample: the default is picked from what it read, and those lines are
+/// indexed — never nothing at all.
+#[test]
+fn a_pass_that_ends_short_of_the_sample_indexes_what_it_read() {
+    bounded("a pass that ends short of the sample", || {
+        let lines = hangul_lines(300);
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        let body = encoded(&text, Utf16Le, true);
+        let end = 3000u64;
+        assert!(body.len() as u64 > crate::kind::SNIFF_BYTES as u64);
+        let mut net = net(&body, gate());
+        let mut win = net.window("log.txt");
+        let Backing::Stream(stream) = &mut win.doc.backing else {
+            unreachable!("a streamed document");
+        };
+        let inner = stream.pass.take().expect("the pass's reader");
+        stream.pass = Some(Box::new(Short { inner, end }));
+        let mut drv = Driver::new(800.0, 500.0);
+        for _ in 0..400 {
+            drv.idle(&mut win, 1);
+            if !net.reply() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(win.doc.encoding_label().as_deref(), Some("UTF-16LE (BOM)"));
+        assert!(win.doc.line_count() > 10, "{} lines", win.doc.line_count());
+        assert_eq!(rows(&win)[0], lines[0]);
+    });
+}
