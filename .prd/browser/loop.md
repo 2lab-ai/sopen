@@ -16,10 +16,11 @@ WU row is in [`loop.done.md`](loop.done.md). Target: [`ssot.md`](ssot.md). Contr
 | ID | Status | What | Who |
 |---|---|---|---|
 | K-L2 | 🚪 owner | The owner-assisted receipt K-L1 built (`../research/fkeys-linux.md` §6): in a terminal of the real Plasma session the owner runs the receipt script, presses Esc, F1…F12 without and with Fn, Alt+Tab and Meta, then Fn+Esc and the F1 position again (does it now send F1?), and answers whether brightness or anything outside the window changed. It gives the top row's real codes (this account cannot read input devices) and confirms that brightness stays put on the real screen. Batched with K-F3. | the owner, at the Linux laptop |
-| K-S4 | 🟡 spec done | Rewrite 04 §6.4 and §7 from K-L1: on KDE Wayland, while an xtools window has focus, sopen holds a keyboard-shortcuts inhibitor for it and maps the top row's codes (K-L2's table) to F1…F12; every other key a global shortcut owns is handed back to KDE (kglobalaccel `invokeShortcut`, measured for Alt+Tab), so only the top row changes; `fkeys = "system"` turns it off; TUI mode cannot (KWin takes media keys before the terminal). Reviewed by two engines, then its work units. | orchestrator |
+| KL-W | 🔴 open | 04 §9's units, in its order: KL-W1 the key decision and shared types, KL-W5 the headless driver, KL-W2 the hand-back and KL-W3 the inhibitor side by side, KL-W4 the shell after 10's XW-shell (route B), KL-W6 the docs, KL-W7 the measured table after K-L2. The switch ships off until K-L2's table exists. | coder |
 
 Closed in round 3 so far: K-L1 (the feasibility gate: feasible in GUI mode, with the side effects
-above handed back) — [`loop.done.md`](loop.done.md), R3 part 1.
+above handed back) — [`loop.done.md`](loop.done.md), R3 part 1; K-S4 (04 §6.4 and §7 rewritten,
+reviewed, merged as #100) — R3 part 2.
 
 ## Build facts
 
