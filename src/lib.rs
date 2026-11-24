@@ -19,6 +19,7 @@ pub mod app;
 pub mod cache;
 pub mod config;
 pub mod cut;
+pub mod encoding;
 pub mod ffmpeg;
 pub mod fileops;
 pub mod fnkeys;
@@ -35,6 +36,8 @@ pub mod target;
 pub mod tree;
 pub mod url;
 pub mod usage;
+pub mod view_keys;
+pub mod views;
 pub mod zed;
 
 #[cfg(test)]

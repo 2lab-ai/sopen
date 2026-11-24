@@ -15,8 +15,11 @@ WU row is in [`loop.done.md`](loop.done.md). Target: [`ssot.md`](ssot.md). Contr
 
 | ID | Status | What | Who |
 |---|---|---|---|
-| K-L1 | 🟡 running | Feasibility gate for message 19 on Linux (KDE Plasma 6 Wayland): with a keyboard-shortcuts inhibitor on a focused sopen-like surface, does a globally bound top-row key (screen brightness) reach the client, can it be read under eframe, what else stops while sopen is focused, and is the inhibitor dropped when the client dies. A prototype in a private headless compositor, never on the owner's display. It reverses 04 §6.4 only if it passes; the owner decides any side effect (e.g. Alt+Tab inside sopen). Its verdict covers GUI mode, where sopen owns the window; in a terminal (message 23 makes the TUI the default) sopen owns no window, which the xtools workstream's XR-T answers. | research unit |
-| K-L2 | 🔴 open | The owner-assisted receipt K-L1 designs: the owner presses F1…F12 in a logging mode on the Linux laptop, so the top row's real codes are measured, not recalled (this account cannot read input devices). Batched with K-F3. | the owner, at the Linux laptop |
+| K-L2 | 🚪 owner | The owner-assisted receipt K-L1 built (`../research/fkeys-linux.md` §6): in a terminal of the real Plasma session the owner runs the receipt script, presses Esc, F1…F12 without and with Fn, Alt+Tab and Meta, then Fn+Esc and the F1 position again (does it now send F1?), and answers whether brightness or anything outside the window changed. It gives the top row's real codes (this account cannot read input devices) and confirms that brightness stays put on the real screen. Batched with K-F3. | the owner, at the Linux laptop |
+| K-S4 | 🟡 spec done | Rewrite 04 §6.4 and §7 from K-L1: on KDE Wayland, while an xtools window has focus, sopen holds a keyboard-shortcuts inhibitor for it and maps the top row's codes (K-L2's table) to F1…F12; every other key a global shortcut owns is handed back to KDE (kglobalaccel `invokeShortcut`, measured for Alt+Tab), so only the top row changes; `fkeys = "system"` turns it off; TUI mode cannot (KWin takes media keys before the terminal). Reviewed by two engines, then its work units. | orchestrator |
+
+Closed in round 3 so far: K-L1 (the feasibility gate: feasible in GUI mode, with the side effects
+above handed back) — [`loop.done.md`](loop.done.md), R3 part 1.
 
 ## Build facts
 
