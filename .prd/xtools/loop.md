@@ -45,6 +45,7 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
 | F-mp3vbr | 🔴 open | A 22 kHz VBR mp3 cut comes out misaligned; found while fixing ffmpeg 9.1 (#101), recorded, not fixed | coder |
 | F-numpad | 🔴 open | The Ctrl+numpad digit alias reads the physical key first (`src/gui/mod.rs`, `fkey_events`) | coder |
 | F-keynames | 🔴 open | Key names outside help still mix forms: "Cmd/Ctrl+R" literals, "⌘/Ctrl" hovers, README line 95; 01, 02 and 03 write `Cmd/Ctrl+Z` | coder |
+| F-ci-macos | 🔴 open | A merge to main runs `ci.yml` twice on macOS: CI's own push run and Preview's `gate` (`preview.yml` calls `ci.yml`). Dropping CI's push trigger for main, so that Preview's gate is the one run, would halve the macOS checks per merge while runners are short | orchestrator |
 | F-k_d1 | 🔴 open | `gui::browser::tests::s6::k_d1_f8_here_goes_to_the_trash_and_shift_f8_does_not` failed once in a loaded full run; it passes alone 3/3 | coder |
 
 ## Build facts
@@ -57,10 +58,13 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
   them needed test-only fixes (#101, #102, #103): ffmpeg 9.1 renders a short clip before its first
   progress report, and a dropped stream gives its slot back on a thread of its own. Keep at most
   three compiling units on one machine.
-- The Preview workflow's macOS jobs share runners with every PR's macOS check (about 26 minutes
-  each). On 2026-11-24 two macOS build jobs never got a runner and were cancelled after exactly 15
-  minutes while PR checks held the runners; where the 15-minute cutoff comes from is not known. A
-  rerun of just those jobs passed. Merge, let the Preview finish, then push the next PRs.
+- macOS arm64 hosted runners are short. On 2026-11-24 and 2026-11-25 Preview's macOS build jobs
+  were cancelled after 15 minutes of waiting, with GitHub's annotation "The job was not acquired by
+  Runner of type hosted even after multiple attempts" and the notice "Due to capacity constraints,
+  jobs targeting macOS arm64 runners may experience longer queue times". A rerun of just the failed
+  jobs passed each time. Every merge to main starts two macOS checks (CI's push run and Preview's
+  gate) plus two macOS builds, about 26 minutes each for the checks; merge, let the Preview
+  finish, then push the next PRs.
 - unicode-width is pinned to `=0.2.2` (#104's review fix): ratatui-core 0.1.2's `cell_width` adds 1
   per halfwidth sound mark, which 0.2.3 already counts. Lift the pin with a ratatui-core that drops
   its compensation.
