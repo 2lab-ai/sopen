@@ -35,6 +35,7 @@ pub mod target;
 pub mod tree;
 pub mod url;
 pub mod usage;
+pub mod views;
 pub mod zed;
 
 #[cfg(test)]
