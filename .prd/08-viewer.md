@@ -206,7 +206,7 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
   error and is stopped by (e) alone (0 of 4,048 in KS X 1001); a GB2312 text whose every character
   decodes in CP949 is 66–68 % Hangul, stopped by (d) alone.
 - **A BOM is skipped only under its own encoding** (D26, D37): `EF BB BF` under UTF-8; `FF FE` / `FE FF`
-  under UTF-16 or UCS-2 of that order; `FF FE 00 00` / `00 00 FE FF` under UTF-32 of that order. Line 1
+  under UTF-16 or UCS-2 of that order; `FF FE 00 00` / `00 00 FE FF` under UTF-32 of that order (so a file starting `FF FE 00 00`, picked as UTF-32LE, switched by F8 to UTF-16LE or UCS-2LE has its `FF FE` skipped as that encoding's own BOM and `00 00` is its first unit). Line 1
   then starts after it, so `#!/bin/sh` after a UTF-8 BOM picks the syntax (*trace* §3 T14). Under any
   other encoding its bytes are text from byte 0 (Latin-1 shows `EF BB BF` as `ï»¿`); switching back
   skips it again. Go to `0x…` counts file bytes either way. A place inside a skipped BOM is line 1's start:
