@@ -19,6 +19,7 @@ pub mod app;
 pub mod cache;
 pub mod config;
 pub mod cut;
+pub mod encoding;
 pub mod ffmpeg;
 pub mod fileops;
 pub mod fnkeys;
