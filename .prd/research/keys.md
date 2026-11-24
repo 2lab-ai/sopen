@@ -510,6 +510,11 @@ no key other than their F-key. The digit aliases and the clickable row fix exact
 - Fallback only. sopen should not touch sysfs, hidraw or the compositor.
 - Note in the README that external keyboards send F-keys directly, and that the folio relies on
   its own Fn lock.
+- **2026-11-24, measured:** the Linux laptop's kernel log for the current boot (`journalctl -k -b`,
+  read by the orchestrator) has `hid_asus: unknown parameter 'fnlock_default' ignored`. A
+  `/etc/modprobe.d` line `options hid_asus fnlock_default=0` does nothing: `fnlock_default` is
+  asus_wmi's (item 1). The same day the per-app route was found after all: the compositor's
+  shortcuts inhibitor, `fkeys-linux.md`; the contract is 04 §6.4.
 
 ### 4.3 Windows (research only; Windows is out of sopen's scope, spec §9)
 
