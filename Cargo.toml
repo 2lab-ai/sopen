@@ -97,10 +97,13 @@ unicode-segmentation = "1.13.3"
 # (`gui::term_input`): pure Rust over mio, rustix and parking_lot, already in the tree, so nothing
 # new is linked (its Windows crates are in the lock only). Cell widths are unicode-width's
 # (10 §10), already in the tree (eframe → egui-wgpu → wgpu → wgpu-core → naga →
-# codespan-reporting), at the same version. The lock adds 20 packages and bumps none.
+# codespan-reporting, which takes ">=0.1,<0.3"). Pinned to 0.2.2: ratatui-core 0.1.2's
+# `cell_width` adds 1 for each halfwidth sound mark (U+FF9E/U+FF9F) because unicode-width before
+# 0.2.3 gave them 0; 0.2.3 gives them 1, so with it `ﾊﾟ` would take 3 cells in the buffer and
+# its diff, against 2 in a terminal. One measure for the buffer, the diff and `cells::width`.
 ratatui-core = "0.1.2"
 crossterm = "0.29.0"
-unicode-width = "0.2"
+unicode-width = "=0.2.2"
 
 [build-dependencies]
 # build.rs checks the downloaded sherpa-onnx archive against its pinned SHA-256.
