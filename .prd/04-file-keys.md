@@ -23,6 +23,8 @@ AGENTS.md "Rules" (file operations exist and never overwrite).
   map below (§3).
 - Every sopen window's F-key row becomes clickable, and Cmd/Ctrl+1…0 act as F1…F10 everywhere (§6.1).
 - On macOS, while a sopen window is focused, the keyboard's top row sends F1…F12 without fn (§6.2).
+- On KDE Plasma's Wayland session, while an xtools GUI window has the keyboard, the top row sends
+  F1…F12 and every other KDE shortcut is handed back to KDE (§6.4).
 - The directory tree's key is F10 (Alt+F10 too); the tree itself is [`05-directory-tree.md`](05-directory-tree.md).
 
 ## 2. The F-key row of the file list
@@ -468,11 +470,209 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
 
 ### 6.4 Linux and Windows
 
-- **Linux: no per-app mechanism** for an unprivileged app — every Fn-lock control found is root-only,
-  hardware-specific and global, and a Wayland client cannot remap keys (keys.md §4.2). sopen changes
-  nothing there; §6.1 is the answer. Keyboards that send F-codes reach sopen as F-keys today; the
-  README says that a laptop keyboard's own Fn lock (often Fn+Esc) is the way to get them there.
-- **Windows: no OS API**, only vendor tools (keys.md §4.3); Windows is out of sopen's scope (01 §9).
+On Linux no keyboard setting can be switched for one app. Every Fn-lock control found is root-only,
+hardware-specific and global (keys.md §4.2). KDE Plasma's Wayland compositor (KWin) has a per-window
+opt-out instead: while the focused surface holds a keyboard-shortcuts inhibitor
+(`zwp_keyboard_shortcuts_inhibitor_v1`), KWin skips its global shortcuts, and a media key reaches
+the window as a key (K-L1, `research/fkeys-linux.md`). sopen uses it, changes no setting, and hands
+every other shortcut back to KDE, so inside an xtools GUI window only the top row changes.
+
+Evidence: *measured* = K-L1's private headless KWin 6.7.5 with injected keys (study E1–E5); [추정] =
+not checked; [가설] = an item of §8 settles it.
+
+#### 6.4.1 Where it applies
+
+sopen asks for an inhibitor only when every check below passes. The checks run in this order, and
+the first Wayland request is made only after the last one:
+
+1. **Before the window.** `run_window_sized` (`src/gui/mod.rs:1252`) checks three things before it
+   opens the window:
+   - the run is not a scripted run or a test build (`src/fnkeys/mod.rs:99-105`, `:518-520`);
+   - `SOPEN_FKEYS_TABLE`, if set, parses — a malformed value is an error;
+   - the top-row table (§6.4.3) has a row.
+2. **In the app-creation closure.** The window is a Wayland window: eframe's creation context gives
+   a Wayland display and window handle (`eframe-0.37.0/src/epi.rs:101-117`). An X11 or XWayland
+   window gets nothing. The closure then starts the hand-back thread and the inhibitor thread, and
+   waits for neither.
+3. **The config.** `fkeys` is `"function"`; an absent key counts as `"function"`. The hand-back
+   thread reads it first, as the macOS feed does (`config::load(&config::path()?)`,
+   `src/gui/mod.rs:1756`). `"system"`, or a config that cannot be read, ends the thread, and nothing
+   else starts (the rule of `src/gui/mod.rs:1487-1493`). `"system"` therefore never binds anything
+   and never calls the bus. `sopen config fkeys function|system` sets the key, as on macOS (§6.2).
+4. **KWin's own kglobalaccel.** The session bus's `org.kde.kglobalaccel` and `org.kde.KWin` must
+   have one owner. kglobalaccel lives inside KWin (study §2), so this is the kglobalaccel whose
+   shortcuts KWin skips [추정 that the two names share one owner; K-L6]. The first snapshot (§6.4.4)
+   is read. The thread then says *ready*.
+5. **The manager.** Only after *ready* does the inhibitor thread bind
+   `zwp_keyboard_shortcuts_inhibit_manager_v1` and the seat. KWin offers the manager to every client
+   and grants an inhibitor without a prompt (study §2; *measured*).
+
+When any check fails, nothing happens. §6.1's clickable row and Cmd/Ctrl+digits work as they do
+everywhere.
+
+#### 6.4.2 The inhibitor
+
+- **Bound on a guest queue of winit's own `wl_display`** (`Backend::from_foreign_display`,
+  `wayland-backend-0.3.17/src/sys/mod.rs:102`). This is the same Wayland client as winit, which is
+  what lets it name the window's `wl_surface`. winit has no support for the protocol.
+- **Held only while the window has the keyboard and its snapshot is fresh.**
+  - At focus-out it is destroyed.
+  - At focus-in the snapshot is read again, and the inhibitor is requested once the read is done.
+  - While a refresh is pending there is no inhibitor, and KDE has every key.
+  - KWin applies an inhibitor only to the focused surface anyway (study §2), and creating one at
+    each focus-in was *measured* to behave the same as holding one (E1 P3).
+- **One owner and one guard.**
+  - The inhibitor thread owns the guest queue. It waits in `poll` on the display's fd and a stop
+    pipe (`EventQueue::prepare_read`, `wayland-client-0.31.15/src/event_queue.rs:456`), never in
+    `blocking_dispatch`.
+  - The inhibitor lives in a guard that sends `destroy` and flushes on every exit path of that
+    thread, unwinding included.
+  - The window holds a handle to the same inhibitor. It sends `destroy` when the owning thread
+    disappears (its channel closes).
+  - **One rule for creating it.** The inhibitor thread sends `inhibit_shortcuts` only when all
+    hold: the window has the keyboard; this focus-in's snapshot is read; nothing has failed since
+    this focus-in; no window call is past 500 ms; and it holds none. Every other path only
+    destroys. A second inhibitor for the surface is `already_inhibited`
+    (`wayland-protocols-0.32.13/…/keyboard-shortcuts-inhibit-unstable-v1.xml:61,71-73`), and any
+    protocol error ends the whole connection, winit's window included (`wayland.xml:73`).
+  - The guest backend never outlives winit's display (`wayland-backend-0.3.17/src/sys/mod.rs:98-101`);
+    it holds because the one event loop, and its display, live for the whole process.
+- **The window's end.** In `App::on_exit` the window sends `destroy` unconditionally, then stops and
+  joins the thread. eframe calls `on_exit` while the window still exists
+  (`eframe-0.37.0/src/native/glow_integration.rs:508-520`, `wgpu_integration.rs:593-607`).
+  The inhibitor goes before the surface. KWin keys its table by the raw surface and removes an
+  entry only when the inhibitor goes (study §3.2).
+- **When sopen dies,** KWin destroys the client's inhibitor (study §3.2). After `kill -9` the next
+  press fired the shortcut again (*measured*, with the focus already elsewhere). Nothing global was
+  changed, so there is nothing to restore.
+
+#### 6.4.3 The top row
+
+- **One key source: winit's own events, before eframe.** The GUI shell owns the winit handler:
+  - It builds the app with `eframe::create_native` (`eframe-0.37.0/src/lib.rs:376`) and wraps the
+    handler it returns.
+  - One `EventLoop` per process, kept for every window and for the glow retry. winit refuses a
+    second one (`winit-0.30.13/src/event_loop.rs:119`); each window uses `run_app_on_demand`
+    (`platform/run_on_demand.rs:70`).
+  - `create_native` returns no `Result`: a renderer's error stays inside eframe
+    (`native/run.rs:96, 177-191, 541`), and `run_app_on_demand` returns `Ok(())`. The retry's
+    trigger is the shell still in its slot when the loop returns — wgpu fails at `set_window`
+    (`wgpu_integration.rs:272`), before the app creator (`:325-345`). Still in its slot after glow
+    too → `cannot open a window: neither wgpu nor glow started`, exit 1. A run whose app was created
+    ends as a close.
+  - The shell builds its one `EventLoop<eframe::UserEvent>` itself, on every OS, and applies
+    `event_loop_hook()` to that builder: `create_native` never runs `NativeOptions::event_loop_builder`
+    (`run.rs:54-56`), and on macOS the default menu's Quit would skip the unsaved-changes prompt
+    (`src/gui/mod.rs:1216-1224`).
+  - The wrapper sees each `WindowEvent::KeyboardInput` and `ModifiersChanged` before eframe. A key
+    event's code is its evdev code (`PhysicalKeyExtScancode::to_scancode`). E5 *measured* the
+    brightness key as `scancode=Some(224)`, `logical=Named(BrightnessDown)`, which egui alone never
+    sees (`egui-winit-0.37.0/src/lib.rs:1670`).
+  - Modifiers come from winit's xkb state, Meta included. egui-winit drops Meta on Linux
+    (`lib.rs:554-564`).
+- **The table** maps an evdev code to a slot 1…12, in `src/fnkeys/top_row.rs`.
+  - Its rows come from the owner's receipt K-L2 only, never from recall; a position that sends a
+    chord is no row and stays KDE's.
+  - **On Linux the switch ships OFF until K-L2's measured table exists.** Until the table has a
+    row, check 1 fails.
+  - One table serves every keyboard on the seat. A key carries no device [추정], so another
+    keyboard's key that sends a table code is that F-key too.
+  - `SOPEN_FKEYS_TABLE=<code>:<slot>[,…]` replaces the table for one run, for receipts only.
+- **A table code's key event is rewritten into F*n*.**
+  - Its `physical_key` and `logical_key` become F*n*'s and its `text` is dropped; winit's modifiers
+    are kept. eframe then sees an F-key, and §3's rules apply: exact modifiers, and no plain F-key
+    while a field has the typing.
+  - Its repeats and its release are rewritten the same way.
+  - The chord goes where that F-key chord goes (§6.4.4).
+  - The table code's own media chord is never looked up.
+
+#### 6.4.4 Every other key goes back to KDE
+
+While the inhibitor holds, KWin runs none of its global shortcuts for the window (study §2), so
+Alt+Tab, Meta, Meta+L, Print, volume, Ctrl+F1–F4, Alt+F4 and the rest arrive as keys (*measured*
+for brightness, Meta, Alt+Tab and Alt+F4, E1).
+
+- **The rule.**
+  - A press whose chord a KDE global shortcut owns never reaches eframe: the wrapper drops it, with
+    its repeats and its release.
+  - Instead, the hand-back thread invokes the owner, `/component/<c>`
+    `org.kde.kglobalaccel.Component.invokeShortcut("<action>")`. This is *measured* for Alt+Tab, also
+    with Alt held: focus moved on Alt's release, as with the native shortcut (E3, E4).
+  - Every other key does what it does today.
+  - An F-key chord made from the top row is the F-key's chord. Ctrl + the key printed F1 is KDE's
+    desktop 1 when KDE owns Ctrl+F1, sopen's when sopen binds it, and nothing otherwise.
+- **The snapshot.**
+  - It holds every active component's shortcuts with their keys: `org.kde.KGlobalAccel.allComponents`,
+    then `allShortcutInfos` and `isActive` per component. These names are from memory [추정], and
+    KL-W2 reads the installed interface first. Only `action(int)` and `invokeShortcut` were
+    measured (E3).
+  - It is read before every inhibitor (§6.4.2).
+  - A chord is winit's logical key, or for a key with no logical key its code's key, plus winit's
+    modifiers. It is turned into kglobalaccel's key code (Qt's key plus modifiers, the form E3 passed
+    to `action(int)`) by one table in `src/fnkeys/handback.rs`.
+- **Requests.** The window only sends to the hand-back thread, and the thread invokes **once per
+  press**.
+  - Each request carries the focus generation, and at focus-out the unsent requests of the old
+    generation are dropped, never replayed.
+  - Calls run on a zbus connection built with `method_timeout(250 ms)`
+    (`zbus-5.19.0/src/blocking/connection/builder.rs:300`). KWin answers in-process well under that
+    [추정], and a stuck KDE gets its shortcuts back before the next press.
+  - A timeout or an error is a failure (§6.4.5). A request whose outcome is unknown is never retried.
+- **Meta alone** (KWin's modifier-only shortcuts; E1's "Meta tap") is handed back at Meta's release
+  when no other key and no pointer button came since its press, if the snapshot holds a
+  modifier-only chord for it [가설: KWin's rule may have more conditions; K-L6].
+
+#### 6.4.5 Failing toward KDE
+
+- **The inhibitor goes at once when there is any doubt.** Each of these is a doubt:
+  - a snapshot that cannot be read;
+  - a call that times out or fails;
+  - the hand-back thread or the inhibitor thread ending.
+
+  The status row then says `the F-key switch did not take effect: <reason>` (`NOT_IN_EFFECT`,
+  `src/fnkeys/mod.rs:62`). The reason goes through the feed's `Said` and `publish`
+  (`src/gui/mod.rs:1404-1409`, `:1702-1714`), because `Feed::pass` rewrites the window's line on
+  every pass (`:1541-1551`). No new inhibitor is made until the next focus-in. A protocol error is
+  not survivable: the window ends, and KWin drops the inhibitor with the client (§6.4.2).
+- **A stalled window.** The window's thread marks the start and the end of each event it handles. If
+  one call lasts 500 ms, the inhibitor thread destroys the inhibitor until that call returns. A
+  frame that blocks for seconds then costs the top row, never Alt+Tab or Meta+L.
+- **What KWin keeps for itself, inhibitor or not:** the power key, Ctrl+Alt+F1…F12, the locked
+  screen, screen edges and an open Alt+Tab switcher (study §2). KWin has no escape chord. A process
+  stopped whole (`SIGSTOP`) keeps its inhibitor while focused; a click on another window ends it.
+
+#### 6.4.6 What the hand-back does not reproduce
+
+| Case | Inside an xtools window |
+|---|---|
+| A chord the snapshot does not list (kglobalaccel names it otherwise, or the Qt table lacks it) | acts inside xtools, as an unbound key would. K-L6 and K-L8 check the lock (Meta+L), Alt+Tab, the launcher (Meta) and Print |
+| A held handed-back chord | acts once per press. KWin repeats a held shortcut; sopen does not |
+| Meta alone | the rule of §6.4.4 [가설] |
+| Meta+L (lock) | handed back to its owner [추정; the private session ran `--no-lockscreen`, K-L8]. If that fails, the screen does not lock and the status row says so. The idle lock is unaffected |
+| Screen-reader and accessibility key grabs | off while the window has the keyboard. KWin skips them when inhibited, and there is no action to invoke (study §2) |
+| Keys the kernel handles (some backlight and fan keys, a kernel Fn lock) | never become keys; unchanged |
+
+#### 6.4.7 Other desktops, and the terminal
+
+- **GNOME: not requested.** Mutter shows an Allow/Deny dialog for an inhibitor (study §4). Once it
+  is allowed, GNOME has no kglobalaccel to hand its shortcuts back through.
+- **sway: not requested.** sway honours the inhibitor (study §4), but it has no "which binding owns
+  this key" query, so its workspace and window keys would be gone.
+- **X11 and XWayland: nothing.** §6.1 is the answer.
+- **xtools in a terminal (10-tui.md).** sopen owns no surface there, and KWin takes a bound media
+  key before the terminal unless the terminal holds an inhibitor itself:
+  - kitty's `grab_keyboard` holds one [추정], and kitty would also need its own map, since the kitty
+    protocol has no brightness code;
+  - herdr-app holds none (`research/tui-gui.md` §10).
+
+  That route is the terminal's setting and is not specified. The top row is F-keys there only when
+  the keyboard sends them (Fn held, or its Fn lock); a real F1 reaches the TUI as its escape
+  sequence (`CSI P` under the kitty protocol) [추정]. §6.1's fallbacks are 10 §9's. A macOS TUI
+  taking HIDFKeyMode on focus reports is [가설] and not specified.
+
+#### Windows
+
+- **Windows: no OS API**, only vendor tools (keys.md §4.3). Windows is out of sopen's scope (01 §9).
 
 ## 7. Decisions
 
@@ -484,6 +684,16 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
 | Copy into a staged temp, then publish without replacing | 01 §6a's "Save to…" rule; a copy is never seen half-made under its name |
 | The target field takes `host:path` | sopen's own command-line form (01 A1); it makes copying between hosts and to this machine possible from one window |
 | The macOS switch is on by default, behind a crash-safe restore and the owner's receipt | the owner asked for F-keys without fn; a global setting must come back even if sopen dies |
+| Linux, KDE Plasma Wayland: an inhibitor per xtools GUI window, held while the window has the keyboard and its snapshot is fresh (§6.4.2) | Message 19: F1 is F1 inside xtools, the OS untouched. It is KWin's per-window opt-out, and the measured per-focus mode lets each focus-in refresh first |
+| Route B: the GUI shell owns winit's handler (`create_native`) and decides each key before eframe (§6.4.3) | One key source, with xkb modifiers, Meta included. Route A paired egui's input with a second `wl_keyboard`, and that was unsound: egui sets `repeat` itself in `begin_pass` (`egui-winit lib.rs:1159`, `input_state/mod.rs:405-413`), and egui-winit drops Meta |
+| Only the top row changes. Top-row F-key chords go where F-key chords go, and KDE-owned chords are handed back and never reach eframe (§6.4.3–6.4.4) | Every other key keeps today's meaning, where KWin took it before sopen |
+| Hand-back: a snapshot read before each inhibitor, `invokeShortcut` once per press from its own thread, a 250 ms timeout, focus generations, no replay and no retry (§6.4.4) | The window never waits on the bus. A stale or unknown request must not act after the focus has moved |
+| Fail toward KDE: any doubt, or a window call of 500 ms, drops the inhibitor, and the status row says why (§6.4.5) | A broken inhibitor costs every KDE shortcut, the lock included; a broken top row costs only F-keys |
+| KWin only, gated on KWin owning kglobalaccel; never GNOME or sway (§6.4.1, §6.4.7) | Without a hand-back, an inhibitor takes every compositor shortcut. GNOME would also prompt |
+| The table comes from K-L2 only, ships empty, and `SOPEN_FKEYS_TABLE` serves receipts (§6.4.3) | A guessed code would break a key. The headless receipts need a table before K-L2 |
+| The same `fkeys` key as macOS, and `"system"` has no side effect (§6.4.1) | One word, one meaning |
+| A terminal: sopen does nothing; a terminal's own inhibitor is not specified (§6.4.7) | sopen owns no surface there; kitty's grab is the terminal's setting |
+| The Fn-lock answer to "이거 온오프를 어떻게 할수 있음?" goes in the README (§9 KL-W6) | It is how to use the hardware, not sopen's contract |
 
 ## 8. Acceptance
 
@@ -582,5 +792,266 @@ Run locally and on a remote folder under `/tmp/sopen-receipts/`; window receipts
   HIDFKeyMode` shows 0 again within a second. E1 proved the setter-to-filter half on 26.7.1
   (02 §8.2); K-F3 proves the key half: a plain F5 opens the Copy dialog. Until this receipt
   exists, that half of §6.2 is unproven.
-- K-F4. `sopen config fkeys system` → the config file holds `fkeys = "system"` and sopen never opens
-  IOHIDSystem (test: the fake is never called).
+- K-F4. `sopen config fkeys system` → the config file holds `fkeys = "system"`. On macOS, sopen never
+  opens IOHIDSystem; on Linux, it never binds the inhibit manager and never calls kglobalaccel (test:
+  the fakes are never called; K-L5 (a) live).
+
+**Linux (K-L2–K-L8).** Scripted runs never switch, so these items observe other things:
+- files that the keys made;
+- stand-in signal counts;
+- `dbus-monitor` on the private bus;
+- `WAYLAND_DEBUG=1` request logs;
+- `SOPEN_LOG=debug` lines;
+- the owner's eyes.
+
+Before K-L2 the table is `SOPEN_FKEYS_TABLE=224:7` (KEY_BRIGHTNESSDOWN → F7).
+
+**The private session.** K-L5 and K-L6 are `#[ignore]`d live tests (KL-W5), run on the Linux laptop
+and never in the owner's session. They keep the isolation of study §1:
+- `env -i` with display and bus variables cleared, and its own HOME, XDG and runtime folders (0700);
+- `dbus-run-session`;
+- `kwin_wayland --virtual` on its own socket, without `--replace`, with `--no-lockscreen`;
+- a refusal to start on the owner's bus or display;
+- keys only through KWin's fake input;
+- stand-in kglobalaccel components;
+- a kill of only its own PIDs, and a check that no KDE config of the owner's is newer than the run.
+
+- K-L2. **Owner-assisted receipt: the top row's codes.** This is the browser loop's K-L2. It runs on
+  the Linux laptop, from a terminal in the real Plasma session, on the laptop's own keyboard, and
+  changes no setting. The owner runs the study's receipt (§6): Esc, F1…F12 without and with Fn,
+  Alt+Tab and Meta, and whether anything outside the window changed. Then one step more: **Fn+Esc,
+  then the F1 position**. Does it now send KEY_F1? The answer is recorded, and the README states it.
+  - The receipt gives the code each position sends, without and with Fn, and the positions that never
+    arrive.
+  - It shows the inhibitor granted.
+  - It shows the backlight unchanged in the inhibit step, by sysfs and by the owner's eye.
+  - KL-W7 writes one row per position that sent a single media code. A position that sends an
+    F-code, a chord or nothing is no row.
+- K-L3. **The key decision** (test, every OS). A table code's press, repeats and release become
+  F*n*'s, with winit's modifiers kept and the text dropped:
+  - Shift + the code → Shift+F*n*, which nothing binds.
+  - Ctrl + the code → handed back when the snapshot holds Ctrl+F*n*, else to sopen.
+  - The media chord is never looked up.
+
+  For other keys:
+  - A KDE-owned chord is dropped with its repeats and release, and one request is sent per press.
+  - An unlisted chord goes to eframe.
+  - Meta down then up alone → the modifier-only chord, once. Meta, L, Meta up → Meta+L only. Meta
+    then a pointer button → nothing.
+  - Focus lost while an F*n* is held → its release.
+
+  Table input:
+  - An empty table with no `SOPEN_FKEYS_TABLE` → nothing starts.
+  - `224`, `224:13` or `x:1` → an error before the window.
+- K-L4. **The hand-back** (test, every OS, fake bus).
+  - **Qt codes.** Every chord the owner's KDE binds (keys.md §1) round-trips through the Qt code
+    table.
+  - **Snapshot.** A recorded `allShortcutInfos` reply parses, and inactive components are left out.
+  - **Gate.** No *ready*, and nothing bound or called, when:
+    - `fkeys = "system"`;
+    - the config is unreadable;
+    - kglobalaccel is absent;
+    - kglobalaccel's owner is not KWin's;
+    - the snapshot fails.
+  - **Timeout.** A fake that answers after 300 ms → a failure: the inhibitor is destroyed, and the
+    status row says why.
+  - **Generations.** At focus-out, the old generation's unsent requests are dropped, and a timed-out
+    request is not retried.
+  - **Refresh.** A focus-in with its refresh pending → no inhibitor until the refresh is ready.
+- K-L5. **Headless: the top row and the inhibitor.** The private session runs sopen with
+  `fkeys = "function"` and the folder `a1 b1 l1 l2`, with a stand-in on `Monitor Brightness Down`.
+  - (a) With `fkeys = "system"`, KEY_BRIGHTNESSDOWN → the stand-in fires. No inhibit manager is
+    bound, and sopen makes no kglobalaccel call.
+  - (b) With `"function"`, KEY_BRIGHTNESSDOWN → no fire. Then `made` and Enter → the folder `made`
+    exists (F7's dialog).
+  - (c) Another window focused → it fires; back on xtools, after the refresh → it does not.
+  - (d) `kill -9` while focused → the next press fires.
+  - (e) Ctrl+Q → `zwp_keyboard_shortcuts_inhibitor_v1.destroy` comes before the window's
+    `wl_surface.destroy`.
+- K-L6. **Headless: the hand-back** (the bar on `a1`).
+  - (a) Alt down, Tab, Alt up 1 s later → one `invokeShortcut("Walk Through Windows")`, and the other
+    window gets the keyboard at Alt's release.
+  - (b) A stand-in on Meta+L, pressed ×20 → it fires 20 times. Then F2, `renamed`, Enter → `a1` is
+    renamed, so `l` never acted inside xtools.
+  - (c) Alt+F4 → one `invokeShortcut` of the action the snapshot names for it, then the window closes
+    through sopen's own close path. A stand-in on Ctrl+Alt+J → it fires once, and nothing happens in
+    xtools. Ctrl+7, unbound by KDE → sopen's F7: a folder is made.
+  - (d) A stand-in on Meta alone → a Meta tap fires it once, and Meta+L does not.
+  - (e) A stand-in on Print → it fires once. KEY_VOLUMEUP held 1 s, outside the table, with a
+    stand-in → it fires once.
+  - (f) **The premises, landing right after KL-W1 (KL-W5):**
+    - `GetNameOwner` gives one owner for `org.kde.kglobalaccel` and `org.kde.KWin`;
+    - the installed interface has `allComponents`, `allShortcutInfos`, `isActive` and
+      `invokeShortcut` with the signatures KL-W2 uses;
+    - the snapshot lists the stand-ins, with the lock (Meta+L), Alt+Tab, the launcher and Print under
+      kglobalaccel names KL-W2's table resolves.
+
+    If (f) fails, §6.4.1 check 4 or §6.4.4 is rewritten before KL-W2 merges.
+- K-L7. **Failing toward KDE** (test, fakes, a test clock).
+  - **The guard.** A panic in the inhibitor thread → its guard sends `destroy`.
+  - **The window's handle.** The thread gone → the window's handle sends `destroy`.
+  - **`on_exit`.** It sends `destroy` even when the thread already did, before the surface goes.
+  - **A stall.** A window call of 500 ms → `destroy`. The inhibitor is asked for again once the
+    call returns, under §6.4.2's one rule: a stall that ends after a failure since focus-in → no
+    inhibitor; a fresh snapshot and a stall ending at the same moment → one `inhibit_shortcuts`.
+  - **No waiting.** The creation closure returns at once, against a compositor and a bus that answer
+    after 2 s.
+  - **The status line.** The hook, then `logic`, then `ui` run in that order, and the status line
+    survives `Feed::pass`.
+- K-L8. **Owner-assisted: the real session, with K-L2's rows released.** In xtools, on a folder:
+  - **The top row.** The key printed F7, without Fn → the MkDir dialog. The F1 key → the key help,
+    and the brightness does not change.
+  - **Handed back.** Alt+Tab, Meta (the launcher), Meta+L (it locks) and Print (Spectacle) each act
+    as without sopen. The `SOPEN_LOG=debug` line names the action each one resolved to in the real
+    snapshot.
+  - **Outside xtools.** Another window focused → the F1 key changes the brightness.
+  - **Death.** `kill -9` while xtools is focused → it changes the brightness again.
+
+## 9. Work units (round 3)
+
+The units build §6.4. Each owns its files, and another unit edits them only through a named
+hand-over (§3 rule 5). The gate is `just check` with `SOPEN_REQUIRE_FFMPEG=1` and
+`SOPEN_REQUIRE_GIT=1`. Pure logic compiles on every OS and is tested on the Mac too; code under
+`#[cfg(target_os = "linux")]` is gated by the Linux run.
+
+**Order:**
+1. KL-W1.
+2. KL-W5's driver with K-L6 (f).
+3. KL-W2 and KL-W3, in parallel.
+4. KL-W4, after spec 10's shell unit X1 hands over `src/gui/mod.rs`.
+5. KL-W6.
+6. KL-W7, after the owner's K-L2.
+
+### KL-W1 — the key decision and the shared types
+
+- **Owns:**
+  - `src/fnkeys/top_row.rs` and `top_row_tests.rs`;
+  - `src/fnkeys/mod.rs`: the docs at `:1-7` and `:514-517`, and the `mod` lines of every new module;
+  - `Cargo.toml` and `Cargo.lock`.
+- **Exports:**
+  - `Chord` (a winit key, or a code, plus winit's modifiers);
+  - `Action` (a component and an action);
+  - `Generation`;
+  - `Ready`;
+  - `Destroy` (the window's destroy request);
+  - `Failure` (the status reason);
+  - the channel shapes between the window, the hand-back thread and the inhibitor thread.
+- **Implements:**
+  - `TOP_ROW`, empty, its doc naming K-L2;
+  - the parse of `SOPEN_FKEYS_TABLE`;
+  - `decide(event, scancode, modifiers, &table, lookup, &mut Held) -> Verdict`, where `Verdict` is
+    one of forward, rewrite to F*n*, hand back, or drop. It covers repeats, releases, focus loss and
+    the Meta-alone tracker, over winit's types; the Linux caller supplies the scancode.
+- **Manifest.** Linux dependencies at the versions already in `Cargo.lock`, so the package list does
+  not change:
+  - `wayland-client =0.31.15`;
+  - `wayland-backend =0.3.17` (`client_system`);
+  - `wayland-protocols =0.32.13` (`client`, `unstable`);
+  - `raw-window-handle =0.6.2`;
+  - `winit =0.30.13`, on Linux too;
+  - `zbus =5.19.0`, with `default-features = false` and `["async-io", "blocking-api"]`.
+    `blocking-api` is the one feature the tree lacks: accesskit_unix builds zbus without it.
+  - A Linux dev-dependency: `wayland-protocols-plasma =0.3.12` (`client`).
+- **Tests:** K-L3.
+
+### KL-W5 — the headless driver (right after KL-W1)
+
+- **Owns:** `tests/fkeys_kwin_live.rs`, with `#![cfg(target_os = "linux")]`, `#[ignore]`, and
+  `SOPEN_TEST_KWIN=1`.
+- **Implements:**
+  - the private session with §8's isolation;
+  - the fake-input injector;
+  - stand-in components;
+  - a probe window;
+  - capture of `dbus-monitor` and `WAYLAND_DEBUG`.
+- **Tests:** K-L6 (f) first. K-L5 and K-L6 (a)–(e) are added once KL-W4 lands, through this unit's
+  own hand-over.
+- No path of a run (the private session's folders, logs) is printed into the repo.
+
+### KL-W2 — the hand-back
+
+- **Owns:** `src/fnkeys/handback.rs` and `handback_tests.rs`.
+- **Implements:**
+  - **First,** read the installed kglobalaccel interface files on the Linux laptop, and fix the
+    method names and signatures of §6.4.4 from them.
+  - **Pure:** the `Chord` ↔ Qt code table, the snapshot parse, and `lookup`.
+  - **A `Bus` trait,** with its zbus implementation (`method_timeout(250 ms)`).
+  - **The thread.** It reads the config (check 3), checks the gate (check 4), and sends `Ready`. It
+    refreshes the snapshot at each focus-in. It invokes per request and per generation; it drops
+    stale generations and never retries. Every failure becomes a `Failure`.
+- **Tests:** K-L4.
+
+### KL-W3 — the inhibitor
+
+- **Owns:** `src/fnkeys/wayland.rs` and `wayland_tests.rs`, all under the Linux `cfg`.
+- **Implements:**
+  - **The thread:**
+    - the guest queue on winit's display;
+    - the manager and the seat bound only after `Ready`;
+    - `inhibit` only under §6.4.2's one rule, and `destroy` at focus-out, at a `Destroy` and on a stall
+      (the window's 500 ms marks);
+    - the guard that destroys on every exit, unwinding included;
+    - `poll` on the display's fd and a stop pipe.
+  - **The window's handle:** it sends `destroy` when the thread disappears and in `end()`.
+- **Tests:** K-L7: the guard, the handle and the stall, against a fake queue.
+
+### KL-W4 — the shell (after X1)
+
+- **Owns:** `src/gui/mod.rs`, by hand-over from spec 10's shell work (X1) once X1 has merged.
+- **Implements:**
+  - **The run.** `create_native`, with one `EventLoop<eframe::UserEvent>` per process, built by the
+    shell with `event_loop_hook()` applied, kept for every window and for the glow retry; the retry
+    fires when the shell is still in its slot as the loop returns (§6.4.3). Its handler wrapper calls
+    `decide` on key, modifier, pointer-button and focus events, and marks the start and end of every
+    handler callback (`new_events` included: eframe runs overdue logic passes there, `run.rs:401-407`)
+    for the stall check.
+  - **Before the window.** `run_window_sized` parses the table before the window opens.
+  - **The creation closure** starts the threads, and the window never waits on them.
+  - **`on_exit`** runs `end()`.
+  - **Failures** go through `Said` and `publish`.
+  - **Debug lines:** `fkeys: top row <code> → F<n>`, `fkeys: handed back <component>/<action>` and
+    `fkeys: inhibitor off: <reason>`.
+- **Tests:**
+  - the hook, `logic` and `ui` in that order (K-L7);
+  - a scripted run, `"system"` or an empty table → nothing starts (K-F4);
+  - a wgpu that fails before the app → glow on the same loop; on macOS, the loop is built with the
+    default menu off.
+
+### KL-W6 — the docs
+
+- **Owns:** `src/config.rs` (doc comments only), `README.md`, `AGENTS.md` and
+  `.prd/research/keys.md`.
+- **Implements:**
+  - **README.** It keeps the macOS paragraph and states five facts:
+    1. On KDE Plasma's Wayland session, with `"function"`, while an xtools GUI window has the
+       keyboard, the top row sends F1–F12 there, and every other KDE shortcut works as before; a
+       held one acts once.
+    2. It is off until the laptop keyboard's top row is measured, and the release with those codes
+       turns it on.
+    3. On GNOME, sway and X11 nothing changes. In a terminal the top row is F-keys only when the
+       keyboard sends them: with Fn held, or with its Fn lock.
+    4. `"system"` leaves everything alone. The F-key row and Cmd/Ctrl+1…0 work either way.
+    5. The keyboard's own Fn lock gives F-keys everywhere, with K-L2's measured answer for Fn+Esc. A
+       `hid_asus fnlock_default` module line does nothing (keys.md §4.2).
+  - **AGENTS.md:** the `SOPEN_FKEYS_TABLE` row, and the live test in the list of hand-run tests.
+  - **`src/config.rs`:** `fkeys` documented for both systems.
+- **Tests:** none.
+
+### KL-W7 — the measured table (after K-L2)
+
+- **Owns, by hand-over:**
+  - the `TOP_ROW` rows;
+  - one test checking them against K-L2's summary, which is checked in with its date and keyboard;
+  - README fact 2.
+- **Then:** K-L8.
+
+## 10. Tensions
+
+- **Route B needs the GUI shell on `create_native`, and spec 10 reworks that shell.**
+  - Today `run_window_sized` calls `run_native` (`src/gui/mod.rs:1300-1341`), which keeps winit's
+    events inside eframe.
+  - Spec 10 (xtools TUI-first; `research/tui-gui.md`) changes the window backend in X1.
+  - KL-W4 is therefore sequenced after X1, and takes `src/gui/mod.rs` from it. If X1 already owns
+    the winit handler, KL-W4 only adds its wrapper; if X1 keeps `run_native`, KL-W4 makes the move
+    itself.
+  - KL-W1, KL-W2, KL-W3 and KL-W5 do not wait.
