@@ -6,9 +6,9 @@
 //!   of that context, the F-key slots a hosted viewer adds) or, in a window of its own (image,
 //!   media, hex, the binary dialog), from that window's F-key row ([`for_window`]). Both end with
 //!   the F-key aliases and the clickable row (04 §6.1), then where ⌘ and Ctrl apply.
-//! - **One text on every machine** (10 T27): keys are named by [`Mods::prefix`] (`Ctrl/⌘+R`,
-//!   `⌘+Backspace`), and the rows a machine cannot press (⌘⌫ off a Mac) are listed too, so the
-//!   page reads the same in a Mac window, a Linux one and a terminal.
+//! - **One text in both backends** (10 T27): keys are named by [`Mods::prefix`], the same on
+//!   every machine (`Ctrl/⌘+R`, `⌘+Backspace`), so the window and the terminal on one machine
+//!   read alike; it lists the rows this machine can press ([`keys::rows`]: no ⌘⌫ off a Mac).
 //! - **Who opens it**: a window of its own on F1 ([`super::own_keys`]); the browser on
 //!   `keys::Command::Help` with its context's page (S1-E). [`open`] puts it on screen.
 //! - **While it is open** it covers the window and takes the keyboard and the pointer: Esc, F1
@@ -49,16 +49,22 @@ pub(crate) fn for_context(context: Context, mode: Mode, own: &[FKey]) -> Page {
 
 /// [`for_context`] with the rows of the slices in `upto` — the set of landed slices
 /// ([`keys::LANDED_SLICES`]; a slice's integration WU adds its number), or every slice in the
-/// tests.
+/// tests — that this machine can press.
 fn page_upto(context: Context, mode: Mode, own: &[FKey], upto: keys::Slices) -> Page {
+    page_of(context, mode, own, keys::rows(context, upto))
+}
+
+/// The page of `rows`, rows of `context` in the table's order (the tests give a Mac's and
+/// another machine's).
+fn page_of<'a>(
+    context: Context,
+    mode: Mode,
+    own: &[FKey],
+    rows: impl Iterator<Item = &'a keys::Row>,
+) -> Page {
     // One line per wording, in the table's order; its keys plain ones first.
     let mut lines: Vec<(Vec<(bool, String)>, String)> = Vec::new();
     let mut slots = Vec::new();
-    // Every row of the context, whether this machine can press it or not (not `keys::rows`,
-    // which drops ⌘⌫ off a Mac): one text on every machine.
-    let rows = keys::TABLE
-        .iter()
-        .filter(|r| r.context == context && upto.has(r.slice));
     for row in rows {
         let plain = match row.trigger {
             Trigger::Key(key, Mods::None) => {
@@ -351,7 +357,7 @@ pub(crate) fn end_pass(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::browser::keys::{Row, LANDED_SLICES};
+    use crate::gui::browser::keys::{rows, Row, LANDED_SLICES};
     use crate::gui::testkit::Driver;
     use crate::gui::Window;
 
@@ -399,9 +405,9 @@ mod tests {
             .unwrap()
             .what
             .starts_with("Switch to preview mode"));
-        // Each landed row's key is on exactly one line, the ones this machine cannot press too.
+        // Each landed row this machine can press is on exactly one line.
         let all: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
-        for row in every_row(Context::List, LANDED_SLICES) {
+        for row in rows(Context::List, LANDED_SLICES) {
             let name = row.trigger.name();
             let hits = all
                 .iter()
@@ -421,16 +427,19 @@ mod tests {
             Some("Pin the git panel to the other side; again: unpin"),
             "{page:#?}"
         );
-        // S6 has landed: F7 makes a folder; F8, Del and ⌘⌫ (a Mac window's, listed on every
-        // machine) delete to the Trash, Shift+F8 and Shift+Del without it — each action on one
-        // line.
+        // S6 has landed: F7 makes a folder; F8, Del (and ⌘⌫ on macOS) delete to the Trash,
+        // Shift+F8 and Shift+Del without it — each action on one line.
         assert_eq!(
             line(&page, "F7").map(|l| l.what.as_str()),
             Some("Make a folder (asks its name)"),
             "{page:#?}"
         );
+        let delete = match cfg!(target_os = "macos") {
+            true => "F8, Del, ⌘+Backspace",
+            false => "F8, Del",
+        };
         assert_eq!(
-            line(&page, "F8, Del, ⌘+Backspace").map(|l| l.what.as_str()),
+            line(&page, delete).map(|l| l.what.as_str()),
             Some("Delete the selection or the entry (asks; locally to the Trash)"),
             "{page:#?}"
         );
@@ -443,31 +452,72 @@ mod tests {
         assert_eq!(page.lines.first().map(|l| l.keys.as_str()), Some("F1"));
     }
 
-    /// Every row of `context` of the slices in `upto`, whether this machine can press it or not.
-    fn every_row(context: Context, upto: keys::Slices) -> impl Iterator<Item = &'static Row> {
-        keys::TABLE
-            .iter()
-            .filter(move |r| r.context == context && upto.has(r.slice))
+    /// The rows of `context` of the slices in `upto` that a Mac (`mac`) or another machine can
+    /// press — [`keys::rows`] on such a build (⌘ is a Mac's).
+    fn rows_on(
+        mac: bool,
+        context: Context,
+        upto: keys::Slices,
+    ) -> impl Iterator<Item = &'static Row> {
+        keys::TABLE.iter().filter(move |r| {
+            r.context == context
+                && upto.has(r.slice)
+                && (mac || !matches!(r.trigger, Trigger::Key(_, Mods::MacCmd)))
+        })
     }
 
-    /// The help is one text on every machine and in both backends (10 T27): the key names come
-    /// from no per-machine input — a command row reads `Ctrl/⌘+R`, never this machine's `Cmd+R`
-    /// or `Ctrl+R`; the Mac-only ⌘⌫ is listed off a Mac too — and the last lines name each
-    /// alias with where it works, then where ⌘ and Ctrl apply. The literals below hold on a
-    /// macOS build and on a Linux one alike (no `cfg!` in this test).
+    /// The help is one text in both backends (10 T27): its key names come from no per-machine
+    /// input — a command row reads `Ctrl/⌘+R`, never this machine's `Cmd+R` or `Ctrl+R` — and
+    /// the last lines name each alias with where it works, then where ⌘ and Ctrl apply. It
+    /// lists what the machine can press: a Mac's page and another machine's, built from each
+    /// one's rows, differ only by ⌘⌫ on the delete line, and this build's page is its own.
     #[test]
     fn the_help_is_one_text_on_every_machine() {
+        let mac_here = cfg!(target_os = "macos");
+        assert_eq!(Mods::MacCmd.here(), mac_here);
+        for context in Context::ALL {
+            let all = keys::ALL_SLICES;
+            let page_on = |mac| page_of(context, Mode::Preview, &[], rows_on(mac, context, all));
+            let (mac, other) = (page_on(true), page_on(false));
+            let here = page_upto(context, Mode::Preview, &[], all);
+            assert_eq!(&here, if mac_here { &mac } else { &other }, "{context:?}");
+            assert_eq!(mac.title, other.title);
+            assert_eq!(mac.lines.len(), other.lines.len(), "{context:?}");
+            let differ: Vec<(&Line, &Line)> = mac
+                .lines
+                .iter()
+                .zip(&other.lines)
+                .filter(|(m, o)| m != o)
+                .collect();
+            let delete = "Delete the selection or the entry (asks; locally to the Trash)";
+            match context {
+                Context::List => assert_eq!(
+                    differ,
+                    [(
+                        &Line {
+                            keys: "F8, Del, ⌘+Backspace".into(),
+                            what: delete.into()
+                        },
+                        &Line {
+                            keys: "F8, Del".into(),
+                            what: delete.into()
+                        }
+                    )],
+                    "{context:?}"
+                ),
+                _ => assert_eq!(differ, [], "{context:?}"),
+            }
+            for name in mac.lines.iter().flat_map(|l| l.keys.split(", ")) {
+                assert!(
+                    !name.starts_with("Cmd+") && !name.starts_with("Ctrl+"),
+                    "a machine's own name: {name} in {context:?}"
+                );
+            }
+        }
         let page = page_upto(Context::List, Mode::Preview, &[], keys::ALL_SLICES);
         let keys: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
-        for name in keys.iter().flat_map(|k| k.split(", ")) {
-            assert!(
-                !name.starts_with("Cmd+") && !name.starts_with("Ctrl+"),
-                "a machine's own name: {name} in {keys:?}"
-            );
-        }
         assert!(keys.contains(&"Ctrl/⌘+R"), "{keys:?}");
         assert!(keys.contains(&"Ctrl/⌘+U"), "{keys:?}");
-        assert!(keys.contains(&"F8, Del, ⌘+Backspace"), "{keys:?}");
         assert_eq!(
             aliases(),
             [
@@ -677,22 +727,26 @@ mod tests {
         );
     }
 
-    /// Every context's page, with every slice landed, holds every row once (S2–S5 open their
-    /// contexts' help with this), the ones this machine cannot press too.
+    /// Every context's page, with every slice landed, holds every row this machine can press
+    /// once (S2–S5 open their contexts' help with this), and no row it cannot (⌘⌫ off a Mac).
     #[test]
     fn every_contexts_page_covers_its_rows() {
         for context in Context::ALL {
             let page = page_upto(context, Mode::Preview, &[], keys::ALL_SLICES);
             let all: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
-            for row in every_row(context, keys::ALL_SLICES) {
+            for row in rows_on(true, context, keys::ALL_SLICES) {
                 let name = row.trigger.name();
                 let hits = all
                     .iter()
                     .filter(|keys| keys.split(", ").any(|k| k == name))
                     .count();
-                assert_eq!(hits, 1, "{context:?}: {name} in {all:?}");
+                let here = match row.trigger {
+                    Trigger::Key(_, mods) => mods.here(),
+                    _ => true,
+                };
+                assert_eq!(hits, usize::from(here), "{context:?}: {name} in {all:?}");
             }
-            if every_row(context, keys::ALL_SLICES).any(|r| r.trigger == Trigger::Letter) {
+            if rows(context, keys::ALL_SLICES).any(|r| r.trigger == Trigger::Letter) {
                 assert!(all.contains(&"a letter"), "{context:?}");
             }
             assert!(page.lines.ends_with(&aliases()), "{context:?}");
