@@ -287,6 +287,24 @@ pub fn opened_line(shown: &str) -> String {
 /// other side waits for. Fixed: it carries nothing of the address.
 pub const TUNNEL_OPEN: &str = "sopen-tunnel-open";
 
+/// The line HOST's sopen prints before [`TUNNEL_OPEN`] once the address's window there has
+/// started (09 §7): the other side then says that closing the window closes the tunnel. A HOST
+/// that opened the system browser instead, or an older one, never prints it. Fixed, as
+/// [`TUNNEL_OPEN`].
+pub const TUNNEL_WINDOW: &str = "sopen-tunnel-window";
+
+/// The line HOST's sopen prints when the address's window there was closed (09 §7): the other
+/// side closes the tunnel at once and exits 0. Fixed, as [`TUNNEL_OPEN`].
+pub const TUNNEL_CLOSED: &str = "sopen-tunnel-closed";
+
+/// Says `cue` ([`TUNNEL_OPEN`], [`TUNNEL_WINDOW`], [`TUNNEL_CLOSED`]) on `out` as one line,
+/// flushed, ignoring errors: the other side may be gone and its end of the output with it, and
+/// HOST's half goes on all the same — `println!` would panic there (09 §7).
+pub fn write_cue(out: &mut dyn std::io::Write, cue: &str) {
+    let _ = writeln!(out, "{cue}");
+    let _ = out.flush();
+}
+
 /// What opens an address: `SOPEN_BROWSER` (a receipt hook: a command given the address as its
 /// one argument) when set and not empty, else the default browser's opener — `open` on macOS,
 /// `xdg-open` elsewhere.
@@ -594,8 +612,39 @@ mod tests {
             opened_line(&u.shown()),
             "opened http://me:***@127.0.0.1:1/?… in the browser"
         );
-        // The tunnel's cue carries nothing of the address.
-        assert!(!TUNNEL_OPEN.contains("http"));
+        // The tunnel's cues carry nothing of the address, and are three.
+        for cue in [TUNNEL_OPEN, TUNNEL_WINDOW, TUNNEL_CLOSED] {
+            assert!(!cue.contains("http"), "{cue}");
+            assert!(cue.starts_with("sopen-tunnel-"), "{cue}");
+        }
+        assert_ne!(TUNNEL_WINDOW, TUNNEL_OPEN);
+        assert_ne!(TUNNEL_CLOSED, TUNNEL_OPEN);
+        assert_ne!(TUNNEL_WINDOW, TUNNEL_CLOSED);
+    }
+
+    /// A cue is one flushed line; an output that refuses it (the other side gone) is no error
+    /// and no panic.
+    #[test]
+    fn a_cue_is_one_line_and_a_closed_output_is_ignored() {
+        let mut out = Vec::new();
+        write_cue(&mut out, TUNNEL_WINDOW);
+        write_cue(&mut out, TUNNEL_OPEN);
+        assert_eq!(out, b"sopen-tunnel-window\nsopen-tunnel-open\n");
+        struct Gone(usize);
+        impl std::io::Write for Gone {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0 += 1;
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let mut gone = Gone(0);
+        write_cue(&mut gone, TUNNEL_CLOSED);
+        // Tried, and the flush too.
+        assert!(gone.0 >= 2, "{}", gone.0);
     }
 
     #[test]
