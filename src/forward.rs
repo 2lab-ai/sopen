@@ -280,7 +280,8 @@ pub fn quote(word: &str) -> String {
 }
 
 /// The `sh` script HOST runs, on one line (no shell reads it differently for a newline). Its
-/// arguments are `[--app APP] [--hex] -- SOURCE`; it always adds `--here`.
+/// arguments are `[--app APP] [--hex] [--hold-until-eof] [--browser] -- SOURCE`; it always adds
+/// `--here`.
 fn script(host: &str, install_paths: &str) -> String {
     let missing = quote(&format!(
         "sopen is not installed on {host} (brew install 2lab-ai/tap/sopen-preview)"
@@ -332,8 +333,8 @@ fn script(host: &str, install_paths: &str) -> String {
     .join(" ")
 }
 
-/// The command for HOST's sshd: `exec [env K=V…] sh -c <script> sopen [--app APP] [--hex] --
-/// SOURCE`,
+/// The command for HOST's sshd: `exec [env K=V…] sh -c <script> sopen [--app APP] [--hex]
+/// [--browser] -- SOURCE`,
 /// every word but `exec` quoted. The hooks go in front of `sh`, so the script sees
 /// `SOPEN_TARGET_BIN` and the sopen it starts sees them all. The bare `exec` (a constant, never
 /// data) replaces the login shell that parses the line — dash and fish would otherwise stay as
@@ -344,6 +345,7 @@ pub fn remote_words(
     source: &str,
     app: Option<&str>,
     hex: bool,
+    browser: bool,
     env: &[String],
     install_paths: &str,
 ) -> Vec<String> {
@@ -354,17 +356,35 @@ pub fn remote_words(
     if hex {
         flags.push("--hex".to_string());
     }
+    if browser {
+        flags.push(BROWSER_FLAG.to_string());
+    }
     words(host, &flags, source, env, install_paths)
 }
 
 /// [`remote_words`] for an address held open through a tunnel ([`tunnel`]): HOST's sopen gets
-/// `--here --hold-until-eof -- URL` — it opens the browser, then waits for its input's end.
-pub fn tunnel_words(host: &str, url: &str, env: &[String], install_paths: &str) -> Vec<String> {
-    words(host, &[HOLD_FLAG.to_string()], url, env, install_paths)
+/// `--here --hold-until-eof [--browser] -- URL` — it opens the address, then waits for its
+/// input's end.
+pub fn tunnel_words(
+    host: &str,
+    url: &str,
+    browser: bool,
+    env: &[String],
+    install_paths: &str,
+) -> Vec<String> {
+    let mut flags = vec![HOLD_FLAG.to_string()];
+    if browser {
+        flags.push(BROWSER_FLAG.to_string());
+    }
+    words(host, &flags, url, env, install_paths)
 }
 
 /// HOST's sopen flag that keeps it (and the ssh session, and the tunnel) until its input ends.
 pub const HOLD_FLAG: &str = "--hold-until-eof";
+
+/// `sopen URL`'s flag for the system browser (09 §7), passed on to HOST's sopen as given: an
+/// older one does not know it and exits 2 with its own line.
+pub const BROWSER_FLAG: &str = "--browser";
 
 /// `exec [env K=V…] sh -c <script> sopen <flags…> -- SOURCE`, every word but `exec` quoted.
 fn words(
@@ -426,15 +446,25 @@ pub fn ssh_args(
 }
 
 /// Runs sopen on HOST for `source` (already as HOST sees it) and waits; returns the exit code to
-/// leave with.
-pub fn run(host: &str, source: &str, app: Option<&str>, hex: bool, state_dir: &Path) -> Result<u8> {
+/// leave with. `browser`: an address's `--browser`, passed on.
+pub fn run(
+    host: &str,
+    source: &str,
+    app: Option<&str>,
+    hex: bool,
+    browser: bool,
+    state_dir: &Path,
+) -> Result<u8> {
     let env = forwarded_env(|key| std::env::var_os(key))?;
-    let words = remote_words(host, source, app, hex, &env, INSTALL_PATHS);
+    let words = remote_words(host, source, app, hex, browser, &env, INSTALL_PATHS);
     let connection = crate::remote::connection_args(host, state_dir)?;
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // An address is logged as sopen prints it, never whole (`url::redacted`).
     let logged = match crate::url::parse(source) {
-        Some(_) => remote_words(host, &crate::url::redacted(source), app, hex, &env, ""),
+        Some(_) => {
+            let shown = crate::url::redacted(source);
+            remote_words(host, &shown, app, hex, browser, &env, "")
+        }
         None => words.clone(),
     };
     crate::debug!(
@@ -543,13 +573,14 @@ const TUNNEL_TRIES: usize = 2;
 /// side sees HOST's command end. The guard reaps its watcher and exits with ssh's status.
 const GUARD: &str = r#"exec 3<&0 4>&1 >/dev/null; "$@" <&3 >&4 3<&- 4>&- & ssh=$!; exec 4>&-; (read -r _ <&3; kill "$ssh" 2>/dev/null) 2>/dev/null & watch=$!; exec 3<&-; wait "$ssh"; code=$?; kill "$watch" 2>/dev/null; wait "$watch" 2>/dev/null; exit "$code""#;
 
-/// What a tunnel runs: the ssh program, its connection, HOST, the address, the hooks and the
-/// install paths HOST's script looks in.
+/// What a tunnel runs: the ssh program, its connection, HOST, the address and its `--browser`,
+/// the hooks and the install paths HOST's script looks in.
 pub(crate) struct Tunnel<'a> {
     pub ssh: &'a std::ffi::OsStr,
     pub connection: Vec<OsString>,
     pub host: &'a str,
     pub url: &'a crate::url::Url,
+    pub browser: bool,
     pub env: &'a [String],
     pub install_paths: &'a str,
 }
@@ -558,12 +589,75 @@ pub(crate) struct Tunnel<'a> {
 enum Attempt {
     /// The remote port was taken: try the next.
     Taken,
-    /// The run's result: HOST's exit code, or 0 once stopped after the address opened.
+    /// The run's result: HOST's exit code, or 0 once stopped after the address opened, or once
+    /// HOST's window was closed.
     Done(Result<u8>),
 }
 
-/// Runs the tunnel on `ports` in turn until one is not taken on HOST; `say` gets the one line
-/// that says the address is open there, `stop` is polled for a signal that ends it.
+/// A line of HOST's sopen that is a cue for this side (09 §7). Matched exactly, as HOST writes
+/// it — only its end (`\n` or `\r\n`) taken off, never a space or a tab before it: any other
+/// line — a later sopen's cue among them — is HOST's plain output, passed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cue {
+    /// [`crate::url::TUNNEL_WINDOW`]: the address is in a window there.
+    Window,
+    /// [`crate::url::TUNNEL_OPEN`]: the address is open there.
+    Open,
+    /// [`crate::url::TUNNEL_CLOSED`]: its window there was closed.
+    Closed,
+}
+
+impl Cue {
+    fn of(line: &str) -> Option<Cue> {
+        let line = match line.strip_suffix('\n') {
+            Some(line) => line.strip_suffix('\r').unwrap_or(line),
+            None => line,
+        };
+        match line {
+            crate::url::TUNNEL_WINDOW => Some(Cue::Window),
+            crate::url::TUNNEL_OPEN => Some(Cue::Open),
+            crate::url::TUNNEL_CLOSED => Some(Cue::Closed),
+            _ => None,
+        }
+    }
+}
+
+/// What HOST's cues have said so far in one attempt.
+#[derive(Default)]
+struct Heard {
+    window: bool,
+    /// The open line was said.
+    open: bool,
+    closed: bool,
+}
+
+impl Heard {
+    /// Takes the cues that came, in their order: the open line (`open_line`, given whether the
+    /// window cue came first — an older HOST, or one on the system browser, never says it) is
+    /// said once.
+    fn take(
+        &mut self,
+        cues: &std::sync::mpsc::Receiver<Cue>,
+        open_line: &dyn Fn(bool) -> String,
+        say: &mut dyn FnMut(&str),
+    ) {
+        for cue in cues.try_iter() {
+            match cue {
+                Cue::Window => self.window = true,
+                Cue::Open if !self.open => {
+                    self.open = true;
+                    say(&open_line(self.window));
+                }
+                Cue::Open => {}
+                Cue::Closed => self.closed = true,
+            }
+        }
+    }
+}
+
+/// Runs the tunnel on `ports` in turn until one is not taken on HOST; `say` gets the lines that
+/// say the address is open there and, if HOST says so, that its window there was closed (09
+/// §7); `stop` is polled for a signal that ends it.
 pub(crate) fn run_tunnel(
     t: &Tunnel,
     ports: &[u16],
@@ -605,10 +699,11 @@ fn attempt(
     use std::sync::Arc;
     let there = t.url.with_port(port);
     let forward = t.url.remote_forward(port);
-    let words = tunnel_words(t.host, &there, t.env, t.install_paths);
+    let words = tunnel_words(t.host, &there, t.browser, t.env, t.install_paths);
     let args = tunnel_args(t.connection.clone(), t.host, &forward, words);
     // Logged as sopen prints the address, never whole.
-    let logged = tunnel_words(t.host, &crate::url::redacted(&there), t.env, "");
+    let shown_there = crate::url::redacted(&there);
+    let logged = tunnel_words(t.host, &shown_there, t.browser, t.env, "");
     crate::debug!(
         "{}",
         crate::render_command(
@@ -629,13 +724,14 @@ fn attempt(
         .context("cannot run ssh (is OpenSSH installed?)")?;
     // Held, never written: its end is HOST's (and the guard's) cue.
     let mut input = child.stdin.take();
-    let (opened_tx, opened) = std::sync::mpsc::channel();
+    // HOST's cues, in the order it said them; every other line of its output is passed on.
+    let (cue_tx, cues) = std::sync::mpsc::channel();
     let out = relay(child.stdout.take(), std::io::stdout, move |line| {
-        let open = line.trim_end() == crate::url::TUNNEL_OPEN;
-        if open {
-            let _ = opened_tx.send(());
+        let cue = Cue::of(line);
+        if let Some(cue) = cue {
+            let _ = cue_tx.send(cue);
         }
-        !open
+        cue.is_none()
     });
     let taken = Arc::new(AtomicBool::new(false));
     let seen = taken.clone();
@@ -647,26 +743,22 @@ fn attempt(
         !failed
     });
     let shown = t.url.shown();
-    let mut is_open = false;
-    let mut say_open = |is_open: &mut bool| {
-        if !*is_open && opened.try_recv().is_ok() {
-            *is_open = true;
-            let line = match port == t.url.port() {
-                true => format!(
-                    "{shown} is open on {} through a tunnel — Ctrl-C closes it",
-                    t.host
-                ),
-                false => format!(
-                    "{shown} is open on {} as {} through a tunnel (port {} could not be \
-                     forwarded there) — Ctrl-C closes it",
-                    t.host,
-                    crate::url::redacted(&there),
-                    t.url.port()
-                ),
-            };
-            say(&line);
+    let open_line = |window: bool| {
+        let closes = match window {
+            true => "closing its window there, or Ctrl-C here, closes it",
+            false => "Ctrl-C closes it",
+        };
+        match port == t.url.port() {
+            true => format!("{shown} is open on {} through a tunnel — {closes}", t.host),
+            false => format!(
+                "{shown} is open on {} as {shown_there} through a tunnel (port {} could not be \
+                 forwarded there) — {closes}",
+                t.host,
+                t.url.port()
+            ),
         }
     };
+    let mut heard = Heard::default();
     let stopped = |signal: i32, is_open: bool| -> Attempt {
         if is_open {
             Attempt::Done(Ok(0))
@@ -674,6 +766,14 @@ fn attempt(
             eprintln!("sopen: stopped before {shown} opened on {}", t.host);
             Attempt::Done(Ok(128u8.saturating_add(u8::try_from(signal).unwrap_or(0))))
         }
+    };
+    // HOST's window was closed (09 §7): said once the tunnel is closed, and the run is over.
+    let window_closed = |say: &mut dyn FnMut(&str)| -> Attempt {
+        say(&format!(
+            "{shown}: its window on {} was closed; the tunnel is closed",
+            t.host
+        ));
+        Attempt::Done(Ok(0))
     };
     let mut out = Some(out);
     // When ssh's output ended (HOST's command is over), and ssh still runs.
@@ -683,21 +783,36 @@ fn attempt(
             input.take();
             end(&mut child);
             ended(out.take(), err);
-            return Ok(stopped(signal, is_open));
+            return Ok(stopped(signal, heard.open));
         }
-        say_open(&mut is_open);
         if let Some(status) = child.try_wait()? {
             // A watcher left behind (the guard killed by a signal) ends ssh at this end.
             input.take();
             ended(out.take(), err);
+            // A stop during the drain comes first, as before 09: an open cue not read yet is
+            // not said, and the run was stopped before the address opened.
             if let Some(signal) = stop() {
-                return Ok(stopped(signal, is_open));
+                return Ok(stopped(signal, heard.open));
             }
-            say_open(&mut is_open);
-            if !is_open && taken.load(Ordering::SeqCst) && status.code() == Some(255) {
+            // Only now, the relay drained, are HOST's last cues all in: a closed cue counts
+            // whether it came before ssh's exit or with it.
+            heard.take(&cues, &open_line, say);
+            if heard.closed {
+                return Ok(window_closed(say));
+            }
+            if !heard.open && taken.load(Ordering::SeqCst) && status.code() == Some(255) {
                 return Ok(Attempt::Taken);
             }
             return Ok(Attempt::Done(exit_code(t.host, status)));
+        }
+        heard.take(&cues, &open_line, say);
+        // HOST's window was closed while ssh runs: the tunnel is closed at once, whether ssh
+        // would stay (for the browser's connections) or not.
+        if heard.closed {
+            input.take();
+            end(&mut child);
+            ended(out.take(), err);
+            return Ok(window_closed(say));
         }
         if out.as_ref().is_some_and(|o| o.try_recv().is_ok()) {
             out = None;
@@ -709,7 +824,7 @@ fn attempt(
             input.take();
             end(&mut child);
             ended(None, err);
-            say_open(&mut is_open);
+            heard.take(&cues, &open_line, say);
             bail!(
                 "sopen on {} ended while ssh stayed for the browser's connections; the tunnel \
                  to {shown} is closed",
@@ -919,9 +1034,10 @@ pub fn tunnel_port_is_private(port: u16) -> Result<()> {
 }
 
 /// `sopen URL` with HOST: serves the loopback address `url` from this machine on HOST through a
-/// tunnel and opens it in HOST's browser; returns once Ctrl-C or SIGTERM ends it (0), or ssh
-/// ends (HOST's exit code, as [`run`]).
-pub fn tunnel(host: &str, url: &crate::url::Url, state_dir: &Path) -> Result<u8> {
+/// tunnel and opens it in HOST's browser (`browser`: `--browser`, passed on); returns once
+/// Ctrl-C or SIGTERM ends it, or HOST's window is closed (0), or ssh ends (HOST's exit code, as
+/// [`run`]).
+pub fn tunnel(host: &str, url: &crate::url::Url, browser: bool, state_dir: &Path) -> Result<u8> {
     use std::hash::BuildHasher;
     let env = forwarded_env(|key| std::env::var_os(key))?;
     let tunnel = Tunnel {
@@ -929,14 +1045,21 @@ pub fn tunnel(host: &str, url: &crate::url::Url, state_dir: &Path) -> Result<u8>
         connection: tunnel_connection(&crate::remote::connection_args(host, state_dir)?),
         host,
         url,
+        browser,
         env: &env,
         install_paths: INSTALL_PATHS,
     };
     let seed = std::collections::hash_map::RandomState::new();
     let ports = tunnel_ports(url.port(), TUNNEL_TRIES, |i| seed.hash_one(i));
     let watch = signals::Watch::start();
+    // This side's lines go out as HOST's plain ones do ([`relay`]), a write error ignored —
+    // never `println!`, which panics once the output is gone (`| head -1`): the tunnel then
+    // lives on until Ctrl-C or HOST's end, as HOST's half does with its cues (09 §7).
     run_tunnel(&tunnel, &ports, &|| watch.signal(), &mut |line| {
-        println!("{line}")
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
     })
 }
 
@@ -1299,6 +1422,7 @@ mod tests {
             "/tmp/a b.png",
             Some("ImHex"),
             false,
+            false,
             &[],
             INSTALL_PATHS,
         );
@@ -1337,19 +1461,25 @@ mod tests {
         assert_eq!(flags(false, false), ["-T", "-n"]);
 
         let env = ["SOPEN_LOG=debug".to_string()];
-        let words = remote_words("box", "/x", None, false, &env, INSTALL_PATHS);
+        let words = remote_words("box", "/x", None, false, false, &env, INSTALL_PATHS);
         assert_eq!(words[..4], ["exec", "'env'", "'SOPEN_LOG=debug'", "'sh'"]);
         assert_eq!(words[words.len() - 3..], ["'sopen'", "'--'", "'/x'"]);
         // `--hex` travels after `--app`, before `--`.
-        let words = remote_words("box", "/x", None, true, &[], INSTALL_PATHS);
+        let words = remote_words("box", "/x", None, true, false, &[], INSTALL_PATHS);
         assert_eq!(
             words[words.len() - 4..],
             ["'sopen'", "'--hex'", "'--'", "'/x'"]
         );
-        let words = remote_words("box", "/x", Some("ImHex"), true, &[], INSTALL_PATHS);
+        let words = remote_words("box", "/x", Some("ImHex"), true, false, &[], INSTALL_PATHS);
         assert_eq!(
             words[words.len() - 6..],
             ["'sopen'", "'--app'", "'ImHex'", "'--hex'", "'--'", "'/x'"]
+        );
+        // An address's `--browser` (09 §7) travels as given, before `--`.
+        let words = remote_words("box", "https://x/", None, false, true, &[], INSTALL_PATHS);
+        assert_eq!(
+            words[words.len() - 4..],
+            ["'sopen'", "'--browser'", "'--'", "'https://x/'"]
         );
 
         let script = script("box", INSTALL_PATHS);
@@ -1443,7 +1573,7 @@ mod tests {
             .any(|a| a.to_string_lossy().starts_with("ConnectTimeout")));
 
         let url = address("http://127.0.0.1:1234/a b?x#y".replace(' ', "%20").as_str());
-        let words = tunnel_words("box", url.as_str(), &[], INSTALL_PATHS);
+        let words = tunnel_words("box", url.as_str(), false, &[], INSTALL_PATHS);
         let args = tunnel_args(
             connection.clone(),
             "box",
@@ -1475,6 +1605,18 @@ mod tests {
             [
                 "'sopen'",
                 "'--hold-until-eof'",
+                "'--'",
+                "'http://127.0.0.1:1234/a%20b?x#y'"
+            ]
+        );
+        // `--browser` (09 §7) goes to HOST's half with it.
+        let words = tunnel_words("box", url.as_str(), true, &[], INSTALL_PATHS);
+        assert_eq!(
+            words[words.len() - 5..],
+            [
+                "'sopen'",
+                "'--hold-until-eof'",
+                "'--browser'",
                 "'--'",
                 "'http://127.0.0.1:1234/a%20b?x#y'"
             ]
@@ -1516,6 +1658,16 @@ mod tests {
     /// otherwise it prints [`crate::url::TUNNEL_OPEN`], as HOST's sopen does, and then runs
     /// `then`.
     fn stand_in_ssh(dir: &Path, taken: u16, then: &str) -> PathBuf {
+        stand_in_host(
+            dir,
+            taken,
+            &format!("echo {}\n{then}", crate::url::TUNNEL_OPEN),
+        )
+    }
+
+    /// [`stand_in_ssh`] whose HOST half runs `script` (shell lines) in place of the open cue and
+    /// `then`: a HOST sopen of any version, the cues of 09 §7 included.
+    fn stand_in_host(dir: &Path, taken: u16, script: &str) -> PathBuf {
         let ssh = dir.join("ssh");
         let file = |name: &str| quote(dir.join(name).to_str().unwrap());
         executable(
@@ -1527,9 +1679,7 @@ mod tests {
                  echo --- >> {calls}\n\
                  fwd=; prev=; for a in \"$@\"; do if [ \"$prev\" = -R ]; then fwd=$a; fi; prev=$a; done\n\
                  case $fwd in 127.0.0.1:{taken}:*) echo 'Error: remote port forwarding failed for listen port {taken}' >&2; exit 255;; esac\n\
-                 echo {open}\n\
-                 {then}\n",
-                open = crate::url::TUNNEL_OPEN,
+                 {script}\n",
                 pids = file("pids"),
                 calls = file("calls"),
             ),
@@ -1558,6 +1708,8 @@ mod tests {
             connection: tunnel_connection(&[]),
             host: "box",
             url,
+            // As the tests of `sopen URL` run it (09 §7).
+            browser: true,
             env: &[],
             install_paths: INSTALL_PATHS,
         }
@@ -1792,6 +1944,148 @@ mod tests {
         let ssh = stand_in_ssh(tmp.path(), 1, "exec >/dev/null; sleep 0.3; exit 4");
         let code = run_tunnel(&tunnel_for(&ssh, &url), &[1234], &|| None, &mut |_| {}).unwrap();
         assert_eq!(code, 4);
+    }
+
+    /// HOST's window (09 §7): the open line names it only after `sopen-tunnel-window`, on the
+    /// address's own port and on a fallback one; `sopen-tunnel-closed` ends the run with 0 and
+    /// its line — read after ssh's exit (whatever HOST's code), and while ssh stays, which closes
+    /// the tunnel under it at once, everything reaped. A HOST without the window cue gets
+    /// today's line, and its closed cue counts the same.
+    #[test]
+    fn hosts_window_cues_set_the_lines_and_its_close_ends_the_run() {
+        use crate::url::{TUNNEL_CLOSED, TUNNEL_OPEN, TUNNEL_WINDOW};
+        let url = address("http://me:s3cret@127.0.0.1:1234/x?token=abc");
+        let shown = "http://me:***@127.0.0.1:1234/x?…";
+        let window = format!(
+            "{shown} is open on box through a tunnel — closing its window there, or Ctrl-C \
+             here, closes it"
+        );
+        let closed = format!("{shown}: its window on box was closed; the tunnel is closed");
+
+        // The cues, then HOST's command ends at once, with another code: the cue counts.
+        for (say, opened) in [
+            (format!("echo {TUNNEL_WINDOW}; echo {TUNNEL_OPEN}"), &window),
+            (
+                format!("echo {TUNNEL_OPEN}"),
+                &format!("{shown} is open on box through a tunnel — Ctrl-C closes it"),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ssh = stand_in_host(
+                tmp.path(),
+                1,
+                &format!("{say}; echo {TUNNEL_CLOSED}; exit 4"),
+            );
+            let mut said = Vec::new();
+            let code = run_tunnel(&tunnel_for(&ssh, &url), &[1234], &|| None, &mut |l| {
+                said.push(l.to_string())
+            })
+            .unwrap();
+            assert_eq!(code, 0, "{say}");
+            assert_eq!(said, [opened.as_str(), closed.as_str()], "{say}");
+        }
+
+        // A fallback port, and ssh staying after the cue (its output open): closed under it.
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = stand_in_host(
+            tmp.path(),
+            1234,
+            &format!(
+                "echo {TUNNEL_WINDOW}; echo {TUNNEL_OPEN}; echo {TUNNEL_CLOSED}; trap '' INT HUP; \
+                 exec sleep 60"
+            ),
+        );
+        let pids = std::sync::Mutex::new(Vec::new());
+        let mut said = Vec::new();
+        let started = std::time::Instant::now();
+        let code = run_tunnel(
+            &tunnel_for(&ssh, &url),
+            &[1234, 50001],
+            &|| None,
+            &mut |line| {
+                // At the first line: ssh, the guard and its watcher, all still there.
+                let mut pids = pids.lock().unwrap();
+                if pids.is_empty() {
+                    *pids = tunnel_pids(tmp.path());
+                }
+                said.push(line.to_string())
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert_eq!(
+            said,
+            [
+                format!(
+                    "{shown} is open on box as http://me:***@127.0.0.1:50001/x?… through a \
+                     tunnel (port 1234 could not be forwarded there) — closing its window there, \
+                     or Ctrl-C here, closes it"
+                ),
+                closed
+            ]
+        );
+        let pids = pids.into_inner().unwrap();
+        assert!(pids.len() >= 3, "{pids:?}");
+        all_reaped(&pids);
+    }
+
+    /// A cue is the whole line but its end (`\n`, `\r\n`, or none at the output's end): a space
+    /// or a tab after it, or anything before it, makes it HOST's plain output (09 §7).
+    #[test]
+    fn cues_are_matched_exactly() {
+        use crate::url::{TUNNEL_CLOSED, TUNNEL_OPEN, TUNNEL_WINDOW};
+        for (cue, want) in [
+            (TUNNEL_WINDOW, Cue::Window),
+            (TUNNEL_OPEN, Cue::Open),
+            (TUNNEL_CLOSED, Cue::Closed),
+        ] {
+            for line in [format!("{cue}\n"), format!("{cue}\r\n"), cue.to_string()] {
+                assert_eq!(Cue::of(&line), Some(want), "{line:?}");
+            }
+            for line in [
+                format!("{cue} \n"),
+                format!("{cue}\t\n"),
+                format!("{cue} \r\n"),
+                format!("{cue}\r\r\n"),
+                format!(" {cue}\n"),
+                format!("{cue}x\n"),
+                cue.to_uppercase(),
+            ] {
+                assert_eq!(Cue::of(&line), None, "{line:?}");
+            }
+        }
+    }
+
+    /// A stop (Ctrl-C, SIGTERM) that comes while this side drains HOST's output after ssh's
+    /// exit, an open cue in that output not yet read: stopped before the address opened — the
+    /// stop is checked before the cues are, as before 09; the open line is not said.
+    #[test]
+    fn a_stop_during_the_drain_comes_before_an_open_cue_in_it() {
+        use crate::url::{TUNNEL_OPEN, TUNNEL_WINDOW};
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("stopped");
+        // ssh ends at once; what it left running says the cues later, once this side drains,
+        // and the stop comes before that drain is over.
+        let ssh = stand_in_host(
+            tmp.path(),
+            1,
+            &format!(
+                "(sleep 1; echo {TUNNEL_WINDOW}; echo {TUNNEL_OPEN}; : > {}) &\nexit 0",
+                quote(marker.to_str().unwrap())
+            ),
+        );
+        let url = address("http://127.0.0.1:1234/");
+        let mut said = Vec::new();
+        let code = run_tunnel(
+            &tunnel_for(&ssh, &url),
+            &[1234],
+            &|| marker.exists().then_some(15),
+            &mut |l| said.push(l.to_string()),
+        )
+        .unwrap();
+        assert_eq!(code, 128 + 15);
+        assert_eq!(said, Vec::<String>::new());
     }
 
     /// The listener tables HOST's sopen reads: Linux's `/proc/net/tcp{,6}` rows (this machine's
@@ -2228,7 +2522,15 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
         for sh in login_shells() {
             let h = host("Darwin", "");
             executable(&h.bin.join("sopen"), &fake_sopen());
-            let words = remote_words("box", source, Some("Hex Fiend"), false, &env, INSTALL_PATHS);
+            let words = remote_words(
+                "box",
+                source,
+                Some("Hex Fiend"),
+                false,
+                false,
+                &env,
+                INSTALL_PATHS,
+            );
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert_eq!(err, "", "{sh:?}");
@@ -2255,7 +2557,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
             );
             assert_eq!(value(&out, "SOPEN_LOG"), "debug", "{sh:?}");
             // `--hex` reaches HOST's sopen after `--here`, before `--`.
-            let words = remote_words("box", source, None, true, &env, INSTALL_PATHS);
+            let words = remote_words("box", source, None, true, false, &env, INSTALL_PATHS);
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             let args: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("arg ")).collect();
@@ -2279,7 +2581,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
             let elsewhere = h.root.join("build/sopen-dev");
             executable(&elsewhere, &fake_sopen());
             let env = [format!("SOPEN_TARGET_BIN={}", elsewhere.display())];
-            let words = remote_words("box", "/x", None, false, &env, &h.not_installed());
+            let words = remote_words("box", "/x", None, false, false, &env, &h.not_installed());
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert!(has_line(&out, "arg [--here]"), "{sh:?}: {out}");
@@ -2293,7 +2595,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
             // production list: a sopen installed on the test machine would be found first.)
             executable(&h.home.join(".cargo/bin/sopen"), &fake_sopen());
             let paths = format!(r#"{} "$HOME/.cargo/bin/sopen""#, h.not_installed());
-            let words = remote_words("box", "/x", None, false, &[], &paths);
+            let words = remote_words("box", "/x", None, false, false, &[], &paths);
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert!(has_line(&out, "arg [/x]"), "{sh:?}: {out}");
@@ -2383,7 +2685,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
         executable(&brew.join("sopen"), &fake_sopen());
         executable(&brew.join("ffmpeg"), "#!/bin/sh\n");
         let paths = quote(brew.join("sopen").to_str().unwrap());
-        let words = remote_words("box", "/x", None, false, &[], &paths);
+        let words = remote_words("box", "/x", None, false, false, &[], &paths);
         let (code, out, err) = h.run(sh, &words, &base);
         assert_eq!(code, 0, "{sh:?}: {err}");
         let path = value(&out, "PATH");
@@ -2405,7 +2707,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
         let elsewhere = h.root.join("build/sopen-dev");
         executable(&elsewhere, &fake_sopen());
         let env = [format!("SOPEN_TARGET_BIN={}", elsewhere.display())];
-        let words = remote_words("box", "/x", None, false, &env, &h.not_installed());
+        let words = remote_words("box", "/x", None, false, false, &env, &h.not_installed());
         let (code, out, err) = h.run(sh, &words, &base);
         assert_eq!(code, 0, "{sh:?}: {err}");
         let path = value(&out, "PATH");
@@ -2443,7 +2745,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
     fn the_script_says_when_sopen_is_missing() {
         for sh in login_shells() {
             let h = host("Darwin", "");
-            let words = remote_words("me@box", "/x", None, false, &[], &h.not_installed());
+            let words = remote_words("me@box", "/x", None, false, false, &[], &h.not_installed());
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 127, "{sh:?}: {out} {err}");
             assert_eq!(
@@ -2464,7 +2766,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
         // show here as no exit code (-1) — and to ssh as a lost connection (255).
         for sh in login_shells() {
             let h = host("Darwin", "");
-            let words = remote_words("box", "/x", None, false, &[], INSTALL_PATHS);
+            let words = remote_words("box", "/x", None, false, false, &[], INSTALL_PATHS);
             for (signal, code) in [("INT", 130), ("TERM", 143), ("HUP", 129)] {
                 executable(
                     &h.bin.join("sopen"),
@@ -2519,7 +2821,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
             }
             std::fs::write(h.root.join("session-env"), session).unwrap();
             executable(&h.bin.join("sopen"), &fake_sopen());
-            let words = remote_words("box", "/x", None, false, &[], INSTALL_PATHS);
+            let words = remote_words("box", "/x", None, false, false, &[], INSTALL_PATHS);
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert!(!pwned.exists(), "{sh:?}: a session value was evaluated");
@@ -2549,7 +2851,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
             std::fs::create_dir_all(&run).unwrap();
             std::fs::write(run.join("wayland-0.lock"), "").unwrap();
             let _socket = std::os::unix::net::UnixListener::bind(run.join("wayland-3")).unwrap();
-            let words = remote_words("box", "/x", None, false, &[], INSTALL_PATHS);
+            let words = remote_words("box", "/x", None, false, false, &[], INSTALL_PATHS);
             let runtime = [("XDG_RUNTIME_DIR", run.to_str().unwrap())];
             let (code, out, err) = h.run(&sh, &words, &runtime);
             assert_eq!(code, 0, "{sh:?}: {err}");

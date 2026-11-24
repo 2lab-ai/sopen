@@ -222,6 +222,138 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   preparation's budget (preview.rs:50); a view whose budget refused anything reloads once at the
   hand-over, so the viewer shows the whole page. The viewer has no byte budget.
 
+#### X-W1 result (2026-11-25)
+
+A prototype outside the repo ran this section's server — the steps, Range, turns of one piece,
+cancel; one worker thread and one connection per view — over a real-time throttled fake of one SFTP
+channel (a reply one round trip after its request, bytes at 2 MB/s behind the reply before:
+`Throttled`'s timing, stream/mod.rs:263-291, at 50 ms RTT). Engines: WKWebView in an eframe window
+(Rust, objc2-web-kit 0.3.2; WebKit 21624.5.1.11.3, macOS 26.7.1) on the Mac; WebKitGTK 2.52.6,
+dlopen'ed, offscreen on its own GTK thread, on the Linux laptop under a private headless compositor
+(own runtime folder, bus and socket; the live session unchanged before and after every run). 56 Mac
+runs, 46 Linux runs; a range is three runs unless it says one. The RTT counts follow sopen's calls at
+cd521ca — `realpath` (sftp.rs:787-810) and `stat` (sftp.rs:354-369) one each, `open_ranged` = open
+then fstat (sftp/ranged.rs:158-194), `reopen` = `into_connection().into_ranged` with the CLOSE not
+waited for (sftp/ranged.rs:392-400) — so they hold by construction; the wall times are measured
+through the engines. The fake's sleeps overshoot on the Mac: 4 RTT took 207–239 ms there, 200.4–208.4
+ms on Linux.
+
+- **A handler answering from a worker thread — held, both.** Mac: `webView:startURLSchemeTask:`
+  (main) retains the task and sends `(id, path, Range)` to the worker; the worker's messages come
+  back by `dispatch_async_f` on the main queue, and only there call `didReceiveResponse:`,
+  `didReceiveData:`, `didFinish`, through one function that checks the thread and a per-task
+  tombstone and wraps the call in an exception catch: 0 off-main calls and 0 exceptions in every run.
+  Linux: the scheme callback (GTK thread) refs the request and sends the same; once the head is known
+  the GTK thread calls `webkit_uri_scheme_request_finish_with_response` with a
+  `WebKitURISchemeResponse` (`_new(stream, length)`, `_set_status`, `_set_content_type`,
+  `_set_http_headers` with a libsoup `SoupMessageHeaders`; the soup symbols resolve by `dlsym` on the
+  WebKit handle) over a `GInputStream` subclass (`g_type_register_static_simple`, class and instance
+  sizes asserted against `g_type_query`) whose `read_async` keeps a pending `GTask` until a piece
+  comes; pieces cross by `g_idle_add_full`; every vfunc and completion ran on the GTK thread: 0
+  off-thread in every run.
+- **Push and pull.** The Mac is push: each piece goes to WebKit as it arrives, no flow control. Linux
+  is pull: WebKit asks 8 KiB per `read_async`, one at a time, then closes with the synchronous
+  `close_fn` and drops the stream, on the GTK thread; the glue's buffer peaked at one 64 KiB read
+  because WebKit drained at once. A reader that stops pulling would let it grow **[미측정]**.
+- **The head comes first, on both**: `didReceiveResponse:` precedes any data; WebKitGTK takes status,
+  length and headers in the response object at finish. A request's first message is therefore its
+  complete head (status, type, length, `Content-Range`); 403, 404 and 416 are a head with no body. The
+  prototype did not sniff: it sent text types with no charset, so its head went when the steps ended.
+  In sopen the head of a text type waits for the first read when the charset rule above needs its
+  first 8 KiB (they come in that first 64 KiB read): it goes at 5 RTT together with the first bytes,
+  not at 4 — the first byte stays at 5 RTT, so the page loses nothing; every other head goes when the
+  steps end **[추정: derived from the measured RTTs]**.
+- **Stop mid-response — held, both.** Mac: navigating away gave `stopURLSchemeTask` on the main thread
+  9 ms after `loadRequest` (one run; 2 MiB of 20 MiB delivered); later pieces were dropped at the
+  tombstone. Negative control (one run): one `didReceiveData:` after stop raised
+  `NSInternalInconsistencyException` "This task has already been stopped" — "WebKit throws" above is
+  measured now. Linux: the page's `WebKitWebResource` emitted `failed` (code 302, "Load request
+  cancelled"), then the pending read's `GCancellable` fired, both on the GTK thread, for the main
+  resource and for an image alike; the glue completes that read with `G_IO_ERROR_CANCELLED` from an
+  idle (never inside the emission), and WebKit closes and finalizes the stream. The worker sees a
+  stop after the 64 KiB read in flight (16 ms Linux, 0.4–71 ms Mac, one run each), or after the steps
+  in progress (150–168 ms when a 20-image page was left on Linux); 0 calls after stop.
+- **Stop before the head.** Mac: `stopURLSchemeTask` comes before any response — 19 of 19 head-less
+  images when a 20-image page was left at +600 ms; late heads are dropped. Linux: nothing on the
+  request fires — WebKitGTK 2.52 has no cancel signal on `WebKitURISchemeRequest`, and a read's
+  cancellable exists only once reading starts. A late `finish_with_response` on the dead request is
+  accepted and WebKit then keeps pulling its body at the link's rate — 5,373,952 B of 20 MiB by the
+  end of each run — the next page's file waiting 674–676 ms instead of 183–186 ms and teardown taking
+  442–454 ms instead of ~1 ms. The view's `resource-load-started` → `WebKitWebResource::failed` is the
+  signal: 0.6 ms after the new load for the main resource (one run), and for 20 of 20 head-less
+  images within 1.1–2.2 ms; acting on it, the glue drops the head, gives its ref back and never
+  finishes — no warning, nothing read. Whether a media element's requests emit it is **[미측정]**.
+- **Stop after the last byte.** Mac `<video>`: WebKit stopped 0–59 range tasks per run after their
+  last byte but before `didFinish` came in the next main-queue block; the tombstone dropped those
+  `didFinish`es, 0 exceptions.
+- **Turns — held, both.** A CSS asked while a 6 MiB HTML streams ended 740–741 ms (Linux) / 764–772 ms
+  (Mac) after it was asked, the HTML 4.05 s / 4.14–4.18 s after its own; FIFO control: the CSS 3.66 s /
+  3.74–3.75 s. On Linux the page background from that CSS showed 2.34–2.35 s into the run while the
+  HTML streamed until 5.26 s (FIFO: 5.70–5.72 s). A CSS behind a 4.3 MB image: 1.03 s / 1.08 s, FIFO
+  2.88 s / 2.97–3.00 s. The CSS waits for the piece in flight (1 MiB at 2 MB/s = 0.52 s) plus its own
+  5 RTT. A new request's first turn here is its steps and its first piece, on the handle just opened
+  (else two more reopens).
+- **A run of ranges on one handle — held only with change 1.** Read literally, every Range request is
+  a new request: it leaves the `Ranged` and runs the four steps. Mac `<video>`: WebKit reads the MP4
+  with 133 requests one after another, 131 of them tiny ranges (`bytes=0-1`, `0-7`, `32-39`, …; 2–784
+  B each) and 2 without a Range. Re-checked,
+  each costs 264–289 ms, and the video did not play within 60 s (0 of 3). Kept handle, each costs
+  50–59 ms (the read): it played at 7.7–8.2 s in 2 of 4 runs and stalled in the other 2 (not within
+  60 s). Kept handle plus a block cache (the request read as its aligned 256 KiB block, kept per view,
+  later ranges inside it answered from memory): 130 of 133 ranges from memory, `playing` 428–477 ms
+  after the page started; a zero-latency fake: 88 ms (one run). Ten scripted XHR ranges: Linux
+  716–719 ms kept vs 2.52–2.54 s re-checked; Mac 0.77–1.01 s vs 2.88–3.13 s. Linux media made no
+  request at all, `<video>` nor Ogg Vorbis `<audio>` (its demuxer present) — the laptop lacks
+  gst-plugins-good **[추정: the cause]** — so Linux Range is measured with XHR; "measured on both
+  engines" above had held for the Mac only (the research's Linux handler answered whole files).
+  Linux Range needs `webkit_uri_scheme_request_get_http_headers` +
+  `soup_message_headers_get_one("Range")`; the 206 goes as the response object's status and headers.
+- **RTT.** A new request: realpath, stat, open, fstat = 4 RTT before the head (200.4–208.4 ms Linux),
+  its first bytes 1 more — 5 RTT to the first byte, 60–200 ms at the reference rig's 12–40 ms, not
+  48–160. A folder adds the index's realpath and stat: 6 RTT (one run: 300.7 ms Linux, 338.6 ms
+  Mac). `reopen`: 2 RTT. **A page of R requests — the HTML and its subresources — costs R × 5 RTT,
+  strictly in series on one handle.** The fixture was the HTML, one stylesheet and N images, R = N + 2
+  (no favicon or redirect was requested): N = 1, 5, 20 → 757–761, 1766–1771, 5522–5536 ms Linux (Mac
+  845–1091, 1945–2436, 6160–7621 ms); at 12–40 ms, 1.3–4.4 s for R = 22 **[추정: scaled]**.
+- **The main-thread rule** (§12's X-W1 brief, *web* §4: "back on the main thread"). On macOS 26.7.1
+  WebKit accepted task calls from the worker thread — whole requests answered off-main, 0.02–0.9 ms a
+  call, no exception, pages loaded (negative control, two runs). Main-only stays sopen's rule for
+  another reason: the tombstone and `stopURLSchemeTask` must share a thread for "no call after stop"
+  to hold; off-main, a call can cross a stop.
+
+**Changes this section takes [decision]:**
+1. **A path checked once in a view is not checked again**, and small ranges come from a block cache:
+   the view keeps each checked file's resolved path and fingerprint; a request on the file whose
+   handle is open is served from that handle with no steps, on another file it is a `reopen` with the
+   fingerprint compare (2 RTT); a small request reads its aligned block (256 KiB here) and later ranges
+   inside a kept block are answered from memory, for the view's life and within its budget (06's
+   block cache is the candidate **[추정]**). Without the first a `<video>` costs 4 RTT per range;
+   without the second it plays late or not at all.
+2. A new request's first turn is its steps and its first piece.
+3. **Stop, per engine**: Mac `stopURLSchemeTask` — before the head, mid-body, or after the last byte
+   before `didFinish`; Linux the read's `GCancellable` mid-body and, before the head, the view's
+   `WebKitWebResource::failed` matched to the request by URI (the request has no signal of its own).
+   The glue keeps a tombstone per request and drops late messages; the server ends a stopped request
+   after the 64 KiB read in flight, or after the steps in progress.
+4. **The scheme trait (WV-0)**: in `start(id, path, range)`, `stop(id)`; out a complete `head`, then
+   `data`*, then `done` or `fail` (a sniffed text type's head waits for its first read, above), each
+   delivered by the engine glue on the engine's thread (Mac main queue, Linux GTK context by idle).
+   The Linux glue owns a per-request buffer that WebKit pulls in 8 KiB reads and bounds it by credit
+   to the server **[추정: the bound not built]**.
+5. **Open for WV-C**: a page of R small files (the HTML and its subresources) costs R × 5 RTT on one
+   handle. Pipelining the realpath and stat of every queued new request, and several handles open on
+   the channel (open, fstat, read pipelined), would bring a page to ~5 RTT plus transfer **[추정: not
+   built]** — it needs a batched `RemoteFs` call and a several-handle `Ranged`. A turn makes the
+   request behind it wait one piece (0.52 s at 2 MB/s); pieces sized by link time (~100 ms) would cut
+   that **[추정]**.
+
+Per unit: WV-C takes 1, 2, 3's server half and 5; WV-0 takes 4; WV-A retains each task, calls it only
+from the main queue behind the tombstone, and expects the after-the-last-byte stop; WV-B builds the
+`GInputStream` subclass with its layout asserted at start, completes reads outside the cancel
+emission, never holds its own state across a call into GLib or WebKit (a completion can re-enter
+`read_async`) **[추정: designed around, not provoked]**, watches `resource-load-started`/`failed`
+for the stop before the head, and reads Range from the request's headers.
+
 ### 3.2 Engine settings, every view
 
 No JS↔native bridge (no `WKScriptMessageHandler`, no script message handler); no UI delegate
