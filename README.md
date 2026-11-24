@@ -1,9 +1,12 @@
 # sopen
 
+`sopen` is the command; xtools is the multi-function tool it opens — the file browser, the
+viewers, the image, video, audio and hex editors, the git panel and the directory tree.
+
 Open a file or folder on another machine as if it were local:
 
 ```sh
-sopen myserver:~/project           # folder → sopen's file browser: two panels, Enter views any file
+sopen myserver:~/project           # folder → the xtools file browser: two panels, Enter views any file
 sopen myserver:/var/log/app.log    # text → VS Code remote (Remote - SSH), else Zed
 sopen myserver:/tmp/shot.png       # image → view, rectangle crop / pixelize, cut / copy / paste, save back
 sopen myserver:/tmp/talk.mp4       # video → play, cut / copy / paste, crop → save back or a new file
@@ -18,7 +21,7 @@ Same syntax as `scp`. Uses your `ssh` and `~/.ssh/config`; the remote needs noth
 
 Remote files are never downloaded just to look at them: sopen reads what is on screen and a
 little around it, the rest as you move, like a video stream — a 24 GB file in the hex editor
-shows its first screen after reading 64 KiB of it. Edits in sopen's image, video, audio and hex
+shows its first screen after reading 64 KiB of it. Edits in the xtools image, video, audio and hex
 windows are kept on this machine until you save — in memory and, a moment later, on disk, so a
 crash loses at most that moment's — and Save writes back to the remote file, Save As to a local
 one.
@@ -53,7 +56,7 @@ brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64
 
 Only sshd with its SFTP subsystem (the default). sopen installs and runs nothing there. When you open
 a text file (or press F4 in the file browser), VS Code Remote - SSH or Zed installs its own remote server on first use — that is the editor's behaviour,
-not sopen's. Folders are listed over SFTP. What sopen shows itself — text in the file browser, images,
+not sopen's. Folders are listed over SFTP. What xtools shows itself — text in the file browser, images,
 video, audio, the hex editor — is read over SFTP a piece at a time and handled on this machine; video
 and audio are decoded here by ffmpeg from that stream. The git panel runs the remote's own `git`, when
 it has one, over the same ssh connection — nothing is uploaded. (A `--target` machine is
@@ -71,7 +74,7 @@ sopen --here myserver:/tmp/a.html             # …but this one here
 sopen config                                  # where the config file is, the target (and fkeys, if set)
 sopen config target --unset                   # back to this machine
 sopen config fkeys system                     # macOS: sopen never touches what the top row sends
-sopen config fkeys function                   # …or F1–F12 without fn while sopen is in front (the default)
+sopen config fkeys function                   # …or F1–F12 without fn while xtools is in front (the default)
 ```
 
 The config file is `~/.config/sopen/config.toml` (`$XDG_CONFIG_HOME/sopen/config.toml` when that is
@@ -82,13 +85,13 @@ target = "<host>"
 fkeys = "function"   # or "system"; without the key, "function"
 ```
 
-`fkeys` is for macOS: with `"function"` (the default), while a sopen window is in front sopen
+`fkeys` is for macOS: with `"function"` (the default), while an xtools window is in front sopen
 switches the Mac's top row to F1–F12 without fn — so F5 should copy — and brightness and volume
-need fn; once no sopen window is in front (or the Mac sleeps, or you switch user), the Mac's own
+need fn; once no xtools window is in front (or the Mac sleeps, or you switch user), the Mac's own
 setting is back, even if sopen crashed. The switch is measured to reach the keyboard driver;
-that a plain F5 then reaches sopen is not yet checked on a real keyboard (`.prd/04-file-keys.md`
+that a plain F5 then reaches xtools is not yet checked on a real keyboard (`.prd/04-file-keys.md`
 §6.2, K-F3). The setting is global,
-so other apps see F-keys while sopen is in front. `"system"` leaves the Mac's setting alone; the
+so other apps see F-keys while xtools is in front. `"system"` leaves the Mac's setting alone; the
 F-key row's slots and Cmd/Ctrl+1…0 (F1–F10) work either way. Linux has no such switch: a laptop's
 own Fn lock (often Fn+Esc) is the way there.
 
@@ -100,7 +103,7 @@ A local file (or a `localhost:` one) is fetched by `<host>` from this machine by
 name, so that name must work for `ssh` on `<host>`.
 
 The window opens on `<host>`'s desktop session (on Linux sopen finds it through
-`systemctl --user`). On macOS an app started over ssh cannot take focus: sopen's own window
+`systemctl --user`). On macOS an app started over ssh cannot take focus: the xtools window
 floats above the other windows until you click, type or scroll in it (or it gets focus), but the editor
 (for text) opens behind the active app; under KDE Plasma it is brought to the screen you are on. From a terminal, Ctrl+C reaches `<host>` and closes the window
 there; a sopen stopped without a terminal leaves the window on `<host>` open.
@@ -158,7 +161,7 @@ yet a real one.
 sopen myserver:/srv/app        # two panels on the folder, as in Total Commander
 ```
 
-A folder opens in sopen's own window: two file panels side by side, each listing `..`, then the
+A folder opens in an xtools window: two file panels side by side, each listing `..`, then the
 folders, then the files (Name · Ext · Size · Date · Time; hidden files dimmed), with
 `N Listed = N bytes` and `N Bytes Free` at the foot.
 
@@ -215,7 +218,7 @@ themselves, and a folder that does not answer says so instead of holding the tre
 the folder in the panel; `Esc` or `F10` closes the tree with the panel as it was. While the tree is
 open the other side keeps what it showed.
 
-Every sopen window looks like PC Shell from the DOS PC Tools 5.5 / 6: the VGA text font, blue
+Every xtools window looks like PC Shell from the DOS PC Tools 5.5 / 6: the VGA text font, blue
 windows framed in box lines (a double line around the active one) with their title in the frame,
 the light-red highlight bar, the title row with the clock, the F-key row at the bottom (only the
 keys that work there are labelled), cyan dialogs with a shadow.
@@ -367,7 +370,7 @@ sopen --hex myserver:/srv/notes.txt   # any file straight in the hex editor, no 
 ```
 
 Anything that is not a folder, text, an image or media opens a small dialog first — its name, size
-and type; nothing is downloaded yet. **Enter** opens sopen's hex editor (the default) at once,
+and type; nothing is downloaded yet. **Enter** opens the xtools hex editor (the default) at once,
 reading only what is on screen. **Save to…** downloads it to the path below the buttons — your
 download folder at first, or the one "Browse…" picks — and never over an existing file: if the name
 is taken it says so and offers the next free one (`data-1.zip`). **Esc** (or closing the window)

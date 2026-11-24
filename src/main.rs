@@ -32,10 +32,11 @@ const EXIT_CONFLICT: u8 = 3;
     about = "Open a file or folder on another machine as if it were local",
     long_about = "Open a file or folder on another machine as if it were local.\n\n\
         SOURCE uses scp syntax: [user@]host:path (relative paths are under the remote home) or a \
-        local path. A folder opens in sopen's own file browser (two panels; Enter shows a file in \
-        its viewer, F4 opens VS Code or Zed); text opens in VS Code when present, otherwise Zed; \
-        images, video and audio in sopen's own window. Any other file (a zip, a binary) asks first: open it in \
-        sopen's hex editor (the default) or save it to a path you choose. --hex opens any file in \
+        local path. A folder opens in xtools, sopen's own tool, in its file browser (two panels; \
+        Enter shows a file in its viewer, F4 opens VS Code or Zed); text opens in VS Code when \
+        present, otherwise Zed; images, video and audio in an xtools window. Any other file (a \
+        zip, a binary) asks first: open it in the xtools hex editor (the default) or save it to a \
+        path you choose. --hex opens any file in \
         the hex editor. An http:// or https:// address opens in the default browser.\n\n\
         It opens on this machine, or with --target HOST on HOST's screen (sopen runs there, \
         started over ssh). SOPEN_TARGET or `sopen config target HOST` make a HOST the default; \
@@ -63,7 +64,7 @@ struct Cli {
     /// Open a copy in this local app; Enter in the terminal uploads the changes
     #[arg(long, value_name = "APP")]
     app: Option<String>,
-    /// Open the file in sopen's hex editor, whatever its type (no dialog first)
+    /// Open the file in the xtools hex editor, whatever its type (no dialog first)
     #[arg(long, conflicts_with = "app")]
     hex: bool,
     /// Internal (HOST's half of `sopen URL` through a tunnel, spec §4a): once the address is
@@ -156,7 +157,7 @@ enum Cmd {
         wait_to_publish: bool,
     },
     /// Show the config file, or set where `sopen SOURCE` opens by default and what the Mac's
-    /// top row sends while sopen is in front
+    /// top row sends while an xtools window is in front
     Config {
         #[command(subcommand)]
         key: Option<ConfigKey>,
@@ -174,8 +175,8 @@ enum ConfigKey {
         #[arg(long, conflicts_with = "host")]
         unset: bool,
     },
-    /// macOS: F1…F12 without fn while sopen is in front (function, the default), or the
-    /// system's setting, never touched (system)
+    /// macOS: F1…F12 without fn while an xtools window is in front (function, the default), or
+    /// the system's setting, never touched (system)
     Fkeys {
         #[arg(value_name = "MODE", value_parser = ["function", "system"])]
         mode: String,
@@ -664,7 +665,7 @@ fn run_open(
 /// Where a kind opens without `--app` / `--hex` (spec §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
-    /// sopen's file browser (§3a).
+    /// The xtools file browser (§3a).
     Browser,
     /// VS Code, else Zed.
     Editor,
@@ -708,7 +709,7 @@ fn folder_run(hooks: &gui::Hooks, display: bool) -> FolderRun {
     }
 }
 
-/// A folder opens in sopen's file browser (spec §3a, owner message 12): two panels, Enter
+/// A folder opens in the xtools file browser (spec §3a, owner message 12): two panels, Enter
 /// shows a file in the viewer for its kind in the same window, F4 opens VS Code or Zed. With
 /// `SOPEN_LIST` the listing is printed instead of a window; with no display (Linux over ssh)
 /// the folder opens in the editor as before, and one line says why.
@@ -931,7 +932,7 @@ fn open_binary(
     }
 }
 
-/// Images and media open in sopen's own window (spec §6, §7). A remote one opens through a
+/// Images and media open in an xtools window (spec §6, §7). A remote one opens through a
 /// stream on this connection, whatever its size: nothing is fetched first ([`open_streamed`], 06
 /// §13). A local image is copied into the cache (Save needs the bytes as opened); local media is
 /// played in place. Without a display (Linux over ssh) and with no scripted save or export, the

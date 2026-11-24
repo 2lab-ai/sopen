@@ -85,9 +85,10 @@ fn text_sits_on_the_vga_cell_grid() {
     });
 }
 
-/// On screen, each part is in its colours: the title row's red block and cyan bar, the window's
-/// blue body (a label sits on it) with its title in the frame colour (white when active, light
-/// grey when not), the F-key row's digits light grey on black and labels black on cyan.
+/// On screen, each part is in its colours: the title row's red block (the tool's name, xtools)
+/// and cyan bar, the window's blue body (a label sits on it) with its title in the frame colour
+/// (white when active, light grey when not), the F-key row's digits light grey on black and
+/// labels black on cyan.
 #[test]
 fn the_parts_are_drawn_in_the_palette() {
     let p = PALETTE;
@@ -101,11 +102,11 @@ fn the_parts_are_drawn_in_the_palette() {
             Some(vec![frame_color]),
             "active={active}"
         );
-        assert_eq!(drv.colors_of(" sopen "), Some(vec![p.program_text]));
+        assert_eq!(drv.colors_of(" xtools "), Some(vec![p.program_text]));
         assert_eq!(drv.colors_of("box:/srv/data"), Some(vec![p.title_text]));
         assert_eq!(drv.colors_of("Save   "), Some(vec![p.key_text]));
         assert_eq!(drv.colors_of("5"), Some(vec![p.key_digit]));
-        let program = drv.find_text(" sopen ").unwrap();
+        let program = drv.find_text(" xtools ").unwrap();
         assert!(filled(&drv, program.center(), p.program_back));
         let place = drv.find_text("box:/srv/data").unwrap();
         assert!(filled(&drv, place.center(), p.title_back));

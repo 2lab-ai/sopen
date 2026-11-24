@@ -2195,7 +2195,7 @@ impl BinaryWindow {
                     egui::Button::new(egui::RichText::new("Open in hex editor").strong())
                         .fill(fill),
                 )
-                .on_hover_text("Enter — opens it in sopen's hex editor");
+                .on_hover_text("Enter — opens it in the xtools hex editor");
             if hex.clicked() {
                 self.start_hex(&ctx);
             }
