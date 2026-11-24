@@ -142,8 +142,12 @@ impl Fx {
     }
 
     /// `path` as the right side's frame shows it: that side has the odd column, 63 cells (504
-    /// points).
+    /// points). The frame the last pass drew there is held to that first, so the check is the
+    /// 504-point side's whatever the path's length — a short path is whole in a 496-point frame
+    /// too.
     fn framed_right(&self, path: &str) -> String {
+        let right = panes(self).last().map(|r| (r.left(), r.width()));
+        assert_eq!(right, Some((496.0, 504.0)), "the right side: 63 cells");
         chrome::frame_title(&self.drv.ctx, path, 504.0)
     }
 
@@ -628,6 +632,40 @@ fn the_sides_and_the_viewer_stand_on_the_cell_grid() {
     assert_eq!(panes(&fx), halves, "126 columns: two of 63");
 }
 
+/// A window hosted as the viewer that keeps the room and the clip its last pass was given.
+struct Probe(Arc<Mutex<Option<(Rect, Rect)>>>);
+
+impl Window for Probe {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        *self.0.lock().unwrap() = Some((ui.max_rect(), ui.clip_rect()));
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// The viewer is given all of the grid's cells and is clipped to them: what a viewer draws past
+/// its room is cut at the grid, never in the 8 points at its foot (10 §4).
+#[test]
+fn the_viewer_is_given_the_grid_and_clipped_to_it() {
+    let mut fx = fixture();
+    let given = Arc::new(Mutex::new(None));
+    let probe = Embedded {
+        window: Box::new(Probe(given.clone())),
+        settle: Box::new(|_| Some(Outcome::default())),
+    };
+    let (ctx, abs) = (fx.drv.ctx.clone(), format!("{}/notes.txt", fx.root));
+    fx.b.view(&ctx, probe, None, abs, None, false);
+    fx.drv.idle(&mut fx.b, 2);
+    let all = grid_columns(0, 125);
+    assert_eq!(
+        *given.lock().unwrap(),
+        Some((all, all)),
+        "its room, its clip"
+    );
+}
+
 /// The git panel over both sides (Cmd/Ctrl+Shift+G) is at all of the grid's cells, as the
 /// viewer is (10 §4).
 #[test]
@@ -646,6 +684,61 @@ fn the_wide_git_panel_is_the_whole_grid() {
         "the git panel over both sides"
     );
     assert_eq!(panes(&g.fx), [grid_columns(0, 125)], "at all the cells");
+}
+
+/// The two sides share an edge (10 §4), and a point on it is one side's — the right one's, as a
+/// cell's left edge is the cell's: one wheel notch at x 496 scrolls the right list alone, and
+/// at y 656, the grid's foot, neither.
+#[test]
+fn a_point_on_the_edge_two_sides_share_is_one_sides() {
+    let mut fx = fixture();
+    fx.key(Key::F9);
+    fx.settle();
+    let many = format!("{}/alpha", fx.root);
+    for i in 0..200 {
+        std::fs::write(format!("{many}/f{i:03}.txt"), "x").unwrap();
+    }
+    fx.b.list(None, many, None, None);
+    fx.settle();
+    // The rows one notch scrolls at `x`, `y`, in the left list and the right one.
+    let notch = |fx: &mut Fx, x: f32, y: f32| {
+        let before = [fx.b.panels[0].top, fx.b.panels[1].top];
+        fx.drv.wheel(&mut fx.b, Pos2::new(x, y), -1.0);
+        [
+            fx.b.panels[0].top - before[0],
+            fx.b.panels[1].top - before[1],
+        ]
+    };
+    let seen = [(496.0, 300.0), (250.0, 656.0), (495.0, 655.0)].map(|(x, y)| notch(&mut fx, x, y));
+    assert_eq!(
+        seen,
+        [[0, 3], [0, 0], [3, 0]],
+        "the edge the right side's, the grid's foot neither side's, the left side's last \
+         point its own"
+    );
+}
+
+/// A press on the edge the git panel on the left shares with the list on the right is the
+/// list's: the keyboard does not go into the git panel (10 §4).
+#[test]
+fn a_press_on_the_edge_beside_the_git_panel_is_not_the_git_panels() {
+    let Some(git) = crate::git::history::fixture::git() else {
+        return;
+    };
+    let mut g = s2::Gx::new(s2::small(&git));
+    g.wait_for_the_panel();
+    // The right list active, its bar on `..`: the git panel on the left.
+    g.fx.b.active = 1;
+    let git_side = g.git();
+    g.until("the git panel on the left", |b| {
+        b.shown.as_ref().is_some_and(|s| s[0] == git_side)
+    });
+    g.settle();
+    assert!(!g.fx.b.git.focus);
+    g.fx.drv.click(&mut g.fx.b, Pos2::new(496.0, 300.0));
+    assert!(!g.fx.b.git.focus, "the edge is the list's");
+    g.fx.drv.click(&mut g.fx.b, Pos2::new(495.0, 300.0));
+    assert!(g.fx.b.git.focus, "the git panel's last column is its own");
 }
 
 /// The panel's foot never hides its count: on the narrowest window, and with a total too long

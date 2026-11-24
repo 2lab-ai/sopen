@@ -840,6 +840,22 @@ fn second_click(resp: &egui::Response, row: egui::Id) -> bool {
     })
 }
 
+/// Whether `p` is on `pane`, a pane's rect on the grid, its right and bottom edges outside it
+/// as a cell's are ([`Grid::at`]): a point on the edge two sides share is one side's, the right
+/// one's, never both — egui's `Rect::contains` holds both edges (10 §4).
+fn on_pane(pane: Rect, p: Pos2) -> bool {
+    pane.min.x <= p.x && p.x < pane.max.x && pane.min.y <= p.y && p.y < pane.max.y
+}
+
+/// Whether the pointer is over `pane` as [`egui::Ui::rect_contains_pointer`] says (in the clip,
+/// on `ui`'s layer), its right and bottom edges outside it ([`on_pane`]).
+fn pointer_on_pane(ui: &egui::Ui, pane: Rect) -> bool {
+    ui.rect_contains_pointer(pane)
+        && ui
+            .input(|i| i.pointer.interact_pos())
+            .is_some_and(|p| on_pane(pane, p))
+}
+
 /// The keys the status row names when nothing else is to be said.
 const LIST_HINT: &str =
     "Enter open · Tab other panel · Backspace up · a letter jumps to a name · F1 the keys";
@@ -2497,7 +2513,7 @@ impl Browser {
         let mut field = None;
         let panel = &mut self.panels[i];
         // The wheel scrolls the rows (the bar stays where it is).
-        if ui.rect_contains_pointer(rect) {
+        if pointer_on_pane(ui, rect) {
             let lines: f32 = ctx.input(|inp| {
                 inp.events
                     .iter()

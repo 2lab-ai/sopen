@@ -531,7 +531,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut TreeView, active: bool) ->
     let row_h = text_h.ceil();
     let visible = ((inner.height() / row_h).floor() as usize).max(1);
     // The wheel scrolls the rows (the bar stays where it is).
-    if ui.rect_contains_pointer(rect) {
+    if super::pointer_on_pane(ui, rect) {
         let lines: f32 = ctx.input(|i| {
             i.events
                 .iter()
