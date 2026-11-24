@@ -125,6 +125,7 @@ fn make(ticket: u64, view: View) -> Effect {
         view,
         at: view.is_bytes().then_some(0),
         notice: None,
+        encoding: None,
         viewing: view == Hex,
     }
 }
@@ -135,6 +136,7 @@ fn make_at(ticket: u64, view: View, at: u64) -> Effect {
         view,
         at: Some(at),
         notice: None,
+        encoding: None,
         viewing: view == Hex,
     }
 }
@@ -490,6 +492,9 @@ fn page_class_by_name() {
         ("feed.xml", true, PageClass::PageFirst),
         ("feed.xml", false, PageClass::PageThird),
         ("/srv/rss.XML", false, PageClass::PageThird),
+        // 09 serves only .html, .htm and .xml as pages.
+        ("feed.rss", false, PageClass::Plain),
+        ("feed.RSS", true, PageClass::Plain),
         ("pic.svg", true, PageClass::Plain),
         ("a.json", false, PageClass::Plain),
         ("Makefile", false, PageClass::Plain),
@@ -572,6 +577,7 @@ fn va2_hex_viewing_editing_and_a_switch() {
         view: Hex,
         at: Some(0),
         notice: None,
+        encoding: None,
         viewing: true,
     };
     let shown_viewing = Effect::Show {
@@ -754,7 +760,8 @@ fn d25_hidden_views_go_stale() {
                 CLEAN.at(80),
                 vec![hide(Hex), release(Hex), show_at(Raw, 80)],
             ),
-            (Input::SaveEnded { landed: true }, CLEAN, vec![close(Hex)]),
+            // Raw saves nothing; the text document reads the file again after it changed.
+            (Input::Reloaded, CLEAN, vec![close(Hex)]),
         ],
     );
     assert_eq!(set.place(Hex), Some(80), "kept for its next make");
@@ -1036,6 +1043,7 @@ fn d10_a_media_view_that_fails_on_screen_gives_way_to_hex() {
         view: Hex,
         at: Some(0),
         notice: Some(notice.clone()),
+        encoding: None,
         viewing: true,
     };
     for name in ["talk.mp4", "shot.png"] {
@@ -1082,6 +1090,7 @@ fn d10_a_media_view_that_fails_on_screen_gives_way_to_hex() {
         view: Hex,
         at: Some(0),
         notice: Some(notice.clone()),
+        encoding: None,
         viewing: true,
     };
     run(
@@ -1223,15 +1232,64 @@ fn a_make_that_fails_says_why() {
         ],
     );
     assert_eq!(summary(&set), "Hex idle made=Hex");
-    let mut set = blank();
+}
+
+/// D10 for a make: an Image (or Video, Audio) view that cannot be made cannot show the file. With
+/// Hex on screen, 1 says why from then on and is not tried again; with nothing on screen (VA-2's
+/// Save: the hex view closed, the stale image made again), Hex shows the file, the reason its
+/// first row (§1: every file has a hex view). Only a Hex view that fails too leaves.
+#[test]
+fn d10_a_media_view_that_cannot_be_made_gives_way_to_hex() {
+    let why = Why::Undecodable("unknown image format".to_string());
+    let mut set = open(named("shot.png"));
     run(
         &mut set,
-        vec![(
-            Input::MakeFailed(Ticket(1), "read failed".to_string()),
-            CLEAN,
-            vec![Effect::Say("read failed".to_string()), Effect::Leave],
-        )],
+        vec![
+            (choose(2), CLEAN, vec![make(0, Hex)]),
+            (
+                Input::Made(Ticket(0)),
+                CLEAN,
+                vec![hide(Image), release(Image), show(Hex)],
+            ),
+            (Input::Reloaded, CLEAN, vec![close(Image)]),
+            (choose(1), CLEAN, vec![make(1, Image)]),
+            (
+                Input::MakeFailed(Ticket(1), "unknown image format".to_string()),
+                CLEAN,
+                vec![say(&why)],
+            ),
+            (choose(1), CLEAN, vec![say(&why)]),
+        ],
     );
+    assert_eq!(set.unshown(), Some(&why));
+    assert_eq!(summary(&set), "Hex idle made=Hex");
+
+    let mut set = blank();
+    let first_row = Effect::Make {
+        ticket: Ticket(2),
+        view: Hex,
+        at: Some(0),
+        notice: Some(why.to_string()),
+        encoding: None,
+        viewing: true,
+    };
+    run(
+        &mut set,
+        vec![
+            (
+                Input::MakeFailed(Ticket(1), "unknown image format".to_string()),
+                CLEAN,
+                vec![first_row],
+            ),
+            (choose(1), CLEAN, vec![say(&why)]),
+            (
+                Input::MakeFailed(Ticket(2), "read failed".to_string()),
+                CLEAN,
+                vec![Effect::Say("read failed".to_string()), Effect::Leave],
+            ),
+        ],
+    );
+    assert!(set.is_left());
 }
 
 /// A different view chosen during a make replaces it; an abandoned make's answer is ignored.
@@ -1332,10 +1390,32 @@ fn d21_one_encoding_per_opening() {
                 vec![hide(Text), show_at(Hex, 0)],
             ),
             (Input::Reloaded, CLEAN, vec![close(Text)]),
-            (choose(1), CLEAN, vec![make(1, Text)]),
+            (choose(3), CLEAN, vec![in_cp949(1, Raw)]),
+            (Input::CancelMake, CLEAN, vec![Effect::Abandon(Ticket(1))]),
+            (choose(1), CLEAN, vec![in_cp949(2, Text)]),
         ],
     );
     assert_eq!(set.encoding(), Some("CP949"));
+    // A binary's 3, made after the encoding was said, decodes by it too (the Hex make above
+    // carried none).
+    let mut set = open(routed("blob.bin", &[0x7f, 0]));
+    let _ = set.apply(Input::Encoding("CP949".to_string()), CLEAN);
+    run(&mut set, vec![(choose(3), CLEAN, vec![in_cp949(0, Text)])]);
+    // Before the text document has said one, a make carries none: §7.2's default.
+    let mut set = open(routed("blob.bin", &[0x7f, 0]));
+    run(&mut set, vec![(choose(3), CLEAN, vec![make(0, Text)])]);
+}
+
+/// A text document made in the opening's CP949 (D21), at byte 0.
+fn in_cp949(ticket: u64, view: View) -> Effect {
+    Effect::Make {
+        ticket: Ticket(ticket),
+        view,
+        at: Some(0),
+        notice: None,
+        encoding: Some("CP949".to_string()),
+        viewing: false,
+    }
 }
 
 // ---- every pending state × every hold × every input ----
@@ -1397,6 +1477,7 @@ fn every_pending_state_by_every_hold_and_input() {
         view: Hex,
         at: Some(0),
         notice: Some(why.to_string()),
+        encoding: None,
         viewing: true,
     };
     /// An input, the holds it is tried with, its effects, the summary after (`=`: unchanged).
@@ -1501,7 +1582,8 @@ fn every_pending_state_by_every_hold_and_input() {
             (Input::Leave, any, vec![abandon(1), Effect::Leave], "left"),
             (Input::Made(Ticket(1)), any, vec![show(Image)], "Image idle made=Image"),
             (Input::Made(Ticket(99)), any, vec![], "="),
-            (fail(1), any, vec![x(), Effect::Leave], "left"),
+            // D10: Image cannot be made, so Hex shows the file, the reason its first row.
+            (fail(1), any, vec![first_row(2)], "- making Hex made="),
             (Input::CancelMake, any, vec![abandon(1), Effect::Leave], "left"),
             (Input::Cancelled, any, vec![], "="),
             (Input::Closed, any, vec![], "="),
@@ -1583,8 +1665,16 @@ fn check(before: &ViewSet, input: &Input, now: Now, fx: &[Effect], after: &ViewS
                 assert_eq!(after.on_screen(), Some(*view), "{what}");
                 assert!(after.is_made(*view), "{what}");
             }
-            Effect::Make { view, viewing, .. } => {
+            Effect::Make {
+                view,
+                viewing,
+                encoding,
+                ..
+            } => {
                 assert_eq!(*viewing, *view == Hex, "{what}: D35");
+                let text = matches!(view, Text | Raw);
+                let want = after.encoding().filter(|_| text);
+                assert_eq!(encoding.as_deref(), want, "{what}: D21");
                 assert_eq!(after.making(), Some(*view), "{what}");
                 assert_eq!(i + 1, fx.len(), "{what}: a make comes last");
             }

@@ -140,15 +140,16 @@ impl Slot {
     }
 }
 
-/// Where 09's page view goes among a text file's views (09 §5–§6, 08 D40).
+/// Where 09's page view goes among a text file's views (09 §5–§6, 08 D40). 09 serves only
+/// `.html`, `.htm` and `.xml` as pages: `.rss`, `.svg` and every other name are [`PageClass::Plain`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageClass {
     /// Not a page file.
     Plain,
-    /// `.html`, `.htm`, and XML whose first 8 KiB holds `<?xml-stylesheet` before the first
-    /// element: 1 Page · 2 Hex · 3 Text.
+    /// `.html`, `.htm`, and an `.xml` whose first 8 KiB holds `<?xml-stylesheet` before the
+    /// first element: 1 Page · 2 Hex · 3 Text.
     PageFirst,
-    /// Any other XML, RSS among it: 1 Text · 2 Hex · 3 Page.
+    /// Any other `.xml`, an RSS feed among them: 1 Text · 2 Hex · 3 Page.
     PageThird,
 }
 
@@ -319,17 +320,21 @@ pub enum Input {
     Choose(Slot),
     /// Esc or F3 left the viewer (§5: "Leaving asks the view on screen"). A view key and a leave
     /// in the same input are reported as the leave alone, or the leave after it: either way no
-    /// view is made ("Leave wins", §4).
+    /// view is made ("Leave wins", §4). While a view is being made, Esc alone is
+    /// [`Input::CancelMake`].
     Leave,
     /// The view [`Effect::Make`] asked for is made.
     Made(Ticket),
-    /// It could not be made: the words for the status row.
+    /// It could not be made: the words for the status row. An Image, Video or Audio view that
+    /// could not be made is one that cannot show the file (D10): 1 says why from then on, and
+    /// with nothing on screen Hex shows the file, the words its first row.
     MakeFailed(Ticket, String),
-    /// Esc on the status row while a view is being made: the make stops and the view on screen
-    /// stays (§5).
+    /// Esc while a view is being made: the make stops and the view on screen stays (§5). While
+    /// [`ViewSet::making`] is `Some`, an Esc the binding gets from VM-6 as `Command::Leave` is
+    /// this; F3, or an Esc in the same input as a view key, is [`Input::Leave`].
     CancelMake,
-    /// The close prompt was cancelled. A binding that cannot tell may leave it out: the next
-    /// choice asks again.
+    /// The close prompt was cancelled. Every binding reports it: until it does, the set counts
+    /// the prompt as up ([`ViewSet::asking`]).
     Cancelled,
     /// The view on screen agreed to close after the prompt: its Save or Save As landed, or
     /// Discard was chosen (07 §10). A landed Save's [`Input::SaveEnded`] comes first. Ignored
@@ -377,12 +382,16 @@ pub enum Effect {
     /// Make the view on a worker from what the opening kept, with progress and Esc on the status
     /// row; the view on screen, if any, stays until [`Input::Made`] says it is made. `at`: a
     /// byte view's place (its own, 0 the first time, or the one that followed the owner).
-    /// `notice`: the made view's first row (D10's reason). `viewing`: as for [`Effect::Show`].
+    /// `notice`: the made view's first row (D10's reason). `encoding`: for Text and Raw, the
+    /// opening's one encoding once the text document has said it — the document made decodes
+    /// by it (D21); `None`: §7.2's default, and always for the other views. `viewing`: as for
+    /// [`Effect::Show`].
     Make {
         ticket: Ticket,
         view: View,
         at: Option<u64>,
         notice: Option<String>,
+        encoding: Option<String>,
         viewing: bool,
     },
     /// Stop making the view of that ticket; whatever it answers later is ignored.
@@ -559,7 +568,9 @@ impl ViewSet {
         }
     }
 
-    /// The close prompt is up for a switch or a leave (VM-6: a question has the keys).
+    /// The close prompt was asked for a switch or a leave and its answer has not come back
+    /// ([`Input::Cancelled`], [`Input::Closed`], or a Save from it that did not land): the prompt
+    /// is up, or the Save chosen in it runs.
     pub fn asking(&self) -> bool {
         matches!(self.pending, Pending::Asking(_))
     }
@@ -622,11 +633,15 @@ impl ViewSet {
                     }
                 }
             }
-            Input::MakeFailed(ticket, why) => {
-                if matches!(self.pending, Pending::Making { ticket: t, .. } if t == ticket) {
-                    self.pending = Pending::Idle;
-                    out.push(Effect::Say(why));
-                    self.leave_if_blank(&mut out);
+            Input::MakeFailed(ticket, words) => {
+                if let Pending::Making {
+                    ticket: t, view, ..
+                } = self.pending
+                {
+                    if t == ticket {
+                        self.pending = Pending::Idle;
+                        self.make_failed(view, words, &mut out);
+                    }
                 }
             }
             Input::CancelMake => {
@@ -781,8 +796,26 @@ impl ViewSet {
             view,
             at: self.place(view),
             notice,
+            encoding: self.encoding.clone().filter(|_| view.doc() == Doc::Text),
             viewing: view == View::Hex,
         });
+    }
+
+    fn make_failed(&mut self, view: View, words: String, out: &mut Vec<Effect>) {
+        if !view.is_media() {
+            out.push(Effect::Say(words));
+            self.leave_if_blank(out);
+            return;
+        }
+        // D10: the media view cannot show the file, so 1 says why rather than trying again.
+        let why = Why::Undecodable(words);
+        if self.on_screen.is_none() {
+            // Every file has a hex view (§1).
+            self.give_way_to_hex(why, out);
+        } else {
+            out.push(Effect::Say(why.to_string()));
+            self.unshown = Some(why);
+        }
     }
 
     fn abandon(&mut self, out: &mut Vec<Effect>) {
@@ -793,7 +826,8 @@ impl ViewSet {
     }
 
     /// A make that ended with nothing on screen — the view that was there closed after its
-    /// prompt, or failed — leaves the viewer: there is no view to stay on.
+    /// prompt, or failed — leaves the viewer: there is no view to stay on. (A media view's
+    /// failed make gives way to Hex instead: `make_failed`.)
     fn leave_if_blank(&mut self, out: &mut Vec<Effect>) {
         if self.on_screen.is_none() {
             self.left = true;
@@ -843,12 +877,17 @@ impl ViewSet {
         let Some(view) = self.on_screen.filter(|v| v.is_media()) else {
             return;
         };
-        let notice = why.to_string();
-        self.unshown = Some(why);
         out.push(Effect::Close(view));
         self.doc_mut(view).made = false;
         self.on_screen = None;
-        // Whatever was under way goes; a Hex view being made is made again with its first row.
+        self.give_way_to_hex(why, out);
+    }
+
+    /// D10 with nothing on screen: from now on 1 says `why`, and Hex shows the file, `why` its
+    /// first row. Whatever was under way goes; a Hex view being made is made again with it.
+    fn give_way_to_hex(&mut self, why: Why, out: &mut Vec<Effect>) {
+        let notice = why.to_string();
+        self.unshown = Some(why);
         self.abandon(out);
         self.pending = Pending::Idle;
         if self.doc(View::Hex).made {
