@@ -189,6 +189,15 @@ GlobalShortcut filter and is not inhibit-gated (`src/input.cpp:1840, 1861-1865`)
 - X11 sessions: no such protocol; out of scope (the laptop is Wayland).
 
 ## 5. TUI mode (xtools in a terminal) — sources only
+
+> **Tension (2026-11-24, after this note):** this section reads Konsole as the owner's terminal. That
+> came from the orchestrator's brief, not a measurement. Measured afterwards (`ps` and `/proc/<pid>/environ` on the
+> laptop): the owner's shells run in **kitty 0.48.2** (`TERM=xterm-kitty`) and in **herdr-app** panes
+> (a GPUI app with libghostty-vt; `TERM_PROGRAM=ghostty`); no Konsole runs. The Konsole findings below
+> still describe Konsole. For kitty, XR-T (`tui-gui.md`) reports a `grab_keyboard` action that holds the
+> same shortcuts inhibitor, so "never reach the TUI" is not established for kitty [추정 until measured];
+> herdr-app holds none. The kitty keyboard protocol has no brightness code either way.
+
 - **Linux/Konsole: the top row's media keys never reach the TUI.** KWin consumes bound keys before
   Konsole (`input.cpp:1076-1082`); Konsole holds no inhibitor or keyboard grab (no match for
   keyboardGrab / shortcuts-inhibit in Konsole `src/` at tag v26.08.1 = the installed `konsole 26.08.1`,
@@ -221,7 +230,7 @@ GlobalShortcut filter and is not inhibit-gated (`src/input.cpp:1840, 1861-1865`)
 Files: `proto/scripts/receipt.sh` (= `the Linux laptop:/tmp/sopen-research-fkeys/proto/scripts/receipt.sh`),
 probe binary `/tmp/sopen-research-fkeys/target/debug/fkeys-probe`. Steps for the owner, at the laptop:
 1. Attach the keyboard to test (the folio = the laptop's own top row; repeat later for others).
-2. In Konsole inside the Plasma session: `bash /tmp/sopen-research-fkeys/proto/scripts/receipt.sh folio`
+2. In a terminal inside the Plasma session (kitty or a herdr-app pane): `bash /tmp/sopen-research-fkeys/proto/scripts/receipt.sh folio`
    (if it says the binary is missing: `bash /tmp/sopen-research-fkeys/build.sh`, about a minute).
 3. Step 1 CONTROL window (no inhibitor): press the key printed F1 → watch the screen → Next; the key
    printed F2 → Next; answer y/n in the terminal.
