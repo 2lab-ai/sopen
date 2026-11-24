@@ -301,3 +301,27 @@ changes. Rows here are snapshots taken when they were moved.
   showing its own scanned size as §6.1 says once its scan runs.
 - Still open, outside any WU: the owner's K-F3 (04 §8); G-R3 under bash (no account with a bash login
   shell).
+
+## R3 (part 1) — K-L1 closed 2026-11-24
+
+- Result: `../research/fkeys-linux.md`. It reverses 04 §6.4 for GUI mode on KDE Wayland. A focused
+  window may hold a `zwp_keyboard_shortcuts_inhibitor_v1`, which KWin 6.7.5 grants with no prompt
+  and applies only while that window has focus. The brightness key then reaches the window
+  (evdev 224) instead of running KDE's shortcut, and sopen can map it to F1. When the client dies,
+  the inhibitor is gone (`kill -9`, then the shortcut fired again). While the window is focused every other
+  global shortcut reaches it too. Handing such a key back through kglobalaccel's `invokeShortcut`
+  was measured for Alt+Tab. TUI mode cannot: KWin takes media keys before the terminal. macOS
+  keeps 04 §6.2 (no route without the temporary switch, or else an Accessibility grant).
+- The orchestrator read the run log `logs/e1/driver.log` and probe A2's log. In the control run
+  the shortcut fired (signals 0 → 1). With the inhibitor it did not (4 → 4), and the window got
+  `KEY_BRIGHTNESSDOWN`. With focus on another window it fired (→ 5), and after `kill -9` it fired
+  again (→ 6). The orchestrator also read the owner receipt script (it opens a probe window twice and
+  writes a log under `/tmp`; it changes no setting; the laptop's copy has the same SHA-256).
+  Measured only in a private headless KWin with injected keys: the real backlight, PowerDevil and
+  real keyboards wait for K-L2.
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| K-L1 | ✅ done 2026-11-24 | Feasibility gate for message 19 on Linux (KDE Plasma 6 Wayland): with a keyboard-shortcuts inhibitor on a focused sopen-like surface, does a globally bound top-row key (screen brightness) reach the client, can it be read under eframe, what else stops while sopen is focused, and is the inhibitor dropped when the client dies. Verdict: feasible in GUI mode with side effects; not in TUI mode. Output: `../research/fkeys-linux.md`. | research unit |

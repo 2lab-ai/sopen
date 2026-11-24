@@ -77,8 +77,9 @@ fn pcm(tools: &Tools, file: &Path, track: usize) -> (u32, Vec<Vec<f32>>) {
 /// does, and comes back as the `n` samples the container declares. A decoder that leaves the
 /// container's trims to the player gives more: ffmpeg 8 decodes Matroska AAC with its 1024
 /// priming samples (CodecDelay) and MP4 AAC to the end of its last frame (the edit list's end);
-/// ffmpeg 9 applies both, and the plain file decodes to exactly `n`. The trims are written into
-/// the file the same way by either.
+/// ffmpeg 9 applies both, and the plain file decodes to exactly `n`. ffmpeg 8 and 9.0 write the
+/// trims the same way; 9.1 writes an MP4's end in the edit list alone (whole frames in `stts`)
+/// and a Matroska end as DiscardPadding, which ffmpeg 9 applies ([`declared`]).
 fn pcm_as_plain(tools: &Tools, file: &Path, track: usize, n: usize) -> (u32, Vec<Vec<f32>>) {
     try_pcm_as_plain(tools, file, track, n).unwrap_or_else(|e| panic!("{e}"))
 }
@@ -144,7 +145,8 @@ fn try_pcm_as_plain(
             lanes[0].len() - lead.min(lanes[0].len())
         ));
     }
-    // Matroska declares no end trim for AAC: the padded bound, less than a frame past `n`.
+    // Matroska AAC from ffmpeg 8 and 9.0 declares no end trim: the padded bound, less than a
+    // frame past `n`.
     if ext == "mkv" && codec == "aac" && lanes[0].len() - lead - n >= 1024 {
         return Err(format!(
             "{}: track {track} decodes {} samples past its {n}, more than an AAC frame",
@@ -161,12 +163,13 @@ fn try_pcm_as_plain(
 }
 
 /// What a file says about its length, read from the file itself — not through a decoder, which
-/// may or may not apply it. MP4 / MOV ([`mp4_audio`]): the track's own sample count (`stts`)
-/// less the priming its edit list skips must be exactly `n`, and the edit list's segment must
-/// be `n` to its timescale's precision. Matroska AAC: CodecDelay must declare the priming;
-/// the end is not declared (ffmpeg writes no DiscardPadding for AAC), so only the padded bound
-/// holds there — the decode is at most one AAC frame longer, checked by the caller's plain
-/// comparison and [`pcm_as_plain`]'s crop. Other containers decode exactly on every ffmpeg.
+/// may or may not apply it. MP4 / MOV ([`mp4_audio`], [`mp4_declares`]): the edit list's
+/// segment must be `n` to its timescale's precision, and the track's own samples (`stts`) less
+/// the priming the edit list skips must hold them. Matroska AAC: CodecDelay must declare the
+/// priming; ffmpeg 8 and 9.0 declare no end (no DiscardPadding; 9.1 writes one), so only the
+/// padded bound holds there — the decode is at most one AAC frame longer, checked by the
+/// caller's plain comparison and [`pcm_as_plain`]'s crop. Other containers decode exactly on
+/// every ffmpeg.
 fn declared(file: &Path, track: usize, rate: u32, n: usize, codec: &str) -> Result<(), String> {
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
     let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
@@ -178,18 +181,8 @@ fn declared(file: &Path, track: usize, rate: u32, n: usize, codec: &str) -> Resu
                     file.display()
                 )
             })?;
-            let rate = u64::from(rate);
-            let plays = (a.stts as i64 - a.media_time.max(0)) as u64 * rate / a.track_scale;
-            let segment = a.segment as f64 * rate as f64 / a.movie_scale as f64;
-            let tick = rate as f64 / a.movie_scale as f64;
-            if plays != n as u64 || (segment - n as f64).abs() > tick.max(1.0) {
-                return Err(format!(
-                    "{}: track {track} declares {plays} samples (edit list: {segment:.1} from \
-                     sample {}), not {n}",
-                    file.display(),
-                    a.media_time
-                ));
-            }
+            mp4_declares(&a, rate, n)
+                .map_err(|why| format!("{}: track {track} {why}", file.display()))?;
         }
         "mkv" if codec == "aac" => {
             // CodecDelay (0x56AA), in nanoseconds, in each AAC track's header, in track order
@@ -218,6 +211,53 @@ fn declared(file: &Path, track: usize, rate: u32, n: usize, codec: &str) -> Resu
     Ok(())
 }
 
+/// Whether an MP4 / MOV sound track at `rate` declares exactly `n` samples, or what it declares.
+/// The edit list's segment is what a player plays: it must be `n` to its timescale's precision,
+/// less than one of its ticks off (exact at a timescale of the rate, within 44.1 samples at
+/// 1000, whichever way the muxer rounded). The sample table must hold the segment after the
+/// priming. Where its last sample is cut short, the muxer wrote the end trim there too
+/// (ffmpeg 8 and 9.0): it must end at exactly `n`, the one exact count a coarse edit list
+/// leaves. Where every sample is a whole frame (ffmpeg 9.1, whose AAC encoder marks the end
+/// padding on its last packet: only the edit list trims it), it holds `n` and less than one
+/// frame more.
+fn mp4_declares(a: &Mp4Audio, rate: u32, n: usize) -> Result<(), String> {
+    let (rate, n) = (u64::from(rate), n as u64);
+    let samples = |t: u64| t * rate / a.track_scale;
+    let held = samples((a.stts as i64 - a.media_time.max(0)).max(0) as u64);
+    let frame = samples(a.frame);
+    let cut_short = a.last < a.frame;
+    let segment = a.segment as f64 * rate as f64 / a.movie_scale as f64;
+    let tick = rate as f64 / a.movie_scale as f64;
+    let holds = if cut_short {
+        held == n
+    } else {
+        held >= n && held < n + frame
+    };
+    if !holds || (segment - n as f64).abs() >= tick {
+        // The count the file pins, where it pins one: its sample table cut short, or an edit
+        // list at a timescale of at least the rate.
+        let (count, table) = if cut_short {
+            (held.to_string(), "its last sample cut short".to_string())
+        } else if tick <= 1.0 {
+            (
+                format!("{}", segment.round()),
+                format!("in whole frames of {frame}"),
+            )
+        } else {
+            (
+                format!("{segment:.1}"),
+                format!("in whole frames of {frame}"),
+            )
+        };
+        return Err(format!(
+            "declares {count} samples (edit list: {segment:.1} from sample {}; sample table: \
+             {held} past it, {table}), not {n}",
+            a.media_time
+        ));
+    }
+    Ok(())
+}
+
 /// An MP4 / MOV audio track as its boxes declare it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Mp4Audio {
@@ -230,6 +270,9 @@ struct Mp4Audio {
     media_time: i64,
     /// Every sample's duration, summed (`stts`).
     stts: u64,
+    /// The longest sample's duration (one codec frame: 1024 for AAC), and the last one's.
+    frame: u64,
+    last: u64,
 }
 
 /// The boxes in `b` (`size`, `type`, contents), as `(type, contents)`.
@@ -299,9 +342,14 @@ fn mp4_audio(file: &[u8], track: usize) -> Result<Mp4Audio, String> {
         be(mdhd, 12, 4)
     };
     let stts = need(child(trak, &[b"mdia", b"minf", b"stbl", b"stts"]), "stts")?;
-    let total = (0..be(stts, 4, 4) as usize)
-        .map(|k| be(stts, 8 + 8 * k, 4) * be(stts, 12 + 8 * k, 4))
-        .sum();
+    // (count, duration) runs.
+    let runs: Vec<(u64, u64)> = (0..be(stts, 4, 4) as usize)
+        .map(|k| (be(stts, 8 + 8 * k, 4), be(stts, 12 + 8 * k, 4)))
+        .filter(|r| r.0 > 0)
+        .collect();
+    let total = runs.iter().map(|r| r.0 * r.1).sum();
+    let frame = runs.iter().map(|r| r.1).max().ok_or("an empty stts")?;
+    let last = runs.last().map_or(0, |r| r.1);
     // No edit list: all of the track.
     let (mut segment, mut media_time) = (total * movie_scale / track_scale, 0i64);
     if let Some(elst) = child(trak, &[b"edts", b"elst"]) {
@@ -345,6 +393,8 @@ fn mp4_audio(file: &[u8], track: usize) -> Result<Mp4Audio, String> {
         segment,
         media_time,
         stts: total,
+        frame,
+        last,
     })
 }
 
@@ -1468,8 +1518,9 @@ fn a_render_declaring_100_samples_more_is_refused() {
     let said = declared(&out, 0, 44_100, n, "aac").unwrap_err();
     assert!(said.contains("declares 88300 samples"), "{said}");
     assert!(declared(&out, 0, 44_100, n + 100, "aac").is_ok());
-    // A movie timescale of 1000 (ffmpeg 8's): the edit list says milliseconds, the track's own
-    // sample count still says exactly how many.
+    // A movie timescale of 1000 (ffmpeg 8's): the edit list says milliseconds, 44.1 samples a
+    // tick — fewer than the 100 — and where the sample table cuts its last sample short
+    // (ffmpeg 8, 9.0) it says exactly how many ([`mp4_declares`]).
     let coarse = tmp.path().join("coarse.m4a");
     ff(
         &tools,
@@ -1495,7 +1546,71 @@ fn a_render_declaring_100_samples_more_is_refused() {
     );
     assert!(declared(&coarse, 0, 44_100, n + 100, "aac").is_ok());
     let said = declared(&coarse, 0, 44_100, n, "aac").unwrap_err();
-    assert!(said.contains("declares 88300 samples"), "{said}");
+    // Whole frames (ffmpeg 9.1) leave only the edit list's 2002 ms to say how many.
+    let count = if boxes.last < boxes.frame {
+        "88300"
+    } else {
+        "88288.2"
+    };
+    assert!(
+        said.contains(&format!("declares {count} samples")),
+        "{said}"
+    );
+}
+
+/// The two ways ffmpeg writes an AAC track's end into MP4, at both timescales, without ffmpeg:
+/// 88 200 samples after 1024 of priming, 88 frames of 1024. ffmpeg 8 and 9.0 cut the last
+/// sample short (136) and the edit list says 88 200; ffmpeg 9.1 keeps all 88 frames whole and
+/// only the edit list says 88 200.
+#[test]
+fn an_mp4_declares_its_samples_in_its_edit_list_and_holds_them_in_its_sample_table() {
+    let track = |movie_scale: u64, segment: u64, stts: u64, last: u64| Mp4Audio {
+        movie_scale,
+        track_scale: 44_100,
+        segment,
+        media_time: 1024,
+        stts,
+        frame: 1024,
+        last,
+    };
+    let cut_short = track(44_100, 88_200, 87 * 1024 + 136, 136);
+    let whole = track(44_100, 88_200, 88 * 1024, 1024);
+    for a in [cut_short, whole] {
+        assert_eq!(mp4_declares(&a, 44_100, 88_200), Ok(()), "{a:?}");
+        for n in [88_199, 88_201, 88_100, 88_300] {
+            let why = mp4_declares(&a, 44_100, n).unwrap_err();
+            assert!(
+                why.contains("declares 88200 samples"),
+                "{a:?} as {n}: {why}"
+            );
+        }
+    }
+    // A coarse edit list: 2000 ms is 88 200 to within 44.1 samples.
+    let coarse_short = Mp4Audio {
+        movie_scale: 1000,
+        segment: 2000,
+        ..cut_short
+    };
+    let coarse_whole = Mp4Audio {
+        movie_scale: 1000,
+        segment: 2000,
+        ..whole
+    };
+    for a in [coarse_short, coarse_whole] {
+        assert_eq!(mp4_declares(&a, 44_100, 88_200), Ok(()), "{a:?}");
+        assert!(mp4_declares(&a, 44_100, 88_300).is_err(), "{a:?}");
+        assert!(mp4_declares(&a, 44_100, 88_100).is_err(), "{a:?}");
+    }
+    // The sample table cut short says exactly how many, where the edit list cannot tell ...
+    assert!(mp4_declares(&coarse_short, 44_100, 88_210).is_err());
+    // ... whole frames hold them and less than one more frame.
+    assert_eq!(mp4_declares(&coarse_whole, 44_100, 88_210), Ok(()));
+    // A sample table short of the segment, or a whole frame past it, is refused.
+    let short = track(44_100, 89_100, 88 * 1024, 1024);
+    let why = mp4_declares(&short, 44_100, 89_100).unwrap_err();
+    assert!(why.contains("sample table: 89088 past it"), "{why}");
+    let over = track(44_100, 88_000, 88 * 1024, 1024);
+    assert!(mp4_declares(&over, 44_100, 88_000).is_err());
 }
 
 /// `sopen cut` of AAC is Out − In long and its sound is where it was in the source: the old
@@ -1538,6 +1653,75 @@ fn an_aac_cut_is_where_it_was_in_the_source() {
         "the cut's sound is {lag} samples off (difference {worst})"
     );
     assert!(worst < 0.1, "re-encoded, still the source's sound: {worst}");
+}
+
+/// A 22.05 kHz mp3 (MPEG-2: 576-sample frames) edited and cut is exactly the timeline's samples,
+/// each where it was in the source — on ffmpeg 9.1 too, whose LAME tag at these rates says 529
+/// samples too little encoder delay ([`ffmpeg::mp3`]). Held to the source's own decode: a plain
+/// encode by the same ffmpeg carries the same tag, so [`pcm_as_plain`] cannot see it. The
+/// source says another encoder in its tag (`LAME3.100`), as a LAME-made file does: the output's
+/// is ffmpeg's own, which the mend looks for. It is constant-rate: a `sopen cut` of this chirp
+/// as a VBR (`-q:a 2`) mp3 matched it at no offset (ffmpeg 9.0.2 and 9.1, 2026-11-24) — a
+/// matter of its own.
+#[test]
+fn a_22_khz_mp3_edit_and_cut_are_the_timeline_s_samples_where_they_were() {
+    let Some(tools) = tools_or_skip() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("t.mp3");
+    let chirp = "aevalsrc='0.5*sin(2*PI*(200*t+300*t*t))'";
+    tones(
+        &tools,
+        &src,
+        chirp,
+        22_050,
+        &[
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "64k",
+            "-metadata:s:a:0",
+            "encoder=LAME3.100",
+        ],
+    );
+    let said = |file: &Path| ffmpeg::mp3::tag(&std::fs::read(file).unwrap()).expect("a tag");
+    assert_eq!(&said(&src).encoder, b"LAME3.100");
+    let (_, full) = pcm(&tools, &src, 0);
+    let at = |what: &str, got: &[f32], from: usize| {
+        let (lag, worst) = best_lag(&full[0], got, from, 2_500);
+        assert_eq!(lag, 0, "{what}: {lag} samples off (difference {worst})");
+        assert!(worst < 0.1, "{what}: still the source's sound: {worst}");
+    };
+    // Save and Export: 2–3 s, then 0.5–1.5 s.
+    let probe = ffmpeg::probe(&tools, &src).unwrap();
+    let pieces = [(44_100, 66_150), (11_025, 33_075)];
+    let spec = audio_spec(&probe, spans(22_050.0, &pieces, false));
+    let out = render(&tools, &src, "out.mp3", &spec);
+    let (_, edit) = pcm(&tools, &out, 0);
+    assert_eq!(edit[0].len(), 44_100, "the edit's samples");
+    assert_eq!(said(&out).delay, 576, "{:?}", said(&out));
+    at("the edit's first piece", &edit[0][..22_050], 44_100);
+    at("the edit's second piece", &edit[0][22_050..], 11_025);
+    // `sopen cut` 1–3 s.
+    let published = cut_and_publish(
+        &mut crate::remote::LocalFs::new(),
+        &tools,
+        &src,
+        tmp.path().to_str().unwrap(),
+        "t.mp3",
+        &CutRequest {
+            in_s: 1.0,
+            out_s: 3.0,
+            crop: None,
+        },
+        &tmp.path().join("work"),
+        &mut |_| {},
+    )
+    .unwrap();
+    let cut_file = tmp.path().join(&published.name);
+    let (_, cut) = pcm(&tools, &cut_file, 0);
+    assert_eq!(cut[0].len(), 44_100, "the cut's samples");
+    assert_eq!(said(&cut_file).delay, 576, "{:?}", said(&cut_file));
+    at("the cut", &cut[0], 22_050);
 }
 
 /// A 4 s, 25 fps frame counter with 1 kHz bursts at whole source seconds on one AAC track, the
