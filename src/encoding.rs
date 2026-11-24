@@ -87,14 +87,16 @@ impl<'a> Around<'a> {
         self.at + self.bytes.len() as u64
     }
 
-    /// What was read of the `n` bytes before `x`.
+    /// What was read of the `n` bytes before `x`. A place past the bytes read has nothing known
+    /// before it — the bytes up to it were not read — so it gets none (a caller's slip: a debug
+    /// build says so), never the last bytes read as if they ended at `x`.
     fn before(&self, x: u64, n: usize) -> &'a [u8] {
+        debug_assert!(x <= self.end(), "the bytes before {x} were not read");
         let lo = x.saturating_sub(n as u64).max(self.at);
-        let hi = x.min(self.end());
-        if hi <= lo {
+        if x > self.end() || x <= lo {
             return &[];
         }
-        &self.bytes[(lo - self.at) as usize..(hi - self.at) as usize]
+        &self.bytes[(lo - self.at) as usize..(x - self.at) as usize]
     }
 
     /// What was read of the `n` bytes from `x`.
@@ -514,8 +516,13 @@ impl Encoding {
     /// surrogate whose preceding unit is a high one, the only look-back a pair needs (D38).
     fn low_after_high(self, near: &Around, q: u64) -> bool {
         let be = self.big_endian();
-        let (before, at) = (near.before(q, 2), near.after(q, 2));
-        before.len() == 2 && at.len() == 2 && is_high(u16_of(before, be)) && is_low(u16_of(at, be))
+        // The unit at `q` first: a place at or past the bytes read has none, and no pair.
+        let at = near.after(q, 2);
+        if at.len() < 2 || !is_low(u16_of(at, be)) {
+            return false;
+        }
+        let before = near.before(q, 2);
+        before.len() == 2 && is_high(u16_of(before, be))
     }
 
     /// Whether a character start here needs a proof from before the place beyond

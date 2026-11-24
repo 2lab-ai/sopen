@@ -197,6 +197,25 @@ const VM1: [Encoding; 10] = [
     Ascii, Utf8, Utf16Le, Utf16Be, Ucs2Le, Ucs2Be, Utf32Le, Utf32Be, Latin1, Cp437,
 ];
 
+/// UTF-8 by std's own `Utf8Chunks`, an oracle of the lengths: each valid character its bytes,
+/// each invalid sequence one U+FFFD as long as std says it is.
+fn utf8_chunks(file: &[u8]) -> Vec<Cell> {
+    let mut out = Vec::new();
+    for chunk in file.utf8_chunks() {
+        out.extend(chunk.valid().chars().map(|ch| Cell {
+            ch,
+            len: ch.len_utf8() as u8,
+        }));
+        if !chunk.invalid().is_empty() {
+            out.push(Cell {
+                ch: FFFD,
+                len: chunk.invalid().len() as u8,
+            });
+        }
+    }
+    out
+}
+
 /// The start of every character of `cells`, then their end.
 fn starts(cells: &[Cell]) -> Vec<usize> {
     let mut out = Vec::with_capacity(cells.len() + 1);
@@ -226,6 +245,7 @@ fn check_rules(e: Encoding, file: &[u8], los: &[usize]) {
     let from = |x: usize| &all[index(x).expect("a character start")..];
     if e == Utf8 {
         assert_eq!(e.decode(file, true), today_decode(file, true), "{}", ctx());
+        assert_eq!(all, utf8_chunks(file), "{}", ctx());
     }
     for &lo in los {
         let line = &file[lo..];
@@ -259,6 +279,7 @@ fn check_rules(e: Encoding, file: &[u8], los: &[usize]) {
                 let piece = &file[lo..k];
                 assert_eq!(e.decode(piece, false), today_decode(piece, false));
                 assert_eq!(e.decode(piece, true), today_decode(piece, true));
+                assert_eq!(e.decode(piece, true).0, utf8_chunks(piece), "{}", ctx());
             }
         }
 
@@ -314,9 +335,21 @@ fn check_rules(e: Encoding, file: &[u8], los: &[usize]) {
                 let s = (s as usize).min(n);
                 assert!(index(s).is_some(), "{}: {s}", ctx());
                 assert_eq!(e.decode(&file[s..], true).0, from(s), "{}", ctx());
+                // The first character start at or after the rounded place…
+                let floor = (floor as usize).min(n);
+                let first = bounds[bounds.partition_point(|&b| b < floor)];
                 if e == Utf8 {
                     let today = if x == lo { lo } else { x + today_skip(file, x) };
                     assert_eq!(s, today, "{}", ctx());
+                    // …but for the stray continuation bytes today's skip passes over, each its
+                    // own U+FFFD: never a real character's start.
+                    let passed = &all[index(first).unwrap()..index(s).unwrap()];
+                    let stray = |(i, c): (usize, &Cell)| {
+                        c.ch == FFFD && c.len == 1 && file[first + i] & 0xC0 == 0x80
+                    };
+                    assert!(passed.iter().enumerate().all(stray), "{}: {s}", ctx());
+                } else {
+                    assert_eq!(s, first, "{}", ctx());
                 }
             }
         }
@@ -993,7 +1026,8 @@ fn ea5_the_nul_pattern_over_the_corpus() {
         ("Korean UTF-32LE", encode(Utf32Le, &korean), none),
         ("English UTF-8", english.clone().into_bytes(), none),
         ("Korean UTF-8", korean.clone().into_bytes(), none),
-        ("CP949 (KS X 1001 pairs)", cp949, none),
+        // No pattern; step 3's, CP949 once VM-4 fills it.
+        ("CP949 (KS X 1001 pairs)", cp949, found(Cp949)),
         ("Latin-1", latin1, none),
         ("random bytes", random, none),
         ("zeros", vec![0; 8192], none),
@@ -1014,10 +1048,10 @@ fn ea5_the_nul_pattern_over_the_corpus() {
         // The answer is the first 8 KiB's (D27).
         let head = &bytes[..bytes.len().min(SNIFF_BYTES)];
         for got in [pick(&bytes, false), pick(head, bytes.len() > SNIFF_BYTES)] {
-            if want == none {
-                // No pattern: steps 1–2 find nothing; step 3 (VM-4's) or 4 answers.
-                let later = [none, found(Cp949)];
-                assert!(later.contains(&got), "{name}: {got:?}");
+            if want == found(Cp949) {
+                // Steps 1–2 find nothing; step 4 answers until step 3 is filled. Every other
+                // sample without a pattern stays UTF-8 then too, so a wrong CP949 pick shows.
+                assert!([none, want].contains(&got), "{name}: {got:?}");
             } else {
                 assert_eq!(got, want, "{name}");
             }
@@ -1137,6 +1171,12 @@ fn ea7_a_standalone_low_surrogate_at_a_grid_point_and_a_jump_is_one_fffd() {
         }
         let x = e.restart_start(Around::new(0, &file), 2);
         assert_eq!(x, Some(2), "a restart keeps it too");
+        // So does `left`, at the unit and at its second byte (D38: only a valid pair's low
+        // half is moved past).
+        for left in [2, 3] {
+            let s = e.left_start(Around::new(0, &file), left);
+            assert_eq!(s, Some(2), "{e:?} left {left}");
+        }
     }
 }
 
@@ -1167,6 +1207,11 @@ fn ea7_not_wrapped_every_left_equals_the_whole_decode() {
         for left in 0..=line.len() as u64 {
             let s = e.left_start(Around::anchored(0, &line), left).unwrap();
             assert_eq!(s % e.unit() as u64, 0, "{e:?} {left}");
+            // The first character start at or after `left` rounded down: the row shows from
+            // the character `left` is in, or the next — never further on.
+            let floor = e.align_down(left) as usize;
+            let first = bounds[bounds.partition_point(|&b| b < floor)];
+            assert_eq!(s as usize, first, "{e:?} {left}");
             let i = bounds
                 .binary_search(&(s as usize))
                 .expect("a character start");
@@ -1177,6 +1222,32 @@ fn ea7_not_wrapped_every_left_equals_the_whole_decode() {
             );
         }
     }
+}
+
+/// The review's counterexample: `E3 81 81` at 9..12 read only up to 11, cut at 12. The bytes
+/// before 12 were not read, so they are not taken to be 9..11 (which would cut at 10, inside
+/// nothing the whole decode has); a debug build stops on the caller's slip.
+#[test]
+fn a_place_past_the_bytes_read_has_nothing_before_it() {
+    let mut file = vec![b'a'; 9];
+    file.extend([0xE3, 0x81, 0x81]);
+    let short = Around::new(0, &file[..11]);
+    match std::panic::catch_unwind(|| Utf8.grid_cut(short, 12)) {
+        Ok(cut) => assert_eq!(cut, Some(12)),
+        Err(slip) => {
+            let said = slip.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(said.contains("were not read"), "{said}");
+        }
+    }
+    assert_eq!(Utf8.grid_cut(Around::new(0, &file), 12), Some(12));
+    assert_eq!(Utf8.grid_cut(Around::new(0, &file[..11]), 11), Some(9));
+    // A UTF-16 place at or past the bytes read has no unit, so no pair, and is no slip.
+    let pair = encode(Utf16Le, "😀");
+    assert_eq!(
+        Utf16Le.restart_start(Around::new(0, &pair[..2]), 2),
+        Some(2)
+    );
+    assert_eq!(Utf16Le.left_start(Around::new(0, &pair[..2]), 3), Some(2));
 }
 
 // ---------------------------------------------------------------------------------------------
