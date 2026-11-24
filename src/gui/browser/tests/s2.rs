@@ -832,7 +832,9 @@ fn at_most_two_parked_streams_per_host() {
             })
         });
         g.settle();
-        assert!(r.in_flight() <= 2, "{} slots held", r.in_flight());
+        // A dropped stream gives its slot back on a thread of its own (Running's drop), so the
+        // third stream holds the slot first for a moment; a read in that moment waits, never fails.
+        g.until("at most two slots held", |_| r.in_flight() <= 2);
     }
     let dropped: Vec<bool> = tops
         .iter()
