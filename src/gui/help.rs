@@ -5,7 +5,10 @@
 //! - **What it lists** comes from the browser's one key table ([`for_context`]: its landed rows
 //!   of that context, the F-key slots a hosted viewer adds) or, in a window of its own (image,
 //!   media, hex, the binary dialog), from that window's F-key row ([`for_window`]). Both end with
-//!   the Cmd/Ctrl+digit aliases and the clickable row (04 §6.1).
+//!   the F-key aliases and the clickable row (04 §6.1), then where ⌘ and Ctrl apply.
+//! - **One text on every machine** (10 T27): keys are named by [`Mods::prefix`] (`Ctrl/⌘+R`,
+//!   `⌘+Backspace`), and the rows a machine cannot press (⌘⌫ off a Mac) are listed too, so the
+//!   page reads the same in a Mac window, a Linux one and a terminal.
 //! - **Who opens it**: a window of its own on F1 ([`super::own_keys`]); the browser on
 //!   `keys::Command::Help` with its context's page (S1-E). [`open`] puts it on screen.
 //! - **While it is open** it covers the window and takes the keyboard and the pointer: Esc, F1
@@ -51,7 +54,12 @@ fn page_upto(context: Context, mode: Mode, own: &[FKey], upto: keys::Slices) -> 
     // One line per wording, in the table's order; its keys plain ones first.
     let mut lines: Vec<(Vec<(bool, String)>, String)> = Vec::new();
     let mut slots = Vec::new();
-    for row in keys::rows(context, upto) {
+    // Every row of the context, whether this machine can press it or not (not `keys::rows`,
+    // which drops ⌘⌫ off a Mac): one text on every machine.
+    let rows = keys::TABLE
+        .iter()
+        .filter(|r| r.context == context && upto.has(r.slice));
+    for row in rows {
         let plain = match row.trigger {
             Trigger::Key(key, Mods::None) => {
                 slots.extend(chrome::fkey_number(key));
@@ -91,7 +99,7 @@ fn page_upto(context: Context, mode: Mode, own: &[FKey], upto: keys::Slices) -> 
     own.sort_by_key(|k| k.n);
     own.dedup_by_key(|k| k.n);
     out.extend(own.into_iter().map(own_line));
-    out.push(aliases());
+    out.extend(aliases());
     Page {
         title: format!("Keys in {}", context.name()),
         lines: out,
@@ -112,7 +120,7 @@ pub(crate) fn for_window(row: &[FKey]) -> Page {
     let mut row = row.to_vec();
     row.sort_by_key(|k| k.n);
     let mut lines: Vec<Line> = row.into_iter().map(own_line).collect();
-    lines.push(aliases());
+    lines.extend(aliases());
     Page {
         title: "Keys".to_string(),
         lines,
@@ -127,23 +135,33 @@ fn own_line(key: FKey) -> Line {
     }
 }
 
-/// The last line of every page: Cmd/Ctrl+digits and the row's slots act as F-keys (04 §6.1).
-fn aliases() -> Line {
-    Line {
-        keys: format!("{}+1…9, 0", keys::command_name()),
-        what: "F1…F10 (so does a click on a slot)".to_string(),
-    }
+/// The last lines of every page (10 T27): the F-key aliases, each with where it works —
+/// Cmd/Ctrl+digits and the row's slots everywhere (04 §6.1), Alt+digits in a terminal (10 §9) —
+/// then which of ⌘ and Ctrl a `Ctrl/⌘` key is.
+fn aliases() -> [Line; 2] {
+    let (cmd, alt) = (Mods::Command.prefix(), Mods::Alt.prefix());
+    [
+        Line {
+            keys: format!("{cmd}1…0 · {alt}1…0"),
+            what: format!("F1…F10 ({alt}1…0 in a terminal); so does a click on a slot"),
+        },
+        Line {
+            keys: cmd.trim_end_matches('+').to_string(),
+            what: "⌘ applies in a Mac window; Ctrl everywhere else (in a terminal on every OS)"
+                .to_string(),
+        },
+    ]
 }
 
 /// What a window's own F-key does, from its row's label (the viewers' keys, 01 §3a).
 fn describe(key: FKey) -> String {
-    let cmd = keys::command_name();
+    let cmd = Mods::Command.prefix();
     match (key.n, key.label) {
         (1, "Help") => "This screen".to_string(),
-        (3, "Exit") => format!("Close the window (as {cmd}+W)"),
-        (5, "Save") => format!("Save (as {cmd}+S)"),
-        (6, "Goto") => format!("Go to an offset (as {cmd}+G)"),
-        (7, "SaveAs") => format!("Save As: a new local file with your edits (as Alt+{cmd}+S)"),
+        (3, "Exit") => format!("Close the window (as {cmd}W)"),
+        (5, "Save") => format!("Save (as {cmd}S)"),
+        (6, "Goto") => format!("Go to an offset (as {cmd}G)"),
+        (7, "SaveAs") => format!("Save As: a new local file with your edits (as {cmd}Alt+S)"),
         (8, "Asc/hx") => "Type in the ASCII or the hex column (as Tab)".to_string(),
         (2, "Unwrap") => "One row per line (as W)".to_string(),
         (2, "Wrap") => "Wrap the lines at the window's width (as W)".to_string(),
@@ -333,7 +351,7 @@ pub(crate) fn end_pass(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::browser::keys::{rows, LANDED_SLICES};
+    use crate::gui::browser::keys::{Row, LANDED_SLICES};
     use crate::gui::testkit::Driver;
     use crate::gui::Window;
 
@@ -348,7 +366,6 @@ mod tests {
     fn the_list_page_lists_the_tables_rows() {
         let page = for_context(Context::List, Mode::Preview, &[]);
         assert_eq!(page.title, "Keys in the file list");
-        let cmd = keys::command_name();
         for (keys, what) in [
             ("F1", "This screen"),
             ("F2, Shift+F6", "Rename the entry under the bar, in place"),
@@ -371,11 +388,8 @@ mod tests {
                 "{keys}: {page:#?}"
             );
         }
-        assert!(
-            line(&page, &format!("Backspace, {cmd}+PgUp")).is_some(),
-            "{page:#?}"
-        );
-        assert!(line(&page, &format!("{cmd}+A")).is_some());
+        assert!(line(&page, "Backspace, Ctrl/⌘+PgUp").is_some(), "{page:#?}");
+        assert!(line(&page, "Ctrl/⌘+A").is_some());
         assert!(line(&page, "F9")
             .unwrap()
             .what
@@ -385,9 +399,9 @@ mod tests {
             .unwrap()
             .what
             .starts_with("Switch to preview mode"));
-        // Each landed row's key is on exactly one line.
+        // Each landed row's key is on exactly one line, the ones this machine cannot press too.
         let all: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
-        for row in rows(Context::List, LANDED_SLICES) {
+        for row in every_row(Context::List, LANDED_SLICES) {
             let name = row.trigger.name();
             let hits = all
                 .iter()
@@ -403,23 +417,20 @@ mod tests {
         );
         // S2 has landed: Cmd/Ctrl+G pins the git panel.
         assert_eq!(
-            line(&page, &format!("{cmd}+G")).map(|l| l.what.as_str()),
+            line(&page, "Ctrl/⌘+G").map(|l| l.what.as_str()),
             Some("Pin the git panel to the other side; again: unpin"),
             "{page:#?}"
         );
-        // S6 has landed: F7 makes a folder; F8, Del (and ⌘⌫ on macOS) delete to the Trash,
-        // Shift+F8 and Shift+Del without it — each action on one line.
+        // S6 has landed: F7 makes a folder; F8, Del and ⌘⌫ (a Mac window's, listed on every
+        // machine) delete to the Trash, Shift+F8 and Shift+Del without it — each action on one
+        // line.
         assert_eq!(
             line(&page, "F7").map(|l| l.what.as_str()),
             Some("Make a folder (asks its name)"),
             "{page:#?}"
         );
-        let delete = match cfg!(target_os = "macos") {
-            true => format!("F8, Del, {cmd}+Backspace"),
-            false => "F8, Del".to_string(),
-        };
         assert_eq!(
-            line(&page, &delete).map(|l| l.what.as_str()),
+            line(&page, "F8, Del, ⌘+Backspace").map(|l| l.what.as_str()),
             Some("Delete the selection or the entry (asks; locally to the Trash)"),
             "{page:#?}"
         );
@@ -428,8 +439,72 @@ mod tests {
             Some("Delete without the Trash (asks)"),
             "{page:#?}"
         );
-        assert_eq!(page.lines.last(), Some(&aliases()));
+        assert!(page.lines.ends_with(&aliases()), "{page:#?}");
         assert_eq!(page.lines.first().map(|l| l.keys.as_str()), Some("F1"));
+    }
+
+    /// Every row of `context` of the slices in `upto`, whether this machine can press it or not.
+    fn every_row(context: Context, upto: keys::Slices) -> impl Iterator<Item = &'static Row> {
+        keys::TABLE
+            .iter()
+            .filter(move |r| r.context == context && upto.has(r.slice))
+    }
+
+    /// The help is one text on every machine and in both backends (10 T27): the key names come
+    /// from no per-machine input — a command row reads `Ctrl/⌘+R`, never this machine's `Cmd+R`
+    /// or `Ctrl+R`; the Mac-only ⌘⌫ is listed off a Mac too — and the last lines name each
+    /// alias with where it works, then where ⌘ and Ctrl apply. The literals below hold on a
+    /// macOS build and on a Linux one alike (no `cfg!` in this test).
+    #[test]
+    fn the_help_is_one_text_on_every_machine() {
+        let page = page_upto(Context::List, Mode::Preview, &[], keys::ALL_SLICES);
+        let keys: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
+        for name in keys.iter().flat_map(|k| k.split(", ")) {
+            assert!(
+                !name.starts_with("Cmd+") && !name.starts_with("Ctrl+"),
+                "a machine's own name: {name} in {keys:?}"
+            );
+        }
+        assert!(keys.contains(&"Ctrl/⌘+R"), "{keys:?}");
+        assert!(keys.contains(&"Ctrl/⌘+U"), "{keys:?}");
+        assert!(keys.contains(&"F8, Del, ⌘+Backspace"), "{keys:?}");
+        assert_eq!(
+            aliases(),
+            [
+                Line {
+                    keys: "Ctrl/⌘+1…0 · Alt+1…0".into(),
+                    what: "F1…F10 (Alt+1…0 in a terminal); so does a click on a slot".into(),
+                },
+                Line {
+                    keys: "Ctrl/⌘".into(),
+                    what: "⌘ applies in a Mac window; Ctrl everywhere else (in a terminal on \
+                           every OS)"
+                        .into(),
+                },
+            ]
+        );
+        // Every context's page and a window's page end with those lines, one of each.
+        let window = for_window(&[chrome::HELP_KEY, chrome::EXIT_KEY]);
+        for page in Context::ALL
+            .iter()
+            .map(|&c| page_upto(c, Mode::Preview, &[], keys::ALL_SLICES))
+            .chain([window])
+        {
+            assert!(page.lines.ends_with(&aliases()), "{page:#?}");
+            for alias in aliases() {
+                assert_eq!(
+                    page.lines.iter().filter(|l| **l == alias).count(),
+                    1,
+                    "{page:#?}"
+                );
+            }
+        }
+        // The rows that tell, per modifier: Shift, Alt, Cmd/Ctrl, Cmd/Ctrl+Shift, ⌘.
+        let git = page_upto(Context::Git, Mode::Preview, &[], keys::ALL_SLICES);
+        let git: Vec<&str> = git.lines.iter().map(|l| l.keys.as_str()).collect();
+        assert!(git.contains(&"Ctrl/⌘+Shift+F"), "{git:?}");
+        assert!(git.contains(&"Shift+F3"), "{git:?}");
+        assert!(keys.contains(&"F10, Alt+F10"), "{keys:?}");
     }
 
     /// F1 in the tree (05 §1, landed with S5): every key of the tree's context, the aliases last.
@@ -437,7 +512,6 @@ mod tests {
     fn the_tree_page_lists_the_trees_keys() {
         let page = for_context(Context::Tree, Mode::Preview, &[]);
         assert_eq!(page.title, "Keys in the directory tree");
-        let cmd = keys::command_name();
         for (keys, what) in [
             ("F1", "This screen"),
             ("F10, Esc, Alt+F10", "Close the tree, the list as it was"),
@@ -447,7 +521,7 @@ mod tests {
             ("↑, ↓, PgUp, PgDn, Home, End", "Move the bar"),
             ("a letter", "The next folder starting with it"),
             ("Space", "Size the folder now"),
-            (&format!("{cmd}+R"), "List the folder again"),
+            ("Ctrl/⌘+R", "List the folder again"),
         ] {
             assert_eq!(
                 line(&page, keys).map(|l| l.what.as_str()),
@@ -455,7 +529,7 @@ mod tests {
                 "{keys}: {page:#?}"
             );
         }
-        assert_eq!(page.lines.last(), Some(&aliases()));
+        assert!(page.lines.ends_with(&aliases()), "{page:#?}");
     }
 
     /// F1 in the git panel (03 §9; S2's keys, S3's and S4's since they landed), each on one
@@ -469,7 +543,6 @@ mod tests {
     fn the_git_page_lists_the_git_panels_keys() {
         let page = for_context(Context::Git, Mode::Preview, &[]);
         assert_eq!(page.title, "Keys in the git panel");
-        let cmd = keys::command_name();
         for (keys, what) in [
             ("F1", "This screen"),
             ("Shift+F3", "The file at this revision"),
@@ -491,16 +564,13 @@ mod tests {
             ("Tab, Shift+Tab", "Back to the list"),
             ("Esc", "Close the innermost open thing; with none, unpin"),
             ("a letter", "Find, starting with it"),
-            (&format!("{cmd}+Shift+F"), "History search"),
-            (&format!("{cmd}+F"), "Find"),
-            (&format!("{cmd}+R"), "Refresh (hard)"),
-            (&format!("{cmd}+J"), "The bar to HEAD"),
-            (
-                &format!("{cmd}+Shift+G"),
-                "The git panel over both sides, and back",
-            ),
-            (&format!("{cmd}+G"), "Pin this git panel; again: unpin"),
-            (&format!("{cmd}+K"), "The filters"),
+            ("Ctrl/⌘+Shift+F", "History search"),
+            ("Ctrl/⌘+F", "Find"),
+            ("Ctrl/⌘+R", "Refresh (hard)"),
+            ("Ctrl/⌘+J", "The bar to HEAD"),
+            ("Ctrl/⌘+Shift+G", "The git panel over both sides, and back"),
+            ("Ctrl/⌘+G", "Pin this git panel; again: unpin"),
+            ("Ctrl/⌘+K", "The filters"),
             // S3, and S4's F2.
             ("F2", "A commit: reword it; a branch's label: rename it"),
             ("F5", "Cherry-pick it or the marked ones; a stash: apply it"),
@@ -508,33 +578,24 @@ mod tests {
             ("F7", "A new branch here (uncommitted row: commit)"),
             ("F8", "Delete, drop or discard what is under the bar (asks)"),
             ("F10, Shift+F10", "The menu of what is under the bar"),
-            (&format!("{cmd}+Shift+R"), "Fetch all"),
-            (&format!("{cmd}+Z"), "Undo the newest backup group"),
-            (&format!("{cmd}+B"), "The backups"),
-            (&format!("{cmd}+L"), "The command log"),
+            ("Ctrl/⌘+Shift+R", "Fetch all"),
+            ("Ctrl/⌘+Z", "Undo the newest backup group"),
+            ("Ctrl/⌘+B", "The backups"),
+            ("Ctrl/⌘+L", "The command log"),
             (
-                &format!("{cmd}+Shift+C"),
+                "Ctrl/⌘+Shift+C",
                 "The operation in progress: Continue (asks)",
             ),
-            (
-                &format!("{cmd}+Shift+S"),
-                "The operation in progress: Skip (asks)",
-            ),
-            (
-                &format!("{cmd}+Shift+A"),
-                "The operation in progress: Abort (asks)",
-            ),
-            (
-                &format!("{cmd}+Shift+B"),
-                "Bisect in progress: Reset (asks)",
-            ),
+            ("Ctrl/⌘+Shift+S", "The operation in progress: Skip (asks)"),
+            ("Ctrl/⌘+Shift+A", "The operation in progress: Abort (asks)"),
+            ("Ctrl/⌘+Shift+B", "Bisect in progress: Reset (asks)"),
             // S4.
             (
-                &format!("{cmd}+E"),
+                "Ctrl/⌘+E",
                 "Plan a history edit from the commit under the bar",
             ),
-            (&format!("{cmd}+Shift+M"), "An edit stop: Amend (asks)"),
-            (&format!("{cmd}+Shift+P"), "An edit stop: Split (asks)"),
+            ("Ctrl/⌘+Shift+M", "An edit stop: Amend (asks)"),
+            ("Ctrl/⌘+Shift+P", "An edit stop: Split (asks)"),
         ] {
             assert_eq!(
                 line(&page, keys).map(|l| l.what.as_str()),
@@ -546,7 +607,7 @@ mod tests {
             .unwrap()
             .what
             .starts_with("Switch to dual mode"));
-        assert_eq!(page.lines.last(), Some(&aliases()));
+        assert!(page.lines.ends_with(&aliases()), "{page:#?}");
     }
 
     /// A viewer in the browser: the table's viewer rows, then the viewer's own slots the table
@@ -557,6 +618,7 @@ mod tests {
         own.extend_from_slice(chrome::HEX_KEYS);
         let page = for_context(Context::Viewer, Mode::Preview, &own);
         let keys: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
+        let [digits, command] = aliases();
         assert_eq!(
             keys,
             [
@@ -567,18 +629,19 @@ mod tests {
                 "F6",
                 "F7",
                 "F8",
-                &aliases().keys
+                &digits.keys,
+                &command.keys
             ]
         );
-        let cmd = keys::command_name();
-        assert_eq!(
-            line(&page, "F5").unwrap().what,
-            format!("Save (as {cmd}+S)")
-        );
+        assert_eq!(line(&page, "F5").unwrap().what, "Save (as Ctrl/⌘+S)");
         assert_eq!(line(&page, "F3, Esc").unwrap().what, "Back to the list");
         assert_eq!(
+            line(&page, "F6").unwrap().what,
+            "Go to an offset (as Ctrl/⌘+G)"
+        );
+        assert_eq!(
             line(&page, "F7").unwrap().what,
-            format!("Save As: a new local file with your edits (as Alt+{cmd}+S)")
+            "Save As: a new local file with your edits (as Ctrl/⌘+Alt+S)"
         );
     }
 
@@ -588,7 +651,7 @@ mod tests {
         let row = chrome::merged(&[chrome::HELP_KEY, chrome::EXIT_KEY], chrome::IMAGE_KEYS);
         let page = for_window(&row);
         assert_eq!(page.title, "Keys");
-        let cmd = keys::command_name();
+        let [digits, command] = aliases();
         assert_eq!(
             page.lines,
             [
@@ -598,29 +661,30 @@ mod tests {
                 },
                 Line {
                     keys: "F3".into(),
-                    what: format!("Close the window (as {cmd}+W)")
+                    what: "Close the window (as Ctrl/⌘+W)".into()
                 },
                 Line {
                     keys: "F5".into(),
-                    what: format!("Save (as {cmd}+S)")
+                    what: "Save (as Ctrl/⌘+S)".into()
                 },
                 Line {
                     keys: "F7".into(),
-                    what: format!("Save As: a new local file with your edits (as Alt+{cmd}+S)")
+                    what: "Save As: a new local file with your edits (as Ctrl/⌘+Alt+S)".into()
                 },
-                aliases(),
+                digits,
+                command,
             ]
         );
     }
 
     /// Every context's page, with every slice landed, holds every row once (S2–S5 open their
-    /// contexts' help with this).
+    /// contexts' help with this), the ones this machine cannot press too.
     #[test]
     fn every_contexts_page_covers_its_rows() {
         for context in Context::ALL {
             let page = page_upto(context, Mode::Preview, &[], keys::ALL_SLICES);
             let all: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
-            for row in rows(context, keys::ALL_SLICES) {
+            for row in every_row(context, keys::ALL_SLICES) {
                 let name = row.trigger.name();
                 let hits = all
                     .iter()
@@ -628,10 +692,10 @@ mod tests {
                     .count();
                 assert_eq!(hits, 1, "{context:?}: {name} in {all:?}");
             }
-            if rows(context, keys::ALL_SLICES).any(|r| r.trigger == Trigger::Letter) {
+            if every_row(context, keys::ALL_SLICES).any(|r| r.trigger == Trigger::Letter) {
                 assert!(all.contains(&"a letter"), "{context:?}");
             }
-            assert_eq!(page.lines.last(), Some(&aliases()), "{context:?}");
+            assert!(page.lines.ends_with(&aliases()), "{context:?}");
         }
     }
 
@@ -679,13 +743,15 @@ mod tests {
             drv.colors_of("F2, Shift+F6"),
             Some(vec![chrome::PALETTE.help_key])
         );
-        let alias = aliases().keys;
-        assert!(drv.find_text(&alias).is_none(), "below the screen");
+        let [digits, command] = aliases();
+        assert!(drv.find_text(&digits.keys).is_none(), "below the screen");
         assert!(drv
             .find_text("Esc, F1 or F3: back · ↑ ↓ PgUp PgDn: more")
             .is_some());
         drv.key(&mut win, Key::End, egui::Modifiers::NONE);
-        assert!(drv.find_text(&alias).is_some(), "End: the last line");
+        // Whole, not cut: the alias keys fit the key column.
+        assert!(drv.find_text(&digits.keys).is_some(), "End: the aliases");
+        assert!(drv.find_text(&command.keys).is_some(), "End: the last line");
         assert!(drv.find_text("This screen").is_none());
         drv.key(&mut win, Key::Home, egui::Modifiers::NONE);
         assert!(drv.find_text("This screen").is_some());

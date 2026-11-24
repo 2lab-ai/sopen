@@ -306,25 +306,18 @@ impl Mods {
         self != Mods::MacCmd || cfg!(target_os = "macos")
     }
 
-    /// How the help screen writes them before the key: `Shift+`, `Cmd+` / `Ctrl+`.
+    /// How the help screen writes them before the key, the same on every machine (10 T27):
+    /// `Shift+`, `Ctrl/⌘+` (⌘ in a Mac window, Ctrl everywhere else), `⌘+` for the Mac-only ⌘.
     pub fn prefix(self) -> String {
-        let command = command_name();
         match self {
-            Mods::None => String::new(),
-            Mods::Shift => "Shift+".to_string(),
-            Mods::Alt => "Alt+".to_string(),
-            Mods::Command | Mods::MacCmd => format!("{command}+"),
-            Mods::CommandShift => format!("{command}+Shift+"),
+            Mods::None => "",
+            Mods::Shift => "Shift+",
+            Mods::Alt => "Alt+",
+            Mods::Command => "Ctrl/⌘+",
+            Mods::CommandShift => "Ctrl/⌘+Shift+",
+            Mods::MacCmd => "⌘+",
         }
-    }
-}
-
-/// The platform's name of egui's COMMAND: `Cmd` on macOS, `Ctrl` elsewhere.
-pub fn command_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Cmd"
-    } else {
-        "Ctrl"
+        .to_string()
     }
 }
 
@@ -341,7 +334,7 @@ pub enum Trigger {
 }
 
 impl Trigger {
-    /// How the help screen writes it: `Shift+F6`, `Cmd+A`, `+`, `a letter`.
+    /// How the help screen writes it: `Shift+F6`, `Ctrl/⌘+A`, `+`, `a letter`.
     pub fn name(self) -> String {
         match self {
             Trigger::Key(key, mods) => format!("{}{}", mods.prefix(), key_name(key)),
@@ -1323,19 +1316,22 @@ mod tests {
         assert_eq!(left, vec![press(K::A, SHIFT)]);
     }
 
-    /// The help screen's names: the platform's command key, the arrows as glyphs.
+    /// The help screen's names, one text on every machine (10 T27): Cmd/Ctrl as `Ctrl/⌘`, the
+    /// Mac-only ⌘ as `⌘`, the arrows as glyphs.
     #[test]
     fn trigger_names() {
-        let cmd = command_name();
         assert_eq!(Trigger::Key(K::F6, Mods::Shift).name(), "Shift+F6");
-        assert_eq!(Trigger::Key(K::A, Mods::Command).name(), format!("{cmd}+A"));
+        assert_eq!(Trigger::Key(K::F10, Mods::Alt).name(), "Alt+F10");
+        assert_eq!(Trigger::Key(K::A, Mods::Command).name(), "Ctrl/⌘+A");
+        assert_eq!(Trigger::Key(K::R, Mods::Command).name(), "Ctrl/⌘+R");
         assert_eq!(
             Trigger::Key(K::F, Mods::CommandShift).name(),
-            format!("{cmd}+Shift+F")
+            "Ctrl/⌘+Shift+F"
         );
+        assert_eq!(Trigger::Key(K::ArrowLeft, Mods::Command).name(), "Ctrl/⌘+←");
         assert_eq!(
-            Trigger::Key(K::ArrowLeft, Mods::Command).name(),
-            format!("{cmd}+←")
+            Trigger::Key(K::Backspace, Mods::MacCmd).name(),
+            "⌘+Backspace"
         );
         assert_eq!(Trigger::Key(K::Escape, Mods::None).name(), "Esc");
         assert_eq!(Trigger::Char('*').name(), "*");
