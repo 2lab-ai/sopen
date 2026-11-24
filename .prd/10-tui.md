@@ -107,8 +107,11 @@ switch opens the window (§7.1). **Hand-off box**: the TUI's stand-in for a cont
   101/101 key-table rows, 26/26 ⌘ variants and 20/20 F-key aliases reach the GUI's command; under
   legacy encoding 90/101 and 4/10 aliases, every loss already in crossterm's decode (§9). Its rules,
   egui-winit 0.37's event shape:
-  - a named key → `Event::Key` with modifiers; Cmd/Ctrl+X and +C → `Cut` / `Copy` alone; without the
-    kitty protocol's event types a release is made after the key;
+  - a named key → `Event::Key` with modifiers; Cmd/Ctrl+X and +C → `Cut` / `Copy`, then X's or C's
+    release; a bracketed paste → `Paste`, then V's release, as a window's Cmd/Ctrl+V gives; every
+    press is followed at once by a made release, and releases the terminal reports are dropped
+    (`term_input::RELEASES`, as built in #106: the shell's digit aliases and egui's repeat marking
+    need a release, and kitty reports none for text keys under flag 1);
   - **Ctrl → egui's `command` on every OS** (T26): Ctrl+x arrives with `ctrl` and `command` set, as
     egui reports Ctrl on Linux, so every Cmd/Ctrl row matches (`Mods::matches` needs `m.command`,
     `keys.rs:290-301`; a Mac's ⌃ alone would match none; the spike's negative control with egui-winit's
@@ -207,8 +210,8 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
   `the window did not open: <reason> — check the display, or set a target` (T31).
 - In a **switched window** — one opened by a switch, here or on HOST through `--state-stdin` —
   F12, `[TUI]` or closing it returns, even with no terminal on HOST's side. Cmd/Ctrl+Q and +W are
-  that close too — the shell already treats them as the close button (`closing()`,
-  `gui/mod.rs:1174-1185`) — so they return with the state (on HOST, with the cue) (M1). A window
+  that close too — the shell already treats them as the close button (`closing()` in
+  `gui/mod.rs`) — so they return with the state (on HOST, with the cue) (M1). A window
   started directly quits on close, as today; it shows `[TUI]` only when its process has a terminal
   on input and output (F12 then takes it), else neither works there.
 
@@ -474,7 +477,7 @@ WV-D still ships without waiting (09 §12).
 | T24 | XF lands after X6 and X7 (and so after X3 and X4) | message 23 asks for pictures and video in the terminal itself; a flip with them handed off falls short of it |
 | T25 | Every printable ASCII character egui names a key for becomes `Event::Key` + `Event::Text` in the TUI, as egui-winit sends it; other ASCII and non-ASCII text (Hangul) stay `Text` alone (widened in round 2) | the key table matches key triggers only on `Event::Key` (`keys.rs:602-617, 1029-1031`); the viewers match letters as keys (`text.rs:3979`, `image.rs:3258-3268, 4829`, `mod.rs:1880-1882`); no table row matches a plain letter, and fields insert from `Text` |
 | T26 | Ctrl = egui's `command` in the TUI on every OS; ⌘ only under the kitty protocol | ⌘ never reaches a terminal in legacy encoding; with a Mac's ⌃ as `ctrl` alone every Cmd row would be unreachable (`keys.rs:290-301`) |
-| T27 | The help in both backends is one text: every command row as `Ctrl/⌘+…` (`Mods::prefix`, `describe`), one line on where ⌘ applies, every alias with where it works | the help screen is 1:1 content; per-machine key names would differ |
+| T27 | The help in both backends is one text: every command row as `Ctrl/⌘+…` (`Mods::prefix`, `describe`), one line on where ⌘ applies, every alias with where it works; it lists the rows this machine can press (`keys::rows`), so ⌘⌫ is absent off macOS (#107's review) | the help screen is 1:1 content; per-machine key names would differ, and a row that cannot be pressed would mislead |
 | T28 | The in-process switch leaves the terminal (alternate screen and modes off); the remote switch keeps raw mode and the alternate screen, dims, deletes pictures and reads Ctrl+C; re-entry flushes pending input | the window owns the terminal's machine in one case and not in the other; keys typed meanwhile were meant for the window |
 | T29 | The remote switch's ssh runs with `BatchMode=yes` and `SSH_ASKPASS_REQUIRE=never`, HOST's stderr on the status row, one line per outcome | ssh cannot ask a question while the TUI holds raw mode; each end gets its own answer |
 | T30 | Returning with unsaved edits asks HOST's close prompt there; a writing job makes it wait; input ending with unsaved edits keeps HOST's window open (01 A11 over 09 §7's end-of-input close, which applies only to a window with nothing to lose); Cmd/Ctrl+Q and +W are that window's close and return with the cue, as in one process (round 2); `--state-stdin` makes HOST's window a switched window | an edit is never dropped unasked; the shell already treats Q and W as the close (`gui/mod.rs:1174-1185`); the owner can still return from a window with no terminal |

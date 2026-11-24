@@ -12,8 +12,8 @@ use crate::gui::testkit::Driver;
 use crate::gui::Window;
 use eframe::egui::{Color32, Event, Key, Modifiers, Pos2};
 
-/// The git panel filling the window, as a side of the browser draws it, with what its keys and
-/// clicks asked for.
+/// The git panel filling the window's cell grid, as the browser draws it over both sides (10 §4),
+/// with what its keys and clicks asked for.
 struct Host {
     view: GitView,
     active: bool,
@@ -30,7 +30,8 @@ impl Window for Host {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
-                let rect = ui.max_rect().shrink(2.0);
+                let grid = crate::gui::cells::Grid::over(ui.max_rect());
+                let rect = grid.rect(grid.all());
                 self.rect = rect;
                 self.actions
                     .extend(draw(ui, rect, &mut self.view, self.active));

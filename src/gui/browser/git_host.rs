@@ -2324,7 +2324,7 @@ impl Browser {
                 && inp
                     .pointer
                     .interact_pos()
-                    .is_some_and(|pos| rect.contains(pos))
+                    .is_some_and(|pos| on_pane(rect, pos))
         });
         if pressed && !self.ops.holds_keyboard() && self.tree.is_none() && self.listing.is_empty() {
             if side != 1 - self.active {
