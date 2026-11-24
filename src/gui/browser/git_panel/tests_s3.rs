@@ -702,7 +702,7 @@ fn the_menu_draws_in_the_dialog_look_and_its_keys_choose() {
     fx.click("Repository…");
     fx.idle();
     fx.assert_shows("Fetch all remotes…");
-    fx.assert_shows(&format!("{}+Shift+R", keys::command_name()));
+    fx.assert_shows("Ctrl/⌘+Shift+R");
     fx.press(Key::End);
     fx.press(Key::Enter);
     assert_eq!(
@@ -1222,10 +1222,7 @@ fn the_result_dialog_lists_each_step_and_the_error() {
     assert!(ResultDialog::of("Delete branch b", &outcome(false)).is_none());
     assert_eq!(
         dialogs::status_text("Deleted branch b", &outcome(false)),
-        format!(
-            "Deleted branch b · backup 20261123T102405Z · {}+Z undoes",
-            keys::command_name()
-        )
+        "Deleted branch b · backup 20261123T102405Z · Ctrl/⌘+Z undoes"
     );
     let mut quiet_outcome = outcome(false);
     quiet_outcome.backup = None;
@@ -1248,10 +1245,7 @@ fn the_result_dialog_lists_each_step_and_the_error() {
     fx.assert_shows("git branch -d b");
     fx.assert_shows("error: failed to push some refs to 'origin'\nhint: fetch first");
     fx.assert_shows("git push --progress origin refs/heads/b:refs/heads/b");
-    fx.assert_shows(&format!(
-        "backup 20261123T102405Z · {}+Z undoes",
-        keys::command_name()
-    ));
+    fx.assert_shows("backup 20261123T102405Z · Ctrl/⌘+Z undoes");
     fx.press(Key::Enter);
     assert_eq!(fx.host.results_closed, 1);
 
