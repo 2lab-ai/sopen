@@ -15,11 +15,18 @@
 //! the file and the byte of it a row starts at, and the memos are keyed the same way, so rows
 //! are found alike inside the line index and past it — where a line's start is found by
 //! looking back from a place, or is not known and the line is cut in pieces on the same
-//! [`RESTART`] grid ([`Span::loose`]). The `\r` before a line's end is dropped by the row that
-//! holds the end ([`Wrapper::cut`]), not looked for when the line is placed: its last byte may
+//! [`RESTART`] grid ([`Span::loose`]). The CR before a line's end is dropped by the row that
+//! holds the end ([`Wrapper::cut`]), not looked for when the line is placed: its last unit may
 //! be far away and not fetched.
+//!
+//! The characters are the document's encoding's (08 §7.3, [`Encoding::decode`]): a restart
+//! begins at the first character start its window's rule gives (rule 2), a place inside a line
+//! not wrapped at the first one at or after it (rule 4), and every offset is a multiple of the
+//! unit. Where no rule proves a character start (CP949, D28) the bytes show as placeholder
+//! marks ([`MARK`], dim) up to the first start one proves, never as characters.
 
-use super::{chrome, Span, Stale, TextDoc, Window_, LINE_MAX, TAB};
+use super::{chrome, Span, Stale, TextDoc, Window_, LINE_MAX, REACH, TAB};
+use crate::encoding::{Around, Encoding, AHEAD, W};
 use anyhow::Result;
 use eframe::egui::{self, Color32, FontId};
 use std::collections::HashMap;
@@ -36,51 +43,56 @@ const RESTART_BEHIND: u64 = 64;
 /// …and after it, for the cluster's end or the next word's start.
 const RESTART_AHEAD: u64 = 128;
 
-/// A character of a line as decoded: what it is (U+FFFD for bytes that are not UTF-8) and the
-/// bytes it takes in the file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Cell {
-    pub ch: char,
-    pub len: u8,
+/// A character of a line as decoded: what it is (U+FFFD for bytes that are not one) and the
+/// bytes it takes in the file — the encoding core's, one decoder per encoding.
+pub(super) use crate::encoding::Cell;
+
+/// A character as a row paints it: a C1 control (U+0080–U+009F, which Latin-1 makes of
+/// 0x80–0x9F) as a dim `·` (08 D32: it is valid, so not U+FFFD, and has no glyph), anything else
+/// as the skin shows it ([`chrome::shown_char`]). One cell either way: no byte moves.
+pub(super) fn face(c: char) -> char {
+    if faint(c) {
+        '·'
+    } else {
+        chrome::shown_char(c)
+    }
 }
 
-/// Decodes `bytes` — a piece of a line that starts at a character — as `from_utf8_lossy` does
-/// (each maximal bad sequence one U+FFFD). `whole`: the piece runs to the end of what it is cut
-/// from (the line, or a restart point), so a character cut in two at its end is bad bytes;
-/// otherwise such a character is left for the next piece. Returns the characters and the bytes
-/// they cover.
-pub(super) fn decode(bytes: &[u8], whole: bool) -> (Vec<Cell>, usize) {
-    let end = if whole {
-        bytes.len()
-    } else {
-        super::cut_char_start(bytes)
-    };
-    let mut out = Vec::with_capacity(end);
-    let mut rest = &bytes[..end];
-    while !rest.is_empty() {
-        let (valid, bad) = match std::str::from_utf8(rest) {
-            Ok(s) => (s, 0),
-            Err(e) => {
-                let ok = e.valid_up_to();
-                // Valid up to there, by the error.
-                let s = std::str::from_utf8(&rest[..ok]).unwrap_or_default();
-                (s, e.error_len().unwrap_or(rest.len() - ok))
-            }
-        };
-        out.extend(valid.chars().map(|ch| Cell {
-            ch,
-            len: ch.len_utf8() as u8,
-        }));
-        rest = &rest[valid.len()..];
-        if bad > 0 {
-            out.push(Cell {
-                ch: char::REPLACEMENT_CHARACTER,
-                len: bad as u8,
-            });
-            rest = &rest[bad..];
-        }
-    }
-    (out, end)
+/// Whether `c` is painted dim as its face: a C1 control (D32).
+fn faint(c: char) -> bool {
+    ('\u{80}'..='\u{9F}').contains(&c)
+}
+
+/// What stands for a byte no rule proves a character start before (08 §7.4, D28), painted dim:
+/// a mark is honest where a syllable read out of phase would not be.
+pub(super) const MARK: char = '░';
+
+/// `bytes` of a line from its byte `s`, where `s` is no character start proven, as characters
+/// (`whole`: as [`Encoding::decode`]'s): placeholder marks up to `start`, the first one proven
+/// — when `None`, the first a rule proves in them, the window's first sync byte (rule 2,
+/// unanchored) — then the characters from there; all marks when none is. Returns the
+/// characters, the bytes they cover and how many of them are marks.
+fn marked(
+    enc: Encoding,
+    s: u64,
+    bytes: &[u8],
+    whole: bool,
+    start: Option<u64>,
+) -> (Vec<Cell>, usize, usize) {
+    let from = start
+        .or_else(|| enc.restart_start(Around::new(s, bytes), s))
+        .map_or(bytes.len(), |t| ((t - s) as usize).min(bytes.len()));
+    let unit = enc.unit();
+    let mut cells: Vec<Cell> = (0..from.div_ceil(unit))
+        .map(|i| Cell {
+            ch: MARK,
+            len: unit.min(from - i * unit) as u8,
+        })
+        .collect();
+    let marks = cells.len();
+    let (rest, used) = enc.decode(&bytes[from..], whole);
+    cells.extend(rest);
+    (cells, from + used, marks)
 }
 
 /// How a row is measured: egui's own layout of the text, in the viewer's font.
@@ -153,6 +165,10 @@ pub(super) struct Cut {
     pub taken: usize,
     pub bytes: usize,
     pub shown: Vec<(char, u8)>,
+    /// How many of the first `shown` are placeholder marks ([`MARK`], painted dim).
+    pub dim: usize,
+    /// Which of `shown` are C1 controls' dim `·` (08 D32), in order.
+    pub dots: Vec<usize>,
 }
 
 impl Cut {
@@ -234,6 +250,8 @@ struct Clusters {
     kind: Vec<Kind>,
     /// Each character as painted, with how many times (a tab: spaces).
     shown: Vec<(char, u8)>,
+    /// Which characters are C1 controls (painted dim, D32).
+    dots: Vec<usize>,
 }
 
 impl Clusters {
@@ -242,13 +260,7 @@ impl Clusters {
         // Tabs stay tabs here (a cluster of their own), widened below.
         let face: String = cells
             .iter()
-            .map(|c| {
-                if c.ch == '\t' {
-                    '\t'
-                } else {
-                    chrome::shown_char(c.ch)
-                }
-            })
+            .map(|c| if c.ch == '\t' { '\t' } else { face(c.ch) })
             .collect();
         let face_chars: Vec<char> = face.chars().collect();
         let widths = m.estimate(&face_chars);
@@ -259,6 +271,7 @@ impl Clusters {
             guess: Vec::new(),
             kind: Vec::new(),
             shown: Vec::with_capacity(face_chars.len()),
+            dots: (0..cells.len()).filter(|&i| faint(cells[i].ch)).collect(),
         };
         let (mut x, mut i) = (0f32, 0usize);
         for g in face.graphemes(true) {
@@ -333,6 +346,8 @@ pub(super) fn cut_row(cells: &[Cell], complete: bool, width: f32, m: &Measure) -
             taken: 0,
             bytes: 0,
             shown: Vec::new(),
+            dim: 0,
+            dots: Vec::new(),
         };
     }
     let c = Clusters::new(cells, m);
@@ -443,6 +458,8 @@ pub(super) fn cut_row(cells: &[Cell], complete: bool, width: f32, m: &Measure) -
         taken,
         bytes: cells[..taken].iter().map(|c| usize::from(c.len)).sum(),
         shown: c.shown[..shown].to_vec(),
+        dim: 0,
+        dots: c.dots.iter().copied().filter(|&i| i < shown).collect(),
     }
 }
 
@@ -607,19 +624,24 @@ impl Wrapper<'_> {
         if let Some(r) = self.memo.restarts.get(&(span.start, k)) {
             return Ok(*r);
         }
+        let enc = self.doc.enc;
         let from = at - RESTART_BEHIND;
         let n = (RESTART_BEHIND + RESTART_AHEAD) as usize;
         let bytes = self
             .doc
             .span_bytes(span, from, n, &mut Window_::default(), false)?;
-        // From the first character start in what was read.
-        let lead = bytes
-            .iter()
-            .take(3)
-            .take_while(|&&b| b & 0xC0 == 0x80)
-            .count();
+        // From the first character start in what was read (08 §7.3 rule 2). None proven there
+        // (CP949, D28): the restart is at the point itself, its row shown from the first start
+        // a rule proves ([`Wrapper::cells`]).
+        let near = Around::new(from, &bytes);
+        let Some(lead) = enc.restart_start(near, from) else {
+            let r = at.min(span.len);
+            remember(&mut self.memo.restarts, (span.start, k), r);
+            return Ok(r);
+        };
+        let lead = ((lead - from) as usize).min(bytes.len());
         let whole = from + bytes.len() as u64 == span.len;
-        let (cells, _) = decode(&bytes[lead..], whole);
+        let (cells, _) = enc.decode(&bytes[lead..], whole);
         let text: String = cells.iter().map(|c| c.ch).collect();
         // Each cluster's start in the line, and whether it is a space; the line's end, if read.
         let mut starts: Vec<(u64, bool)> = Vec::new();
@@ -644,13 +666,8 @@ impl Wrapper<'_> {
         let cluster = starts.iter().find(|g| g.0 >= at).map(|g| g.0);
         let r = match word.or(cluster) {
             Some(r) => r,
-            None => {
-                let skip = bytes[(at - from) as usize..]
-                    .iter()
-                    .take(3)
-                    .take_while(|&&b| b & 0xC0 == 0x80);
-                at + skip.count() as u64
-            }
+            // A cluster longer than the window: the first character start at the point itself.
+            None => enc.restart_start(near, at).unwrap_or(at),
         };
         let r = r.min(span.len);
         remember(&mut self.memo.restarts, (span.start, k), r);
@@ -681,39 +698,99 @@ impl Wrapper<'_> {
         }
     }
 
-    /// The row of `span` that starts at byte `s`. The `\r` before a line's end is looked for
+    /// The row of `span` that starts at byte `s`. The CR before a line's end is looked for
     /// here, in the row that holds the end, when the index did not read it (06 §7.2): it is
     /// taken by the row and not shown.
     fn cut(&mut self, span: Span, s: u64) -> Result<Rc<Cut>> {
         if let Some(cut) = self.memo.rows.get(&(span.start, s)) {
             return Ok(cut.clone());
         }
+        let enc = self.doc.enc;
+        let unit = enc.unit();
         let limit = self.restart_after(span, s)?.min(span.len);
         let want = limit.saturating_sub(s).min(self.read as u64) as usize;
         let mut bytes = self
             .doc
             .span_bytes(span, s, want, &mut self.memo.window, true)?;
         let complete = s + want as u64 == limit;
-        let cr = span.cr && s + want as u64 == span.len && bytes.last() == Some(&b'\r');
+        let cr = span.cr && s + want as u64 == span.len && enc.ends_with_cr(&bytes, s);
         if cr {
-            bytes.pop();
+            bytes.truncate(bytes.len() - unit);
         }
-        let (cells, _) = decode(&bytes, complete);
+        // A row starts where the row before it ended — a character start — but in an encoding
+        // that needs its start proven (D28).
+        let (cells, _, dim) = if enc.needs_phase() {
+            self.cells(span, s, &bytes, complete)?
+        } else {
+            let (cells, used) = enc.decode(&bytes, complete);
+            (cells, used, 0)
+        };
         let mut cut = cut_row(&cells, complete, self.width, &self.m);
+        cut.dim = dim.min(cut.shown.len());
         if cr && cut.bytes == bytes.len() {
-            cut.bytes += 1;
+            cut.bytes += unit;
         }
         let cut = Rc::new(cut);
         remember(&mut self.memo.rows, (span.start, s), cut.clone());
         Ok(cut)
     }
 
-    /// `e` is where the rows of `span` end: its end, or the `\r` before it alone.
+    /// 08 §7.3 rule 4: the first character start of `span` at or after its byte `x` (a place
+    /// inside the line, a row start), from [`Encoding::look_back`] bytes before it — or, in an
+    /// encoding that needs a proof (CP949, §7.4), from its line start within [`REACH`], else
+    /// [`W`] bytes before it. `None`: nothing proves one.
+    fn start_at(&mut self, span: Span, x: u64) -> Result<Option<u64>> {
+        let enc = self.doc.enc;
+        if x == 0 && !span.blind {
+            return Ok(Some(0));
+        }
+        let back = if !enc.needs_phase() {
+            enc.look_back() as u64
+        } else if !span.blind && x <= REACH {
+            x
+        } else {
+            W as u64
+        };
+        let from = enc.align_down(x).saturating_sub(back);
+        let n = (x - from) as usize + AHEAD;
+        let window = &mut self.memo.window;
+        let bytes = self.doc.span_bytes(span, from, n, window, false)?;
+        let near = Around {
+            at: from,
+            bytes: &bytes,
+            anchored: from == 0 && !span.blind,
+        };
+        Ok(enc.left_start(near, x))
+    }
+
+    /// `bytes` of `span` from its byte `s` as characters, decoded from the first character
+    /// start at or after `s` ([`Wrapper::start_at`]) with placeholder marks before it, all of
+    /// them marks when none is proven ([`marked`]). Returns the characters, the bytes they
+    /// cover and how many of them are marks.
+    fn cells(
+        &mut self,
+        span: Span,
+        s: u64,
+        bytes: &[u8],
+        whole: bool,
+    ) -> Result<(Vec<Cell>, usize, usize)> {
+        let enc = self.doc.enc;
+        Ok(match self.start_at(span, s)? {
+            Some(t) if t == s => {
+                let (cells, used) = enc.decode(bytes, whole);
+                (cells, used, 0)
+            }
+            start => marked(enc, s, bytes, whole, start),
+        })
+    }
+
+    /// `e` is where the rows of `span` end: its end, or the CR unit before it alone.
     fn ended(&mut self, span: Span, e: u64) -> Result<bool> {
         if e >= span.len {
             return Ok(true);
         }
-        Ok(span.cr && e + 1 == span.len && self.cut(span, e)?.shown.is_empty())
+        let unit = self.doc.enc.unit() as u64;
+        Ok(span.cr && e + unit == span.len && self.cut(span, e)?.shown.is_empty())
     }
 
     /// The row starts of `span` from restart point `a` to the next one (or the line's end).
@@ -743,7 +820,7 @@ impl Wrapper<'_> {
         }
         let mut a = self.restart_before(span, span.len)?;
         if a > 0 && self.ended(span, a)? {
-            // The restart point is on the `\r` before the line's end: no row starts there
+            // The restart point is on the CR before the line's end: no row starts there
             // (going down never makes one), so the last row is of the segment before.
             a = self.restart_before(span, a)?;
         }
@@ -766,7 +843,7 @@ impl Wrapper<'_> {
         }
         let span = self.span(p)?;
         if p.off >= span.len || self.ended(span, p.off)? {
-            // Past the line's rows, or on the `\r` before its end: its last row.
+            // Past the line's rows, or on the CR before its end: its last row.
             return self.last_of(span);
         }
         let a = self.restart_before(span, p.off + 1)?;
@@ -858,26 +935,26 @@ impl Wrapper<'_> {
     /// its last characters as are painted in `columns` columns and in the row's width, a tab
     /// counted as wide as it can be (where it stops depends on where the row starts).
     pub fn end_left(&mut self, span: Span, columns: usize) -> Result<u64> {
-        let n = span.len.min(self.read as u64);
-        let from = span.len - n;
+        let enc = self.doc.enc;
+        let unit = enc.unit();
+        // The line's last bytes, from a unit's start: a line of an odd length (its last unit
+        // cut by the file's end) has its suffix start a byte earlier.
+        let from = enc.align_down(span.len - span.len.min(self.read as u64));
+        let n = span.len - from;
+        // From a character's start (rule 4); a place none is proven at shows no character.
+        let Some(lead) = self.start_at(span, from)? else {
+            return Ok(from);
+        };
+        let lead = lead.saturating_sub(from).min(n) as usize;
         let window = &mut self.memo.window;
         let mut bytes = self.doc.span_bytes(span, from, n as usize, window, true)?;
         let mut end = span.len;
-        if span.cr && bytes.last() == Some(&b'\r') {
-            bytes.pop();
-            end -= 1;
+        if span.cr && enc.ends_with_cr(&bytes, from) {
+            bytes.truncate(bytes.len() - unit);
+            end -= unit as u64;
         }
-        // From a character's start.
-        let lead = match from {
-            0 => 0,
-            _ => bytes
-                .iter()
-                .take(3)
-                .take_while(|&&b| b & 0xC0 == 0x80)
-                .count(),
-        };
-        let (cells, _) = decode(&bytes[lead..], true);
-        let faces: Vec<char> = cells.iter().map(|c| chrome::shown_char(c.ch)).collect();
+        let (cells, _) = enc.decode(&bytes[lead.min(bytes.len())..], true);
+        let faces: Vec<char> = cells.iter().map(|c| face(c.ch)).collect();
         let widths = self.m.estimate(&faces);
         if from == 0 {
             // The whole line is here: as it paints from its first byte, each tab to its
@@ -933,6 +1010,10 @@ impl Wrapper<'_> {
 
     /// The line (or piece) byte `at` of the file is in, and the byte of it that is.
     pub fn holding(&mut self, at: u64) -> Result<Option<Pos>> {
+        // A jump's place (08 §7.3 rule 3): rounded down to the unit, in UTF-16 back across a
+        // pair's low half. It picks the row; the row's own start is the line's, a grid cut's
+        // or a restart's.
+        let at = self.doc.jump_place(at, &mut self.memo.window)?;
         let Some(span) = self.doc.span_holding(at, &mut self.memo.window)? else {
             return Ok(None);
         };
@@ -962,7 +1043,7 @@ impl Wrapper<'_> {
         }
         let window = &mut self.memo.window;
         let before = self.doc.span_bytes(span, 0, off as usize, window, true)?;
-        Ok(Some(decode(&before, true).0.len()))
+        Ok(Some(self.doc.enc.decode(&before, true).0.len()))
     }
 
     /// Up to `rows` rows from `p`, and whether they reach the end of the file.
@@ -1013,27 +1094,30 @@ impl Wrapper<'_> {
         if self.doc.total() == 0 || self.doc.line_count() == 0 {
             return Ok((out, true));
         }
+        let enc = self.doc.enc;
         let mut span = self.span(p)?;
         loop {
-            let want = span.len.saturating_sub(left).min(self.read as u64) as usize;
+            let at = left.min(span.len);
+            // From a character's start (the place within a line is a byte of it: rule 4); a
+            // place none is proven at (CP949, D28) shows placeholder marks from there.
+            let proven = self.start_at(span, at)?;
+            let start = proven.map_or(at, |s| s.min(span.len));
+            let want = span.len.saturating_sub(start).min(self.read as u64) as usize;
             let window = &mut self.memo.window;
-            let mut bytes = self.doc.span_bytes(span, left, want, window, true)?;
-            let whole = left + want as u64 >= span.len;
-            if span.cr && whole && bytes.last() == Some(&b'\r') {
-                bytes.pop();
+            let mut bytes = self.doc.span_bytes(span, start, want, window, true)?;
+            let whole = start + want as u64 >= span.len;
+            if span.cr && whole && enc.ends_with_cr(&bytes, start) {
+                bytes.truncate(bytes.len() - enc.unit());
             }
-            // From a character's start (the place within a line is a byte of it).
-            let lead = match left {
-                0 => 0,
-                _ => bytes
-                    .iter()
-                    .take(3)
-                    .take_while(|&&b| b & 0xC0 == 0x80)
-                    .count(),
+            let (cells, used, dim) = match proven {
+                Some(_) => {
+                    let (cells, used) = enc.decode(&bytes, whole);
+                    (cells, used, 0)
+                }
+                None => marked(enc, start, &bytes, whole, None),
             };
-            let start = left.min(span.len) + lead as u64;
-            let (cells, used) = decode(&bytes[lead..], whole);
             let mut shown = Vec::with_capacity(cells.len());
+            let mut dots = Vec::new();
             let mut col = 0usize;
             for cell in &cells {
                 if cell.ch == '\t' {
@@ -1041,7 +1125,10 @@ impl Wrapper<'_> {
                     shown.push((' ', wide as u8));
                     col += wide;
                 } else {
-                    shown.push((chrome::shown_char(cell.ch), 1));
+                    if faint(cell.ch) {
+                        dots.push(shown.len());
+                    }
+                    shown.push((face(cell.ch), 1));
                     col += 1;
                 }
             }
@@ -1054,7 +1141,9 @@ impl Wrapper<'_> {
                 cut: Rc::new(Cut {
                     taken: cells.len(),
                     bytes: used,
+                    dim: dim.min(shown.len()),
                     shown,
+                    dots,
                 }),
                 first_char,
             });
@@ -1072,10 +1161,11 @@ impl Wrapper<'_> {
 mod tests {
     use super::*;
 
-    /// Decoding matches `from_utf8_lossy` character for character, and a piece that is not whole
-    /// leaves a character cut at its end for the next piece.
+    /// UTF-8 rows decode as they did (`from_utf8_lossy`, character for character), and a piece
+    /// that is not whole leaves a character cut at its end for the next piece.
     #[test]
     fn decoding_matches_lossy_and_leaves_a_cut_character() {
+        let decode = |b: &[u8], whole| Encoding::Utf8.decode(b, whole);
         let bytes = b"a\xff\xe2\x82b\xed\xa0\x80\xf0\x9f\x98\x80c";
         let (cells, used) = decode(bytes, true);
         assert_eq!(used, bytes.len());
@@ -1089,5 +1179,20 @@ mod tests {
         let cut = [b'x', 0xed, 0x95];
         assert_eq!(decode(&cut, false).1, 1);
         assert_eq!(decode(&cut, true).0.len(), 2);
+    }
+
+    /// Where no character start is proven, the bytes are placeholder marks up to the first
+    /// one a rule proves — all of them when none does — and never characters (D28).
+    #[test]
+    fn unproven_bytes_are_marks_up_to_a_proven_start() {
+        let bytes = b"abcdef";
+        let (cells, used, marks) = marked(Encoding::Utf8, 10, bytes, true, Some(13));
+        assert_eq!((used, marks), (6, 3));
+        let text: String = cells.iter().map(|c| c.ch).collect();
+        assert_eq!(text, "░░░def");
+        // CP949's slot proves nothing (VM-4 fills it): every byte a mark.
+        let (cells, used, marks) = marked(Encoding::Cp949, 10, bytes, true, None);
+        assert_eq!((used, marks), (6, 6));
+        assert!(cells.iter().all(|c| c.ch == MARK && c.len == 1));
     }
 }
