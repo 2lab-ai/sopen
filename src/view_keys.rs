@@ -9,8 +9,9 @@
 //! only a whole input or a held key decides: a key's typed text goes where its key went, Leave wins,
 //! auto-repeats. The egui binding (VM-7) calls [`ViewKeys::take`] in the shell's input hook, after
 //! the Cmd/Ctrl+digit aliases (`fkey_events`, `gui/mod.rs:815`): Cmd/Ctrl+1…3 reach it as F1…F3,
-//! Cmd/Ctrl+9 and a click on slot 9 as F9. A terminal binding (VM-8) sends the character `1` alone,
-//! which is a press of its own here, and no key releases (`ViewKeys::new(false, [])`). A window on
+//! Cmd/Ctrl+9 and a click on slot 9 as F9. A terminal binding (VM-8) gets the same events from the
+//! translator (`gui::term_input`): a digit as its key and its text, and every press followed at once
+//! by a made release (`ViewKeys::new(term_input::RELEASES, [])`). A window on
 //! its own (`--hex`, the binary dialog, the image and
 //! media windows) has no views and no view keys (D24).
 
