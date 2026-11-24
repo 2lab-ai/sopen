@@ -14,9 +14,10 @@ name, the editor, the viewer's views, web pages) land on this architecture: thei
 in cells as this document says. Measurements and the prototype: [`research/tui-gui.md`](research/tui-gui.md)
 (XR-T), cited *tui* §n, its code citations at 255a52f; sopen code cited at this branch's `src/`.
 **[M]** measured there · **[S]** read in source · **[추정]** inferred, not measured · **[owner]** only
-the owner's terminals or hands can answer (the probe of *tui* §13). Decisions are T1–T39 (§13): T1–T10,
-T12, T24 and T25–T39 are the orchestrator's (T12 and T24 rewritten in review round 1), the rest this
-document's; all reversible.
+the owner's terminals or hands can answer (the probe of *tui* §13) · **[M spike]** measured in the
+real repo by the spike on branch `spike/tui-host` (§17). Decisions are T1–T40 (§13): T1–T10, T12,
+T24 and T25–T40 are the orchestrator's (T12 and T24 rewritten in review round 1; T25, T27, T30 and
+T32 extended in round 2), the rest this document's; all reversible.
 
 Owner message 23 (2026-11-24), verbatim:
 
@@ -61,29 +62,35 @@ switch opens the window (§7.1). **Hand-off box**: the TUI's stand-in for a cont
 
 ## 4. The architecture (T1)
 
-- **The core** draws every screen into a ratatui `Buffer`; the prototype's `core.rs` (928 lines:
-  list, F-key row, dialog, state, keys) is the shape [M]. Cell API: text, fill, frame (`╔═╗║` /
-  `┌─┐│`, joints `╟ ╢` / `├ ┤`), scroll bar (`↑ ░ ↓`, one-cell thumb), F-key row, dialog with its
-  shadow, field, button; widths by unicode-width (§10); colours the skin's 16 as RGB (T15, §5).
-  **The cell API sets no modifiers** (no bold, underline, reverse or blink): PC Shell's look is
-  colour only, and the caret is the cursor (T37). A screen declares its regions (a cell rect and
-  `Picture`, `Video` or `Web`). Layout is a function of the grid size only.
-- **The terminal backend**: ratatui 0.30 + crossterm 0.29, as the prototype [M] — alternate screen,
-  raw mode, SGR mouse reporting so the row, the mode button and rows click [M] (the terminal's own
-  selection then needs Shift+drag in most terminals [추정]); the kitty keyboard protocol (flag 1)
-  pushed only after the terminal answers `CSI ? u`; truecolor when `COLORTERM` says `truecolor` or
-  `24bit` (kitty's environment, herdr-core's help string [M *tui* §7.1]), else §5's 256-colour table;
-  the caret is the terminal's cursor; only changed cells are sent. **No font is loaded on the TUI's
-  path.** Re-entering after a switch flushes the terminal's pending input: keys typed meanwhile are
-  dropped, never acted on (T28).
+- **The core** (`src/gui/cells.rs`) draws every screen into a `ratatui_core::Buffer` (ratatui-core
+  0.1.2: the buffer only, not ratatui), as the spike did in the real repo (branch `spike/tui-host`:
+  grid, painter, layer record, cell API and read-back, 451 lines [M spike]). Cell API: text, fill,
+  frame (`╔═╗║` / `┌─┐│`, joints `╟ ╢` / `├ ┤`), scroll bar (`↑ ░ ↓`, one-cell thumb), F-key row,
+  dialog with its shadow, field, button; widths by unicode-width (§10); colours the skin's 16 as RGB
+  (T15, §5). **The cell API sets no modifiers** (no bold, underline, reverse or blink): PC Shell's
+  look is colour only, and the caret is the cursor (T37). A screen declares its regions (a cell rect
+  and `Picture`, `Video` or `Web`). Layout is a function of the grid size only.
+- **The terminal backend** (`src/gui/term.rs`): crossterm 0.29 printing the core's layers —
+  alternate screen, raw mode, SGR mouse reporting so the row, the mode button and rows click [M]
+  (the terminal's own selection then needs Shift+drag in most terminals [추정]); the kitty keyboard
+  protocol (flag 1) pushed by default whenever the terminal answers `CSI ? u`; platform output —
+  egui's `CopyText` as OSC 52, the terminal's paste as bracketed `Paste` (Ctrl+V brings nothing in a
+  terminal), the terminal cursor at the focused field's caret so the terminal draws a Hangul
+  composition there (no preedit reaches a terminal) — seams the spike found, not built there;
+  truecolor when `COLORTERM` says `truecolor` or `24bit` (kitty's environment, herdr-core's help
+  string [M *tui* §7.1]), else §5's 256-colour table; the caret is the terminal's cursor; only
+  changed cells are sent. **No font is loaded on the TUI's path.** Re-entering after a switch
+  flushes the terminal's pending input: keys typed meanwhile are dropped, never acted on (T28).
 - **The window backend** owns winit's handler (route B, T34): it builds the app with
   `eframe::create_native` and keeps one `EventLoop` per process for every window, each window run by
   `run_app_on_demand` (04 §6.4.3); 04's KL-W4 adds only its key wrapper. XR-T measured the switch
-  with `run_native`, so X1 measures it again (TW-1). Each cell is painted at (col × 8, row × 16) pt —
-  its background, then its glyph at its own cell (the VGA font, then the system fallbacks), never
-  through egui's text layout, which is what moves Hangul off the grid (*tui* §1.3, §5). The grid is
-  floor(w/8) × floor(h/16), the remainder in the background; the caret two scan lines at the cell's
-  foot. A window opened by a switch has the terminal's grid size (T16).
+  with `run_native`, so X1b measures it again (TW-1). Each cell is painted at (col × 8, row × 16) pt
+  — its background, then its glyph at its own cell (the VGA font, then the system fallbacks), never
+  through egui's text layout, which is what moves Hangul off the grid (*tui* §1.3, §5). A wide
+  glyph's second cell keeps the glyph's colours, which ratatui-core resets: before the spike's fix
+  (15333c7) the bar's second cells of `사`/`진` were `0000aa`, after it every bar cell `ff5555` [M
+  spike]. The grid is floor(w/8) × floor(h/16), the remainder in the background; the caret two scan
+  lines at the cell's foot. A window opened by a switch has the terminal's grid size (T16).
 - **Regions in the window**: a picture is a texture at the rect (the image exactly inside its frame,
   the other 1,800 cells passing the pixel check [M *tui* §6]); a video frame a texture uploaded each
   frame (320×180 at 93 fps [M]); a web view a WKWebView subview at the rect on macOS (09 §2.2; the
@@ -95,21 +102,36 @@ switch opens the window (§7.1). **Hand-off box**: the TUI's stand-in for a cont
   `egui::Event`s and runs a headless `egui::Context` pass, so the `FKeyInput` plugin's input hook
   (`gui/mod.rs`) and the key table (`browser/keys.rs`) see them as from the window; key, focus,
   memory and repaint code stay, drawing and the 45 font measurements (→ unicode-width) change (*tui*
-  §11 [M counts]). The headless pass is measured; **the translation is not prototyped** [추정], the
-  spike's item (§17). Its rules:
-  - a named key → `Event::Key` with modifiers;
+  §11 [M counts]). **The translator** (`src/gui/term_input.rs`, 231 lines) was built and measured by
+  the spike, through crossterm's real parser in a pty, on macOS [M spike]: under the kitty protocol
+  101/101 key-table rows, 26/26 ⌘ variants and 20/20 F-key aliases reach the GUI's command; under
+  legacy encoding 90/101 and 4/10 aliases, every loss already in crossterm's decode (§9). Its rules,
+  egui-winit 0.37's event shape:
+  - a named key → `Event::Key` with modifiers; Cmd/Ctrl+X and +C → `Cut` / `Copy` alone; without the
+    kitty protocol's event types a release is made after the key;
   - **Ctrl → egui's `command` on every OS** (T26): Ctrl+x arrives with `ctrl` and `command` set, as
     egui reports Ctrl on Linux, so every Cmd/Ctrl row matches (`Mods::matches` needs `m.command`,
-    `keys.rs:290-301`; a Mac's ⌃ alone would match none). ⌘, passed only under the kitty protocol, arrives as
-    `mac_cmd` + `command`; ⌘-only rows (⌘⌫) are reachable only that way, Del and F8 are their routes;
-  - **a printable key the key table binds as a key trigger** — today Space (`keys.rs:486, 526,
-    565`) — → `Event::Key` **and** `Event::Text`, as egui-winit delivers it in the window: `find`
-    matches key triggers only on `Event::Key` (`keys.rs:602-617`) and whitespace cannot be a text
-    trigger (`keys.rs:1029-1031`), so one binding takes that shape in both backends (T25);
-  - any other printable character without Ctrl/Alt → `Event::Text` alone (a terminal sends no key
-    event or physical key, 08 §9, so 08's view keys match the character); Ctrl/Alt + a character →
-    `Event::Key` with modifiers, no text; mouse → pointer events at the cell's centre; wheel by lines.
-- **Screens not yet moved** keep working in the window and are hand-off boxes in the TUI (T17).
+    `keys.rs:290-301`; a Mac's ⌃ alone would match none; the spike's negative control with egui-winit's
+    macOS rule lost Ctrl+A [M spike]). ⌘, passed only under the kitty protocol, arrives as `mac_cmd` +
+    `command` on macOS and as nothing elsewhere; ⌘-only rows (⌘⌫) are reachable only that way, Del
+    and F8 are their routes;
+  - **every printable ASCII character egui names a key for** (letters, digits, Space and the
+    punctuation keys) → `Event::Key` **and** `Event::Text`, as egui-winit sends it (T25): the key
+    table matches key triggers only on `Event::Key` (`keys.rs:602-617`; Space at `:486, 526, 565`,
+    whitespace never a text trigger, `:1029-1031`), and the viewers match letters as keys —
+    `W` (`text.rs:3979`), `C P F 1` (`image.rs:3258-3268`), `H` (`image.rs:4829`), through
+    `plain_key`'s `consume_key` (`mod.rs:1880-1882`); no key-table row matches a plain letter, and an
+    egui field inserts from `Text`. Other ASCII (`# $ % & ( ) * < > @ ^ _ ~ "`) and all non-ASCII
+    text — a Hangul commit arrives as characters — → `Event::Text` alone (without it the letter
+    jumps fail: the spike's negative control); with Ctrl or Alt held, the key and no text; mouse →
+    pointer events at the cell's centre; wheel by lines; focus reports → `WindowFocused`.
+- **Screens not yet moved** keep working in the window and are hand-off boxes in the TUI (T17). The
+  spike hosted all four of today's panes (preview, Enter viewer, git panel, tree) and the F2 field and
+  F7 modal at cell rects of a cell-grid window with 0 lines changed inside them: clipping, Tab, click,
+  F-key and Esc routing and resize hold, with a failing negative control [M spike]. In a terminal they
+  show nothing (they are egui shapes), which is why the TUI draws hand-off boxes and X1b moves the
+  list's dialogs. The grid gives the odd column to the right side, so a hosted pane is 504 pt wide
+  where the old half was 496 [M spike].
   *tui* option C's projector (egui shapes laid onto cells) stays only as a lint over them: off-grid
   counts may not grow past *tui* §1.3's rerun; a screen leaves it in the step that moves it (T1).
 
@@ -184,9 +206,11 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
   left) brings the TUI back with its state unchanged and one line naming the reason and what to do:
   `the window did not open: <reason> — check the display, or set a target` (T31).
 - In a **switched window** — one opened by a switch, here or on HOST through `--state-stdin` —
-  F12, `[TUI]` or closing it returns, even with no terminal on HOST's side. Cmd+Q returns too in one
-  process (the process holds the state); on HOST it closes the window without the cue (§7.3). A window started directly quits on close, as today; it shows `[TUI]` only when its
-  process has a terminal on input and output (F12 then takes it), else neither works there.
+  F12, `[TUI]` or closing it returns, even with no terminal on HOST's side. Cmd/Ctrl+Q and +W are
+  that close too — the shell already treats them as the close button (`closing()`,
+  `gui/mod.rs:1174-1185`) — so they return with the state (on HOST, with the cue) (M1). A window
+  started directly quits on close, as today; it shows `[TUI]` only when its process has a terminal
+  on input and output (F12 then takes it), else neither works there.
 
 ### 7.3 Across machines (T29, T30, T35)
 
@@ -202,10 +226,10 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
 - **Meanwhile** this side keeps raw mode and the alternate screen (T28): pictures deleted, the screen
   dimmed under `xtools is in a window on HOST — close it or press F12 there; Ctrl+C ends it here`,
   only Ctrl+C read.
-- **Coming back with unsaved edits** (T30): F12 or a close in HOST's window first asks that window's
-  close prompt there (Save · Discard · Cancel; 07 §10); a running Save or any writing job (§7.4)
-  makes the return wait. Cmd+Q there is that window's close; it sends no cue, and this side restores
-  its state from before the switch with `the window on HOST was quit`.
+- **Coming back with unsaved edits** (T30): F12 or a close in HOST's window (Cmd/Ctrl+Q and +W
+  included) first asks that window's close prompt there — **Save** · **Save As…** · **Discard** ·
+  **Cancel** (07 §10, `07-streaming-edit.md:801`); Cancel keeps the window; a running Save or any
+  writing job (§7.4) makes the return wait.
 - **HOST's input ending** — Ctrl+C here, or the link dropping — closes HOST's window by 09 §7's
   end-of-input rule **only when it has nothing to lose**. With unsaved edits it **stays open** (01
   A11: never dropped unasked): HOST's sopen prints `sopen-xtools-kept` if its output still works,
@@ -226,6 +250,7 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
 | 128 + n | `sopen on HOST ended by signal n` |
 | 127 | `sopen is not installed on HOST (brew install 2lab-ai/tap/sopen-preview)` |
 | 255 | `could not reach HOST: <ssh's line> — run ssh HOST once in a shell to answer its questions` |
+| no exit code (ssh killed by a signal) | `ssh to HOST ended without an exit code (<status>)`, as `forward.rs:1016` says it |
 
 - **Paths** go out rewritten as §4a's SOURCE (local → `<this machine>:<abs>`, HOST's own → local) and
   come back with `<this machine>:<abs>` local again. HOST reads this machine's files by its own ssh
@@ -239,8 +264,9 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
   folders, bars, selections and scroll, the active side, the mode, each side's content (tree open, git
   pin), an open dialog with its typed text, caret and error; the open viewer — file, 08's view,
   place, encoding, wrap; the source host. No caches, streams or jobs: the receiver opens them again.
-  An unknown `"v"` is refused with `HOST sent switch state v<n>; this sopen reads v1 — update one of
-  them`, and the TUI stays. **Each step that moves a screen adds that screen's fields and bumps
+  A reader accepts its own `v` and every older one (a field the older state lacks takes its
+  default); a newer `"v"` is refused with `HOST sent switch state v<n>; this sopen reads up to v<m> —
+  update one of them`, and the TUI stays. **Each step that moves a screen adds that screen's fields and bumps
   `v`**: the tree's bar and open rows (X4); the git panel's bar, marks, details and filters, and the
   planner's unsaved plan, which asks first as unsaved edits do (X4). Unknown fields are ignored.
 - **Every running job that writes** — a Save, a file operation, a git fetch, push or rebase, an
@@ -248,7 +274,8 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
   switch wait. Reads are dropped and started again on the other side.
 - **Unsaved edits across machines**: 07's journal is per machine (07 §3) and does not cross in the
   first cut. The switch first asks `Save the changes to host:/abs before switching to HOST?` →
-  **Save** (switch once it lands) · **Discard** (switch with the file as stored) · **Cancel** (stay).
+  **Save** or **Save As…** (switch once it lands) · **Discard** (switch with the file as stored) ·
+  **Cancel** (stay), 07 §10's four choices.
 
 ## 8. Pictures, video and pages in a terminal (T8)
 
@@ -290,12 +317,12 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
 | F1–F12, Shift/Alt/Ctrl+F5–F10, Shift+Del, Ctrl+PgUp, Ctrl+←/→, Shift+Tab | decoded [M] | decoded [M] |
 | The clickable F-key row and mode button | mouse reporting [M] | the same |
 | **Alt+1…0 → F1…F10** (T7); **Alt+G → the switch** (T33) | `ESC <char>`, read by crossterm as Alt+char [M] | `CSI …;3u` [추정] |
-| Ctrl+1…0 → F1…F10 (04 §6.1) | lost: Ctrl+3 → Esc, Ctrl+8 → Backspace, Ctrl+1/0 → digits [M] | decoded [M] |
-| Ctrl+letter (= Cmd/Ctrl, T26) | Ctrl+I = Tab, Ctrl+M = Enter [M]; Ctrl+J may arrive as LF [추정, TK-1] | distinct [M] |
+| Ctrl+1…0 → F1…F10 (04 §6.1) | Ctrl+4…7 only; Ctrl+1/9/0 → plain digits, Ctrl+2 → Ctrl+Space, Ctrl+3 → Esc, Ctrl+8 → Backspace [M spike] | decoded, 10/10 [M spike] |
+| Ctrl+letter (= Cmd/Ctrl, T26) | Ctrl+I = Tab, Ctrl+M = Enter [M]; Ctrl+J is sent as LF and decoded as Ctrl+J, so it reaches `ToHead` [M spike] | distinct [M] |
 | Cmd+… (macOS) | never sent | `CSI …;9u` when the terminal passes ⌘ [M decode]; ⌘+digits are tab keys there [추정] |
 | Shift+F3; Ctrl+Shift+letter (git) | read as a cursor report; Shift lost, so the Ctrl chord arrives [M] | distinct [M] |
-| Space (a key trigger, T25) | the character → `Key` + `Text` | the same |
-| 08's view keys | the character `1`/`2`/`3`; F9 then a digit | the same |
+| A printable ASCII key (Space, letters, digits; T25) | the character → `Key` + `Text` | the same |
+| 08's view keys | `1`/`2`/`3` → `Key` + `Text`, matched by the window's own binding (08 §8: physical key first, else the logical key; the translator gives no physical key); F9 then a digit | the same |
 | Esc | a lone `ESC`, by timing | `CSI 27u` |
 
 - **Alt+digits and Alt+G** are taken once, by the `FKeyInput` plugin's input hook, **in the TUI only**
@@ -307,17 +334,24 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
 - **Alt+G** (T33): `G` for GUI; under legacy it arrives as `ESC g`, which crossterm decodes as
   Alt+G [M for `ESC x`]; the key table binds no Alt+letter (its Alt rows are F-keys, and Cmd+Alt+G is
   another chord under exact matching); with no text, it never reaches a letter jump.
-- **Under legacy encoding** a Ctrl+Shift chord arrives as its Ctrl chord, so in the git panel
-  Ctrl+Shift+F, R, G, B do Find, Reread, Pin, Backups, and Ctrl+Shift+M arrives as Enter [추정 from
-  the encoding]; these actions and Shift+F3's file at revision are reached through the F10 menu of
-  what is under the bar, which already holds every action (03 §7) (T17). Raw mode clears ISIG and
-  IXON, so Ctrl+C, Ctrl+Z, Ctrl+S and Ctrl+Q arrive as keys [추정: cfmakeraw].
+- **Legacy encoding loses 17 bindings** (the spike's 118 plays of every key-table row and alias, all
+  lost in crossterm's own decode, i.e. in what the terminal sent — none in the egui layer [M spike]):
+  ⌘⌫ (1: a legacy terminal cannot send ⌘); Shift+F3 (1: `CSI 1;2R` reads as a cursor report); 9
+  Ctrl+Shift+letter git rows (Shift lost: +F, +R, +G, +B fire Find, Reread, Pin, Backups, **+M
+  arrives as Enter → Details**, +C, +S, +A, +P fire nothing); 6 Ctrl+digit aliases (Ctrl+1, 9, 0 →
+  letter jumps; Ctrl+2 → nothing; Ctrl+3 → Esc → Stop; Ctrl+8 → Backspace → Up). Their routes: the
+  Ctrl+Shift actions and Shift+F3's file at revision are in the F10 menu of what is under the bar,
+  which already holds every action (03 §7) (T17); the F-keys by Alt+digits, the row, or real F-keys;
+  ⌘⌫ by Del or F8. The kitty protocol, pushed by default, loses none. Raw mode clears ISIG and IXON,
+  so Ctrl+C, Ctrl+Z, Ctrl+S and Ctrl+Q arrive as keys [추정: cfmakeraw].
 - **F12 = the switch** (T4), taken by the `FKeyInput` plugin in every context, fields included (it
   types nothing), never a key-table row (`no_duplicate_bindings` forbids F12 rows and stays).
   Whether kitty, herdr-app and herdr pass F12 is [owner, TK-2]; the button always works.
-- **Help names every alias neutrally** (T27): one text in both backends, saying where each works —
-  `Ctrl/⌘+1…0 · Alt+1…0 in a terminal`, `F12 · Alt+G in a terminal` — in place of `help.rs`'s
-  `aliases()`, which names this machine's command key (`keys::command_name()`).
+- **The help in both backends is one text** (T27): every alias named with where it works —
+  `Ctrl/⌘+1…0 · Alt+1…0 in a terminal`, `F12 · Alt+G in a terminal` — and every command row written
+  `Ctrl/⌘+R`, `Ctrl/⌘+Shift+F`, with one line saying `⌘ applies in a Mac window; Ctrl everywhere
+  else`. It replaces the machine's own name (`keys::command_name()`) in `Mods::prefix`
+  (`keys.rs:309-351`), help's `aliases()` and `describe` (`help.rs:139-146`).
 - **No per-app F-key switch in a terminal** (T9): sopen owns no surface there; the macOS HID switch
   (04 §6.2) and the Wayland shortcuts inhibitor (04 §6.4) are the window's; kitty's own keyboard grab
   is the owner's terminal setting, a later study. In the TUI the F-keys that always work are real
@@ -361,8 +395,9 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
   can, else a one-key hand-off. **T24 places the flip after X6 and X7** (and so after X3 and X4):
   message 23 asks for pictures and video in the terminal itself, so at the flip they are drawn there,
   not handed off.
-- **One routing table** (T36): first match wins, checked in this order — explicit mode, kind, input
-  and output terminals, destination, display. `--hex` makes the kind hex, then rows 4–10 apply.
+- **One routing table** (T36): first match wins, in the rows' order — the explicit mode (rows 1–3),
+  the kinds routed elsewhere (4–5), input and output terminals (6), a folder (7), the destination
+  (8), the display (9–10). `--hex` makes the kind hex, then rows 4–10 apply.
 
 | # | When | Opens |
 |---|---|---|
@@ -391,19 +426,19 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
 | 01 A9, A10, §4a | `target` = where SOURCE opens | the switch's destination (X2, for `--tui`); for `sopen <folder>`, where the window opens on a switch; GUI kinds as today (XF) | X2, XF |
 | 01 §4a, the forward | HOST runs `sopen --here …` | every forwarded window run passes `--gui`; the switch's half `--gui --state-stdin` with `BatchMode=yes`, the `sopen-xtools-state` and `sopen-xtools-kept` cues | X2 |
 | 01 §4a, the config | `target`, `fkeys` | plus `screen` (T12) and `pictures` (T20) | X7 |
-| 01 A14 | every window | the HID switch and the inhibitor are the window's; the TUI has the row, Alt+digits, real F-keys | X1 |
+| 01 A14 | every window | the HID switch and the inhibitor are the window's; the TUI has the row, Alt+digits, real F-keys | X1b |
 | 01 §3a, the skin | translucent shadows and overlays, half-cell paddings | §6's look | each step, for its screens |
-| 01 §3a, 04 §3 rule 4 | no plain F-key acts while a field has the typing | except F12 and Alt+G, which type nothing (as 08 D29 excepts F9) | X1 |
-| 04 §3 rule 3 | Cmd on macOS, Ctrl elsewhere | in the TUI Ctrl on every OS, ⌘ only under the kitty protocol (T26) | X1 |
-| 04 §2 | "F11 and F12 stay unused" | F12 = the switch, the `FKeyInput` plugin's (not a table row) | X1 |
-| 04 §6.1 | Cmd/Ctrl+1…0 | plus Alt+1…0 in the TUI; Cmd/Ctrl+1…0 in the TUI under the kitty protocol | X1 |
-| 04 §10, KL-W4 | "if X1 already owns the winit handler…"; KL-W4's run is `create_native` | X1 owns `create_native` and the one event loop (T34); KL-W4 adds only its wrapper | X1 |
-| `src/gui/help.rs` | `aliases()` names this machine's command key | one neutral text naming each alias and where it works (T27) | X1 |
-| 08 §8–§9, VM-7, VM-8 | provisional; "if XR-T keeps egui windows" | VM-8 (cells) replaces VM-7's screen half in X3; VM-7's input half (the window's key and text, `Driver::press`) stays for the window; §9's "Alt+digit is none either" gains "except as the TUI's F-key aliases"; its "opens on Hex" becomes §8's: an image opens on 1 | X3 |
+| 01 §3a, 04 §3 rule 4 | no plain F-key acts while a field has the typing | except F12 and Alt+G, which type nothing (as 08 D29 excepts F9) | X1b |
+| 04 §3 rule 3 | Cmd on macOS, Ctrl elsewhere | in the TUI Ctrl on every OS, ⌘ only under the kitty protocol (T26) | X1b |
+| 04 §2 | "F11 and F12 stay unused" | F12 = the switch, the `FKeyInput` plugin's (not a table row) | X1b |
+| 04 §6.1 | Cmd/Ctrl+1…0 | plus Alt+1…0 in the TUI; Cmd/Ctrl+1…0 in the TUI under the kitty protocol | X1b |
+| 04 §10, KL-W4 | "if X1 already owns the winit handler…"; KL-W4's run is `create_native` | X1b owns `create_native` and the one event loop (T34); KL-W4 adds only its wrapper | X1b |
+| `src/gui/help.rs` (`aliases()`, `describe`, `:139-146`); `keys.rs` `Mods::prefix` (`:309-351`) | this machine's command key (`Cmd+R` on macOS, `Ctrl+R` elsewhere) | `Ctrl/⌘+R` on every row, one line on where ⌘ applies, each alias with where it works (T27) | X1a |
+| 08 §8–§9, VM-7, VM-8 | provisional; "if XR-T keeps egui windows" | VM-8 (cells) replaces VM-7's screen half in X3; VM-7's input half (the window's key and text, `Driver::press`) stays for the window; §9's "Alt+digit is none either" gains "except as the TUI's F-key aliases"; its "opens on Hex" becomes §8's: an image and a video open on 1 | X3 |
 | 09 §8 | "the source is view 1 there" (`09-web-view.md:433`) | 08's slots kept: HTML and styled XML open on 3, plain XML and RSS on 1; F12; no snapshot | X3 |
-| 09 WV-D, WV-E chrome | egui | cells if X1 has landed, else egui moved in X6 (T23) | X1, X6 |
-| README | line 9 (folder → window); "Requirements" (a desktop session); "Open on another machine's screen" | `--tui`, F12, Alt+G (X1); the switch to a target (X2); folder → TUI, target = the window's place, a section "In the terminal" (XF) | X1, X2, XF |
-| AGENTS.md "Receipts" | — | rows for `--tui`, `--gui`, `SOPEN_CELLS` (a local path, not forwarded), `SOPEN_REQUIRE_TMUX`, `SOPEN_SCREEN`, `SOPEN_PICTURES` | X1, X7 |
+| 09 WV-D, WV-E chrome | egui | cells if X1a has landed, else egui moved in X6 (T23) | X1a, X6 |
+| README | line 9 (folder → window); "Requirements" (a desktop session); "Open on another machine's screen" | `--tui`, F12, Alt+G (X1b); the switch to a target (X2); folder → TUI, target = the window's place, a section "In the terminal" (XF) | X1b, X2, XF |
+| AGENTS.md "Receipts" | — | rows for `--tui`, `--gui`, `SOPEN_CELLS` (a local path, not forwarded), `SOPEN_REQUIRE_TMUX`, `SOPEN_SCREEN`, `SOPEN_PICTURES` | X1a, X1b, X7 |
 
 **Frozen meanwhile** (*tui* §12): new egui screens — 08's screens and the editor are written in cells
 — and egui widget work on screens about to move; bug fixes continue. 09's chrome follows T23, so
@@ -435,23 +470,24 @@ WV-D still ships without waiting (09 §12).
 | T20 | `HC_TERMINAL_ID` set → half blocks until the probe answers; `SOPEN_PICTURES` / `pictures` overrides the pick | herdr parses kitty frames but may not draw them; its `TERM_PROGRAM` says ghostty |
 | T21 | 08's slots in both backends: an image and a video open on 1; HTML and styled XML on 3 with view 1 a hand-off row; plain XML and RSS on 1; no page snapshot | the state's `view` must mean the same in both backends; the engine runs inside a window (09 §2) |
 | T22 | No sound on a remote screen (T12); the waveform and F12 | sound comes out of the machine sopen runs on |
-| T23 | 09's page viewer and address window chrome: cells if X1 has landed, else egui moved in X6 | 09 §12 ships WV-D without waiting; the page itself is a region either way |
+| T23 | 09's page viewer and address window chrome: cells if X1a has landed, else egui moved in X6 | 09 §12 ships WV-D without waiting; the page itself is a region either way |
 | T24 | XF lands after X6 and X7 (and so after X3 and X4) | message 23 asks for pictures and video in the terminal itself; a flip with them handed off falls short of it |
-| T25 | A printable key the key table binds as a key trigger (today Space) becomes `Event::Key` + `Event::Text` in the TUI, as the window delivers it; one binding takes that shape in both | `find` matches key triggers only on `Event::Key`; whitespace cannot be a text trigger (`keys.rs:602-617, 1029-1031`) |
+| T25 | Every printable ASCII character egui names a key for becomes `Event::Key` + `Event::Text` in the TUI, as egui-winit sends it; other ASCII and non-ASCII text (Hangul) stay `Text` alone (widened in round 2) | the key table matches key triggers only on `Event::Key` (`keys.rs:602-617, 1029-1031`); the viewers match letters as keys (`text.rs:3979`, `image.rs:3258-3268, 4829`, `mod.rs:1880-1882`); no table row matches a plain letter, and fields insert from `Text` |
 | T26 | Ctrl = egui's `command` in the TUI on every OS; ⌘ only under the kitty protocol | ⌘ never reaches a terminal in legacy encoding; with a Mac's ⌃ as `ctrl` alone every Cmd row would be unreachable (`keys.rs:290-301`) |
-| T27 | Help names every alias in one neutral text, the same in both backends | the help screen is 1:1 content; per-machine key names would differ |
+| T27 | The help in both backends is one text: every command row as `Ctrl/⌘+…` (`Mods::prefix`, `describe`), one line on where ⌘ applies, every alias with where it works | the help screen is 1:1 content; per-machine key names would differ |
 | T28 | The in-process switch leaves the terminal (alternate screen and modes off); the remote switch keeps raw mode and the alternate screen, dims, deletes pictures and reads Ctrl+C; re-entry flushes pending input | the window owns the terminal's machine in one case and not in the other; keys typed meanwhile were meant for the window |
 | T29 | The remote switch's ssh runs with `BatchMode=yes` and `SSH_ASKPASS_REQUIRE=never`, HOST's stderr on the status row, one line per outcome | ssh cannot ask a question while the TUI holds raw mode; each end gets its own answer |
-| T30 | Returning with unsaved edits asks HOST's close prompt there; a writing job makes it wait; input ending with unsaved edits keeps HOST's window open (01 A11 over 09 §7's end-of-input close, which applies only to a window with nothing to lose); Cmd+Q is that window's close and sends no cue; `--state-stdin` makes HOST's window a switched window | an edit is never dropped unasked; the owner can still return from a window with no terminal |
+| T30 | Returning with unsaved edits asks HOST's close prompt there; a writing job makes it wait; input ending with unsaved edits keeps HOST's window open (01 A11 over 09 §7's end-of-input close, which applies only to a window with nothing to lose); Cmd/Ctrl+Q and +W are that window's close and return with the cue, as in one process (round 2); `--state-stdin` makes HOST's window a switched window | an edit is never dropped unasked; the shell already treats Q and W as the close (`gui/mod.rs:1174-1185`); the owner can still return from a window with no terminal |
 | T31 | A local window that fails to start brings the TUI back unchanged, with an actionable line | the terminal was already left; the owner must not lose the screen |
-| T32 | An unknown state version is refused with a line; each step that moves a screen adds its fields and bumps `v`; every running writing job makes the switch wait | version skew must say so; a writing job cannot be carried |
+| T32 | A reader accepts its own and every older state version; a newer one is refused with a line; each step that moves a screen adds its fields and bumps `v`; every running writing job makes the switch wait | the two ends update at different times; skew must say so; a writing job cannot be carried |
 | T33 | Alt+G is the switch's keyboard alias in the TUI | it arrives under legacy encoding as `ESC g`; the table binds no Alt+letter, and with no text it never reaches a letter jump |
-| T34 | Route B: the window backend owns winit's handler through `eframe::create_native`, one event loop per process; X1 measures the switch again | 04 §6.4.3 already needs it; XR-T measured `run_native` |
+| T34 | Route B: the window backend owns winit's handler through `eframe::create_native`, one event loop per process; X1b measures the switch again | 04 §6.4.3 already needs it; XR-T measured `run_native` |
 | T35 | Every forwarded window run passes `--gui`, from X2 | after the flip a forward with `-t` would start a TUI inside ssh on HOST |
-| T36 | One routing table (§11) with precedence: explicit mode, kind, terminals, destination, display | overlapping rules gave no answer for, e.g., an image on a terminal with no display and no target |
+| T36 | One routing table (§11), first match in the rows' order: explicit mode, kinds routed elsewhere, terminals, a folder, destination, display | overlapping rules gave no answer for, e.g., an image on a terminal with no display and no target |
 | T37 | 1:1 is defined under truecolor; a 256-colour terminal goes through one fixed table; the cell API has no modifiers | the oracle needs one answer per colour; modifiers would be a second, unchecked channel |
 | T38 | In an ambiguous-wide terminal every ambiguous glyph from sopen's tables is substituted (§10); file content is laid in 2 cells | frames and cut names must hold; content must not change |
 | T39 | `sopen --tui <file>` opens the TUI on its folder, the bar on it, its viewer open | `--tui` must have one meaning for every SOURCE |
+| T40 | XR-T's X1 splits into X1a (the grid in the window, no TUI) and X1b (the terminal, the list's dialogs, OSC 52, the cursor at a field, kitty flag 1 by default); the translator is built in parallel from the start; tests move by one kit change; ratatui-core (the buffer only), not ratatui | the spike: panes host unchanged at cell rects, so X1a ships with no TUI; the dialogs are invisible only in a terminal; the kit re-point fixed the list's text queries at once; the buffer is all the core needs |
 
 ## 14. Acceptance
 
@@ -459,42 +495,49 @@ WV-D still ships without waiting (09 §12).
 or hands (*tui* §13's probe, extended by these items).
 
 **The screen**
-- TS-1 [X1]. The list, the F-key row and the F7 dialog with `새 폴더 2026` typed, the fixture with
+- TS-1 [X1b]. The list, the F-key row and the F7 dialog with `새 폴더 2026` typed, the fixture with
   Korean names and U+1F3B5, 100×30, and again with F1's help open: cell dumps of (a) the terminal bytes
   through vt100, (b) a private tmux server's `capture-pane -e`, (c) the window's shapes laid onto cells
   → 0 character, foreground, background and modifier differences but the mode label; the caret equal;
   (d) the same bytes with `COLORTERM` unset → equal through §5's 256-colour table. macOS and Linux CI.
-- TS-2 [X1, owner]. The same in kitty and a herdr-app pane on the Linux laptop and a herdr pane on the
+- TS-2 [X1b, owner]. The same in kitty and a herdr-app pane on the Linux laptop and a herdr pane on the
   Mac: kitty by its remote-control text dump [추정: not tried], herdr by a screenshot, cell by cell.
-- TS-3 [X1]. The window's screenshot: every background and every ≥ 2-ink-pixel glyph's foreground =
-  the dump; regions masked, colour glyphs excepted (T18). TS-5 [X1]: resized to 80×24 and 160×50,
-  each dump = the window's at that size. TS-7 [X1]: the projector lint stays within *tui* §1.3.
+- TS-3 [X1a]. The window's screenshot: every background and every ≥ 2-ink-pixel glyph's foreground =
+  the dump; regions masked, colour glyphs excepted (T18). TS-5 [X1b]: resized to 80×24 and 160×50,
+  each dump = the window's at that size. TS-7 [X1a]: the projector lint stays within *tui* §1.3.
 - TS-4 [each step]. Every moved screen passes TS-1 (a) and (c) — X3: text and hex viewers, a UTF-16
   Hangul file in view 1, the encoding list open; X4: lanes, the tree; X6: the chrome around regions.
-- TS-6 [X1]. A pty emulator advancing ambiguous glyphs by 2, the list holding a name cut with "…" and
+- TS-6 [X1b]. A pty emulator advancing ambiguous glyphs by 2, the list holding a name cut with "…" and
   a name with `é` → every §10 glyph substituted (`~` for the cut), no row broken, the oracle equal
-  through the table; [owner] the probe's advances in each owner terminal. TC-1 [X1]: `한글 문서
+  through the table; [owner] the probe's advances in each owner terminal. TC-1 [X1b]: `한글 문서
   초안.txt` takes the same cells in both (its 6 Hangul in 12); an emoji 2 cells, no ink outside them.
+- TS-8 [X1a]. In the window, the list and title in cells and today's panes hosted at cell rects:
+  the spike's three `q1_*` tests (clip and resize; the keyboard between the grid and egui fields,
+  dialogs and the viewer; Tab and clicks to and from the git panel) pass and their negative control
+  fails; the bar on a Hangul name is `ff5555` in every cell; the tree gets the clip check the spike
+  lacked [M spike for the rest].
 
 **The switch**
-- TW-1 [X1]. One process, a display, route B: F12 from the list with the F7 dialog open and typed into
+- TW-1 [X1b]. One process, a display, route B: F12 from the list with the F7 dialog open and typed into
   → the window's dump = the TUI's but the label; a folder made; F12 → the TUI lists it, the dialog as
   left; twice per run, first-frame times recorded; keys typed while the window was up do nothing back
   in the TUI. `[GUI]` and Alt+G = F12; closing returns; a window with no terminal shows no `[TUI]`. No
   display and no target → the status line; a HOST destination before X2 → its line.
 - TW-2 [X2]. A stand-in ssh running HOST's half locally: state in, cue out, paths rewritten both ways,
-  `BatchMode=yes` on its command line, HOST's stderr on the status row; Ctrl+C → the state from before;
-  each of §7.3's outcomes (0 without the cue, 1, 2, 3, 128 + n, 127, 255) → its line, the TUI stays;
+  `BatchMode=yes` on its command line and `SSH_ASKPASS_REQUIRE=never` in its environment, HOST's
+  stderr on the status row; Ctrl+C → the state from before; each of §7.3's outcomes (0 without the
+  cue, 1, 2, 3, 128 + n, 127, 255, no exit code) → its line, the TUI stays;
   an unknown `"v"` → its line; a running copy → `waiting for…`, then the switch.
 - TW-3 [X2, owner]. The owner's direction: the TUI in a herdr pane on the Mac shown on the laptop,
   `target = <the Linux laptop>`; F12 → the window there, same cells; a folder made; close → the Mac's
   TUI lists it; timed.
 - TW-4 [X2]. An unsaved hex edit, F12 to HOST → the save question; Cancel stays; Save → switched after
-  it lands. On HOST: edit, F12 → HOST's close prompt; Cancel → the window stays; Save → back with
-  the state. Edit, then Ctrl+C here, and again with the stand-in's link cut → HOST's window stays with
-  its edit, this side restored with the kept or the lost-link line. Cmd+Q on HOST → the quit line.
-  In one process the edit crosses unsaved and saves from the window.
-- TW-5 [X1]. An injected window start-up failure → the TUI back with its state unchanged and the line.
+  it lands. On HOST: edit, F12 → HOST's close prompt (Save · Save As… · Discard · Cancel); Cancel → the
+  window stays; Save → back with the state; the same with Cmd/Ctrl+Q and +W → back with the cue.
+  Edit, then Ctrl+C here, and again with the stand-in's link cut → HOST's window stays with its edit,
+  this side restored with the kept or the lost-link line. In one process the edit crosses unsaved and
+  saves from the window.
+- TW-5 [X1b]. An injected window start-up failure → the TUI back with its state unchanged and the line.
 
 **Pictures, keys, routing, leaving**
 - TP-1 [X7]. The pick against scripted answers: kitty → kitty; DA1 with `4` → sixel; none → half
@@ -505,35 +548,48 @@ or hands (*tui* §13's probe, extended by these items).
   and its source. TP-4 [X6]: a region = its cell rect × (8, 16) pt; a dialog over a macOS web view
   hides it (`hitTest` at its centre is not the view). TP-5 [X3]: `index.html` opens on 3, `feed.xml`
   on 1, an image on 1 in a half-block terminal.
-- TK-1 [X1]. *tui* §4's table as a test (legacy and kitty bytes → commands): Alt+digits → F-keys and
+- TK-1 [X1b]. *tui* §4's table as a test (legacy and kitty bytes → commands): Alt+digits → F-keys and
   Alt+G → the switch under legacy, Ctrl+digits under kitty; Space selects in the list, marks in the git
   panel and sizes in the tree, in both encodings; Ctrl+R rereads on a macOS build; Ctrl+J under legacy
-  → `ToHead` or the recorded byte; the Ctrl+Shift actions in the F10 menu; the kitty flags pushed only
-  after `CSI ? u` is answered.
-- TK-2 [X1, owner]. In kitty, herdr-app and herdr on the Mac: a click on `[GUI]` and on the F-key row
+  → `ToHead`; the 17 legacy losses of §9 exactly, none under kitty; the Ctrl+Shift actions in the F10
+  menu; the kitty flags pushed only after `CSI ? u` is answered. The spike measured the decode half on
+  macOS (101/101 and 90/101 rows, the 17 losses, Ctrl+J → `ToHead`, and 21 browser steps with
+  identical states under both encodings) [M spike]; the unit runs it on Linux too.
+- TK-2 [X1b, owner]. In kitty, herdr-app and herdr on the Mac: a click on `[GUI]` and on the F-key row
   acts; which of F12, Alt+G, Alt+1…0 and Ctrl+1…0 arrive; the DSR round trip (information only);
-  whether the herdr panes are viewed from another machine. TK-3 [X3]: the character `1` with no key
-  event → view 1; F9 then `2` → Hex; in an editable hex view `1` is typed.
+  whether the herdr panes are viewed from another machine. TK-3 [X3, X6]: in the TUI `1` → view 1;
+  F9 then `2` → Hex; in an editable hex view `1` is typed; `W` in the text viewer wraps and unwraps
+  (X3); `P`, `F` and `H` act in the image viewer (X6); a Hangul name typed in the F7 field arrives
+  whole, as `Text` alone.
 - TF-1 [XF]. Each row of §11's table, in order: `--app`, `--gui` here without a display (exit 1),
   `--tui` with output to a pipe (exit 2), an address, a text file, a pipe (`SOPEN_LIST` prints, a
   `while read` loop is not eaten), a folder with and without a target, an image with a target, with a
   display, and **on a terminal with no display and no target** → the TUI's picture.
-- TL-1 [X1]. Exit, a test-hook panic, SIGTERM, SIGHUP and the in-process switch → the alternate screen
+- TL-1 [X1b]. Exit, a test-hook panic, SIGTERM, SIGHUP and the in-process switch → the alternate screen
   left, modes reset, kitty flags popped, pictures deleted; the remote switch → still in raw mode and
   the alternate screen, pictures deleted, only Ctrl+C read (bytes checked).
 
 ## 15. Test plan
 
-- **Tests query cells** (T10): `find_text`, `click_text`, `texts`, `text_starting_with`,
-  `colors_of`, `rows_of` are re-implemented over the grid with the same signatures; the ≈75 pixel
-  queries (`pictures`, `rects`, `segments`, `galleys`, `strokes`) are rewritten as region rects [M
-  counts *tui* §11]. The Driver's input side stays. A screen's tests change in the step that moves it.
+- **Tests query cells, by one test-kit change** (T10, unit XW-kit): the kit's text queries (`find_text`,
+  `click_text`, `texts`, `text_starting_with`, `colors_of`, `rows_of`) answer from cells with the same
+  signatures, plus a column/range query and runs that stop at frame glyphs. It lands once, before any
+  screen moves; a later step rewrites only its screens' geometry asserts. Measured on the list and
+  title [M spike]: with the list in cells and the kit untouched, 14 of 226 browser tests failed; the
+  kit re-point fixed 9 and answered 17 list-text query sites in 11 tests with the same values; 6 sites
+  were edited by hand (3 `framed` → `framed_right`, 2 geometry tests); 0 behaviour failures, 0 vacuous
+  passes logged; the other 2,220 lib tests were untouched. For dialogs, the F-key and status rows it
+  is [추정] (they add focus and button clicks). Kit cautions: a cell match is a substring of a row,
+  looser than galley equality, so absent-text asserts weaken; cells keep no draw-call identity, hence
+  the column query. The ≈75 pixel queries (`pictures`, `rects`, `segments`, `galleys`, `strokes`)
+  become region rects in their screens' steps [M counts *tui* §11]. The Driver's input side stays.
 - **Two harness tests per screen**: terminal bytes through vt100 = the buffer; the window's shapes
   laid onto cells = the buffer (§5), with §5's 256-colour and §10's substitution tables as oracle
   maps. **tmux** is CI's second emulator (`SOPEN_REQUIRE_TMUX=1`, as the other `SOPEN_REQUIRE_*`).
-  **A terminal driver** plays legacy and kitty bytes into a pty (*tui* §4's `keyaxis`), the character
-  alone for typed text (08 §12). **The remote switch** runs against a stand-in ssh (AGENTS.md: no ssh
-  or network in tests), as 01 §4a's forward is tested today.
+  **A terminal driver** plays legacy and kitty bytes into a pty (*tui* §4's `keyaxis`, the spike's
+  key-row player), sending a typed character alone as a terminal does; the translator makes the
+  events. **The remote switch** runs against a stand-in ssh (AGENTS.md: no ssh or network in tests),
+  as 01 §4a's forward is tested today.
 - **Receipts**: `SOPEN_CELLS=<path>` writes the grid (a row per line plus an attribute table) once
   `SOPEN_KEYS` have settled, then ends — both backends, one format for TS-1, TS-2 and the owner's
   receipts. It names a local path, so like §4a's other path settings it is not forwarded; a receipt
@@ -543,33 +599,59 @@ or hands (*tui* §13's probe, extended by these items).
 
 ## 16. Migration order
 
-*tui* §12 adjusted by T2 and T24: XR-T's X2 bundled "TUI by default" with the cross-machine switch;
-the switch stays early and the flip is its own last step, XF. Each step ships alone (prerelease),
-none waits for a later one, and each moves its screens' tests (§15).
+*tui* §12 adjusted by T2 and T24 and by the spike: XR-T's X2 bundled "TUI by default" with the
+cross-machine switch, so the switch stays early and the flip is its own last step, XF; XR-T's X1
+splits in two (T40). Each step ships alone (prerelease) and none waits for a later one; tests move
+once, by the kit (§15).
 
-1. **X1 — the core, both backends, the list**: the cell API, the terminal backend, the window's cell
-   painter on route B, the dump/diff harness, `SOPEN_CELLS`, the neutral help text; the list, title,
-   status, F-key row and the list's dialogs (F2, F5–F8, groups) in cells **in both**; `sopen --tui`;
-   F12 and Alt+G → the window in one process. Viewers, tree and git panel stay egui in the window,
+1. **X1a — the grid in the window, no TUI**: the cell core (`src/gui/cells.rs`) → the test kit's
+   text queries answer from cells → the grid with today's egui panes hosted at cell rects → the
+   list, title, status and F-key rows in cells; the neutral help text. Everything else is today's
+   egui, at a cell rect. The spike measured this part: ≈0.94k product lines (cells 436, list and title
+   216, `browser.rs` 53, the translator 231) plus 183 in the kit [M spike].
+2. **X1b — the terminal**: the terminal backend (`src/gui/term.rs`: loop, layers, kitty flag 1 by
+   default, mouse, OSC 52, the cursor at a field for Hangul composition, leaving and flushing), the
+   list's dialogs in cells (F2, F5–F8, groups: egui and invisible in a terminal, fine in the window,
+   so they gate X1b only), route B with F12 and Alt+G, `sopen --tui`. The translator
+   (`src/gui/term_input.rs`) is built in parallel from the start. Viewers, tree and git panel are
    hand-off boxes in the TUI.
-2. **X2 — the switch across machines** (HOST's half, the state and cues, `--gui` on every forward).
-3. **X3 — the text and hex viewers, their previews and the binary dialog in cells**: 08's views and
+3. **X2 — the switch across machines** (HOST's half, the state and cues, `--gui` on every forward).
+4. **X3 — the text and hex viewers, their previews and the binary dialog in cells**: 08's views and
    encodings (VM-8).
-4. **X4 — the tree and the git panel in cells**: lanes as glyphs, details, dialogs, the planner.
-5. **X5 — the editor (XR-E)**, cell-native; its left-panel directory/git tabs need X4.
-6. **X6 — the image and media chrome in cells; pictures, video and the web view as regions.**
-7. **X7 — terminal pictures and video**: the pick, the fast path, in-band frames, `screen` and
+5. **X4 — the tree and the git panel in cells**: lanes as glyphs, details, dialogs, the planner.
+6. **X5 — the editor (XR-E)**, cell-native; its left-panel directory/git tabs need X4.
+7. **X6 — the image and media chrome in cells; pictures, video and the web view as regions.**
+8. **X7 — terminal pictures and video**: the pick, the fast path, in-band frames, `screen` and
    `pictures`.
-8. **XF — the flip** (T2, T3, T24), after X6 and X7: §11's rows 7 and 10 and §12's XF rows change.
+9. **XF — the flip** (T2, T3, T24), after X6 and X7: §11's rows 7 and 10 and §12's XF rows change.
 
 ## 17. Work units
 
-Sized after the spike in the real repo: hosting legacy egui panes in a cell-grid window, the
-crossterm→egui translation, test breakage.
+Sized by the spike in the real repo (branch `spike/tui-host`, 402fde1…15333c7, never merged; all three
+seams PASS: egui panes hosted at cell rects, crossterm → egui as the neutral input, test breakage
+0.9–2.2 % beyond the kit re-point on the list and title). Sizes are product lines; **[M]** = the spike's
+`git diff --numstat`, **[추정]** = not built there. Each unit owns its files; a file shared by two units
+passes from one to the next in the order given. The gate is §15's.
 
-| ID | Unit | Owns | After |
-|---|---|---|---|
-| — | (placeholder — filled from the spike's results) | — | — |
+| ID | Unit | Owns | Size | After | Ships alone as |
+|---|---|---|---|---|---|
+| XW-0 | Scaffold: ratatui-core 0.1.2, crossterm 0.29, unicode-width 0.2 (the lock adds 20 packages, bumps none [M]); the `mod` lines | `Cargo.toml`, `Cargo.lock`, `src/gui/mod.rs` (`mod` lines only) | ≈10 | — | no change |
+| XW-cells | Cell core: grid (`Grid::over`, `rect`), painter (background runs, a glyph per cell, the wide-glyph second-cell fix), layer record, cell API, read-back | `src/gui/cells.rs` (new) | ≈450 (451 [M]) | XW-0 | no change: nothing draws through it yet |
+| XW-kit | Test kit: text queries answer from cells; a column/range query; runs stop at frame glyphs | `src/gui/testkit.rs` | ≈190 (+190 [M], 13 of them the spike's flip log, dropped) | XW-cells | no change: every test passes as before |
+| XW-help | Neutral key names (T27): `Mods::prefix`, help's `aliases()` and `describe` | `src/gui/help.rs`; `src/gui/browser/keys.rs` (`prefix` and its tests only) | ≈60 [추정] | XW-0 | the window's help reads `Ctrl/⌘+…` |
+| XW-grid | Grid and hosting: `panels_ui` splits the central area into cells (the odd column to the right), today's panes at `grid.rect(side)`, the Enter viewer in a scope at `grid.rect(all)`; 3 one-call test fixes (`framed` → `framed_right`) | `src/gui/browser.rs` (`panels_ui`, the viewer scope); `src/gui/browser/tests.rs`, `tests/s1.rs` (those calls) | ≈50 (≈46 [M]) | XW-kit | the window as today, panes 504 pt wide |
+| XW-list | The list, title, status and F-key rows in cells; `panel_ui` deleted; 2 geometry tests rewritten | `src/gui/browser/list_cells.rs` (new); `src/gui/browser.rs` (after XW-grid); `src/gui/chrome.rs` (the rows' drawing); `src/gui/browser/tests.rs` (the 2 tests) | ≈220 (list and title 216 [M]; status and F-key rows [추정]) | XW-grid | **X1a**: the window's list in cells |
+| XW-input | The translator (§4's rules) and its replays: the key-row table under legacy and kitty, the three test sequences and Hangul | `src/gui/term_input.rs` (new), `src/gui/term_input/tests.rs` (new) | 231 [M] + tests | XW-0; parallel to XW-cells–XW-list | no change: no caller yet |
+| XW-shell | Route B: `create_native`, one event loop per process, `run_app_on_demand` per window; `FKeyInput`'s F12, Alt+digits and Alt+G; the start-up failure path (T31). Then `src/gui/mod.rs` passes to 04's KL-W4 | `src/gui/mod.rs` | [추정] | XW-0 | the window as today, its run re-measured (TW-1's times) |
+| XW-dialogs | The list's dialogs in cells: the F2 field, F5–F8 modals, the group dialogs | `src/gui/browser/ops.rs`, `src/gui/browser/ops/`, `src/gui/browser/panel.rs` | [추정: where the spike puts X1's cost] | XW-list | the window's dialogs in cells |
+| XW-term | The terminal backend (from the spike's 272-line runner): loop, layer drawing, kitty flag 1 by default, mouse, OSC 52, the cursor at a field, resize, leaving and flushing, the in-process switch; `--tui`; README and AGENTS rows | `src/gui/term.rs` (new); `src/main.rs` (`--tui`); `README.md`, `AGENTS.md` | ≈300 [추정] | XW-list, XW-input, XW-shell, XW-dialogs | **X1b**: `sopen --tui` |
+
+- **Order**: XW-0 → XW-cells → XW-kit → XW-grid → XW-list, with XW-help, XW-input and XW-shell
+  in parallel from XW-0; XW-dialogs after XW-list; XW-term last. X1a ships with XW-list (and
+  XW-help); X1b with XW-term.
+- **Steps X2–XF** are cut into units when X1b has merged: the spike measured the list, a low-query
+  screen, and says dialogs, the F-key and status rows and the terminal backend carry the rest of the
+  cost [추정 beyond the list].
 
 ## Tensions
 
@@ -583,13 +665,13 @@ crossterm→egui translation, test breakage.
   of" Ctrl/Cmd+digits; T7 keeps both.
 - **04 §2, 04 §3 rules 3–4 and 01 §3a vs T4, T26, T33.** F12 was to stay unused, the key table's test
   forbids F12 rows, no plain F-key acts while a field has the typing, and Cmd is ⌘ on macOS; F12 and
-  Alt+G are the plugin's and act in fields, and the TUI reads Ctrl as Cmd on every OS. Amended with X1.
+  Alt+G are the plugin's and act in fields, and the TUI reads Ctrl as Cmd on every OS. Amended with X1b.
 - **08 §9 vs 09 §8 on a page's slots.** 08 §9 opens HTML on Text with view 1 saying why; 09 §8 says
   "the source is view 1 there". T21 keeps 08's slots (Text = 3), so a window on 3 lands on 3.
 - **09 §7's end-of-input close vs 01 A11.** A window with unsaved edits would close when its tunnel's
   or switch's input ends; T30 keeps it open, and 09 §7's rule applies to a window with nothing to lose.
 - **09 §12 vs the freeze.** *tui* §12 freezes new egui screens; 09 ships WV-D without waiting. T23:
-  its chrome is cells if X1 has landed, else egui moved in X6.
+  its chrome is cells if X1a has landed, else egui moved in X6.
 - **T8's "over ssh" vs the owner's herdr path**, which has no ssh environment: T12 makes it the
   owner's `screen = "remote"`; the probe says whether herdr panes are viewed from elsewhere.
   *tui* §14.5 (video across machines) is settled by T8.
