@@ -4563,8 +4563,10 @@ fn the_bar_says_the_encoding_and_the_rows_are_whole() {
     let mut drv = Driver::new(900.0, 500.0);
     drv.until(&mut win, 10, |w| w.ready());
     assert!(bar_says(&drv, "40 lines"), "{:?}", drv.texts());
+    // The encoding is a label of its own, a cell after the rest's ` ·`.
+    assert!(bar_says(&drv, "plain text ·"), "{:?}", drv.texts());
     assert!(
-        bar_says(&drv, "plain text · UTF-16LE (BOM)"),
+        drv.find_text("UTF-16LE (BOM)").is_some(),
         "{:?}",
         drv.texts()
     );
@@ -4588,12 +4590,14 @@ fn the_bar_says_the_encoding_and_the_rows_are_whole() {
     assert!(drv.find_text("plain English").is_some());
     let mut win = viewer(tmp.path(), "main.rs", RUST);
     drv.until(&mut win, 10, |w| w.ready());
-    assert!(bar_says(&drv, "Rust · UTF-8"), "{:?}", drv.texts());
+    assert!(bar_says(&drv, "Rust ·"), "{:?}", drv.texts());
+    assert!(drv.find_text("UTF-8").is_some(), "{:?}", drv.texts());
     assert!(drv.find_text("fn main() {").is_some());
 }
 
-/// A long path never hides the bar's stats: they are laid out whole at the right first, and the
-/// title gets the rest, cut from the left as a path is (`chrome::fit_left`).
+/// A long path never hides the bar's stats: they are laid out whole at the right first (the
+/// encoding, then the rest up to its ` ·`, a cell apart as a space would be), and the title gets
+/// the rest of the bar, cut from the left as a path is (`chrome::fit_left`).
 #[test]
 fn a_long_title_is_cut_before_the_bar_s_stats() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4609,7 +4613,7 @@ fn a_long_title_is_cut_before_the_bar_s_stats() {
     );
     let stats = |win: &TextWindow| {
         format!(
-            "{} lines · {} · plain text · UTF-16LE (guessed)",
+            "{} lines · {} · plain text ·",
             win.doc.line_count(),
             crate::human(win.doc.size())
         )
@@ -4619,6 +4623,10 @@ fn a_long_title_is_cut_before_the_bar_s_stats() {
     let whole = stats(&win);
     let shown = drv.find_text(&whole);
     assert!(shown.is_some(), "{whole} whole: {:?}", drv.texts());
+    let encoding = drv.find_text("UTF-16LE (guessed)");
+    assert!(encoding.is_some(), "{:?}", drv.texts());
+    let gap = encoding.unwrap().left() - shown.unwrap().right();
+    assert_eq!(gap, chrome::CELL.x, "one cell, as a space");
     assert!(drv.find_text(&title).is_none(), "the title is cut");
     let cut: Vec<String> = drv
         .texts()
@@ -4639,6 +4647,7 @@ fn a_long_title_is_cut_before_the_bar_s_stats() {
     drv.idle(&mut win, 2);
     assert!(drv.find_text(&title).is_some(), "{:?}", drv.texts());
     assert!(drv.find_text(&whole).is_some());
+    assert!(drv.find_text("UTF-16LE (guessed)").is_some());
 }
 
 /// `SOPEN_STATE` `enc=NAME` (08 D34) names an encoding the text views decode, in any case;

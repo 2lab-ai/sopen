@@ -208,7 +208,7 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   charset`, `http-equiv`, `encoding=`) gets the one `crate::encoding::pick` gives for its first 8 KiB
   (`kind::SNIFF_BYTES`) — the text view's default (08 §7.2), so the page and its source agree:
   `; charset=utf-8` for UTF-8 by its BOM, or by step 4 when the sample is valid UTF-8 — a character
-  cut at the 8 KiB edge accepted, as the sniff's UTF-8 test in `kind::looks_like_text` accepts it
+  cut at the 8 KiB edge accepted: `kind::utf8_text`, never `kind::looks_like_text` (UTF-16/32 too)
   (step 4 is UTF-8 "valid or not": bytes that are not get none); `utf-16le` / `utf-16be` for UTF-16 by
   its BOM or the NUL pattern (a BOM decides before the header anyway: the Encoding Standard's
   *decode*); `utf-32le` / `utf-32be` for UTF-32, though the Encoding Standard defines no UTF-32

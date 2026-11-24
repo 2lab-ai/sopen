@@ -152,23 +152,76 @@ pub fn by_extension(name: &str) -> Option<Kind> {
     }
 }
 
-/// No NUL and valid UTF-8, or UTF-16 / UTF-32 by the text view's default (08 D18: §7.2's step 1,
-/// a BOM, or step 2, the NUL pattern) — [`crate::encoding::pick`] itself, so a file routed to
-/// text this way is decoded by the encoding that routed it (D27). Its other answers do not route:
-/// a CP949 guess (step 3) or a UTF-8 BOM before bytes that are not UTF-8 stay "other".
-/// `truncated` = the buffer stops before the end of the file, so a multi-byte character cut at
-/// the boundary does not count against it.
-pub fn looks_like_text(head: &[u8], truncated: bool) -> bool {
-    use crate::encoding::Encoding::{Utf16Be, Utf16Le, Utf32Be, Utf32Le};
-    let utf8 = !head.contains(&0)
+/// The sniff's UTF-8 test: no NUL and valid UTF-8. `truncated` = the buffer stops before the end
+/// of the file, so a multi-byte character cut at the boundary does not count against it. A
+/// page's `charset=utf-8` is decided by this (09 §4), never by [`looks_like_text`], which takes
+/// UTF-16 and UTF-32 too.
+pub fn utf8_text(head: &[u8], truncated: bool) -> bool {
+    !head.contains(&0)
         && match std::str::from_utf8(head) {
             Ok(_) => true,
             Err(e) => truncated && e.error_len().is_none(),
-        };
-    utf8 || matches!(
-        crate::encoding::pick(head, truncated).encoding,
-        Utf16Le | Utf16Be | Utf32Le | Utf32Be
-    )
+        }
+}
+
+/// Signatures of binary formats, each at its offset, whose fields and samples the NUL pattern
+/// could take for UTF-16 / UTF-32 text (a WAV of quiet 16-bit samples is all ASCII units): a
+/// file that starts with one is that binary, and the pattern is not asked about it (D18).
+const SIGNATURES: &[(usize, &[u8])] = &[
+    // RIFF (WAV, AVI, WebP), MP3 with a tag, FLAC, Ogg.
+    (0, b"RIFF"),
+    (0, b"ID3"),
+    (0, b"fLaC"),
+    (0, b"OggS"),
+    // PNG, GIF, JPEG, PDF, ZIP (and what is a zip: docx, jar, …), SQLite.
+    (0, b"\x89PNG"),
+    (0, b"GIF8"),
+    (0, b"\xFF\xD8\xFF"),
+    (0, b"%PDF"),
+    (0, b"PK\x03\x04"),
+    (0, b"SQLite format 3\0"),
+    // Executables: PE, ELF, Mach-O (32 and 64 bits, either order) and a universal binary.
+    (0, b"MZ"),
+    (0, b"\x7FELF"),
+    (0, b"\xFE\xED\xFA\xCE"),
+    (0, b"\xFE\xED\xFA\xCF"),
+    (0, b"\xCE\xFA\xED\xFE"),
+    (0, b"\xCF\xFA\xED\xFE"),
+    (0, b"\xCA\xFE\xBA\xBE"),
+    // Fonts: TrueType, OpenType (CFF), WOFF, WOFF2.
+    (0, b"\x00\x01\x00\x00"),
+    (0, b"OTTO"),
+    (0, b"wOFF"),
+    (0, b"wOF2"),
+    // A Finder `.DS_Store`, OLE (old Office, MSI), a Windows registry hive.
+    (0, b"\x00\x00\x00\x01Bud1"),
+    (0, b"\xD0\xCF\x11\xE0"),
+    (0, b"regf"),
+    // ISO base media (MP4, MOV, M4A, HEIC, …): the first box is `ftyp`.
+    (4, b"ftyp"),
+];
+
+/// Whether `head` starts as a binary format of [`SIGNATURES`] does.
+fn signed_binary(head: &[u8]) -> bool {
+    SIGNATURES
+        .iter()
+        .any(|&(at, sig)| head.get(at..at + sig.len()) == Some(sig))
+}
+
+/// [`utf8_text`], or UTF-16 / UTF-32 by the text view's default (08 D18: §7.2's step 1, a BOM,
+/// or step 2, the NUL pattern) — [`crate::encoding::pick`] itself, so a file routed to text this
+/// way is decoded by the encoding that routed it (D27). The pattern's guess is not taken for a
+/// file with a binary format's signature ([`SIGNATURES`]); a BOM decides before any (D37). The
+/// default's other answers do not route: a CP949 guess (step 3) or a UTF-8 BOM before bytes that
+/// are not UTF-8 stay "other".
+pub fn looks_like_text(head: &[u8], truncated: bool) -> bool {
+    use crate::encoding::Encoding::{Utf16Be, Utf16Le, Utf32Be, Utf32Le};
+    if utf8_text(head, truncated) {
+        return true;
+    }
+    let picked = crate::encoding::pick(head, truncated);
+    let wide = matches!(picked.encoding, Utf16Le | Utf16Be | Utf32Le | Utf32Be);
+    wide && !(picked.guessed && signed_binary(head))
 }
 
 /// Extensions shared by text and video (`.ts`: TypeScript or MPEG-TS); the content decides.
@@ -509,10 +562,91 @@ mod tests {
             classify("notes.dat", || head, utf32.len() as u64),
             Kind::Text
         );
-        // The pattern's sample is the 8 KiB (D27): binary after it does not count.
+        // The pattern's sample is the 8 KiB (D27): binary after it does not count — the whole
+        // buffer given, so the sample's own cut (`encoding::pick`) is what is held to it.
         let mut file = wide(Encoding::Utf16Le, &"wide text\n".repeat(1000));
         file.extend(std::iter::repeat_n(0xFF, 64 * 1024));
-        assert_eq!(sniffed("notes.dat", &file), Kind::Text);
+        let size = file.len() as u64;
+        assert_eq!(classify("notes.dat", || file, size), Kind::Text);
+    }
+
+    /// `[0x40, 0x00]` 4,074 times as the samples of a canonical 8 kHz 16-bit mono PCM WAV: 8 KiB
+    /// in all, its samples UTF-16LE `@`.
+    fn quiet_wav() -> Vec<u8> {
+        let data: Vec<u8> = [0x40, 0x00].repeat(4074);
+        let mut out = b"RIFF".to_vec();
+        out.extend((36 + data.len() as u32).to_le_bytes());
+        out.extend(b"WAVEfmt ");
+        out.extend(16u32.to_le_bytes());
+        out.extend(1u16.to_le_bytes()); // PCM
+        out.extend(1u16.to_le_bytes()); // mono
+        out.extend(8000u32.to_le_bytes());
+        out.extend(16_000u32.to_le_bytes()); // bytes per second
+        out.extend(2u16.to_le_bytes()); // block align
+        out.extend(16u16.to_le_bytes()); // bits per sample
+        out.extend(b"data");
+        out.extend((data.len() as u32).to_le_bytes());
+        out.extend(data);
+        out
+    }
+
+    /// A binary format's signature is checked before the NUL pattern, so its fields and samples
+    /// are never taken for UTF-16 / UTF-32 text; a BOM still decides first (D37).
+    #[test]
+    fn d18_a_known_binary_signature_is_not_wide_text() {
+        let wav = quiet_wav();
+        assert_eq!(wav.len(), SNIFF_BYTES);
+        let alone = pick(&wav, false).encoding;
+        assert_eq!(alone, Encoding::Utf16Le, "the pattern alone");
+        assert_eq!(sniffed("blob.dat", &wav), Kind::Other);
+        assert_eq!(sniffed("blob.wav", &wav), Kind::Audio);
+        let log = wide(Encoding::Utf16Le, &korean_log());
+        assert_eq!(sniffed("notes.dat", &log), Kind::Text);
+        // Each signature before samples the pattern would take for text.
+        let samples: Vec<u8> = [0x40, 0x00].repeat(2000);
+        let signatures: [&[u8]; 26] = [
+            b"RIFF",
+            b"ID3",
+            b"fLaC",
+            b"OggS",
+            b"\x89PNG",
+            b"GIF8",
+            b"\xFF\xD8\xFF",
+            b"%PDF",
+            b"PK\x03\x04",
+            b"SQLite format 3\0",
+            b"MZ",
+            b"\x7FELF",
+            b"\xFE\xED\xFA\xCE",
+            b"\xFE\xED\xFA\xCF",
+            b"\xCE\xFA\xED\xFE",
+            b"\xCF\xFA\xED\xFE",
+            b"\xCA\xFE\xBA\xBE",
+            b"\x00\x01\x00\x00",
+            b"OTTO",
+            b"wOFF",
+            b"wOF2",
+            b"\x00\x00\x00\x01Bud1",
+            b"\xD0\xCF\x11\xE0",
+            b"regf",
+            b"\x00\x00\x00\x18ftyp",
+            b"\x00\x00\x00\x20ftyp",
+        ];
+        for sig in signatures {
+            let mut file = sig.to_vec();
+            file.extend(&samples);
+            let alone = pick(&file, false).encoding;
+            assert!(
+                WIDE.contains(&alone),
+                "{sig:02x?}: the pattern alone takes it"
+            );
+            assert_eq!(sniffed("blob.dat", &file), Kind::Other, "{sig:02x?}");
+        }
+        // A BOM decides before any signature: `FF FE`, then `RIFF`, is UTF-16LE text.
+        let mut bom = vec![0xFF, 0xFE];
+        bom.extend(b"RIFF");
+        bom.extend(&samples);
+        assert_eq!(sniffed("blob.dat", &bom), Kind::Text);
     }
 
     /// The sniff before D18 (`looks_like_text` at 1c6fa00), the oracle of its UTF-8 half: no NUL

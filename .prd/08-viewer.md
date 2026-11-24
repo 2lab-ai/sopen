@@ -30,8 +30,7 @@ Message 23's first line, verbatim:
 The evidence is the VR-M trace, [`research/viewer-modes.md`](research/viewer-modes.md) (cited as
 *trace* §n); this document turns its draft, [`research/viewer-modes-08-draft.md`](research/viewer-modes-08-draft.md),
 into the contract. Code citations are at 767a8a8, the trace's commit. Since then only fd26122 (the name
-xtools) has touched `src/`: `chrome.rs` past line 225 moves down one line, and `main.rs:681` is cited
-at fd26122. Decisions keep the draft's numbers (D1–D26); D27 on are new. `[추정]` marks what was
+xtools) has touched `src/`: `chrome.rs` past line 225 moves down one line. Decisions keep the draft's numbers (D1–D26); D27 on are new. `[추정]` marks what was
 inferred, not read in code or measured. What it amends in 01, 04, 06, 07, the README and AGENTS.md is §14.
 
 ## 1. The contract
@@ -184,7 +183,7 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
    — in UTF-16 a printable byte beside one 0x00, in UTF-32 beside three. In the order UTF-32LE,
    UTF-32BE, UTF-16LE, UTF-16BE, the first whose sample holds at least 4 whole units, at least **3/4**
    of them ASCII units, is the default.
-3. **Else CP949**, when all of these hold (D39): (a) the sample is not valid UTF-8, with `kind::looks_like_text`'s
+3. **Else CP949**, when all of these hold (D39): (a) the sample is not valid UTF-8, with `kind::utf8_text`'s
    allowance (a character cut by the sample's end is no error when the file goes on); (b) it decodes as
    CP949 with no error (a lead as its last byte is none either when the file goes on); (c) it holds at
    least 4 Hangul syllables (U+AC00–U+D7A3); (d) they are at least **3/4** of its decoded non-ASCII
@@ -219,8 +218,12 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
   §7.2); a local file's first read — before any mark, since the marks depend on it (`Scan::feed`).
 - **Routing** (D18): a file whose kind the sniff decides (no known extension, `kind::detect_sniffed`) is
   text when step 1 or 2 finds UTF-16 or UTF-32 — `kind::looks_like_text` asks `encoding::pick` itself
-  (VM-3), so a UTF-16LE BOM is text where it was not. Step 3 does not route: an extension-less CP949 file fails the sniff's UTF-8 test, stays Other
-  and opens in Hex; its view 3 decodes it as CP949 by step 3.
+  (VM-3), so a UTF-16LE BOM is text where it was not. Step 2's guess is not taken for a file that
+  starts with a binary format's signature (`kind::SIGNATURES`: RIFF, ID3, FLAC, Ogg, PNG, GIF, JPEG,
+  PDF, ZIP, SQLite, PE, ELF, Mach-O, fonts, `.DS_Store`, OLE, a registry hive, `ftyp` at 4): a canonical
+  WAV of quiet 16-bit samples is all ASCII units. A BOM decides before any signature (D37). Step 3
+  does not route: an extension-less CP949 file fails the sniff's UTF-8 test (`kind::utf8_text`),
+  stays Other and opens in Hex; its view 3 decodes it as CP949 by step 3.
 
 ### 7.3 Lines and characters over byte ranges
 
@@ -397,7 +400,7 @@ Every decision is reversible; the owner may change any of them.
 | D15 | ASCII, UTF-8, UTF-16LE/BE, UCS-2LE/BE, UTF-32LE/BE (= UCS-4), Latin-1, CP437, CP949 / EUC-KR | message 20's list and its "등"; the owner is Korean; CP949 resynchronises (§7.4); Latin-1 and CP437 cost a table each | leave CP949 out |
 | D16 | UCS-4 is one entry with UTF-32 | they decode alike for every value that is a character | — |
 | D17 | Default: BOM (D37), then the NUL pattern (8 KiB, ≥ 4 units, ≥ 3/4 ASCII units), then CP949 (D39), then UTF-8 | a BOM is certain; the pattern finds ASCII-heavy UTF-16/32 and rejects all but two of §7.2's binaries | other thresholds |
-| D18 | UTF-16/32 files with no known extension route to text — the CLI route too (`main.rs:681`) | before VM-3 they opened in hex (`kind::looks_like_text` was UTF-8 only) | keep hex; 3 shows them |
+| D18 | UTF-16/32 files with no known extension route to text — the CLI route too (`main.rs`'s `route`) | before VM-3 they opened in hex (`kind::looks_like_text` was UTF-8 only) | keep hex; 3 shows them |
 | D19 | F8 `Encode` (and `E`) opens the list | F8 is free in the text view; `E` mirrors `W`/F2 | another key |
 | D20 | One U+FFFD per invalid unit or sequence, never counted | no extra pass | count them on the bar |
 | D21 | The chosen encoding lasts for this opening only | nothing is stored about files today | remember per path in the state folder |
@@ -525,7 +528,7 @@ Model units are ready to build; screen units wait for XR-T. Files are disjoint e
 |---|---|---|---|---|
 | VM-1 | **Encoding core**: §7.1's list; §7.2's steps 1, 2 and 4 with step 3's slot empty, and the BOM rule; one decoder per encoding (characters and byte lengths); LF/CR unit search; §7.3's four rules, the grid cut's look-back W exposed; a phase slot (a no-op but for CP949) | `src/encoding.rs`, `src/encoding/tests.rs` (new); `src/lib.rs` (`mod` line) | — | ready |
 | VM-2 | **Text document per encoding**: index pass, line reads, spans, look-back, grid pieces, restarts and jumps through VM-1; §7.3's newline sites; the BOM skip and `span_at`'s guard; a rebuild only when the LF unit changes; the placeholder marks (the lazy checkpoints moved to VM-4: `phase()` is `None` for every encoding until CP949); a C1 control as a dim `·` (D32); the bar's encoding and `SOPEN_STATE enc=` (D34) | `src/gui/text.rs`, `src/gui/text/wrap.rs`, `src/gui/text/tests.rs`, `src/gui/text/stream_tests.rs`; `src/gui/mod.rs` (`State`'s `enc` only); `src/gui/browser.rs` (handing `enc` on, as `at`) | VM-1 | ready |
-| VM-3 | **Kind sniff**: UTF-16/32 → text (D18) | `src/kind.rs` | VM-2 (before it, such a file would open misaligned) | ready |
+| VM-3 | **Kind sniff**: UTF-16/32 → text (D18) | `src/kind.rs`; `src/gui/text.rs` (the bar: the stats before the title, the encoding whole) and its tests in `src/gui/text/tests.rs`, `src/gui/text/stream_tests.rs`; `src/views/tests.rs` (the D18 row) | VM-2 (before it, such a file would open misaligned) | ready |
 | VM-4 | **CP949 / EUC-KR**: its decoder, sync bytes, grid cut and phase; step 3 of the pick (D39); `encoding_rs`; the binary-size measure; the lazy phase checkpoints (§7.4), the slot VM-2 left | `src/encoding/cp949.rs`, `src/encoding/cp949_tests.rs` (new); `src/encoding.rs` (the entry, the step-3 slot and the `mod` line only); `src/gui/text.rs` (the checkpoint slot only); `Cargo.toml`, `Cargo.lock` | VM-1, VM-2 | ready |
 | VM-5 | **The view set**: §3's table, §5's switch rules, §6's kept means, screen-free | `src/views.rs`, `src/views/tests.rs` (new); `src/lib.rs` (`mod` line) | — | ready |
 | VM-6 | **The view keys**: §4 as a function of (state, armed, input) → command, the hex view's viewing and editing included | `src/view_keys.rs`, `src/view_keys/tests.rs` (new); `src/lib.rs` (`mod` line) | — | ready |
@@ -558,8 +561,8 @@ Model units are ready to build; screen units wait for XR-T. Files are disjoint e
   (`chrome.rs:140-202`; *trace* §5). With VM-7: 9 View in every view, 8 Encode in Text and Raw.
 - **04 K-R1, now**: the hex row reads `1Help 3Exit 4Edit 5Save 6Goto 7SaveAs 8Asc/hx` (`9View` with VM-7).
 - **01 §3** (VM-3): a UTF-16/32 file with no known extension is text, so the CLI route moves with it:
-  `sopen` on such a file opens the editor (`main.rs:681`, `Kind::Text => Route::Editor`) where today it
-  opens the binary dialog (`Kind::Other => Route::Binary`).
+  `sopen` on such a file opens the editor (`main.rs`'s `route`, `Kind::Text => Route::Editor`) where
+  before VM-3 it opened the binary dialog (`Kind::Other => Route::Binary`).
 - **07 §10** (VM-7): the windows table gains "in the browser's viewer the hex view opens viewing; Enter or
   Insert starts editing, Esc or F9 ends it (08 D35)"; 07 §2's hex model is unchanged.
 - With their units: 06 §7.2 per encoding, AGENTS.md `enc=` (VM-2); 01 §3a's views and D10, 04 §3 rule 4
@@ -579,3 +582,7 @@ Model units are ready to build; screen units wait for XR-T. Files are disjoint e
   whether F9 is reachable without fn, in the GUI and in a terminal.
 - **View 3 of a 24 GB local binary** reads the whole file before its first screen (D23), about 10 s at
   2–3 GB/s `[추정]`; a local stream would not, but is untried.
+- **D18 on the CLI.** `sopen` on a UTF-16/32 file with no known extension hands it to the editor (VS
+  Code, else Zed; `main.rs`'s `route`), whose handling of BOM-less UTF-16 is unverified `[추정: not
+  checked]`; and §7.2's "2 shows it" for a binary the pattern takes for text (int16 0–127, int32
+  0x20–0x7E) has no CLI counterpart — only `--hex` opens such a file as bytes there.
