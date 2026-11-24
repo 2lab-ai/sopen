@@ -280,7 +280,14 @@ fn x_w1_a_pull_engine_reads_through_a_bounded_buffer() {
     assert_eq!(body.room(), WINDOW);
     body.data(vec![7; WINDOW]).unwrap();
     assert_eq!(body.room(), 0);
-    assert_eq!(body.data(vec![1]), Err(Refused::NoRoom { room: 0 }));
+    assert_eq!(
+        body.data(vec![1]),
+        Err(Refused::NoRoom {
+            room: 0,
+            bytes: vec![1]
+        }),
+        "the piece comes back"
+    );
     assert_eq!(drain(&mut t), [(id, Call::Readable)]);
     assert_eq!(t.read(id, 8192), Read::Bytes(vec![7; 8192]));
     assert_eq!(credits(&asked.said(), id), 1);
@@ -323,10 +330,24 @@ fn x_w1_linux_stops_a_request_before_its_head_by_its_address() {
     let (ra, _rb, rc) = (asked.reply(), asked.reply(), asked.reply());
     let _css = rc.head(Head::whole("text/css", 1));
     assert_eq!(drain(&mut t).len(), 1);
-    assert_eq!(t.stop_headless(&img), Some(a));
-    assert_eq!(t.stop_headless(&img), Some(b), "the query is not the path");
-    assert_eq!(t.stop_headless(&img), None);
-    assert_eq!(t.stop_headless(&host.url("x.css")), None, "it has its head");
+    let v2 = format!("{img}?v=2");
+    assert_eq!(t.stop_headless(&img, None), Some(a));
+    assert_eq!(
+        t.stop_headless(&img, None),
+        None,
+        "the query is the address's"
+    );
+    assert_eq!(
+        t.stop_headless(&v2, Some("bytes=0-1")),
+        None,
+        "nor that range"
+    );
+    assert_eq!(t.stop_headless(&v2, None), Some(b));
+    assert_eq!(
+        t.stop_headless(&host.url("x.css"), None),
+        None,
+        "it has its head"
+    );
     let _late = ra.head(Head::whole("image/png", 1));
     assert!(drain(&mut t).is_empty());
     let said = asked.said();
@@ -1406,4 +1427,223 @@ fn compose_draws_each_picture_at_its_frame() {
     assert_eq!(image[(20, 20)], back);
     assert_eq!(image[(39, 29)], Color32::RED, "clipped at the image's edge");
     assert_eq!(image[(36, 24)], Color32::RED);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review of e599079.
+
+/// Review 1: Linux's head-less stop names its request by the resource's own address (query
+/// included): of `file?v=1` and `file?v=2`, the second's failure stops the second only, and its
+/// late head never reaches the engine; the first's still does.
+#[test]
+fn r1_a_headless_stop_takes_only_the_request_with_that_address() {
+    let (mut t, asked, host, _) = table(Mode::Pull);
+    let file = host.url("file.js");
+    let (url_a, url_b) = (format!("{file}?v=1"), format!("{file}?v=2"));
+    let a = t.start(&url_a, None);
+    let b = t.start(&url_b, None);
+    let (ra, rb) = (asked.reply(), asked.reply());
+    assert_eq!(t.stop_headless(&url_b, None), Some(b));
+    assert_eq!(t.live(), 1, "the other request stays");
+    let _late = rb.head(Head::whole("text/javascript", 1));
+    assert!(
+        drain(&mut t).is_empty(),
+        "no call to a stopped engine request"
+    );
+    let head = Head::whole("text/javascript", 1);
+    let _body = ra.head(head.clone());
+    assert_eq!(drain(&mut t), [(a, Call::Head(head))]);
+    let said = asked.said();
+    assert_eq!((stops(&said, a), stops(&said, b)), (0, 1));
+    // The same address with two ranges (a `<video>`): the range names the request.
+    let c = t.start(&url_a, Some("bytes=0-1".into()));
+    let d = t.start(&url_a, Some("bytes=2-3".into()));
+    let (_rc, _rd) = (asked.reply(), asked.reply());
+    assert_eq!(t.stop_headless(&url_a, Some("bytes=2-3")), Some(d));
+    assert_eq!(t.stop_headless(&url_a, None), None);
+    assert_eq!(t.stop_headless(&url_a, Some("bytes=0-1")), Some(c));
+}
+
+/// Review 2: the window bounds what the outbox holds, not only the bytes counted: a piece in a
+/// vector of a larger capacity is kept at its length.
+#[test]
+fn r2_a_piece_is_kept_at_its_length_not_its_capacity() {
+    let (mut t, asked, host, _) = table(Mode::Push);
+    let id = t.start(&host.url("a"), None);
+    let mut body = asked.reply().head(Head::whole("text/plain", 64));
+    for _ in 0..64 {
+        let mut piece = Vec::with_capacity(WINDOW);
+        piece.push(7);
+        body.data(piece).unwrap();
+    }
+    let calls = drain(&mut t);
+    assert_eq!(calls.len(), 65);
+    for (i, call) in calls {
+        assert_eq!(i, id);
+        if let Call::Data(piece) = call {
+            assert!(
+                piece.capacity() < 64,
+                "kept {} for 1 byte",
+                piece.capacity()
+            );
+        }
+    }
+}
+
+/// Review 3: a texture view held without being shown takes no input and paints nothing, and
+/// sopen has the keyboard, though its host keeps drawing it.
+#[test]
+fn r3_a_texture_view_not_shown_takes_no_input() {
+    let fake = FakeEngine::texture();
+    fake.install();
+    let mut win = Hosting::new(vec![address()]);
+    let mut drv = Driver::new(400.0, 300.0);
+    drv.idle(&mut win, 2);
+    let centre = win.rect.center();
+    drv.click(&mut win, centre);
+    assert_eq!(win.webs[0].keyboard(), Keyboard::Page);
+    win.webs[0].set_shown(false);
+    assert_eq!(win.webs[0].keyboard(), Keyboard::Sopen);
+    fake.take(0);
+    drv.click(&mut win, centre);
+    drv.frame(&mut win, vec![Event::Text("x".into())], Modifiers::NONE);
+    let calls = fake.take(0);
+    let input_or_paint = |d: &Did| matches!(d, Did::Input(_) | Did::Paint(_));
+    assert!(!calls.iter().any(input_or_paint), "{calls:?}");
+    assert_eq!(win.webs[0].keyboard(), Keyboard::Sopen);
+    assert!(win.typed.contains('x'), "the typing is the window's");
+}
+
+/// Review 4: a texture page loses the keyboard when a frame does not draw it, and at F12 (the
+/// switch, taken before the pass, so no key reaches the page's routing).
+#[test]
+fn r4_a_texture_page_gives_the_keyboard_back_when_hidden_or_at_the_switch() {
+    let fake = FakeEngine::texture();
+    fake.install();
+    let mut win = Hosting::new(vec![address()]);
+    let mut drv = Driver::new(400.0, 300.0);
+    drv.idle(&mut win, 2);
+    let centre = win.rect.center();
+    drv.click(&mut win, centre);
+    assert_eq!(win.webs[0].keyboard(), Keyboard::Page);
+    win.draw = false;
+    drv.idle(&mut win, 1);
+    win.draw = true;
+    drv.idle(&mut win, 1);
+    assert_eq!(win.webs[0].keyboard(), Keyboard::Sopen, "a frame not drawn");
+    drv.click(&mut win, centre);
+    assert_eq!(win.webs[0].keyboard(), Keyboard::Page);
+    drv.key(&mut win, Key::F12, Modifiers::NONE);
+    assert_eq!(win.webs[0].keyboard(), Keyboard::Sopen, "the switch");
+}
+
+/// Review 5: a native page that has the keyboard gives it back before its view closes.
+#[test]
+fn r5_a_closing_native_view_gives_the_keyboard_back_first() {
+    let fake = FakeEngine::native();
+    fake.install();
+    let mut win = Hosting::new(vec![address()]);
+    let mut drv = Driver::new(400.0, 300.0);
+    drv.idle(&mut win, 2);
+    fake.set_page_keyboard(0, true);
+    fake.take(0);
+    win.webs[0].close();
+    assert_eq!(fake.take(0), [Did::TakeKeyboard, Did::Close]);
+}
+
+/// A second head to a pull engine after the first is a failure read from the body — a GTK
+/// request finished with its response cannot take `finish_error` any more.
+#[test]
+fn r6_a_second_head_to_a_pull_engine_fails_its_body() {
+    let (mut t, asked, host, _) = table(Mode::Pull);
+    let id = t.start(&host.url("a"), None);
+    let reply = asked.reply();
+    let raw = reply.raw();
+    let _body = reply.head(Head::whole("text/plain", 4));
+    assert_eq!(drain(&mut t).len(), 1);
+    raw.head(Head::whole("text/plain", 4));
+    assert_eq!(drain(&mut t), [(id, Call::Readable)]);
+    let read = t.read(id, 8);
+    assert!(
+        matches!(&read, Read::Failed(why) if why.contains("second head")),
+        "{read:?}"
+    );
+    assert_eq!(stops(&asked.said(), id), 1, "the server is told to stop");
+    assert_eq!(t.read(id, 8), Read::Gone);
+}
+
+/// The Esc that takes the keyboard back takes its repeats too, until it is let go: holding it
+/// does not then leave the viewer. The next Esc is the window's.
+#[test]
+fn r7_the_take_back_escs_repeats_are_its_own() {
+    let fake = FakeEngine::texture();
+    fake.install();
+    let mut win = Hosting::new(vec![address()]);
+    let mut drv = Driver::new(400.0, 300.0);
+    drv.idle(&mut win, 2);
+    let centre = win.rect.center();
+    drv.click(&mut win, centre);
+    let esc = |pressed: bool, repeat: bool| Event::Key {
+        key: Key::Escape,
+        physical_key: None,
+        pressed,
+        repeat,
+        modifiers: Modifiers::NONE,
+    };
+    win.keys.clear();
+    drv.frame(&mut win, vec![esc(true, false)], Modifiers::NONE);
+    drv.frame(&mut win, vec![esc(true, true)], Modifiers::NONE);
+    drv.frame(&mut win, vec![esc(true, true)], Modifiers::NONE);
+    drv.frame(&mut win, vec![esc(false, false)], Modifiers::NONE);
+    assert_eq!(win.webs[0].keyboard(), Keyboard::Sopen);
+    assert_eq!(win.keys, [], "the held Esc was the take-back's");
+    drv.key(&mut win, Key::Escape, Modifiers::NONE);
+    assert_eq!(win.keys, [(Key::Escape, Modifiers::NONE)]);
+}
+
+/// The shell's `on_exit` (eframe's, before the window is destroyed) closes the window's views;
+/// a window with no page view at all gets nothing from any of the shell's steps.
+#[test]
+fn r8_on_exit_closes_the_views_and_no_view_is_no_work() {
+    use crate::gui::{Press, Raise, Shell};
+    let fake = FakeEngine::native();
+    fake.install();
+    let shell_of = |webs: Vec<Web>| Shell {
+        inner: Hosting::new(webs),
+        scripted: false,
+        shot: None,
+        frames: 0,
+        started: std::time::Instant::now(),
+        focus_asked: None,
+        raise: Raise::Done,
+        press: Press::Done,
+        fkeys: None,
+        closed: Arc::default(),
+        web: None,
+    };
+    let pass = |ctx: &egui::Context, shell: &mut Shell<Hosting>| {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 300.0))),
+            ..Default::default()
+        };
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(shell, ui, &mut frame));
+        out.textures_delta.clear();
+    };
+    let ctx = egui::Context::default();
+    chrome::install(&ctx);
+    let mut empty = shell_of(vec![]);
+    pass(&ctx, &mut empty);
+    pass(&ctx, &mut empty);
+    eframe::App::on_exit(&mut empty, None);
+    drop(empty);
+    assert_eq!((fake.views(), fake.monitor()), (0, vec![]));
+    let ctx = egui::Context::default();
+    chrome::install(&ctx);
+    let mut shell = shell_of(vec![address()]);
+    pass(&ctx, &mut shell);
+    assert_eq!(fake.monitor(), [true]);
+    eframe::App::on_exit(&mut shell, None);
+    assert_eq!(fake.calls(0).last(), Some(&Did::Close));
+    assert_eq!(fake.monitor(), [true, false]);
 }

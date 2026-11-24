@@ -6,7 +6,8 @@
 //! - **In**, on the engine's thread: a request starts ([`Table::start`]: its id, its path, its
 //!   `Range`) and may be stopped ([`Table::stop`]) — before its head, mid-body, or after its last
 //!   byte but before its end (macOS); on Linux a request stopped before its head has no signal of
-//!   its own, and the view's resource failing names it by its address ([`Table::stop_headless`]).
+//!   its own, and the view's resource failing names it by its address and `Range`, as the
+//!   request had them ([`Table::stop_headless`]).
 //!   The table hands each to the [`Server`].
 //! - **Out**, from the server's worker: one complete [`Head`] — status, type, length,
 //!   `Content-Range` — before any byte, then the body's pieces, then its end or a failure
@@ -258,8 +259,9 @@ impl Head {
 pub enum Refused {
     /// The engine stopped the request: send nothing more.
     Stopped,
-    /// More than [`Body::room`] (the request's credit): wait for [`Server::credit`].
-    NoRoom { room: usize },
+    /// More than [`Body::room`] (the request's credit): wait for [`Server::credit`]. The piece
+    /// comes back, to be sent then.
+    NoRoom { room: usize, bytes: Vec<u8> },
     /// More than the head's length still allows.
     PastLength { left: u64 },
     /// The end before the head's length: the request has failed instead.
@@ -270,7 +272,7 @@ impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refused::Stopped => write!(f, "the request was stopped"),
-            Refused::NoRoom { room } => write!(f, "only {room} bytes may be sent now"),
+            Refused::NoRoom { room, .. } => write!(f, "only {room} bytes may be sent now"),
             Refused::PastLength { left } => write!(f, "only {left} bytes are left of its length"),
             Refused::Short { left } => write!(f, "{left} bytes of its length were never sent"),
         }
@@ -482,7 +484,8 @@ impl Body {
         WINDOW.saturating_sub(usize::try_from(held).unwrap_or(usize::MAX))
     }
 
-    /// A piece (an empty one sends nothing).
+    /// A piece (an empty one sends nothing). It is kept at its length, whatever the vector's
+    /// capacity, so the window bounds the memory the engine's side holds, not only the bytes.
     pub fn data(&mut self, bytes: Vec<u8>) -> Result<(), Refused> {
         if self.stopped() {
             return Err(Refused::Stopped);
@@ -493,9 +496,14 @@ impl Body {
         }
         let room = self.room();
         if bytes.len() > room {
-            return Err(Refused::NoRoom { room });
+            return Err(Refused::NoRoom { room, bytes });
         }
         if !bytes.is_empty() {
+            let bytes = if bytes.capacity() > bytes.len() {
+                bytes.as_slice().to_vec()
+            } else {
+                bytes
+            };
             self.left -= n;
             self.sent += n;
             self.outbox.post(self.id, Piece::Data(bytes));
@@ -583,7 +591,10 @@ pub enum Read {
 
 /// A request the table still has.
 struct Live {
-    path: String,
+    /// The address and `Range` the engine asked with, as it gave them (Linux's head-less stop
+    /// names its request by them).
+    url: String,
+    range: Option<String>,
     flow: Arc<Flow>,
     headed: bool,
     /// Pull: the body's bytes the engine has not read yet.
@@ -648,7 +659,8 @@ impl Table {
         self.live.insert(
             id,
             Live {
-                path: path.clone().unwrap_or_default(),
+                url: url.to_string(),
+                range: range.clone(),
                 flow: flow.clone(),
                 headed: false,
                 buffer: VecDeque::new(),
@@ -677,15 +689,16 @@ impl Table {
         }
     }
 
-    /// Linux's stop before the head (X-W1): the view's resource for `url` failed while its
-    /// request had no head yet. The oldest such request on that address is stopped; its id, or
-    /// `None` when none waits for its head there.
-    pub fn stop_headless(&mut self, url: &str) -> Option<RequestId> {
-        let path = self.host.path_of(url)?;
+    /// Linux's stop before the head (X-W1): the view's resource for `url` (its `Range` header
+    /// `range`, as `resource-load-started` gives them) failed while its request had no head yet.
+    /// The oldest such request with exactly that address and `Range` — the query included, so
+    /// `a.js?v=1` is not `a.js?v=2` — is stopped; its id, or `None` when none waits for its head
+    /// there.
+    pub fn stop_headless(&mut self, url: &str, range: Option<&str>) -> Option<RequestId> {
         let id = self
             .live
             .iter()
-            .find(|(_, live)| !live.headed && live.path == path)
+            .find(|(_, live)| !live.headed && live.url == url && live.range.as_deref() == range)
             .map(|(id, _)| *id)?;
         self.stop(id);
         Some(id)
@@ -732,6 +745,17 @@ impl Table {
                 (true, Piece::Fail(why), Mode::Pull) => {
                     live.buffer.clear();
                     live.end = Some(Err(why));
+                    Call::Readable
+                }
+                // A second head to a pull engine: its request is finished with the first, so the
+                // failure is read from the body; the server stops it.
+                (true, Piece::Head(_), Mode::Pull) => {
+                    live.buffer.clear();
+                    live.end = Some(Err(
+                        "the page server sent a second head after its head".to_string()
+                    ));
+                    live.flow.stopped.store(true, Ordering::SeqCst);
+                    self.server.stop(id);
                     Call::Readable
                 }
                 // Out of order: a body before its head, or a second head. Refused: the request

@@ -20,8 +20,9 @@
 //! - **Keys** (§2.4): sopen has the keyboard or the page has it ([`Keyboard`]); [`route`] says
 //!   where a key goes in each, for the macOS key monitor and for Linux's forwarding alike. On
 //!   macOS the state is the view's own word each frame (the first responder); on Linux it is
-//!   this component's: a click in the page gives it the keyboard, a click elsewhere, Esc and the
-//!   other keys that are always sopen's take it back.
+//!   this component's: a click in the page gives it the keyboard; a click elsewhere, Esc (with
+//!   its repeats) and the other keys that are always sopen's, F12 (the switch), a dialog over
+//!   it, a frame that does not draw it and being held unshown take it back.
 //! - **Scripts** (§3.3): a file view starts with them off and the preview keeps them off; F2
 //!   turns them on only where the backend contains every channel and only on a WebKit version
 //!   that passed WV-S2 ([`scripts_available`]); an address window starts with them on.
@@ -357,6 +358,9 @@ struct Slot {
     /// Where this pass drew it.
     placed: Option<Placed>,
     shown: bool,
+    /// A texture engine's keyboard state (a native engine says its own): here, so that the
+    /// after-frame step takes it back from a view not drawn.
+    keyboard: Keyboard,
     closed: bool,
 }
 
@@ -425,6 +429,10 @@ fn close_slot(slot: &RefCell<Slot>) {
             return;
         }
         s.closed = true;
+        // macOS: winit's view is first responder again before the page's view goes.
+        if s.view.page_has_keyboard() {
+            s.view.take_keyboard();
+        }
         s.view.close();
         (s.engine.clone(), std::mem::take(&mut s.attached))
     };
@@ -477,8 +485,8 @@ pub struct Web {
     wake: Events,
     scripts: bool,
     preview: bool,
-    /// A texture engine's keyboard state (a native engine says its own).
-    keyboard: Keyboard,
+    /// The Esc that took the keyboard back is held: its repeats and its release are its own.
+    esc_held: bool,
     id: egui::Id,
 }
 
@@ -525,6 +533,7 @@ impl Web {
             hidden: true,
             placed: None,
             shown: true,
+            keyboard: Keyboard::Sopen,
             closed: false,
         }));
         VIEWS.with(|views| {
@@ -542,7 +551,7 @@ impl Web {
             wake: events,
             scripts,
             preview: settings.preview,
-            keyboard: Keyboard::Sopen,
+            esc_held: false,
             id: egui::Id::unique(("sopen-web", n)),
         })
     }
@@ -552,7 +561,7 @@ impl Web {
     pub fn ui(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let ctx = ui.ctx().clone();
         let key = window(&ctx);
-        {
+        let shown = {
             let mut slot = self.slot.borrow_mut();
             if slot.closed {
                 return;
@@ -564,9 +573,15 @@ impl Web {
                 rect,
                 scale: ctx.pixels_per_point(),
             });
-        }
+            // F12 is taken before the pass (the shell's input hook): no key of it is routed.
+            if !slot.shown || crate::gui::switch_asked(&ctx) {
+                slot.keyboard = Keyboard::Sopen;
+            }
+            slot.shown
+        };
         self.wake.wake(&ctx);
-        if self.engine.placement() == Placement::Texture {
+        // Held unshown: no input, nothing painted.
+        if shown && self.engine.placement() == Placement::Texture {
             self.forward(ui, rect);
             let painter = ui.painter_at(rect);
             self.slot.borrow_mut().view.paint(&painter, rect);
@@ -584,14 +599,15 @@ impl Web {
         }
         // Under a dialog the keys are the dialog's: the keyboard comes back, nothing goes on.
         if !ui.ctx().memory(|m| m.allows_interaction(ui.layer_id())) {
-            self.keyboard = Keyboard::Sopen;
+            self.slot.borrow_mut().keyboard = Keyboard::Sopen;
             return;
         }
         let over = ui
             .interact(rect, self.id, egui::Sense::hover())
             .contains_pointer();
         let origin = rect.min.to_vec2();
-        let mut keyboard = self.keyboard;
+        let mut keyboard = self.slot.borrow().keyboard;
+        let mut esc_held = self.esc_held;
         let mut out: Vec<egui::Event> = vec![];
         ui.input_mut(|i| {
             i.events.retain(|event| match event {
@@ -617,25 +633,38 @@ impl Web {
                 egui::Event::Key {
                     key,
                     pressed,
+                    repeat,
                     modifiers,
                     ..
-                } => match route(keyboard, *key, *modifiers) {
-                    Route::Page => {
-                        out.push(event.clone());
-                        false
-                    }
-                    Route::TakeBack => {
-                        if *pressed {
-                            keyboard = Keyboard::Sopen;
+                } => {
+                    if *key == egui::Key::Escape && esc_held {
+                        // The take-back's own repeats and release; a new press means its
+                        // release was missed (the page was not drawn then).
+                        if *repeat || !*pressed {
+                            esc_held = *pressed;
+                            return false;
                         }
-                        false
+                        esc_held = false;
                     }
-                    Route::TakeBackAndAct => {
-                        keyboard = Keyboard::Sopen;
-                        true
+                    match route(keyboard, *key, *modifiers) {
+                        Route::Page => {
+                            out.push(event.clone());
+                            false
+                        }
+                        Route::TakeBack => {
+                            if *pressed {
+                                keyboard = Keyboard::Sopen;
+                                esc_held = true;
+                            }
+                            false
+                        }
+                        Route::TakeBackAndAct => {
+                            keyboard = Keyboard::Sopen;
+                            true
+                        }
+                        Route::Sopen => true,
                     }
-                    Route::Sopen => true,
-                },
+                }
                 egui::Event::Text(_)
                 | egui::Event::Copy
                 | egui::Event::Cut
@@ -649,8 +678,9 @@ impl Web {
                 _ => true,
             });
         });
-        self.keyboard = keyboard;
+        self.esc_held = esc_held;
         let mut slot = self.slot.borrow_mut();
+        slot.keyboard = keyboard;
         for event in &out {
             slot.view.input(event);
         }
@@ -715,7 +745,7 @@ impl Web {
             return;
         }
         if on {
-            self.keyboard = Keyboard::Sopen;
+            self.slot.borrow_mut().keyboard = Keyboard::Sopen;
             self.with_view(|view| {
                 if view.page_has_keyboard() {
                     view.take_keyboard();
@@ -738,6 +768,12 @@ impl Web {
     pub fn set_shown(&mut self, shown: bool) {
         let mut slot = self.slot.borrow_mut();
         if !slot.closed {
+            if !shown {
+                slot.keyboard = Keyboard::Sopen;
+                if slot.view.page_has_keyboard() {
+                    slot.view.take_keyboard();
+                }
+            }
             slot.shown = shown;
             slot.view.set_shown(shown);
         }
@@ -752,7 +788,7 @@ impl Web {
         match self.engine.placement() {
             Placement::Native if slot.view.page_has_keyboard() => Keyboard::Page,
             Placement::Native => Keyboard::Sopen,
-            Placement::Texture => self.keyboard,
+            Placement::Texture => slot.keyboard,
         }
     }
 
@@ -823,6 +859,10 @@ pub(crate) fn set_parent(ctx: &egui::Context, parent: Parent) -> WindowKey {
 /// The shell's after-frame step (§2.2), after the pass's last painter: see the module's
 /// "Placement". Nothing in a pass egui will discard (its next pass decides).
 pub(crate) fn after_pass(ctx: &egui::Context) {
+    // Every pass of every window comes here: with no page view, at once.
+    if VIEWS.with(|v| v.borrow().iter().all(|w| w.strong_count() == 0)) {
+        return;
+    }
     if ctx.will_discard() {
         return;
     }
@@ -868,6 +908,9 @@ pub(crate) fn after_pass(ctx: &egui::Context) {
                                 .any(|r| r.intersect(p.rect).is_positive()))
                 }
             };
+            if hidden {
+                s.keyboard = Keyboard::Sopen;
+            }
             if s.attached && hidden != s.hidden {
                 if hidden && s.view.page_has_keyboard() {
                     s.view.take_keyboard();
