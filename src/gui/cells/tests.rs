@@ -77,8 +77,8 @@ struct Shown {
 /// the window painted, not the buffer it was given, as the parity oracle reads it (10 §5): a
 /// rectangle of whole cells is their background (the later over the earlier), one cell wide and
 /// two points tall at a cell's foot the caret, a text the glyph of the cell at its corner and of
-/// as many cells as its text takes (unicode-width), all of what can be seen of it inside them.
-/// Anything else, or anything off the grid, fails.
+/// as many cells as a terminal gives it ([`terminal_cells`], not the core's `width`), all of what
+/// can be seen of it inside them. Anything else, or anything off the grid, fails.
 fn laid_back(shapes: &[ClippedShape], origin: Pos2, area: Cells) -> Vec<Vec<Shown>> {
     let blank = Shown {
         symbol: " ".to_string(),
@@ -123,7 +123,7 @@ fn laid_back(shapes: &[ClippedShape], origin: Pos2, area: Cells) -> Vec<Vec<Show
             egui::Shape::Text(t) => {
                 let (x, y) = corner(t.pos);
                 let text = t.galley.text();
-                let n = width(text).clamp(1, usize::from(area.width) - x);
+                let n = terminal_cells(text).clamp(1, usize::from(area.width) - x);
                 let own = Rect::from_min_size(t.pos, Vec2::new(n as f32 * CELL.x, CELL.y));
                 let seen = Rect::from_min_size(t.pos, t.galley.size()).intersect(c.clip_rect);
                 assert!(
@@ -156,6 +156,25 @@ fn laid_back(shapes: &[ClippedShape], origin: Pos2, area: Cells) -> Vec<Vec<Show
     cells
 }
 
+/// The cells a terminal gives one painted glyph of the tests' texts, by hand from East Asian
+/// Width, not by unicode-width (whose version the core's widths depend on): Hangul, CJK, the
+/// ideographic space and emoji 2, a skin tone 0 (it joins the emoji before it), every other
+/// character 1 — halfwidth katakana and its sound marks (ﾊﾟ) one each.
+fn terminal_cells(glyph: &str) -> usize {
+    glyph
+        .chars()
+        .map(|c| match c {
+            '\u{1F3FB}'..='\u{1F3FF}' => 0,
+            '\u{1100}'..='\u{115F}'
+            | '\u{3000}'..='\u{303E}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7A3}'
+            | '\u{1F300}'..='\u{1FAFF}' => 2,
+            _ => 1,
+        })
+        .sum()
+}
+
 /// The layer's read-back is what was painted: every cell's character, background and caret,
 /// and the foreground of every glyph painted.
 fn assert_painted_as_seen(shapes: &[ClippedShape], layer: &Layer) {
@@ -164,13 +183,13 @@ fn assert_painted_as_seen(shapes: &[ClippedShape], layer: &Layer) {
     assert_eq!(shown.len(), seen.len());
     for (y, (seen, shown)) in seen.iter().zip(&shown).enumerate() {
         assert_eq!(shown.len(), seen.len());
+        // A blank glyph paints nothing: its cells show as unpainted, both of a wide one (U+3000).
+        let mut blank = false;
         for (x, (s, p)) in seen.iter().zip(shown).enumerate() {
-            // A blank cell paints no glyph.
-            let symbol = if s.symbol.trim().is_empty() && !s.symbol.is_empty() {
-                " "
-            } else {
-                &s.symbol
-            };
+            if !s.symbol.is_empty() {
+                blank = s.symbol.trim().is_empty();
+            }
+            let symbol = if blank { " " } else { &s.symbol };
             assert_eq!(p.symbol, symbol, "cell ({x}, {y})");
             assert_eq!(p.bg, s.bg, "cell ({x}, {y}) {symbol:?}");
             assert_eq!(p.caret, s.caret, "cell ({x}, {y})");
@@ -405,16 +424,21 @@ fn hangul_and_emoji_take_two_cells_each() {
     for narrow in ["─", "…", "░", "A", "é"] {
         assert_eq!(width(narrow), 1, "{narrow:?}");
     }
-    let mut buf = empty(24, 2);
+    // Halfwidth katakana with a sound mark is a grapheme of two cells, as a terminal shows it:
+    // ratatui-core adds a cell for each mark, which unicode-width 0.2.3 already counts (3 cells).
+    assert_eq!(width("ﾊﾟｸﾞ"), 4);
+    let mut buf = empty(24, 3);
     assert_eq!(put(&mut buf, 0, 0, "한글 문서 초안.txt", 24, body()), 18);
     assert_eq!(
         put(&mut buf, 0, 1, "\u{1F3B5} \u{1F44D}\u{1F3FD}!", 24, body()),
         6
     );
+    assert_eq!(put(&mut buf, 0, 2, "ﾊﾟｸﾞ.txt", 20, body()), 8);
+    assert_eq!(put(&mut buf, 10, 2, "\u{3000}z", 20, body()), 3);
     let (shapes, layer) = painted(&buf, Pos2::ZERO, None);
     let wide: Vec<(String, f32)> = glyphs(&shapes)
         .into_iter()
-        .filter(|(t, _, _)| width(t) == 2)
+        .filter(|(t, _, _)| terminal_cells(t) == 2)
         .map(|(t, at, _)| (t, at.x / CELL.x))
         .collect();
     let want: Vec<(String, f32)> = [
@@ -426,11 +450,17 @@ fn hangul_and_emoji_take_two_cells_each() {
         ("안", 12.0),
         ("\u{1F3B5}", 0.0),
         ("\u{1F44D}\u{1F3FD}", 3.0),
+        ("ﾊﾟ", 0.0),
+        ("ｸﾞ", 2.0),
     ]
     .into_iter()
     .map(|(t, x)| (t.to_string(), x))
     .collect();
     assert_eq!(wide, want);
+    assert_eq!(
+        find(std::slice::from_ref(&layer), "z")[0].cells,
+        Cells::new(12, 2, 1, 1)
+    );
     assert_eq!(
         find(std::slice::from_ref(&layer), ".txt")[0].cells,
         Cells::new(14, 0, 4, 1)
@@ -459,18 +489,7 @@ fn the_grid_never_drifts_with_the_installed_fonts() {
     for _ in 0..3 {
         shapes = pass(&ctx, size, |p| paint(p, Pos2::ZERO, &buf, None)).0;
     }
-    let f = chrome::font();
-    let han = ctx.fonts_mut(|fonts| {
-        fonts
-            .has_glyph(&f, '한')
-            .then(|| fonts.glyph_width(&f, '한'))
-    });
-    let Some(han) = han else {
-        eprintln!("skipping: no installed font with Hangul");
-        return;
-    };
-    // A font whose Hangul is a full em (16 points) may measure a hair over it.
-    assert!(han <= 2.0 * CELL.x + 0.05, "한 is {han} pt");
+    // Where the glyphs stand does not depend on the font: asserted with or without one.
     let starts: Vec<f32> = glyphs(&shapes)
         .iter()
         .map(|(_, at, _)| at.x / CELL.x)
@@ -479,6 +498,18 @@ fn the_grid_never_drifts_with_the_installed_fonts() {
         starts,
         vec![0.0, 2.0, 5.0, 7.0, 10.0, 12.0, 14.0, 15.0, 16.0, 17.0]
     );
+    let f = chrome::font();
+    let han = ctx.fonts_mut(|fonts| {
+        fonts
+            .has_glyph(&f, '한')
+            .then(|| fonts.glyph_width(&f, '한'))
+    });
+    let Some(han) = han else {
+        eprintln!("skipping the font's measures: no installed font with Hangul");
+        return;
+    };
+    // A font whose Hangul is a full em (16 points) may measure a hair over it.
+    assert!(han <= 2.0 * CELL.x + 0.05, "한 is {han} pt");
     let one_text = ctx.fonts_mut(|fonts| {
         fonts
             .layout_no_wrap(name.to_string(), f.clone(), Color32::WHITE)
@@ -570,12 +601,11 @@ fn what_is_painted_is_what_the_read_back_says() {
     // Half way down the 5 cells the thumb can stand in: 2.5 rounds to the third.
     assert_eq!(seen[5][39].bg, Some(PALETTE.thumb));
     assert!(seen[3][9].caret);
-    assert!(seen.iter().flatten().all(|s| s.modifier.is_empty()));
 }
 
-/// What one paint drew is recorded for the pass when recording is on — its origin, the clip it
-/// was painted under, the cells and the caret, in painting order — and nothing when it is off
-/// (the default); `clear` forgets the last pass's.
+/// What one paint drew is recorded for the pass when recording is on — its origin, the egui layer
+/// and the clip it was painted under, the cells and the caret, in the order of the calls — and
+/// nothing when it is off (the default); `clear` forgets the last pass's.
 #[test]
 fn the_layers_of_a_pass_are_recorded_when_recording_is_on() {
     let ctx = egui::Context::default();
@@ -583,19 +613,21 @@ fn the_layers_of_a_pass_are_recorded_when_recording_is_on() {
     let size = Vec2::new(200.0, 100.0);
     let (a, b) = (empty(3, 1), empty(2, 2));
     let clip = Rect::from_min_size(Pos2::new(16.0, 16.0), Vec2::new(40.0, 40.0));
+    let over = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("over"));
     let two = |p: &egui::Painter| {
         paint(p, Pos2::ZERO, &a, None);
-        paint(
-            &p.with_clip_rect(clip),
-            Pos2::new(16.0, 16.0),
-            &b,
-            Some(Position::new(1, 1)),
-        );
+        let mut top = p.with_clip_rect(clip);
+        top.set_layer_id(over);
+        paint(&top, Pos2::new(16.0, 16.0), &b, Some(Position::new(1, 1)));
     };
     assert!(pass(&ctx, size, two).1.is_empty(), "off by default");
     set_recording(&ctx, true);
     let layers = pass(&ctx, size, two).1;
     assert_eq!(layers.len(), 2);
+    assert_eq!(
+        (layers[0].layer.order, layers[1].layer),
+        (egui::Order::Background, over)
+    );
     assert_eq!(
         (
             layers[0].origin,
@@ -808,17 +840,25 @@ fn the_cell_api_sets_no_modifiers() {
     put(&mut buf, 2, 0, "a한b", 12, body());
     put_right(&mut buf, 12, 1, "12", body());
     assert!(plain(&buf, Cells::new(2, 0, 4, 1)) && plain(&buf, Cells::new(10, 1, 2, 1)));
+    // Each on marks of its own: one that fills first would hide what the next one writes.
     let mut buf = marked();
     let all = buf.area;
     frame(&mut buf, all, "t", true);
+    assert!(plain(&buf, all));
+    let mut buf = marked();
     rule(&mut buf, all, 2, true);
+    assert!(plain(&buf, Cells::new(0, 2, 12, 1)));
+    assert_eq!(buf[(0, 1)].modifier, marks, "the rest untouched");
+    let mut buf = marked();
     scroll_bar(&mut buf, 11, 1, 4, Some(0.5));
-    assert!(plain(&buf, buf.area));
+    assert!(plain(&buf, Cells::new(11, 1, 1, 4)));
+    assert_eq!(buf[(10, 1)].modifier, marks, "the rest untouched");
 
     let mut buf = marked();
     put(&mut buf, 0, 0, "x", 1, body());
     let layer = Layer {
         origin: Pos2::ZERO,
+        layer: egui::LayerId::background(),
         clip: Rect::EVERYTHING,
         buf,
         caret: None,
@@ -851,6 +891,7 @@ fn the_read_back_finds_text_its_cells_and_colours() {
     put(&mut buf, 11, 1, "사진.png", 8, bar());
     let layer = Arc::new(Layer {
         origin: Pos2::new(8.0, 16.0),
+        layer: egui::LayerId::background(),
         clip: Rect::EVERYTHING,
         buf,
         caret: None,

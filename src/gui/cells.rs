@@ -14,6 +14,12 @@
 //! - The read-back ([`Layer::seen`], [`row_text`], [`find`], [`colors`], [`runs`]): character,
 //!   colours and caret per cell.
 //! - [`index256`]: a skin colour in a 256-colour terminal (10 §5).
+//!
+//! A buffer is one layer, and a wide glyph half written over is erased (see [`put`]) inside it
+//! only. A later layer whose cells cover half of a wide glyph in an earlier one leaves the glyph's
+//! other half showing in the window, where a terminal erases the whole glyph: a screen that lays
+//! one buffer over another (a dialog over the list) first [`fill`]s, in the lower buffer, the
+//! cells the upper one covers.
 
 use super::chrome::{self, CELL};
 use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
@@ -264,11 +270,13 @@ pub fn paint(painter: &egui::Painter, origin: Pos2, buf: &Buffer, caret: Option<
 // ---------------------------------------------------------------------------------------------
 // The pass's record of what was painted in cells.
 
-/// What one [`paint`] drew: where its cell (0, 0) is, the clip it was painted under, the cells
-/// and the caret's cell.
+/// What one [`paint`] drew: where its cell (0, 0) is, the egui layer and the clip it was painted
+/// under, the cells and the caret's cell. The record keeps the order of the calls; what is on top
+/// on screen is by egui's order of `layer` (a modal's area over the central panel) first.
 #[derive(Debug, Clone)]
 pub struct Layer {
     pub origin: Pos2,
+    pub layer: egui::LayerId,
     pub clip: Rect,
     pub buf: Buffer,
     pub caret: Option<Position>,
@@ -298,7 +306,7 @@ pub fn clear(ctx: &egui::Context) {
     });
 }
 
-/// The layers painted since [`clear`], in painting order (what is on top comes last).
+/// The layers painted since [`clear`], in the order [`paint`] was called.
 pub fn layers(ctx: &egui::Context) -> Vec<Arc<Layer>> {
     ctx.data(|d| d.get_temp::<Record>(record_id()))
         .map(|r| r.layers)
@@ -311,6 +319,7 @@ fn record(painter: &egui::Painter, origin: Pos2, buf: &Buffer, caret: Option<Pos
         if r.on {
             r.layers.push(Arc::new(Layer {
                 origin,
+                layer: painter.layer_id(),
                 clip: painter.clip_rect(),
                 buf: buf.clone(),
                 caret,
