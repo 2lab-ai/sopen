@@ -18,7 +18,7 @@ use std::process::{Command, ExitStatus};
 /// and `SOPEN_LIST=git` among them, 02 §9). Settings that name local paths — `SOPEN_CODE`,
 /// `SOPEN_ZED`, `SOPEN_FFMPEG`, `SOPEN_FFPROBE`, `SOPEN_GIT`, `SOPEN_CACHE_DIR`, `SOPEN_STATE_DIR`,
 /// `SOPEN_CONFIG` — mean nothing on HOST and stay here.
-pub const FORWARDED_ENV: [&str; 21] = [
+pub const FORWARDED_ENV: [&str; 22] = [
     "SOPEN_STATE",
     "SOPEN_SCREENSHOT",
     "SOPEN_WATCHDOG",
@@ -44,6 +44,8 @@ pub const FORWARDED_ENV: [&str; 21] = [
     // in, on the machine that shows it.
     "SOPEN_BROWSER",
     "SOPEN_LISTENERS",
+    // 09 §4: whether the page view has an engine, read where the page or the address shows.
+    "SOPEN_WEB",
 ];
 
 /// Where HOST's sopen is looked for when the non-interactive ssh session's PATH does not have it
@@ -1343,6 +1345,8 @@ mod tests {
         // 06 §11: a `--target` run carries the stream's hooks to HOST as it carries the others.
         assert!(env.contains(&"SOPEN_STREAM_STATS=v-SOPEN_STREAM_STATS".to_string()));
         assert!(env.contains(&"SOPEN_STREAM_THROTTLE=v-SOPEN_STREAM_THROTTLE".to_string()));
+        // 09 §4: the page view's engine is HOST's, and so is its off switch.
+        assert!(env.contains(&"SOPEN_WEB=v-SOPEN_WEB".to_string()));
         // 07 §7: the hex window's Save As hooks travel as "Save to…"'s do — the window, and the
         // folder it saves into, are on HOST.
         for key in [

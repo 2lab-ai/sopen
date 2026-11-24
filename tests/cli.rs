@@ -4145,6 +4145,41 @@ fn another_address_on_a_target_is_opened_there_as_it_is() {
     );
 }
 
+/// `SOPEN_WEB` (09 §4) travels with `--target` as the other hooks do, on the file route and on
+/// an address's, so the fallback is HOST's own: it reaches HOST's command line before the
+/// script that runs sopen there, and is absent when it is not set here.
+#[test]
+fn sopen_web_travels_to_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let bin = ssh.sopen.to_str().unwrap();
+    let page = format!("{HOST}:/tmp/a.html");
+    for (args, web) in [
+        (vec!["--target", HOST, page.as_str()], true),
+        (
+            vec!["--target", HOST, "--browser", "https://example.com/"],
+            true,
+        ),
+        (vec!["--target", HOST, page.as_str()], false),
+    ] {
+        let mut env = vec![("PATH", ssh.path.as_str()), ("SOPEN_TARGET_BIN", bin)];
+        if web {
+            env.push(("SOPEN_WEB", "off"));
+        }
+        let out = sopen(tmp.path(), &args, &env);
+        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+        let argv = ssh.argv().expect("ssh ran");
+        let at = argv.iter().position(|a| *a == q("env")).expect("env words");
+        let sh = argv.iter().position(|a| *a == q("sh")).expect("the script");
+        let words = &argv[at + 1..sh];
+        assert_eq!(
+            words.contains(&q("SOPEN_WEB=off")),
+            web,
+            "{args:?}: {argv:#?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The cues of 09 §7 on this side. HOST's half is the stand-in sopen playing a HOST of any
 // version (`FAKE_SOPEN_SAY`, `FAKE_SOPEN_HOLD`): an older one, or one that opened the system
