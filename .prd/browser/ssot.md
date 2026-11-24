@@ -2,7 +2,7 @@
 
 Status: in-progress (opened 2026-11-20)
 
-This file fixes the target of the browser workstream, which covers owner messages 14–16. It is not
+This file fixes the target of the browser workstream, which covers owner messages 14–16 and 19. It is not
 reinterpreted during the loop; a change of scope comes only from a new owner message, quoted here
 verbatim.
 
@@ -38,6 +38,12 @@ Message 16 (2026-11-20):
 >
 > 이거 리서치해서 영리하게 디렉토리 트리 보여주도록 해줘.
 
+Message 19 (2026-11-24; the machine's name is replaced by its role, as everywhere in this public
+repo):
+
+> [the Linux laptop]에서 펑션키가 눌린 상태로 되어 있는데 (f1이면 화면 밝기가 조절됨, 이거 온오프를 어떻게 할수 있음?)
+> 이거 디폴트로 xtools에서는 맥북이든 리눅스든 윈도우든 f1키가 실제 F1키 역활하게 해줘 os는 건드리지 말고 여기에서는 항상 f1키는 f1키로 동작하도록 해줘
+
 ## Fixed scope
 
 1. **Git panel.** When the browser's current folder is inside a git work tree, local or remote, sopen can show a git panel with:
@@ -67,6 +73,7 @@ Message 16 (2026-11-20):
 6. **Function keys act as F1…F12 inside sopen (message 15).**
    - Wherever an OS allows it, sopen switches the keyboard to standard function keys only while sopen is focused, and it restores the setting on focus loss, quit and crash recovery.
    - Wherever an OS does not allow it, a fallback works everywhere: a clickable F-key row and alternate keys. The feasibility research is in `.prd/research/keys.md`.
+   - **Message 19** asks for this by default on every OS sopen runs on, without changing the OS, Linux included, where `04-file-keys.md` §6.4 found no per-app mechanism. A feasibility gate (K-L1 in `loop.md`) checks again with a prototype before anything is specified. The workstream's reading, made on 2026-11-24, which the owner may change: macOS's switch, made only while sopen is in front and always restored (04 §6.2–6.3), leaves the OS's setting the owner's. Windows is outside sopen (01 §9).
 7. **Directory tree (message 16).**
    - A key opens a directory tree. The key is chosen by the key survey.
    - The root is the home directory when the current folder is under it, otherwise `/`. The same rule applies to the remote user's home on a remote folder.
