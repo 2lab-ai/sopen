@@ -235,8 +235,9 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
   `LINE_MAX` and the 16 MiB cap stay byte bounds, all multiples of 4 (T16). VM-2 turns every hard-coded
   one-byte newline into the encoding's unit: the `b'\n'` / `b'\r'` tests at `text.rs:738, 745, 1115,
   1197-1204, 1304-1305, 1353-1359, 1613, 1757, 2010` and the one-byte newline lengths at `text.rs:1082,
-  1126, 1161, 1379`.
-- **Three rules place a character start**, each one function per encoding in VM-1:
+  1126, 1161, 1379, 1622`, and in `wrap.rs` the span's unread `\r` tested as the byte 0x0D and popped as
+  one byte (`wrap.rs:697-704, 866-868, 1022-1023`).
+- **Four rules place a character start**, each one function per encoding in VM-1:
   1. **A grid cut** (D36) — a piece boundary at grid point g (a block edge, a GRID point of a line whose
      start is not known, `LINE_MAX`) — is one cut, used by the piece before and the piece after, in
      [g − 3, g]. UTF-8: `cut_char_start` over the bytes before g, as today (`grid_cut`, `text.rs:1313-1319`,
@@ -254,6 +255,13 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
      U+FFFD, as the whole-file decode shows it (D38). **The top row of a jump** is the row holding that
      place ("the row that byte is in at the top", AGENTS.md's `at=`). Rule 3 picks which row; the row's
      own start comes from the line start, a grid cut (rule 1) or a restart (rule 2), never from the jump.
+  4. **A place inside a line, not wrapped** — the byte `left` that every row is shown from (Right/Left
+     by `SIDEWAYS`, End's `end_left`, the sideways wheel: `text.rs:4019-4024, 4277, 4723`) — is aligned
+     down to the unit, then moved to the first character start at or after it: UTF-8 skips up to 3
+     continuation bytes, as today (`wrap.rs:870-878, 1025-1034`); UTF-16 moves past a low surrogate whose
+     preceding unit is a high surrogate; CP949 decodes forward from §7.4's proof before `left` (the line
+     start within REACH, else a checkpoint, else the last sync byte within W), else shows the
+     placeholders.
 - **One decoder per encoding** gives a piece's characters and their byte lengths, in the shape of
   `wrap::Cell { ch, len }` (`wrap.rs:40-45`); the line text, the row text, the highlighter's input and the
   per-character colour count all come from it, so they cannot disagree (T10, T13).
@@ -285,16 +293,17 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
   checkpoint not made yet — the bytes up to the first sync byte show as dim `░` placeholder marks, one
   per byte, never as characters. The status row says `CP949: no character boundary known here — shown
   from the next space or punctuation`.
-- **Checkpoints are made lazily** (D22, D28). Switching into CP949, by F8 or by step 3, rebuilds no
-  index: CP949's LF byte is UTF-8's. The first time a place past REACH in a line longer than REACH is
+- **Checkpoints are made lazily** (D22, D28). Switching into CP949 from UTF-8, ASCII, Latin-1 or CP437,
+  by F8 or by step 3, rebuilds no index: CP949's LF byte is theirs (from UTF-16 or UTF-32 the LF unit
+  changes and D22's rebuild runs). The first time a place past REACH in a line longer than REACH is
   needed, that line is read once from its known start up to the place (a Bulk read, like the index
   pass's), and every GRID point passed keeps its bit, so no stretch is read twice. The cost is at most
   the line's bytes before the place, inside the indexed prefix: ≤ 16 MiB through a stream (all 16 MiB
   take 2–8 s on 06's rig), fewer when the block cache still holds them `[추정]`; a local file is read in
   place. A line shorter than REACH needs none, since its start is within REACH. Until the read ends,
   rule 3 or the placeholders apply.
-- **The grid cut** (§7.3 rule 1): decode forward from the checkpoint at g, else from the last sync byte
-  in [g − W, g); the cut is g − 1 when a lead is pending there, else g. With neither, the placeholders
+- **The grid cut** (§7.3 rule 1): decode forward from the line start within REACH, else the checkpoint
+  at g, else the last sync byte in [g − W, g); the cut is g − 1 when a lead is pending there, else g. With neither, the placeholders
   above. **A restart's start** (rule 2) is the window's first sync byte, or the exact start a line start
   or checkpoint gives; "first sync byte in the window" is for restarts only.
 - **The new dependency**: `encoding_rs = "0.8.35"`, for CP949 only (VM-4): its 17,048-pair table is data
@@ -449,7 +458,10 @@ index cap; an encoding is set by `enc=` or the document's own call until VM-7 br
 - EA-7 (VM-1, VM-2). **Cuts and resyncs equal the whole-file decode**: in UTF-8, UTF-16LE/BE and CP949, a
   character across each grid point and block edge → the pieces on both sides together give it once. In
   UTF-16, a valid pair across a grid point stays one character; a standalone low surrogate at a grid
-  point and at a jump's place is one U+FFFD; a jump onto a pair's low half shows the pair whole.
+  point and at a jump's place is one U+FFFD; a jump onto a pair's low half shows the pair whole. Not
+  wrapped (rule 4): Right ×1–3, End, and a one-byte sideways wheel step, over a CP949 line that starts
+  with one ASCII byte and over a UTF-16LE line holding an emoji → every row equals the whole-file decode
+  from its first shown character; `left` stays a multiple of the unit.
 
 **Views** (VM-5 and VM-6 as tables of state × input; every VA item end to end with VM-7)
 - VA-1. Each row of §3 (HTML, HTM and XML by D40, and by D30 before 09), locally and through the Fake:
@@ -457,8 +469,8 @@ index cap; an encoding is set by `enc=` or the document's own call until VM-7 br
 - VA-2. **Hex: viewing, editing, a switch**: an image, `2`, `1` → the image again, no byte written. In
   Hex, Enter → `editing — Esc ends`; `4`, `1` (key + text) type 0x41, no switch; F9 then `1` → the close
   prompt; Cancel → Hex, viewing, the edit kept; plain `1` → the prompt again; Discard → view 1, the
-  journal gone; again with Save → view 1 once the Save lands, the file holding 0x41. During a Save, `1`
-  → `saving…`, then view 1. Editing, Esc → viewing; a second Esc → the close prompt. A revision's Hex:
+  journal gone; again with Save → view 1 once the Save lands, the file holding 0x41. Viewing, during a
+  Save, `1` → `saving…`, then view 1; editing, it is held back, as today. Editing, Esc → viewing; a second Esc → the close prompt. A revision's Hex:
   Enter says it is read-only. `--hex` types at once, as today. An image crop, then `2` → the prompt.
 - VA-3. F9 then `x` while editing hex → nothing typed, editing ended, no switch. Go to open: `1` goes
   into the field, F9 closes it and arms. The close prompt, Save As or the encoding list up: 1, 2, 3 and
@@ -505,7 +517,7 @@ Model units are ready to build; screen units wait for XR-T. Files are disjoint e
 
 | ID | Unit | Owns | After | When |
 |---|---|---|---|---|
-| VM-1 | **Encoding core**: §7.1's list; §7.2's steps 1, 2 and 4 with step 3's slot empty, and the BOM rule; one decoder per encoding (characters and byte lengths); LF/CR unit search; §7.3's three rules, the grid cut's look-back W exposed; a phase slot (a no-op but for CP949) | `src/encoding.rs`, `src/encoding/tests.rs` (new); `src/lib.rs` (`mod` line) | — | ready |
+| VM-1 | **Encoding core**: §7.1's list; §7.2's steps 1, 2 and 4 with step 3's slot empty, and the BOM rule; one decoder per encoding (characters and byte lengths); LF/CR unit search; §7.3's four rules, the grid cut's look-back W exposed; a phase slot (a no-op but for CP949) | `src/encoding.rs`, `src/encoding/tests.rs` (new); `src/lib.rs` (`mod` line) | — | ready |
 | VM-2 | **Text document per encoding**: index pass, line reads, spans, look-back, grid pieces, restarts and jumps through VM-1; §7.3's newline sites; the BOM skip and `span_at`'s guard; a rebuild only when the LF unit changes; lazy checkpoints through VM-1's phase slot, and the placeholder marks; the bar's encoding and `SOPEN_STATE enc=` (D34) | `src/gui/text.rs`, `src/gui/text/wrap.rs`, `src/gui/text/tests.rs`, `src/gui/text/stream_tests.rs`; `src/gui/mod.rs` (`State`'s `enc` only); `src/gui/browser.rs` (handing `enc` on, as `at`) | VM-1 | ready |
 | VM-3 | **Kind sniff**: UTF-16/32 → text (D18) | `src/kind.rs` | VM-2 (before it, such a file would open misaligned) | ready |
 | VM-4 | **CP949 / EUC-KR**: its decoder, sync bytes, grid cut and phase; step 3 of the pick (D39); `encoding_rs`; the binary-size measure | `src/encoding/cp949.rs`, `src/encoding/cp949_tests.rs` (new); `src/encoding.rs` (the entry, the step-3 slot and the `mod` line only); `Cargo.toml`, `Cargo.lock` | VM-1, VM-2 | ready |
