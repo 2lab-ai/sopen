@@ -114,11 +114,16 @@ downloaded and checked by build.rs; `SHERPA_ONNX_LIB_DIR` for offline builds); `
   its licences and those of what it brings are `THIRD-PARTY-NOTICES`, which must say what the binary links.
   The separation model is never in the repo or the release assets (the formula's resource; spec §7a).
   ffmpeg versions differ in how they *decode* AAC trims a file carries: ffmpeg 9 applies an MP4 edit list's end
-  and Matroska's CodecDelay, ffmpeg 8 (Ubuntu 26.04's, the CI Linux runner's) applies neither — both write the
-  same trims. The render tests therefore hold an AAC render to a plain encode of the same sample count by the
-  same ffmpeg (`pcm_as_plain` in `src/cut/edit_tests.rs`) and read what the file declares without a decoder (an
-  MP4's `stts` and edit list must say exactly the timeline's samples; Matroska declares only its priming, as
-  CodecDelay, so there the end may run on by less than one AAC frame), and read frames with `-fps_mode passthrough`.
+  and Matroska's CodecDelay, ffmpeg 8 (Ubuntu 26.04's, the CI Linux runner's) applies neither — and in how they
+  write them: 8 and 9.0 cut an MP4's last AAC sample short in `stts`, 9.1 keeps whole frames there (only the edit
+  list trims the end) and adds Matroska's DiscardPadding. The render tests therefore hold an AAC render to a plain
+  encode of the same sample count by the same ffmpeg (`pcm_as_plain` in `src/cut/edit_tests.rs`) and read what the
+  file declares without a decoder (an MP4's edit list must say the timeline's samples to its timescale and `stts`
+  hold them — exactly where its last sample is cut short, within one frame where all are whole; Matroska from 8
+  and 9.0 declares only its priming, as CodecDelay, so there the end may run on by less than one AAC frame), and
+  read frames with `-fps_mode passthrough`. ffmpeg 9.1's mp3 muxer writes 529 samples too little encoder delay
+  into the LAME tag below 32 kHz (47 for LAME's 576): every `.mp3` sopen writes — Save, Export, `sopen cut`,
+  `sopen stems` — is mended before it is published (`src/ffmpeg/mp3.rs`).
 - Tests must not need ssh or a network: the remote layer sits behind a trait with a local-filesystem
   implementation used by tests. SFTP itself is tested against this machine's own OpenSSH `sftp-server`, run
   as a child over pipes (`SftpRemote::local_server()`, `src/remote/sftp.rs`; `local_server_args` passes it
