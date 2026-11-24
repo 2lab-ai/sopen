@@ -135,6 +135,9 @@ pub fn cut_and_publish(
         let args = ffmpeg::export_args(src, &dst, req.in_s, req.out_s, crop, media, &plan)?;
         let args = ffmpeg::adapt_to_encoders(args, &ffmpeg::available_encoders(tools)?)?;
         ffmpeg::run_export(tools, &args, req.out_s - req.in_s, progress)?;
+        if out_ext.eq_ignore_ascii_case("mp3") {
+            ffmpeg::mp3::mend_encoder_delay(&dst)?;
+        }
         fs.write_new_sibling(&dst, dir, &name)
     })();
     let _ = std::fs::remove_dir_all(&work);
@@ -301,6 +304,13 @@ fn render(
         if !last {
             files.push(Input::path(&out));
         }
+    }
+    let ext = match to.as_ext {
+        Some(ext) => ext,
+        None => to.dst.extension().and_then(|e| e.to_str()).unwrap_or(""),
+    };
+    if ext.eq_ignore_ascii_case("mp3") {
+        ffmpeg::mp3::mend_encoder_delay(to.dst)?;
     }
     progress(1.0);
     Ok(())
