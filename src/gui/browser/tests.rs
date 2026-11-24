@@ -5,7 +5,7 @@
 use super::*;
 use crate::gui::testkit::{Driver, Meter};
 use crate::remote::{LocalFs, Stat};
-use eframe::egui::{Event, PointerButton};
+use eframe::egui::{Event, PointerButton, Vec2};
 use std::io::Write;
 use std::path::Path;
 
@@ -15,6 +15,7 @@ mod s3;
 mod s4;
 mod s5;
 mod s6;
+mod x1a;
 
 const RUST: &str = "// a comment\nfn main() {\n    let answer = 42;\n}\n";
 
@@ -549,10 +550,13 @@ fn f3_in_a_viewers_text_field_does_not_leave_the_viewer() {
 
 /// The panes the last pass drew in the central area: the bodies a frame fills in the skin's
 /// background, the outermost ones — a preview's or a viewer's own frame inside a side is not
-/// one — from the left.
+/// one — from the left. A body is taller than a row: the status row's cells are a run of the
+/// body's colour of their own, one row tall.
 fn panes(fx: &Fx) -> Vec<Rect> {
     let bodies: Vec<Rect> = (fx.drv.rects().into_iter())
-        .filter(|&(r, fill, _)| fill == chrome::PALETTE.back && r.width() >= 200.0)
+        .filter(|&(r, fill, _)| {
+            fill == chrome::PALETTE.back && r.width() >= 200.0 && r.height() > chrome::CELL.y
+        })
         .map(|(r, _, _)| r)
         .collect();
     let mut out: Vec<Rect> = (bodies.iter().copied())
@@ -564,9 +568,8 @@ fn panes(fx: &Fx) -> Vec<Rect> {
 }
 
 /// Columns `x..x + w` of a 1000 × 700 window's grid in points (10 §4): the central area, under
-/// the title row (a cell) and above the status bar (a cell and 4 points) and the F-key row (a
-/// cell), is 648 points tall from y 16 — 40 rows of cells, the 8 points left at its foot the
-/// background.
+/// the title row and above the status and F-key rows (a cell each), is 652 points tall from
+/// y 16 — 40 rows of cells, the 12 points left at its foot the background.
 fn grid_columns(x: u16, w: u16) -> Rect {
     let (left, width) = (f32::from(x) * 8.0, f32::from(w) * 8.0);
     Rect::from_min_size(Pos2::new(left, 16.0), Vec2::new(width, 40.0 * 16.0))
@@ -741,9 +744,17 @@ fn a_press_on_the_edge_beside_the_git_panel_is_not_the_git_panels() {
     assert!(g.fx.b.git.focus, "the git panel's last column is its own");
 }
 
+/// Cells `x..x + w` of row `y` of the central area's grid in points: under the title row (a
+/// cell), whatever the window's size.
+fn grid_cells(x: u16, y: u16, w: u16) -> Rect {
+    let at = Pos2::new(f32::from(x) * 8.0, 16.0 + f32::from(y) * 16.0);
+    Rect::from_min_size(at, Vec2::new(f32::from(w) * 8.0, 16.0))
+}
+
 /// The panel's foot never hides its count: on the narrowest window, and with a total too long
-/// for the panel, "N Listed" is drawn whole inside each panel's frame — the free space gives
-/// way first, then the end of the total.
+/// for the panel, "N Listed" is drawn whole inside each panel's frame, on its row above the
+/// bottom border — centred on whole cells while it fits, the free space giving way first, then
+/// the end of the total, from the frame's first cell inside.
 #[test]
 fn the_foot_always_shows_the_count_inside_the_frame() {
     let mut fx = fixture();
@@ -753,26 +764,27 @@ fn the_foot_always_shows_the_count_inside_the_frame() {
     assert!(fx.drv.find_text(&whole).is_some(), "{whole}");
     fx.drv.resize(480.0, 320.0);
     fx.drv.idle(&mut fx.b, 3);
-    // Two panels of 30 cells (240 points); inside each frame: 8..232 and 248..472.
+    // 60 columns: two sides of 30 cells, inside each frame cells 1..29 and 31..59; 272 points
+    // under the title row and above the status and F-key rows: 17 rows, the foot in row 15.
     let feet = |fx: &Fx| {
         let feet = fx.drv.texts_starting_with("8 Listed = ");
         assert_eq!(feet.len(), 2, "both counts whole on screen: {feet:?}");
-        for ((rect, _), (left, right)) in feet.iter().zip([(8.0, 232.0), (248.0, 472.0)]) {
-            assert!(
-                rect.left() >= left - 0.5 && rect.right() <= right + 0.5,
-                "inside the frame: {rect:?}"
-            );
-        }
-        feet.into_iter().map(|(_, text)| text).collect::<Vec<_>>()
+        feet
     };
     let shown = feet(&fx);
+    let count = &shown[0].1;
     assert!(
-        !shown[0].contains("Bytes Free"),
-        "the free space gave way: {}",
-        shown[0]
+        !count.contains("Bytes Free"),
+        "the free space gave way: {count}"
     );
-    assert!(shown[0].ends_with(" bytes"), "{}", shown[0]);
-    // A total far too long for the panel.
+    assert!(count.ends_with(" bytes"), "{count}");
+    // Centred in the 28 cells inside: the gap's odd cell is the right one's.
+    let w = count.chars().count() as u16;
+    let gap = (28 - w) / 2;
+    let want = [grid_cells(1 + gap, 15, w), grid_cells(31 + gap, 15, w)];
+    let got: Vec<Rect> = shown.iter().map(|(r, _)| *r).collect();
+    assert_eq!(got, want, "{count:?} centred inside each frame");
+    // A total far too long for the panel: its end cut, from the first cell inside.
     for panel in &mut fx.b.panels {
         for e in &mut panel.entries {
             if e.kind == EntryKind::File {
@@ -782,21 +794,24 @@ fn the_foot_always_shows_the_count_inside_the_frame() {
     }
     fx.drv.idle(&mut fx.b, 2);
     let shown = feet(&fx);
-    assert!(
-        shown[0].ends_with('…'),
-        "the end of the total gave way: {}",
-        shown[0]
+    let cut = &shown[0].1;
+    assert!(cut.ends_with('…'), "the end of the total gave way: {cut}");
+    let got: Vec<Rect> = shown.iter().map(|(r, _)| *r).collect();
+    assert_eq!(
+        got,
+        [grid_cells(1, 15, 28), grid_cells(31, 15, 28)],
+        "{cut:?}"
     );
 }
 
-/// Every cell of a row fits its column at a glyph boundary — never a sliver of a glyph: a long
-/// Hangul name (with wide glyphs) and a long ASCII name end in "…" inside the Name column, a
-/// long extension inside Ext; a size too long for its column is said in a larger unit.
+/// Every cell of a row fits its column at a glyph boundary — never half a glyph: a long Hangul
+/// name (two cells a glyph) and a long ASCII name end in "…" inside the Name column, a long
+/// extension inside Ext, each with the blank cell of the gap after it; a size too long for its
+/// column is said in a larger unit, right-aligned in it.
 #[test]
 fn cells_fit_their_columns_at_a_glyph_boundary() {
     let mut fx = fixture();
-    // The ideographic space is wider than a cell in the test kit's fonts (a system font draws
-    // Hangul wide too).
+    // The ideographic space is two cells, as the Hangul around it.
     let hangul = "한글\u{3000}폴더\u{3000}이름이\u{3000}아주\u{3000}길다";
     std::fs::create_dir(format!("{}/{hangul}", fx.root)).unwrap();
     let ascii = "a_very_long_ascii_file_name.verylongextension";
@@ -816,47 +831,43 @@ fn cells_fit_their_columns_at_a_glyph_boundary() {
     }
     fx.drv.resize(480.0, 320.0);
     fx.drv.idle(&mut fx.b, 3);
-    // The left panel's inside is 8..232: 28 cells — Name 6, a gap, Ext 5, a gap, Size 14.
-    let cell = 8.0;
-    let (name, ext, size) = (
-        (8.0, 8.0 + 6.0 * cell),
-        (8.0 + 7.0 * cell, 8.0 + 12.0 * cell),
-        (8.0 + 13.0 * cell, 8.0 + 27.0 * cell),
-    );
-    let inside =
-        |r: Rect, (left, right): (f32, f32)| r.left() >= left - 0.5 && r.right() <= right + 0.5;
-    for (full, column) in [
-        (hangul, name),
-        ("a_very_long_ascii_file_name", name),
-        ("verylongextension", ext),
-    ] {
+    // The left panel's inside is cells 1..29: 28 cells — Name 6 (cells 1..7), a gap, Ext 5
+    // (8..13), a gap, Size 14 (14..28); its rows are 1..15 of the grid's 17.
+    let rows = |x: u16, w: u16| -> Vec<String> {
+        let area = grid_cells(x, 1, w).union(grid_cells(x, 15, w));
+        fx.drv.column(area).into_iter().map(|(_, t)| t).collect()
+    };
+    let (names, gap, exts, after_ext) = (rows(1, 6), rows(7, 1), rows(8, 5), rows(13, 1));
+    assert_eq!(names.len(), 15, "a row of the list per row: {names:?}");
+    // Each cut name, the cell after its column a blank of the gap — half a wide glyph would
+    // leave it empty (a wide glyph's second cell shows nothing).
+    let cut = |texts: &[String], full: &str| -> usize {
         let start: String = full.chars().take(1).collect();
-        let shown: Vec<_> = fx
-            .drv
-            .texts_starting_with(&start)
-            .into_iter()
-            .filter(|(r, _)| r.left() < 240.0)
-            .collect();
-        let (rect, text) = shown
-            .iter()
-            .find(|(_, t)| t.ends_with('…'))
-            .unwrap_or_else(|| panic!("{full:?}: no whole, cut cell on screen ({shown:?})"));
-        let kept = text.trim_end_matches('…');
+        let y = (texts.iter())
+            .position(|t| t.starts_with(&start) && t.trim_end().ends_with('…'))
+            .unwrap_or_else(|| panic!("{full:?}: no cut cell in its column: {texts:?}"));
+        let kept = texts[y].trim_end().trim_end_matches('…');
         assert!(
             !kept.is_empty() && full.starts_with(kept),
-            "{text:?} is a start of {full:?}"
+            "{:?} is a start of {full:?}",
+            texts[y]
         );
-        assert!(
-            inside(*rect, column),
-            "{text:?} inside its column: {rect:?}"
-        );
-    }
-    // 1 TiB in bytes does not fit 14 cells: the smallest unit that does (MB).
-    let shown = fx.drv.texts_starting_with("1,099,512 MB");
-    assert!(
-        shown.iter().any(|(r, _)| inside(*r, size)),
-        "the size in its column: {shown:?}"
+        y
+    };
+    let y = cut(&names, hangul);
+    assert_eq!(
+        names[y], "한글… ",
+        "two Hangul on four cells, … on the fifth"
     );
+    assert_eq!(gap[y], " ", "the gap after the Hangul name");
+    let y = cut(&names, "a_very_long_ascii_file_name");
+    assert_eq!((names[y].as_str(), gap[y].as_str()), ("a_ver…", " "));
+    assert_eq!(cut(&exts, "verylongextension"), y, "the same row");
+    assert_eq!((exts[y].as_str(), after_ext[y].as_str()), ("very…", " "));
+    // 1 TiB in bytes does not fit 14 cells: the smallest unit that does (MB), at the column's
+    // right end.
+    let sizes = rows(14, 14);
+    assert_eq!(sizes[y], format!("{:>14}", "1,099,512 MB"));
 }
 
 /// F4 runs the real editor launch (`zed::launch`) — VS Code's CLI here is a script that writes

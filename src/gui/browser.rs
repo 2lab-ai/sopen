@@ -1,7 +1,9 @@
 //! The file browser (spec §3a, owner message 12): a folder opens in sopen's own window, two file
 //! panels side by side as in Total Commander, laid out where PC Shell puts things (the program's
 //! name on top, the path in the panel's frame, the counts at its foot, the F-keys at the
-//! bottom — [`super::chrome`] draws all of it). Enter on a file shows the viewer for its kind in
+//! bottom — in [`super::chrome`]'s skin). The lists and the title, status and F-key rows are
+//! cells of the window's grid ([`list_cells`], [`super::cells`]; 10 §4), the other panes today's
+//! egui at their sides' cells. Enter on a file shows the viewer for its kind in
 //! the same window: text in the text viewer, an image in the image window, video and audio in
 //! the media window, anything else in the hex window. F4 opens the highlighted file or folder in
 //! VS Code or Zed.
@@ -30,6 +32,7 @@
 mod git_host;
 mod git_panel;
 pub(crate) mod keys;
+mod list_cells;
 mod ops;
 mod panel;
 mod prepare;
@@ -56,7 +59,7 @@ use crate::remote::ops::FileOps;
 use crate::remote::treefs::TreeFs;
 use crate::remote::{EntryKind, LocalFs, RemoteFs, SftpRemote};
 use anyhow::{bail, Result};
-use eframe::egui::{self, Key, Modifiers, Pos2, Rect, Sense, Vec2};
+use eframe::egui::{self, Key, Modifiers, Pos2, Rect, Sense};
 use git_host::*;
 pub use git_host::{git_connect, git_listing, GitConnect};
 use git_panel::{
@@ -2142,10 +2145,10 @@ impl Browser {
     }
 
     /// The tree's side: the view drawn (its clicks carried out), then the model told what is on
-    /// screen when that changed — phase 2 lists around it, phase 3 sizes on it (05 §6.3).
-    fn tree_ui(&mut self, ui: &mut egui::Ui, i: usize, rect: Rect) {
+    /// screen when that changed — phase 2 lists around it, phase 3 sizes on it (05 §6.3). Called
+    /// only while the tree is open ([`Browser::panels_ui`] lists the side otherwise).
+    fn tree_ui(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let Some(t) = self.tree.as_mut() else {
-            self.panel_ui(ui, i, rect);
             return;
         };
         let mut actions = tree::draw(ui, rect, &mut t.view, true);
@@ -2441,221 +2444,9 @@ impl Browser {
             let rect = grid.rect(side);
             match self.shown.as_ref().map(|s| s[i].clone()) {
                 Some(view::Content::Preview(_)) => self.preview.ui(ui, rect),
-                Some(view::Content::Tree) => self.tree_ui(ui, i, rect),
+                Some(view::Content::Tree) if self.tree.is_some() => self.tree_ui(ui, rect),
                 Some(view::Content::Git(top)) => self.git_ui(ui, i, rect, &top),
-                _ => self.panel_ui(ui, i, rect),
-            }
-        }
-    }
-
-    /// One panel: its frame with the path in the top border, the column heads, the rows — a
-    /// selected entry in the selection's colour, the entry being renamed as a field in its row
-    /// (S1-D's helpers, [`ops::entry_color`] and [`ops::Ops::rename_field`]) — and the footer. A
-    /// click puts the bar on a row (and makes the panel active); a double click opens it.
-    fn panel_ui(&mut self, ui: &mut egui::Ui, i: usize, rect: Rect) {
-        let ctx = ui.ctx().clone();
-        let painter = ui.painter_at(rect);
-        let active = i == self.active && self.viewer.is_none() && !self.git.focus;
-        let title = show(self.label.as_deref(), &self.panels[i].dir);
-        let inner = chrome::panel_frame(&painter, rect, &title, active);
-        let p = chrome::Palette::of(ui.visuals());
-        let font = chrome::mono(ui);
-        let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-        // Rows touch, a cell apart, as on a text screen.
-        let row_h = text_h.ceil();
-        // Columns, in characters: Name (what is left) · Ext · Size · Date · Time.
-        let chars = (inner.width() / cw).floor().max(10.0) as usize;
-        let dated = chars >= 48;
-        let (ext_w, size_w, date_w, time_w) = (5, 14, 10, 5);
-        let fixed = ext_w + size_w + 2 + if dated { date_w + time_w + 2 } else { 0 };
-        let name_w = chars.saturating_sub(fixed + 1).max(4);
-        let col = |c: usize| inner.left() + cw * c as f32;
-        let (x_ext, x_size_end) = (col(name_w + 1), col(name_w + 1 + ext_w + 1 + size_w));
-        let (x_date, x_time) = (
-            col(name_w + ext_w + size_w + 4),
-            col(name_w + ext_w + size_w + date_w + 5),
-        );
-        let head_y = inner.top();
-        let cell = |painter: &egui::Painter, x: f32, y: f32, text: &str, color| {
-            painter.text(
-                Pos2::new(x, y),
-                egui::Align2::LEFT_TOP,
-                text,
-                font.clone(),
-                color,
-            );
-        };
-        cell(&painter, inner.left(), head_y, "Name", p.dim);
-        cell(&painter, x_ext, head_y, "Ext", p.dim);
-        painter.text(
-            Pos2::new(x_size_end, head_y),
-            egui::Align2::RIGHT_TOP,
-            "Size",
-            font.clone(),
-            p.dim,
-        );
-        if dated {
-            cell(&painter, x_date, head_y, "Date", p.dim);
-            cell(&painter, x_time, head_y, "Time", p.dim);
-        }
-        let rows_top = head_y + row_h;
-        // The foot: a row with the line across the window, then the counts.
-        let foot_y = inner.bottom() - row_h;
-        let rule_y = foot_y - row_h;
-        let visible = (((rule_y - rows_top) / row_h).floor() as usize).max(1);
-        if i == self.active {
-            self.visible = visible;
-        }
-        // The entry being renamed (F2), in the panel it was pressed in: its row is the field.
-        let renaming = (i == self.rename_panel)
-            .then(|| self.ops.renaming().map(str::to_string))
-            .flatten();
-        let mut field = None;
-        let panel = &mut self.panels[i];
-        // The wheel scrolls the rows (the bar stays where it is).
-        if pointer_on_pane(ui, rect) {
-            let lines: f32 = ctx.input(|inp| {
-                inp.events
-                    .iter()
-                    .map(|e| match e {
-                        egui::Event::MouseWheel { unit, delta, .. } => match unit {
-                            egui::MouseWheelUnit::Point => -delta.y / row_h,
-                            _ => -delta.y * 3.0,
-                        },
-                        _ => 0.0,
-                    })
-                    .sum()
-            });
-            let max_top = panel.entries.len().saturating_sub(visible);
-            panel.top = (panel.top as f32 + lines)
-                .round()
-                .clamp(0.0, max_top as f32) as usize;
-        }
-        if i == self.active {
-            panel.follow(visible);
-        }
-        let mut clicked = None;
-        for (row, idx) in (panel.top..panel.entries.len()).take(visible).enumerate() {
-            let entry = &panel.entries[idx];
-            let y = rows_top + row as f32 * row_h;
-            let row_rect =
-                Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(inner.width(), row_h));
-            if idx == panel.highlight {
-                chrome::bar(&painter, row_rect, active);
-            }
-            let on_bar = idx == panel.highlight && active;
-            let color = ops::entry_color(&p, entry, panel.is_selected(entry), on_bar);
-            // Each cell fits its column at a glyph boundary, "…" where it is cut: never a
-            // sliver of a glyph (a wide Hangul one included). A size too long for its column
-            // is said in a larger unit, never cut.
-            let (name, ext) = panel::split_name(entry);
-            let name_rect =
-                Rect::from_min_max(row_rect.min, Pos2::new(x_ext - cw, row_rect.bottom()));
-            if idx == panel.highlight && renaming.as_deref() == Some(entry.name.as_str()) {
-                // The name is a field over the Name and Ext columns, drawn after the rows.
-                field = Some(Rect::from_min_max(
-                    row_rect.min,
-                    Pos2::new(x_ext + cw * ext_w as f32, row_rect.bottom()),
-                ));
-            } else {
-                let name = chrome::fit_start(&ctx, name, &font, name_rect.width());
-                let ext = chrome::fit_start(&ctx, ext, &font, cw * ext_w as f32);
-                cell(
-                    &painter.with_clip_rect(name_rect),
-                    inner.left(),
-                    y,
-                    &name,
-                    color,
-                );
-                cell(&painter, x_ext, y, &ext, color);
-            }
-            painter.text(
-                Pos2::new(x_size_end, y),
-                egui::Align2::RIGHT_TOP,
-                panel::size_in(entry, size_w),
-                font.clone(),
-                color,
-            );
-            if dated {
-                let (date, time) = panel::date_cells(entry);
-                cell(&painter, x_date, y, &date, color);
-                cell(&painter, x_time, y, &time, color);
-            }
-            let resp = ui.interact(row_rect, list_id().with((i, idx)), Sense::click());
-            if resp.clicked() {
-                let pair = list_id().with((i, &panel.dir, &entry.name));
-                clicked = Some((idx, second_click(&resp, pair)));
-            }
-        }
-        if let Some(rect) = field {
-            self.ops.rename_field(ui, rect);
-        }
-        // The scroll bar on the right border, beside the rows.
-        let max_top = panel.entries.len().saturating_sub(visible);
-        let column = Rect::from_min_max(
-            Pos2::new(inner.right(), inner.top()),
-            Pos2::new(inner.right() + chrome::CELL.x, rule_y),
-        );
-        chrome::scroll_bar(
-            &painter,
-            column,
-            (max_top > 0).then(|| panel.top as f32 / max_top as f32),
-        );
-        let half = chrome::CELL / 2.0;
-        chrome::rule(
-            &painter,
-            inner.left() - half.x,
-            inner.right() + half.x,
-            rule_y + half.y,
-            active,
-        );
-        // The foot, centred when it fits inside the frame; else without the free space; else
-        // the count from the left, its end cut — the count is never lost.
-        let (listed, free) = panel.foot_parts();
-        let width = |t: &str| {
-            ctx.fonts_mut(|f| {
-                f.layout_no_wrap(t.to_string(), font.clone(), p.text)
-                    .size()
-                    .x
-            })
-        };
-        let whole = match &free {
-            Some(free) => format!("{listed} · {free}"),
-            None => listed.clone(),
-        };
-        let room = inner.width();
-        let (foot, centred) = if width(&whole) <= room {
-            (whole, true)
-        } else if width(&listed) <= room {
-            (listed, true)
-        } else {
-            (chrome::fit_start(&ctx, &listed, &font, room), false)
-        };
-        let (at, align) = if centred {
-            (inner.center().x.round(), egui::Align2::CENTER_TOP)
-        } else {
-            (inner.left(), egui::Align2::LEFT_TOP)
-        };
-        painter.with_clip_rect(inner).text(
-            Pos2::new(at, foot_y),
-            align,
-            foot,
-            font.clone(),
-            p.text,
-        );
-        if let Some((idx, open)) = clicked {
-            // While the tree is open the other side is a snapshot (02 §3.1 O4): a click there
-            // moves nothing.
-            let free = self.listing.is_empty() && self.opening.is_none() && self.tree.is_none();
-            if free && self.viewer.is_none() && !self.ops.holds_keyboard() {
-                self.active = i;
-                // A click in a list gives it the keyboard back from a git panel.
-                self.git.focus = false;
-                self.git.wide = false;
-                self.panels[i].highlight = idx;
-                if open {
-                    self.enter(&ctx, false);
-                }
+                _ => self.panel_cells(ui, i, &grid, side),
             }
         }
     }
@@ -2805,12 +2596,12 @@ impl Window for Browser {
                 .map_or_else(Vec::new, |i| self.git.panels[i].view.fkeys(self.mode)),
             (None, None) => keys::row(Context::List, self.mode),
         };
+        // The title, F-key and status rows in cells, a row each (10 §6).
         chrome::title_panel(ui, "sopen-browser-title", &self.title);
-        chrome::key_panel(ui, "sopen-browser-keys", &keys);
+        chrome::key_panel_cells(ui, "sopen-browser-keys", &keys);
         self.fkeys_line = super::fkeys_status(&ctx);
         let status = self.status_line();
-        chrome::bar_panel(egui::Panel::bottom("sopen-browser-status"))
-            .show(ui, |ui| chrome::status_row(ui, &status));
+        chrome::status_panel_cells(ui, "sopen-browser-status", &status);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {

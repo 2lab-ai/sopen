@@ -411,7 +411,7 @@ const MARK: isize = 2;
 const NAME: isize = 12;
 
 /// Below this many cells a side drops the counts and keeps the size, as the list drops its Date
-/// and Time columns below the same width (`Browser::panel_ui`).
+/// and Time columns below the same width (`Browser::panel_cells`).
 const COUNTED: usize = 48;
 
 /// The tree's keys this frame, through the key table's tree context (04 §3: exact modifiers),
