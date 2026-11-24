@@ -354,6 +354,71 @@ fn a_separated_track_is_its_two_stems_sample_for_sample() {
     );
 }
 
+/// A 22.05 kHz mp3 separates into two mp3 stems that decode exactly as long as it does — on
+/// ffmpeg 9.1 too, whose LAME tag below 32 kHz says 529 samples too little encoder delay
+/// ([`crate::ffmpeg::mp3`]): unmended, each stem would decode 529 samples of priming first.
+#[cfg(feature = "stems")]
+#[test]
+fn a_22_khz_mp3_separates_into_stems_as_long_as_it() {
+    use crate::ffmpeg;
+    use crate::remote::LocalFs;
+    let Some(model) = model_or_skip() else { return };
+    let tools = match ffmpeg::resolve() {
+        Ok(t) => t,
+        Err(e) if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() => panic!("{e:#}"),
+        Err(e) => return eprintln!("skipping the separation test: {e:#}"),
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("talk.mp3");
+    let status = std::process::Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=220:duration=6:sample_rate=22050",
+        ])
+        .args(["-c:a", "libmp3lame", "-b:a", "64k"])
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let work = tmp.path().join("work");
+    crate::cache::private_dir(&work).unwrap();
+    let published = separate_and_publish(
+        &mut LocalFs::new(),
+        &tools,
+        &model,
+        &src,
+        tmp.path().to_str().unwrap(),
+        "talk.mp3",
+        &Options {
+            piece_s: 4.0,
+            context_s: 1.0,
+            threads: 4,
+        },
+        &work,
+        &mut || Ok(()),
+        &mut |_| {},
+    )
+    .unwrap();
+    let samples = |name: &str| -> usize {
+        let out = std::process::Command::new(&tools.ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+            .arg(tmp.path().join(name))
+            .args(["-ac", "1", "-f", "s16le", "-"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        out.stdout.len() / 2
+    };
+    let source = samples("talk.mp3");
+    for stem in [&published.voice, &published.music] {
+        assert!(stem.ends_with(".mp3"), "{stem}");
+        assert_eq!(samples(stem), source, "{stem}");
+    }
+}
+
 /// A file with no audio stream is refused by the probe, before any model is loaded (so no
 /// model is needed here) and before anything is written.
 #[cfg(feature = "stems")]
