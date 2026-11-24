@@ -35,3 +35,31 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
 | ID | Status | What | Who |
 |---|---|---|---|
 | VR-W | ✅ done 2026-11-24 | The OS's web engine in xtools on macOS and Linux Wayland, loaded at runtime (sopen must still start without it), remote pages and their resources, a page's security, XML in each engine. Output: `../research/web-view.md`. | research unit |
+
+## R0 (part 3) — XR-T closed 2026-11-24
+
+- Result: `../research/tui-gui.md`. Recommended architecture: **(A) one cell-grid UI core with two
+  backends**, a terminal backend and a GUI backend that paints the same cells (the VGA font, glyph by
+  glyph per cell) and hosts pixel regions at cell rectangles (images, video, native views).
+  - Killed: (B) a separate TUI kept 1:1 with today's egui GUI by tests (the GUI must move onto the grid
+    first anyway), and (D) the window as a terminal emulator (no native web view; kitty pictures over
+    ssh at 6–8 fps).
+  - (C) egui's shapes projected onto cells stays as a lint for screens not yet moved: the F7 dialog had
+    158 glyphs off the grid, the hex window 1,337.
+  - Measured: the 1:1 proof, the TUI→GUI switch in one process and across machines (the state sent over
+    ssh, 1.1 s end to end), and terminal-picture rates.
+  - The migration order starts with the file list in cells (`--tui`).
+- The orchestrator recomputed the 1:1 proof from the dumps. The file list plus F7 with Hangul typed
+  covers 3,000 cells. Under vt100, tmux and Linux, against the GUI backend's painted cells:
+  - 0 background differences;
+  - 0 foreground differences on painted glyphs;
+  - 1 character difference, the `[GUI]`/`[TUI]` mode button, by design.
+- It also read the prototype's GUI screenshot: PC Shell's look, with Hangul names on whole cells.
+- XR-T also found that the owner's laptop terminals are kitty and herdr-app, not Konsole. The
+  orchestrator confirmed this with `ps` (see the Tension added to `../research/fkeys-linux.md` §5).
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| XR-T | ✅ done 2026-11-24 | The architecture of message 23 with a running prototype: TUI first and a GUI that is the same screen 1:1, the gap in today's GUI, the TUI→GUI switch, terminal graphics, video in a terminal, the migration order. Output: `../research/tui-gui.md`. | research unit |

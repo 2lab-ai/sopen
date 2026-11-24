@@ -210,6 +210,11 @@ pub fn separate_and_publish(
     };
     voice.finish("encoding the voice")?;
     music.finish("encoding the music")?;
+    if out_ext.eq_ignore_ascii_case("mp3") {
+        for file in &files.0 {
+            ffmpeg::mp3::mend_encoder_delay(file)?;
+        }
+    }
 
     before_publish()?;
     let (voice, music) = super::publish_pair(
