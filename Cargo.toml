@@ -92,6 +92,15 @@ syntect = { version = "5.3.0", default-features = false, features = ["default-sy
 # letter and its marks, an emoji sequence stay whole). Already in the tree (eframe → epaint), at
 # the same version.
 unicode-segmentation = "1.13.3"
+# The TUI (`.prd/10-tui.md` §4): every screen is drawn into ratatui-core's cell `Buffer` (the
+# buffer only, not ratatui; `gui::cells`), and crossterm drives the terminal and parses its input
+# (`gui::term_input`): pure Rust over mio, rustix and parking_lot, already in the tree, so nothing
+# new is linked (its Windows crates are in the lock only). Cell widths are unicode-width's
+# (10 §10), already in the tree (eframe → egui-wgpu → wgpu → wgpu-core → naga →
+# codespan-reporting), at the same version. The lock adds 20 packages and bumps none.
+ratatui-core = "0.1.2"
+crossterm = "0.29.0"
+unicode-width = "0.2"
 
 [build-dependencies]
 # build.rs checks the downloaded sherpa-onnx archive against its pinned SHA-256.
