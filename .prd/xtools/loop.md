@@ -8,13 +8,12 @@ here.
 
 | ID | Status | What | Who |
 |---|---|---|---|
-| XR-T | 🔴 open | **Gates XE and XM.** The architecture of message 23 with a running prototype: how xtools becomes a TUI first and a GUI that is the same screen 1:1 (one cell-grid UI with a terminal and a GUI backend, or another route), how much of today's GUI is already cell-aligned and what moves, the TUI→GUI switch (same process with a display; across ssh to the target), terminal graphics (kitty, iTerm2, sixel; which terminals the owner uses support which), video in a terminal, and the order of a migration. Output: `../research/tui-gui.md`. | research unit |
-| VR-W | 🟡 running | The OS's web engine in xtools on macOS and Linux Wayland, loaded at runtime (sopen must still start without it), remote pages and their resources, a page's security, XML in each engine. Output: `../research/web-view.md`. | research unit |
+| XR-T | 🟡 running | **Gates XE and XM.** The architecture of message 23 with a running prototype: how xtools becomes a TUI first and a GUI that is the same screen 1:1 (one cell-grid UI with a terminal and a GUI backend, or another route), how much of today's GUI is already cell-aligned and what moves, the TUI→GUI switch (same process with a display; across ssh to the target), terminal graphics (kitty, iTerm2, sixel; which terminals the owner uses support which), video in a terminal, and the order of a migration. Output: `../research/tui-gui.md`. | research unit |
 | XR-E | 🔴 open | The editor of message 21 after XR-T: the PC Tools / Turbo C IDE editor's look and keys from primary references, the F4 layout, the left panel's tabs, the text buffer for local and remote files, saving through 07's safe paths, VS Code / Zed kept reachable. | research unit |
 | X-SPEC | 🔴 open | The numbered documents for items 1–5, reviewed by two engines before any code; work units with disjoint files. | orchestrator |
 
 Closed so far: VR-M (the viewers' trace and the draft of 08's view and encoding sections) —
-[`loop.done.md`](loop.done.md) R0 part 1.
+[`loop.done.md`](loop.done.md) R0 part 1; VR-W (the web view) — R0 part 2.
 
 ## Build facts
 
