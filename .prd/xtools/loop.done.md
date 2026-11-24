@@ -92,6 +92,20 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
 | XW-input | ✅ done 2026-11-25 | 10 §17: crossterm events become egui events, as the window sends them (#106) | coder |
 | XW-help | ✅ done 2026-11-25 | 10 §17: one help text on every machine, `Ctrl/⌘+…` (#107) | coder |
 
+## R1 (part 2) — X-W1 closed 2026-11-25
+
+- **Result.** `../09-web-view.md` §3.1, in the block "X-W1 result (2026-11-25)". Prototypes ran outside the repo on both engines: macOS WKWebView through objc2-web-kit, and Linux WebKitGTK 2.52.6 offscreen in an isolated headless session. Both used a real-time fake link at 50 ms RTT and 2 MB/s.
+- **Held on both engines:**
+  - a handler answering from a worker thread;
+  - late pieces taken on the engine's thread;
+  - no call after a stop, which macOS throws on;
+  - turns that keep a later CSS request ahead of a long response.
+- **A run of ranges on one handle held only with a spec change.** Media needs one checked handle per path and view, plus a 256 KiB block cache. A video played in 428–477 ms; re-checking every range never played within 60 s.
+- **RTT counts.** About 4 and about 2 RTT, as §3.1 said. The first byte takes 5 RTT, and a page with N resources costs (N+2)×5 RTT in series.
+- **What the units inherit (written in §3.1):**
+  - WV-C: per-view handles, the block cache, checks plus the first piece in one turn. Batching is still to decide.
+  - WV-A: the tombstone, and the stop that can come after the last byte.
+  - WV-B: a GInputStream subclass, and a request stopped before its head. Linux sends no cancel then; the only signal is `resource-load-started`/`failed`.
 ## R1 (part 3) — XR-E and X-SPEC closed 2026-11-25
 
 - **XR-E.** Research in `../research/editor.md`, from primary references:
@@ -109,10 +123,13 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
   - **The fix-check was FIX.** 4 + 7 gaps in the new mechanisms' failure states: a failed swap-back, an interrupted remote check, journal generations and durability, the CRLF boundary, the column's delete dialog, "Shift known" expiring, and the prompt lines.
   - **The orchestrator checked those fixes at their lines.**
 - **Items 2, 4 and 5 were written earlier** (10, 08, 09; #100). With this, every item of `ssot.md` has its contract.
-
 ### Closed rows
 
 | ID | Status | What | Who |
 |---|---|---|---|
+<<<<<<< HEAD
 | XR-E | ✅ done 2026-11-25 | The editor of message 21: the PC Tools / Turbo C IDE editor's look and keys from primary references, the F4 layout, the left panel's tabs, the text buffer for local and remote files, saving through 07's safe paths, VS Code / Zed kept reachable. Result: `../research/editor.md`. | research unit |
 | X-SPEC | ✅ done 2026-11-25 | The numbered document for item 3 (the editor), after XR-E, reviewed by two engines before any code. Items 2, 4 and 5 are written: 10, 08 and 09, merged 2026-11-24 (#100); item 1 shipped as #96. | orchestrator |
+=======
+| X-W1 | ✅ done 2026-11-25 | 09 §12: the stream-fed page handler prototype on both engines, before WV-C and WV-0 | research unit |
+>>>>>>> origin/main
