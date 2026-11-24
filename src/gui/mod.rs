@@ -1,8 +1,10 @@
 //! The file browser and its text viewer (spec §3a), the image window (spec §6), the binary-file
 //! dialog and hex window (spec §6a) and the media window (spec §7). This module is the shared
 //! shell: where the opened file lives ([`Origin`]),
-//! the window runner (wgpu renderer, glow fallback, activation on start, Cmd/Ctrl+Q through the
-//! close prompt), the receipt hooks ([`Hooks`]), the screenshot driver and the windows' feed of the
+//! the window runner (one event loop per process, each window `eframe::create_native` on it;
+//! wgpu renderer, glow fallback, activation on start, Cmd/Ctrl+Q through the close prompt), the
+//! input hook (F-key aliases, F12 the switch), the receipt hooks ([`Hooks`]), the screenshot
+//! driver and the windows' feed of the
 //! macOS F-key switch (`Feed`: whether a window is in front, acted on by a thread of its own;
 //! `.prd/04-file-keys.md` §6.2). Everything that writes
 //! (Save, Save copy, Export, Save to…) is a plain function over [`Origin`] or a local path,
@@ -758,8 +760,11 @@ pub fn own_keys(ui: &mut egui::Ui, keys: &[chrome::FKey]) {
 /// way). Before each pass, once, before any window sees the input: Cmd/Ctrl+1…9, 0 become
 /// F1…F10 and a clicked slot of the F-key row ([`chrome::fkey_row`]) its F-key — plain keys,
 /// so every window and the browser's key table act on them by the F-key's own rules; not while
-/// a text field has the typing (04 §3 rule 4). Then [`help::begin_pass`] before the window's
-/// pass and [`help::end_pass`] after it.
+/// a text field has the typing (04 §3 rule 4). F12 is the switch (10 §9, T4): taken in every
+/// context, a field's included, and said to the pass ([`switch_asked`]). In the terminal
+/// backend's context only ([`mark_terminal`]) Alt+1…0 are F1…F10 too and Alt+G is the switch
+/// (10 §9, T7, T33): in a window Option+digit and Option+G type characters on macOS. Then
+/// [`help::begin_pass`] before the window's pass and [`help::end_pass`] after it.
 #[derive(Debug, Default)]
 pub(crate) struct FKeyInput {
     /// What each digit key (1…9, 0) is while it is down.
@@ -788,13 +793,22 @@ impl egui::Plugin for FKeyInput {
         // The focus as the last pass left it: what has the typing now.
         let typing = ctx.text_edit_focused();
         let clicked = chrome::take_clicked(ctx);
-        fkey_events(
+        let switch = key_aliases(
+            in_terminal(ctx),
             &mut input.events,
             &mut self.digits,
             typing,
             input.focused,
             clicked,
         );
+        // This pass's word only: a switch nothing took is not left for a later pass.
+        ctx.data_mut(|d| {
+            if switch {
+                d.insert_temp(switch_id(), SwitchAsked);
+            } else {
+                d.remove::<SwitchAsked>(switch_id());
+            }
+        });
     }
 
     fn on_begin_pass(&mut self, ui: &mut egui::Ui) {
@@ -806,21 +820,43 @@ impl egui::Plugin for FKeyInput {
     }
 }
 
-/// The F-key events of a pass (see [`FKeyInput`]): a digit pressed with exactly Cmd/Ctrl, not
-/// while a field has the typing, is that F-key pressed without modifiers until it is let go —
-/// its repeats are the F-key's (the digit they type is dropped: egui-winit puts a key's typed
-/// text right after its key event), its release the F-key's. A digit pressed otherwise stays
-/// the digit, its repeats too. Losing the window's focus lets go of every F-key held so (winit
-/// may never send those releases; egui clears its own keys then too). The digit is the
-/// physical key's first, so on a layout whose digits need Shift, Cmd/Ctrl and the key printed 5
-/// still make F5. `clicked` adds a press and a release of its F-key.
+/// [`key_aliases`] of a window's pass (no terminal: Alt+digits and Alt+G stay keys), as the
+/// translator's tests drive the hook.
+#[cfg(test)]
 fn fkey_events(
     events: &mut Vec<egui::Event>,
     digits: &mut [Digit; 10],
     typing: bool,
     focused: bool,
     clicked: Option<u8>,
-) {
+) -> bool {
+    key_aliases(false, events, digits, typing, focused, clicked)
+}
+
+/// The key events of a pass (see [`FKeyInput`]); `terminal`: the terminal backend's pass
+/// ([`in_terminal`]). A digit pressed with exactly Cmd/Ctrl — in a terminal also exactly Alt
+/// (10 T7) — not while a field has the typing, is that F-key pressed without modifiers until it
+/// is let go — its repeats are the F-key's (the digit they type is dropped: egui-winit puts a
+/// key's typed text right after its key event), its release the F-key's. A digit pressed
+/// otherwise stays the digit, its repeats too. Losing the window's focus lets go of every F-key
+/// held so (winit may never send those releases; egui clears its own keys then too). The digit
+/// is the physical key's first, so on a layout whose digits need Shift, Cmd/Ctrl and the key
+/// printed 5 still make F5. `clicked` adds a press and a release of its F-key.
+///
+/// The switch (10 §9, T4, T33), a field's typing or not, as it types nothing: every F12 event
+/// is taken — no window or key-table row has one (`keys.rs`'s `no_duplicate_bindings`) — and
+/// its press without modifiers asks for it; in a terminal Alt+G's press and release are taken
+/// and the press asks for it (a terminal's release is made with its press, modifiers and all:
+/// `term_input`). A repeat asks nothing. Whether this pass asked.
+fn key_aliases(
+    terminal: bool,
+    events: &mut Vec<egui::Event>,
+    digits: &mut [Digit; 10],
+    typing: bool,
+    focused: bool,
+    clicked: Option<u8>,
+) -> bool {
+    use browser::keys::Mods;
     use egui::Key::*;
     let number = |key: egui::Key| -> Option<u8> {
         let n = [Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9, Num0]
@@ -844,9 +880,10 @@ fn fkey_events(
     };
     let mut out = Vec::with_capacity(events.len() + 2);
     let mut after_alias = false;
+    let mut switch = false;
     for event in events.drain(..) {
         let typed_by_alias = std::mem::take(&mut after_alias);
-        let (key, physical_key, pressed, modifiers) = match &event {
+        let (key, physical_key, pressed, repeat, modifiers) = match &event {
             egui::Event::Text(_) if typed_by_alias => continue,
             egui::Event::WindowFocused(false) => {
                 let_go(digits, &mut out);
@@ -857,23 +894,31 @@ fn fkey_events(
                 key,
                 physical_key,
                 pressed,
+                repeat,
                 modifiers,
-                ..
-            } => (*key, *physical_key, *pressed, *modifiers),
+            } => (*key, *physical_key, *pressed, *repeat, *modifiers),
             _ => {
                 out.push(event);
                 continue;
             }
         };
+        let switch_key = match key {
+            F12 => Some(Mods::None),
+            G if terminal && Mods::Alt.matches(modifiers) => Some(Mods::Alt),
+            _ => None,
+        };
+        if let Some(mods) = switch_key {
+            switch |= pressed && !repeat && mods.matches(modifiers);
+            continue;
+        }
         let Some(n) = physical_key.and_then(number).or_else(|| number(key)) else {
             out.push(event);
             continue;
         };
         let digit = &mut digits[usize::from(n - 1)];
+        let alias = Mods::Command.matches(modifiers) || (terminal && Mods::Alt.matches(modifiers));
         let now = match (pressed, *digit) {
-            (true, Digit::Up) if !typing && browser::keys::Mods::Command.matches(modifiers) => {
-                Digit::Alias
-            }
+            (true, Digit::Up) if !typing && alias => Digit::Alias,
             (true, Digit::Up) => Digit::Plain,
             (true, held) => held,
             (false, _) => Digit::Up,
@@ -893,6 +938,45 @@ fn fkey_events(
         out.extend([fkey(n, true), fkey(n, false)]);
     }
     *events = out;
+    switch
+}
+
+/// A pass asked for the switch ([`switch_asked`]).
+#[derive(Debug, Clone, Copy)]
+struct SwitchAsked;
+
+fn switch_id() -> egui::Id {
+    egui::Id::unique("sopen-switch-asked")
+}
+
+/// Whether this pass's input asked for the switch to the other backend (10 §7, T4): F12, or
+/// Alt+G in a terminal, taken before the pass by the shell's input hook ([`FKeyInput`]); the
+/// next pass asks again or not. For the backend that switches. A window started directly has
+/// no terminal to go back to while there is no TUI, so nothing reads it there and F12 does
+/// nothing (10 §7.2: `[TUI]` "only when its process has a terminal on input and output (F12
+/// then takes it), else neither works there").
+pub fn switch_asked(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<SwitchAsked>(switch_id()).is_some())
+}
+
+/// The terminal backend's context ([`mark_terminal`]).
+#[derive(Debug, Clone, Copy)]
+struct InTerminal;
+
+fn terminal_id() -> egui::Id {
+    egui::Id::unique("sopen-in-terminal")
+}
+
+/// Marks `ctx` as the terminal backend's (10 §4: its headless passes run the same input hook):
+/// from its next pass on, the hook reads Alt+1…0 as F1…F10 and Alt+G as the switch (10 §9 —
+/// "in the TUI only": in a window Option+digit and Option+G type characters on macOS).
+pub fn mark_terminal(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(terminal_id(), InTerminal));
+}
+
+/// Whether `ctx` is the terminal backend's ([`mark_terminal`]).
+pub fn in_terminal(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<InTerminal>(terminal_id()).is_some())
 }
 
 /// Runs a hosted window's pass (`pass`) and says whether the window asked to close in it
@@ -1132,6 +1216,11 @@ impl<W: Window> eframe::App for Shell<W> {
         let ctx = ui.ctx().clone();
         if self.frames == 0 {
             ctx.options_mut(|o| o.zoom_with_keyboard = false);
+            // 10 TW-1's time: from the shell made to its window's first pass.
+            crate::debug!(
+                "window: first frame after {} ms",
+                self.started.elapsed().as_millis()
+            );
         }
         // Started from a terminal, the window can come up behind it. eframe shows the window
         // only after the first painted frame (and a hidden window ignores focus), so ask on the
@@ -1230,6 +1319,129 @@ fn event_loop_hook() -> Option<eframe::EventLoopBuilderHook> {
     None
 }
 
+type EventLoop = winit::event_loop::EventLoop<eframe::UserEvent>;
+
+thread_local! {
+    /// This process's one event loop (10 §4, T34; 04 §6.4.3), built by its first window with
+    /// [`event_loop_hook`] applied — `create_native` never runs `NativeOptions`'s builder hook —
+    /// and kept for every window after it and for the glow retry: winit refuses a second loop
+    /// in a process (`winit-0.30.13/src/event_loop.rs:119`), and the windows all run on the main
+    /// thread. A build that failed is kept as its reason: winit counts the loop as made before
+    /// the platform's part runs, so trying again could only say "recreation attempt".
+    static EVENT_LOOP: RefCell<Option<Result<EventLoop, String>>> = const { RefCell::new(None) };
+}
+
+/// Runs `run` on this process's event loop ([`EVENT_LOOP`]), building it first; the reason
+/// when it cannot be built, or a window already runs on it.
+fn on_the_event_loop<R>(run: impl FnOnce(&mut EventLoop) -> R) -> Result<R, String> {
+    EVENT_LOOP.with(|cell| {
+        let mut cell = cell
+            .try_borrow_mut()
+            .map_err(|_| "a window already runs on this thread's event loop".to_string())?;
+        let made = cell.get_or_insert_with(|| {
+            let mut builder = EventLoop::with_user_event();
+            if let Some(hook) = event_loop_hook() {
+                hook(&mut builder);
+            }
+            builder.build().map_err(|e| format!("no event loop: {e}"))
+        });
+        match made {
+            Ok(event_loop) => Ok(run(event_loop)),
+            Err(why) => Err(why.clone()),
+        }
+    })
+}
+
+/// One run of the app in `slot` with `options` on this process's event loop: eframe's handler
+/// (`eframe::create_native`), run by `run_app_on_demand` until the window closes, then dropped
+/// — the app with it, if it started. `Err` only when the loop itself failed: a renderer that
+/// does not start leaves the app in its slot and the loop returns `Ok` (see [`start`]).
+fn attempt<A: eframe::App + 'static>(
+    slot: &RefCell<Option<A>>,
+    options: eframe::NativeOptions,
+) -> Result<(), String> {
+    use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
+    on_the_event_loop(|event_loop| {
+        let mut app = eframe::create_native(
+            "sopen",
+            options,
+            Box::new(|cc| {
+                // The look, before the first frame.
+                chrome::install(&cc.egui_ctx);
+                let app = slot
+                    .borrow_mut()
+                    .take()
+                    .ok_or("the window was already started once")?;
+                Ok(Box::new(app) as Box<dyn eframe::App>)
+            }),
+            event_loop,
+        );
+        let ran = event_loop.run_app_on_demand(&mut app);
+        drop(app);
+        ran.map_err(|e| format!("the event loop failed: {e}"))
+    })?
+}
+
+/// A window that did not open (10 T31, 04 §6.4.3): no renderer started it, or the event loop
+/// could not run — nothing of the window ran. [`run_window`]'s error carries it, so a caller
+/// that goes on without the window can say why (`reason`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotStarted {
+    pub reason: String,
+}
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot open a window: {}", self.reason)
+    }
+}
+
+impl std::error::Error for NotStarted {}
+
+/// The renderers `choice` tries, in order.
+fn renderers(choice: RendererChoice) -> &'static [eframe::Renderer] {
+    use eframe::Renderer::{Glow, Wgpu};
+    match choice {
+        RendererChoice::Auto => &[Wgpu, Glow],
+        RendererChoice::Wgpu => &[Wgpu],
+        RendererChoice::Glow => &[Glow],
+    }
+}
+
+/// Starts the app in `slot` with the first of `choice`'s renderers that takes it; `run` is one
+/// renderer's [`attempt`]. `create_native` returns no `Result`: a renderer's error stays
+/// inside eframe (`native/run.rs:96, 177-191, 541`) and the loop returns `Ok`, so a renderer
+/// started exactly when the app has left its slot (04 §6.4.3) — wgpu fails at `set_window`,
+/// before the app creator — and while it is still there the next one tries: glow after wgpu,
+/// with a line saying so. None took it → [`NotStarted`]. The loop failing is no renderer's
+/// failure and ends it at once: [`NotStarted`] with its reason, or — under a window that
+/// started — an error. A run whose app was created ends as a close.
+fn start<A>(
+    choice: RendererChoice,
+    slot: &RefCell<Option<A>>,
+    mut run: impl FnMut(eframe::Renderer) -> Result<(), String>,
+) -> Result<()> {
+    for (n, &renderer) in renderers(choice).iter().enumerate() {
+        if n > 0 {
+            eprintln!("sopen: the wgpu renderer did not start; using OpenGL (glow)");
+        }
+        let ran = run(renderer);
+        let started = slot.borrow().is_none();
+        match ran {
+            Ok(()) if started => return Ok(()),
+            Ok(()) => {}
+            Err(why) if started => bail!("the window's event loop failed: {why}"),
+            Err(reason) => return Err(NotStarted { reason }.into()),
+        }
+    }
+    let reason = match choice {
+        RendererChoice::Auto => "neither wgpu nor glow started".to_string(),
+        RendererChoice::Wgpu => "the wgpu renderer did not start (SOPEN_RENDERER=wgpu)".into(),
+        RendererChoice::Glow => "the glow renderer did not start (SOPEN_RENDERER=glow)".into(),
+    };
+    Err(NotStarted { reason }.into())
+}
+
 /// sopen gives up (`why`) and exits 1 without unwinding (the screenshot hook's watchdog: a
 /// receipt hook). Nothing is stopped here: on Linux an ffprobe or ffmpeg a preview runs dies
 /// with sopen (the kernel ends it: `PR_SET_PDEATHSIG`); on macOS the one that runs may be left
@@ -1299,49 +1511,25 @@ pub fn run_window_sized<W: Window + 'static>(
     // The app moves into whichever renderer starts. A renderer that fails before creating the
     // app leaves it here for the next one.
     let slot = RefCell::new(Some(shell));
-    let attempt = |renderer: eframe::Renderer| -> Result<(), eframe::Error> {
+    let viewport = egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_app_id("sopen")
+        .with_inner_size(hooks.window_size.unwrap_or(size))
+        .with_min_inner_size(
+            hooks
+                .window_size
+                .map_or(min, |[w, h]| [w.min(min[0]), h.min(min[1])]),
+        )
+        .with_active(true);
+    start(choice, &slot, |renderer| {
         let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_title(title)
-                .with_app_id("sopen")
-                .with_inner_size(hooks.window_size.unwrap_or(size))
-                .with_min_inner_size(
-                    hooks
-                        .window_size
-                        .map_or(min, |[w, h]| [w.min(min[0]), h.min(min[1])]),
-                )
-                .with_active(true),
+            viewport: viewport.clone(),
             renderer,
             centered: true,
-            event_loop_builder: event_loop_hook(),
             ..Default::default()
         };
-        eframe::run_native(
-            "sopen",
-            options,
-            Box::new(|cc| {
-                // The look, before the first frame.
-                chrome::install(&cc.egui_ctx);
-                let shell = slot
-                    .borrow_mut()
-                    .take()
-                    .ok_or("the window was already started once")?;
-                Ok(Box::new(shell) as Box<dyn eframe::App>)
-            }),
-        )
-    };
-    let run = match choice {
-        RendererChoice::Glow => attempt(eframe::Renderer::Glow),
-        RendererChoice::Wgpu => attempt(eframe::Renderer::Wgpu),
-        RendererChoice::Auto => match attempt(eframe::Renderer::Wgpu) {
-            Err(e) if slot.borrow().is_some() => {
-                eprintln!("sopen: the wgpu renderer did not start ({e}); using OpenGL (glow)");
-                attempt(eframe::Renderer::Glow)
-            }
-            other => other,
-        },
-    };
-    run.map_err(|e| anyhow!("cannot open a window: {e}"))?;
+        attempt(&slot, options)
+    })?;
     if hooks.screenshot.is_some() {
         match shot_result.lock().unwrap().take() {
             Some(Ok(line)) => println!("{line}"),
@@ -3388,5 +3576,232 @@ mod tests {
         assert!(drv.find_text("Help   ").is_some(), "the row is still there");
         drv.key(&mut own, egui::Key::F8, egui::Modifiers::NONE);
         assert_eq!(own.f8, 1, "and its keys work");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // XW-shell: F12, Alt+digits and Alt+G (10 §9, T4, T7, T33).
+
+    /// `key` pressed and let go with `modifiers` held, no text typed (F12, and a chord with
+    /// Alt from a terminal, type none: 10 §4).
+    fn press(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        [true, false]
+            .map(|pressed| digit(key, pressed, modifiers))
+            .to_vec()
+    }
+
+    /// The keys `win` saw since the last call, as `(key, pressed)`.
+    fn seen_keys(win: &mut Recorder) -> Vec<(egui::Key, bool)> {
+        left_down(&std::mem::take(&mut win.seen)).1
+    }
+
+    /// 10 §9, T4: F12 is the switch, taken by the shell's input hook in every context — a field
+    /// with the typing included — so neither the window nor a key-table row sees it and it types
+    /// nothing; the pass it was pressed in asks for the switch, the next one does not. A held
+    /// F12's repeat and Shift+F12 ask nothing.
+    #[test]
+    fn xw_shell_f12_is_the_switch_in_every_context_and_types_nothing() {
+        use egui::Key::F12;
+        let (none, shift) = (egui::Modifiers::NONE, egui::Modifiers::SHIFT);
+        for focus in [false, true] {
+            let mut drv = testkit::Driver::new(400.0, 200.0);
+            let mut win = Recorder {
+                seen: Vec::new(),
+                text: "name".into(),
+                focus,
+            };
+            drv.idle(&mut win, 2);
+            assert_eq!(drv.ctx.text_edit_focused(), focus);
+            drv.frame(&mut win, press(F12, none), none);
+            assert!(switch_asked(&drv.ctx), "focus {focus}: F12 asks");
+            drv.idle(&mut win, 1);
+            assert!(
+                !switch_asked(&drv.ctx),
+                "focus {focus}: the next pass does not"
+            );
+            let repeat = egui::Event::Key {
+                key: F12,
+                physical_key: None,
+                pressed: true,
+                repeat: true,
+                modifiers: none,
+            };
+            drv.frame(&mut win, vec![repeat], none);
+            assert!(!switch_asked(&drv.ctx), "focus {focus}: a repeat");
+            drv.frame(&mut win, press(F12, shift), shift);
+            assert!(!switch_asked(&drv.ctx), "focus {focus}: Shift+F12");
+            assert_eq!(seen_keys(&mut win), [], "focus {focus}: no F12 reached it");
+            assert_eq!(win.text, "name");
+            assert!(!drv.ctx.input(|i| i.key_down(F12)));
+        }
+    }
+
+    /// 10 §9: in a window Alt+digits and Alt+G stay the keys they are — Option+digit and
+    /// Option+G type characters on macOS — and Alt+G asks for no switch (the negative control
+    /// of the terminal's test below: the same keys, the context not marked).
+    #[test]
+    fn xw_shell_alt_digits_and_alt_g_stay_keys_in_a_window() {
+        use egui::Key::{Num5, G};
+        let alt = egui::Modifiers::ALT;
+        let mut drv = testkit::Driver::new(400.0, 200.0);
+        let mut win = Recorder {
+            seen: Vec::new(),
+            text: String::new(),
+            focus: false,
+        };
+        drv.idle(&mut win, 2);
+        drv.frame(&mut win, press(Num5, alt), alt);
+        drv.frame(&mut win, press(G, alt), alt);
+        assert!(!switch_asked(&drv.ctx));
+        assert_eq!(
+            seen_keys(&mut win),
+            [(Num5, true), (Num5, false), (G, true), (G, false)]
+        );
+    }
+
+    /// 10 §9, T7, T33: in the terminal backend's context ([`mark_terminal`]) Alt+1…0 are F1…F10,
+    /// alongside Cmd/Ctrl+digits, but not while a field has the typing (04 §6.1); Alt+G is the
+    /// switch, taken even from a field (it types nothing); a plain G stays G.
+    #[test]
+    fn xw_shell_in_a_terminal_alt_digits_are_f_keys_and_alt_g_the_switch() {
+        use egui::Key::{Num5, F5, G};
+        let (alt, none, cmd) = (egui::Modifiers::ALT, egui::Modifiers::NONE, real_command());
+        let mut drv = testkit::Driver::new(400.0, 200.0);
+        mark_terminal(&drv.ctx);
+        let mut win = Recorder {
+            seen: Vec::new(),
+            text: String::new(),
+            focus: false,
+        };
+        drv.idle(&mut win, 2);
+        drv.frame(&mut win, press(Num5, alt), alt);
+        assert_eq!(seen_keys(&mut win), [(F5, true), (F5, false)], "Alt+5");
+        drv.frame(&mut win, press(Num5, cmd), cmd);
+        assert_eq!(seen_keys(&mut win), [(F5, true), (F5, false)], "Cmd/Ctrl+5");
+        drv.frame(&mut win, press(G, alt), alt);
+        assert!(switch_asked(&drv.ctx), "Alt+G asks");
+        assert_eq!(seen_keys(&mut win), [], "and is taken");
+        drv.frame(&mut win, press(G, none), none);
+        assert!(!switch_asked(&drv.ctx), "a plain G does not");
+        assert_eq!(seen_keys(&mut win), [(G, true), (G, false)]);
+
+        win.focus = true;
+        drv.idle(&mut win, 2);
+        assert!(drv.ctx.text_edit_focused());
+        seen_keys(&mut win);
+        drv.frame(&mut win, press(Num5, alt), alt);
+        assert_eq!(
+            seen_keys(&mut win),
+            [(Num5, true), (Num5, false)],
+            "the field's"
+        );
+        drv.frame(&mut win, press(G, alt), alt);
+        assert!(switch_asked(&drv.ctx), "Alt+G from the field");
+        assert_eq!(seen_keys(&mut win), []);
+        assert_eq!(win.text, "", "nothing typed");
+        assert!(!drv.ctx.input(|i| i.key_down(F5) || i.key_down(G)));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // XW-shell: the start and the glow retry (10 T31, T34; 04 §6.4.3).
+
+    /// [`start`] over renderers whose run takes the shell from its slot when `takes` names them
+    /// and whose loop then ends with `ends`: the renderers run, the outcome, and whether the
+    /// shell is still in its slot.
+    fn started(
+        choice: RendererChoice,
+        takes: &[eframe::Renderer],
+        ends: impl Fn(eframe::Renderer) -> Result<(), String>,
+    ) -> (Vec<eframe::Renderer>, Result<()>, bool) {
+        let slot = RefCell::new(Some("the shell"));
+        let mut ran = Vec::new();
+        let out = start(choice, &slot, |renderer| {
+            ran.push(renderer);
+            if takes.contains(&renderer) {
+                slot.borrow_mut().take();
+            }
+            ends(renderer)
+        });
+        let left = slot.borrow().is_some();
+        (ran, out, left)
+    }
+
+    /// The reason of a start that never ran the window ([`NotStarted`]).
+    fn not_started(out: &Result<()>) -> Option<String> {
+        let e = out.as_ref().err()?.downcast_ref::<NotStarted>()?;
+        Some(e.reason.clone())
+    }
+
+    /// 04 §6.4.3: `create_native` returns no `Result`, and a renderer's failure stays inside
+    /// eframe while the loop returns `Ok`, so the retry's trigger is the shell still in its
+    /// slot: wgpu's loop ends `Ok` with the shell there → glow runs and takes it. A wgpu that
+    /// takes it runs alone.
+    #[test]
+    fn xw_shell_the_glow_retry_fires_on_the_shell_still_in_its_slot() {
+        use eframe::Renderer::{Glow, Wgpu};
+        let (ran, out, left) = started(RendererChoice::Auto, &[Glow], |_| Ok(()));
+        assert_eq!(ran, [Wgpu, Glow]);
+        assert!(out.is_ok() && !left, "{out:?}");
+        let (ran, out, left) = started(RendererChoice::Auto, &[Wgpu, Glow], |_| Ok(()));
+        assert_eq!(ran, [Wgpu]);
+        assert!(out.is_ok() && !left, "{out:?}");
+    }
+
+    /// Still in its slot after glow too → `cannot open a window: neither wgpu nor glow started`
+    /// (04 §6.4.3), the shell never run; a forced renderer (`SOPEN_RENDERER`) runs alone and
+    /// is named.
+    #[test]
+    fn xw_shell_no_renderer_started_says_which() {
+        use eframe::Renderer::{Glow, Wgpu};
+        let (ran, out, left) = started(RendererChoice::Auto, &[], |_| Ok(()));
+        assert_eq!(ran, [Wgpu, Glow]);
+        assert!(left);
+        assert_eq!(
+            not_started(&out).as_deref(),
+            Some("neither wgpu nor glow started")
+        );
+        assert_eq!(
+            format!("{:#}", out.unwrap_err()),
+            "cannot open a window: neither wgpu nor glow started"
+        );
+        for (choice, only, name) in [
+            (RendererChoice::Wgpu, Wgpu, "wgpu"),
+            (RendererChoice::Glow, Glow, "glow"),
+        ] {
+            let (ran, out, left) = started(choice, &[], |_| Ok(()));
+            assert_eq!(ran, [only]);
+            assert!(left);
+            assert_eq!(
+                not_started(&out),
+                Some(format!(
+                    "the {name} renderer did not start (SOPEN_RENDERER={name})"
+                ))
+            );
+        }
+    }
+
+    /// The event loop failing — it cannot be built (no display) or cannot run — is no
+    /// renderer's failure: it ends at once, glow untried, with the loop's reason (10 T31's
+    /// line names it). A loop failing under a window that started is an error, not a start
+    /// that failed.
+    #[test]
+    fn xw_shell_a_failed_event_loop_is_not_retried() {
+        use eframe::Renderer::Wgpu;
+        let (ran, out, left) = started(RendererChoice::Auto, &[], |_| {
+            Err("no event loop: no display".into())
+        });
+        assert_eq!(ran, [Wgpu]);
+        assert!(left);
+        assert_eq!(
+            not_started(&out).as_deref(),
+            Some("no event loop: no display")
+        );
+        let (ran, out, left) = started(RendererChoice::Auto, &[Wgpu], |_| {
+            Err("the display went".into())
+        });
+        assert_eq!(ran, [Wgpu]);
+        assert!(
+            !left && out.is_err() && not_started(&out).is_none(),
+            "{out:?}"
+        );
     }
 }
