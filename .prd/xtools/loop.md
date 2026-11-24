@@ -1,19 +1,14 @@
 # xtools — loop (open items only)
 
-Status: round 1 (code), opened 2026-11-25; round 0's research is closed except XR-E. Target:
+Status: round 1 (code), opened 2026-11-25; round 0 (research and specs) is closed. Target:
 [`ssot.md`](ssot.md). Contracts: [`../08-viewer.md`](../08-viewer.md) (view modes and encodings),
 [`../09-web-view.md`](../09-web-view.md) (web pages), [`../10-tui.md`](../10-tui.md) (TUI first, the
-GUI the same cells). Design decisions go there, not here; each unit's row in those documents' work
+GUI the same cells), [`../12-editor.md`](../12-editor.md) (the built-in editor). Design decisions go there, not here; each unit's row in those documents' work
 unit tables says what it owns and what it waits for.
 
-## Round 0 — research (what is left)
+## Round 0 — research
 
-| ID | Status | What | Who |
-|---|---|---|---|
-| XR-E | 🟡 running | The editor of message 21: the PC Tools / Turbo C IDE editor's look and keys from primary references, the F4 layout, the left panel's tabs, the text buffer for local and remote files, saving through 07's safe paths, VS Code / Zed kept reachable. Result: `../research/editor.md`. | research unit |
-| X-SPEC | 🔴 open | The numbered document for item 3 (the editor), after XR-E, reviewed by two engines before any code. Items 2, 4 and 5 are written: 10, 08 and 09, merged 2026-11-24 (#100); item 1 shipped as #96. | orchestrator |
-
-Closed so far: VR-M, VR-W, XR-T — [`loop.done.md`](loop.done.md) R0 parts 1–3.
+Closed: VR-M, VR-W, XR-T, XR-E and X-SPEC — [`loop.done.md`](loop.done.md) R0 parts 1–3 and R1 part 3.
 
 ## Round 1 — code
 
@@ -37,6 +32,7 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
 | WV-E1 | 🔴 open | 09 §12: the CLI half of the address window (starts at once) | coder |
 | WV-rest | 🔴 open | 09 §12's WV-0, WV-C, WV-A, WV-B, WV-D, WV-E2 and WV-F, in its order after X-W1 | coder |
 | X3-hex | 🔴 open | 10 §16's hex step. Carried from #108's review: point the hex tests' `drawn()` at `texts()` once hex paints cells (`galleys()` then holds one-character glyphs), and note that `rects()` will list cell backgrounds and the caret | coder |
+| ED-units | 🔴 open | 12 §16's units: ED-0, ED-buf, ED-enc, ED-ops, ED-save can start now (no screen); then ED-screen, ED-dialogs, ED-layout (ships X5), ED-git, ED-route, after their 10 units | coder |
 
 ## Follow-ups found on the way (not units yet)
 
