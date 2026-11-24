@@ -8,7 +8,7 @@ use super::timeline::{Clip, Timeline, View};
 use super::*;
 use crate::ffmpeg::{Served, Span};
 use crate::remote::{LocalFs, RemoteFs, SftpRemote};
-use crate::stream::http::{Config, Seams, Server, SEND_BUFFER};
+use crate::stream::http::{Config, Gate, Seams, Server, SEND_BUFFER};
 use crate::stream::{limits, refetches, Class, Engine, Opening, Settings, BLOCK, CAP_MAX};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
@@ -924,11 +924,66 @@ impl RemoteFs for Publishing {
     }
 }
 
+/// What the byte server writes, held at a mark: while it holds, no connection is written past
+/// `mark` bytes — the write that would go past it writes up to it, the next one waits until it
+/// is let go ([`Seams::before_write`]).
+struct Withheld {
+    mark: u64,
+    /// Holding, and the writes waiting at the mark.
+    state: Mutex<(bool, usize)>,
+    changed: Condvar,
+}
+
+impl Withheld {
+    fn new(mark: u64) -> Arc<Self> {
+        Arc::new(Self {
+            mark,
+            state: Mutex::default(),
+            changed: Condvar::new(),
+        })
+    }
+
+    /// The server's seam.
+    fn seam(self: &Arc<Self>) -> Arc<dyn Fn(u64, usize) -> Gate + Send + Sync> {
+        let held = self.clone();
+        Arc::new(move |written, offered| {
+            let mut state = held.state.lock().unwrap();
+            if !state.0 || written + offered as u64 <= held.mark {
+                return Gate::Go;
+            }
+            if written < held.mark {
+                return Gate::AtMost((held.mark - written) as usize);
+            }
+            state.1 += 1;
+            while state.0 {
+                state = held.changed.wait(state).unwrap();
+            }
+            state.1 -= 1;
+            Gate::Go
+        })
+    }
+
+    fn hold(&self) {
+        self.state.lock().unwrap().0 = true;
+    }
+
+    fn let_go(&self) {
+        self.state.lock().unwrap().0 = false;
+        self.changed.notify_all();
+    }
+
+    fn waiting(&self) -> usize {
+        self.state.lock().unwrap().1
+    }
+}
+
 /// 06 §12 V22: Cancel during the render kills ffmpeg and leaves no file under the exports and
 /// nothing on the remote; during the upload it stops the upload, removes the remote temp and
 /// links nothing (and so after the upload, before the link); after
 /// the link it is too late and the result names the sibling; a name already taken is never
-/// written over.
+/// written over. The render is held mid-way by its input, whatever ffmpeg's speed: a render
+/// done before its first progress report (ffmpeg 9.1 renders this one in a third of a second,
+/// one report at its end) gives no moment during it to cancel at.
 #[test]
 fn v22_export_cancel_at_each_step() {
     bounded(240, |t| {
@@ -939,7 +994,22 @@ fn v22_export_cancel_at_each_step() {
         let Some(source) = streamed(&path) else {
             return;
         };
-        let media = Media::stream(source, "v.mp4", "v.mp4").unwrap();
+        // 2 MiB a connection: the render reads its input on one, from the keyframe at 8 s past
+        // the edit's end (5.2 MB written to it, unheld), and so stops short of 24 s of the
+        // source, before half the edit; every other connection of the export (the probe, the
+        // render's looks at the head and the `moov`) is written 0.72 MB at most (measured).
+        let withheld = Withheld::new(2 * MIB);
+        let config = Config {
+            clock: Arc::new(Instant::now),
+            tick: None,
+            seams: Seams {
+                before_write: Some(withheld.seam()),
+                ..Seams::default()
+            },
+        };
+        let server = Server::start_with(source.clone(), config).unwrap();
+        let served = Served::new(server, source, "v.mp4", "v.mp4", false);
+        let media = Media::served(&tools, served.clone(), "v.mp4", "v.mp4").unwrap();
         let spec = spec_of(&media, &[(10.0, 30.0)]);
         let target = dir.path().to_str().unwrap().to_string();
         let exports = dir.path().join("exports");
@@ -954,7 +1024,7 @@ fn v22_export_cancel_at_each_step() {
         };
         // How far the last render got.
         let reached = Mutex::new(0.0f64);
-        let export = |fs: &mut dyn RemoteFs, stop: &cut::Stop, cancel_on_progress: bool| {
+        let export = |fs: &mut dyn RemoteFs, stop: &cut::Stop| {
             *reached.lock().unwrap() = 0.0;
             cut::render_and_publish(
                 fs,
@@ -968,9 +1038,6 @@ fn v22_export_cancel_at_each_step() {
                 &mut |f| {
                     let mut got = reached.lock().unwrap();
                     *got = got.max(f);
-                    if cancel_on_progress && f > 0.0 {
-                        stop.cancel();
-                    }
                 },
                 stop,
             )
@@ -981,13 +1048,54 @@ fn v22_export_cancel_at_each_step() {
                 .unwrap_or_default();
             assert!(left.is_empty(), "left under the exports: {left:?}");
         };
+        // The file the render is writing, in its job's folder under the exports.
+        let rendering = || -> Option<PathBuf> {
+            std::fs::read_dir(&exports)
+                .ok()?
+                .map(|e| e.unwrap().path().join("v.cut-10-40.mp4"))
+                .find(|out| out.is_file())
+        };
+        let written = || rendering().map_or(0, |out| size_of(out.to_str().unwrap()));
         let before = listed();
-        // During the render.
+        // During the render: its input held at the mark, it cannot reach its end. Once it has
+        // written part of its output and its input waits at the mark, its ffmpeg — the one
+        // process naming that output — is stopped (SIGSTOP): from there it neither writes nor
+        // ends by itself. The owner's Cancel is made on this thread meanwhile, and the run's
+        // look at its stop, made whatever ffmpeg prints, kills it.
         let stop = cut::Stop::default();
-        let err = export(&mut LocalFs::new(), &stop, true).unwrap_err();
+        withheld.hold();
+        let (err, partial) = std::thread::scope(|scope| {
+            // However this step ends, the run is cancelled and the server let go — the scope
+            // waits for the run, which while held ends no other way.
+            struct Over<'a>(&'a cut::Stop, &'a Withheld);
+            impl Drop for Over<'_> {
+                fn drop(&mut self) {
+                    self.0.cancel();
+                    self.1.let_go();
+                }
+            }
+            let _over = Over(&stop, &withheld);
+            let run = scope.spawn(|| export(&mut LocalFs::new(), &stop));
+            until("the render has written, its input held at the mark", || {
+                withheld.waiting() > 0 && written() > 0
+            });
+            let out = rendering().unwrap();
+            let ffmpeg = super::child::log::pids_naming(&out);
+            assert_eq!(ffmpeg.len(), 1, "the render's ffmpeg: {ffmpeg:?}");
+            // SAFETY: a signal to a pid this test just found as its render's ffmpeg.
+            let sent = unsafe { libc::kill(ffmpeg[0] as libc::pid_t, libc::SIGSTOP) };
+            assert_eq!(sent, 0, "the render's ffmpeg, still running, is stopped");
+            let partial = written();
+            assert!(stop.cancel(), "a Cancel during the render is in time");
+            (run.join().unwrap().unwrap_err(), partial)
+        });
         assert!(crate::remote::is_cancelled(&err), "{err:#}");
         let got = *reached.lock().unwrap();
         assert!(got < 0.9, "ffmpeg was stopped mid-way, not at {got}");
+        // The connection held at the mark is over before anything else is served.
+        until("the held connection has ended", || {
+            served.server().watch().open() == 0
+        });
         assert_eq!(listed(), before, "nothing on the remote");
         nothing_under_exports();
         none_left(dir.path()).unwrap();
@@ -1004,7 +1112,7 @@ fn v22_export_cancel_at_each_step() {
             (fs, stop)
         };
         let (mut fs, stop) = publishing(CancelAt::MidUpload(512 << 10));
-        let err = export(&mut fs, &stop, false).unwrap_err();
+        let err = export(&mut fs, &stop).unwrap_err();
         assert!(crate::remote::is_cancelled(&err), "{err:#}");
         let seen = fs.seen.lock().unwrap();
         let (at_cancel, at_removal) = (
@@ -1012,6 +1120,11 @@ fn v22_export_cancel_at_each_step() {
             seen.at_removal.expect("the temp was removed"),
         );
         let total = seen.total.expect("an upload");
+        // The render cancelled above had written part of what the whole one writes.
+        assert!(
+            partial < total,
+            "the render stopped with {partial} of its {total} bytes written"
+        );
         // Mid-way: part of the file was in the temp when the Cancel landed, not all of it.
         assert!(0 < at_cancel && at_cancel < total, "{seen:?}");
         assert!(
@@ -1024,7 +1137,7 @@ fn v22_export_cancel_at_each_step() {
         nothing_under_exports();
         // After the upload, before the link: the whole temp is there, and still goes.
         let (mut fs, stop) = publishing(CancelAt::AfterUpload);
-        let err = export(&mut fs, &stop, false).unwrap_err();
+        let err = export(&mut fs, &stop).unwrap_err();
         assert!(crate::remote::is_cancelled(&err), "{err:#}");
         let seen = fs.seen.lock().unwrap();
         assert!(
@@ -1036,7 +1149,7 @@ fn v22_export_cancel_at_each_step() {
         nothing_under_exports();
         // After the link.
         let (mut fs, stop) = publishing(CancelAt::AfterLink);
-        let published = export(&mut fs, &stop, false).unwrap();
+        let published = export(&mut fs, &stop).unwrap();
         assert_eq!(
             fs.seen.lock().unwrap().late,
             Some(false),
@@ -1046,7 +1159,7 @@ fn v22_export_cancel_at_each_step() {
         assert!(dir.path().join(&published.name).is_file());
         // Its name is taken now: the next export is published beside it, never over it.
         let first = std::fs::read(dir.path().join(&published.name)).unwrap();
-        let again = export(&mut LocalFs::new(), &cut::Stop::default(), false).unwrap();
+        let again = export(&mut LocalFs::new(), &cut::Stop::default()).unwrap();
         assert_eq!(again.name, crate::remote::suffixed(&published.name, 1));
         assert_eq!(
             std::fs::read(dir.path().join(&published.name)).unwrap(),
