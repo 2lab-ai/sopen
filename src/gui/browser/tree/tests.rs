@@ -9,8 +9,8 @@ use crate::gui::testkit::{self, Driver};
 use crate::gui::Window;
 use eframe::egui::{Event, Key, Modifiers};
 
-/// The tree on the left half of the window, as a side of the browser is laid out, with what its
-/// keys and clicks asked for.
+/// The tree on the left side of the window's cell grid, as the browser lays a side out (10 §4),
+/// with what its keys and clicks asked for.
 struct Host {
     view: TreeView,
     active: bool,
@@ -27,10 +27,8 @@ impl Window for Host {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
-                let area = ui.max_rect();
-                let half = (area.width() / 2.0).floor();
-                let rect =
-                    Rect::from_min_size(area.min, Vec2::new(half, area.height())).shrink(2.0);
+                let grid = crate::gui::cells::Grid::over(ui.max_rect());
+                let rect = grid.rect(crate::gui::cells::halves(grid.all())[0]);
                 self.rect = rect;
                 self.actions
                     .extend(draw(ui, rect, &mut self.view, self.active));
