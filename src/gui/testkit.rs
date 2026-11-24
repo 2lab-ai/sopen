@@ -53,8 +53,8 @@ pub struct Driver {
 /// The last pass's cell layers as they reached the screen.
 struct Placed {
     /// Per layer, the shape its first glyph is among the pass's shapes — its place in painting
-    /// order, and the transform it was painted under; `None` when its glyphs are not there (it
-    /// has none, or was painted invisible).
+    /// order, and the transform it was painted under; `None` when it has no glyph or was painted
+    /// invisible.
     at: Vec<Option<usize>>,
     /// Per shape, whether the cell painter drew it as a glyph of a layer (empty: no layers).
     glyph: Vec<bool>,
@@ -72,6 +72,22 @@ fn glyphs(l: &Layer) -> Vec<(Pos2, String)> {
         }
     }
     out
+}
+
+/// How many shapes [`cells::paint`] adds for `l`: per row a rectangle per run of one background
+/// (none where it has no RGB one), a text per glyph, and the caret's rectangle — each of them
+/// nothing ([`egui::Shape::Noop`]) from a painter that paints invisibly.
+fn shapes_of(l: &Layer) -> usize {
+    let fills: usize = (l.seen().iter())
+        .map(|row| {
+            let starts = row.iter().enumerate();
+            let starts =
+                starts.filter(|&(i, s)| s.bg.is_some() && (i == 0 || row[i - 1].bg != s.bg));
+            starts.count()
+        })
+        .sum();
+    let caret = l.caret.is_some_and(|p| l.buf.area.contains(p));
+    fills + glyphs(l).len() + usize::from(caret)
 }
 
 /// Answers from the shapes and from the cells, each with its place in painting order, as one list
@@ -394,7 +410,11 @@ impl Driver {
 
     /// Where each cell layer of the last pass is among its shapes, and which shapes are the cell
     /// painter's glyphs: a layer's glyphs are the run of texts, in its order and at its cells,
-    /// that [`cells::paint`] adds — matched whole, so two layers never share one.
+    /// that [`cells::paint`] adds — matched whole, so two layers never share one. A layer painted
+    /// invisibly left as many nothings in a row as it has shapes (the layers with the most take
+    /// theirs first); one that left neither panics, naming its origin: a layer transform moved
+    /// its glyphs (`set_transform_layer`, a `Scene`, a drag), and its cells would drop out of
+    /// every answer while its glyphs read as one-character texts.
     fn placed(&self) -> Placed {
         let mut placed = Placed {
             at: vec![None; self.layers.len()],
@@ -411,6 +431,7 @@ impl Driver {
             })
             .collect();
         let mut taken = vec![false; texts.len()];
+        let mut unread = vec![];
         for (at, l) in placed.at.iter_mut().zip(&self.layers) {
             let want = glyphs(l);
             if want.is_empty() {
@@ -420,14 +441,36 @@ impl Driver {
                 let same = (w.iter().zip(&want)).all(|(&(_, p, t), (q, s))| p == *q && t == s);
                 (same && !taken[k..k + w.len()].contains(&true)).then_some(k)
             });
-            if let Some(k) = start {
-                *at = Some(texts[k].0);
-                let run = k..k + want.len();
-                for (t, &(i, _, _)) in taken[run.clone()].iter_mut().zip(&texts[run]) {
-                    *t = true;
-                    placed.glyph[i] = true;
-                }
+            let Some(k) = start else {
+                unread.push((shapes_of(l), l, want));
+                continue;
+            };
+            *at = Some(texts[k].0);
+            let run = k..k + want.len();
+            for (t, &(i, _, _)) in taken[run.clone()].iter_mut().zip(&texts[run]) {
+                *t = true;
+                placed.glyph[i] = true;
             }
+        }
+        unread.sort_by_key(|&(n, _, _)| std::cmp::Reverse(n));
+        let mut nothing = vec![false; self.shapes.len()];
+        for (n, l, want) in unread {
+            let invisible = (0..=self.shapes.len().saturating_sub(n)).find(|&k| {
+                let run = &self.shapes[k..k + n];
+                let noop = |c: &egui::epaint::ClippedShape| matches!(c.shape, egui::Shape::Noop);
+                run.iter().all(noop) && !nothing[k..k + n].contains(&true)
+            });
+            let Some(k) = invisible else {
+                panic!(
+                    "the cell layer at {:?} painted {} glyphs (the first {:?}) that are not among \
+                     the pass's shapes: a layer transform moved them (set_transform_layer, a \
+                     Scene, a drag), and the kit cannot read them",
+                    l.origin,
+                    want.len(),
+                    want[0].1
+                );
+            };
+            nothing[k..k + n].fill(true);
         }
         placed
     }
@@ -786,7 +829,8 @@ impl Driver {
     }
 
     /// Every rectangle the last pass drew where it can be seen (as for [`Driver::find_text`]):
-    /// its bounds, fill colour and stroke width.
+    /// its bounds, fill colour and stroke width — once a screen paints cells, their background
+    /// runs and the caret's two scan lines too.
     pub fn rects(&self) -> Vec<(Rect, egui::Color32, f32)> {
         let found = self.shown(|s| match s {
             egui::Shape::Rect(r) => Some((r.rect, (r.fill, r.stroke.width))),
@@ -1239,6 +1283,136 @@ mod tests {
         assert_eq!(drv.find_text("abcd"), None);
         assert_eq!(drv.text_starting_with("abc"), None);
         assert_eq!(drv.colors_of("bc"), None);
+    }
+
+    /// Two layers alike — the same cells at the same place, under two clips — each take their
+    /// own glyphs: both are read, each under its clip, and no glyph is left over as a text of its
+    /// own; only the one whose clip holds the text finds it.
+    #[test]
+    fn two_layers_alike_each_take_their_own_glyphs() {
+        let buf = || buffer(4, 1, &[(0, 0, "abc", body())]);
+        let narrow = at(0, 0, 1);
+        let mut drv = Driver::new(600.0, 400.0);
+        let layers = vec![(ORIGIN, Rect::EVERYTHING, buf()), (ORIGIN, narrow, buf())];
+        drv.idle(&mut Screen::of(layers), 1);
+        let placed = drv.placed();
+        assert!(
+            matches!(placed.at[..], [Some(a), Some(b)] if a < b),
+            "{:?}",
+            placed.at
+        );
+        assert_eq!(placed.glyph.iter().filter(|&&g| g).count(), 6);
+        let wide = drv.layers[0].clip;
+        let texts = drv.texts();
+        let abc = |clip| (at(0, 0, 3), clip, "abc".to_string());
+        assert_eq!(texts, vec![abc(wide), abc(narrow)]);
+        assert_eq!(drv.labelled("abc"), vec![at(0, 0, 3)]);
+    }
+
+    /// A text that runs past its layer's clip is not found, as a galley that does is not; the
+    /// part of its row inside the clip is.
+    #[test]
+    fn a_text_across_its_clips_edge_is_not_found() {
+        let buf = buffer(10, 1, &[(3, 0, "abcdef", body())]);
+        let mut drv = Driver::new(600.0, 400.0);
+        drv.idle(&mut Screen::of(vec![(ORIGIN, at(0, 0, 5), buf)]), 1);
+        assert_eq!(drv.find_text("abcdef"), None);
+        assert_eq!(drv.colors_of("abcdef"), None);
+        assert_eq!(drv.rows_of("abcdef"), None);
+        assert_eq!(drv.text_starting_with("ab"), None, "its run goes on past");
+        assert_eq!(drv.find_text("ab"), Some(at(3, 0, 2)));
+    }
+
+    /// Paints "abc" in cells on a layer of its own that egui moves by `by` (a layer transform
+    /// moves the shapes themselves), invisibly when `faded` — and, when `beside`, a row of eight
+    /// cells, each in a background of its own, invisibly where it is.
+    #[derive(Default)]
+    struct Moved {
+        by: Vec2,
+        faded: bool,
+        beside: bool,
+    }
+
+    impl Window for Moved {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            let id = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("moved cells"));
+            let moved = egui::emath::TSTransform::from_translation(self.by);
+            ui.ctx().set_transform_layer(id, moved);
+            let mut painter = ui.ctx().layer_painter(id);
+            if self.faded {
+                painter.set_opacity(0.0);
+            }
+            cells::paint(
+                &painter,
+                ORIGIN,
+                &buffer(4, 1, &[(0, 0, "abc", body())]),
+                None,
+            );
+            if self.beside {
+                let bar = Pen::new(PALETTE.bar_text, PALETTE.bar);
+                let texts: Vec<_> = (0..8)
+                    .map(|x| (x, 0, "x", if x % 2 == 0 { bar } else { body() }))
+                    .collect();
+                let mut painter = ui.painter().clone();
+                painter.set_opacity(0.0);
+                cells::paint(&painter, Pos2::ZERO, &buffer(8, 1, &texts), None);
+            }
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+
+    /// A layer whose glyphs a layer transform moved is not read silently as nothing: every text
+    /// query panics, naming the layer's origin — also beside an invisible layer, whose nothings
+    /// are all its own. Unmoved it is read; painted invisibly, moved or not, it is not found and
+    /// nothing panics.
+    #[test]
+    fn a_layer_the_kit_cannot_read_panics() {
+        let mut drv = Driver::new(600.0, 400.0);
+        let by = Vec2::new(40.0, 0.0);
+        let mut win = Moved::default();
+        drv.idle(&mut win, 1);
+        assert_eq!(drv.find_text("abc"), Some(at(0, 0, 3)), "unmoved");
+        for (by, faded) in [(Vec2::ZERO, true), (by, true)] {
+            win = Moved {
+                by,
+                faded,
+                beside: true,
+            };
+            drv.idle(&mut win, 1);
+            assert_eq!(
+                (drv.find_text("abc"), drv.texts()),
+                (None, vec![]),
+                "{by:?}"
+            );
+        }
+        win = Moved {
+            by,
+            faded: false,
+            beside: true,
+        };
+        drv.idle(&mut win, 1);
+        assert_eq!(drv.layers.len(), 2);
+        /// A text query, which must panic here.
+        type Query = fn(&Driver);
+        let queries: [(&str, Query); 4] = [
+            ("find_text", |d| assert!(d.find_text("abc").is_some())),
+            ("texts", |d| assert!(!d.texts().is_empty())),
+            ("text_starting_with", |d| {
+                assert!(d.text_starting_with("a").is_some())
+            }),
+            ("column", |d| {
+                assert!(!d.column(Rect::EVERYTHING).is_empty())
+            }),
+        ];
+        for (name, query) in queries {
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| query(&drv)));
+            let said = ran.expect_err(name);
+            let said = said.downcast_ref::<String>().expect("a message");
+            assert!(said.contains(&format!("{ORIGIN:?}")), "{name}: {said}");
+        }
     }
 
     /// As for a galley: cells outside their layer's clip or the window, or painted invisible,
