@@ -4480,7 +4480,7 @@ fn the_tunnels_output_keeps_hosts_order() {
     for (say, pace) in [
         (
             vec![TUNNEL_WINDOW, TUNNEL_OPEN, said, TUNNEL_CLOSED],
-            Some("0.3"),
+            Some("1"),
         ),
         (
             vec![before, TUNNEL_WINDOW, TUNNEL_OPEN, said, TUNNEL_CLOSED],

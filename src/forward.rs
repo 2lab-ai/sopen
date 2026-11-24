@@ -2071,7 +2071,7 @@ mod tests {
             tmp.path(),
             1,
             &format!(
-                "(sleep 0.3; echo {TUNNEL_WINDOW}; echo {TUNNEL_OPEN}; : > {}) &\nexit 0",
+                "(sleep 1; echo {TUNNEL_WINDOW}; echo {TUNNEL_OPEN}; : > {}) &\nexit 0",
                 quote(marker.to_str().unwrap())
             ),
         );
