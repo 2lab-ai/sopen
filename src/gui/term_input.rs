@@ -9,7 +9,7 @@
 //!   protocol's REPORT_EVENT_TYPES, and for a key that types text not even then unless every key is
 //!   an escape code (crossterm's `KeyboardEnhancementFlags` docs) — while the window's code counts
 //!   on every key down coming up: `FKeyInput` keeps a digit as its F-key, or as the digit, until
-//!   its release (`gui/mod.rs:873-879`), and egui calls every later press of a key still down a
+//!   its release (`key_aliases` in `gui/mod.rs`), and egui calls every later press of a key still down a
 //!   repeat. A release the terminal does report would be a second one, so it is not passed on; a
 //!   repeat is a press of its own; a modifier key's own press or release changes only the
 //!   modifiers.

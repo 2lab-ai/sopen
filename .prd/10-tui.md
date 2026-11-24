@@ -207,8 +207,8 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
   `the window did not open: <reason> — check the display, or set a target` (T31).
 - In a **switched window** — one opened by a switch, here or on HOST through `--state-stdin` —
   F12, `[TUI]` or closing it returns, even with no terminal on HOST's side. Cmd/Ctrl+Q and +W are
-  that close too — the shell already treats them as the close button (`closing()`,
-  `gui/mod.rs:1174-1185`) — so they return with the state (on HOST, with the cue) (M1). A window
+  that close too — the shell already treats them as the close button (`closing()` in
+  `gui/mod.rs`) — so they return with the state (on HOST, with the cue) (M1). A window
   started directly quits on close, as today; it shows `[TUI]` only when its process has a terminal
   on input and output (F12 then takes it), else neither works there.
 
