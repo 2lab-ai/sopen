@@ -16,7 +16,7 @@ use crate::gui::{fkey_events, Digit};
 use crossterm::event::{KeyEventState, MouseButton as MB};
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::{Child, Command as Process, Stdio};
 use std::time::{Duration, Instant};
@@ -118,12 +118,28 @@ impl Decoder {
             };
             // SAFETY: one live pollfd.
             let ready = unsafe { libc::poll(&mut poll, 1, left.as_millis().min(1000) as i32) };
-            if ready <= 0 {
+            if ready < 0 {
+                let e = std::io::Error::last_os_error();
+                assert_eq!(e.kind(), ErrorKind::Interrupted, "poll: {e}");
                 continue;
             }
+            if ready == 0 {
+                continue;
+            }
+            assert_eq!(
+                poll.revents & libc::POLLNVAL,
+                0,
+                "poll: the pty is not open"
+            );
+            // Something to read (POLLIN), or the child's end (POLLHUP, POLLERR): read says which.
             let mut buf = [0u8; 4096];
-            // Linux reads EIO, macOS 0, once the child has gone.
-            let n = self.master.read(&mut buf).unwrap_or(0);
+            let n = loop {
+                match self.master.read(&mut buf) {
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    // Linux reads EIO, macOS 0, once the child has gone.
+                    read => break read.unwrap_or(0),
+                }
+            };
             assert!(n > 0, "the child is gone; it wrote:\n{}", self.seen);
             self.seen.push_str(&String::from_utf8_lossy(&buf[..n]));
             self.partial.extend_from_slice(&buf[..n]);
@@ -666,14 +682,16 @@ struct Play {
 
 /// Every key row of this build's table (all slices); under kitty each Cmd/Ctrl row again with ⌘;
 /// the shell's Ctrl+1…0 aliases (with ⌘ under kitty) in the list; typed `+ - *`, letters and
-/// Hangul — as the spike's player sent them.
+/// Hangul — as the spike's player sent them, and as many: a replay that shrinks fails here.
 fn plays(enc: Enc) -> Vec<Play> {
     let mut plays = vec![];
+    let mut rows = 0;
     for ctx in Context::ALL {
         for row in keys::rows(ctx, ALL_SLICES) {
             let Trigger::Key(k, mods) = row.trigger else {
                 continue;
             };
+            rows += 1;
             let label = format!("{ctx:?} {mods:?}+{}", k.name());
             if enc == Enc::Kitty && matches!(mods, Mods::Command | Mods::CommandShift) {
                 plays.push(Play {
@@ -722,6 +740,28 @@ fn plays(enc: Enc) -> Vec<Play> {
             window: window_text(typed),
         });
     }
+    // The spike's counts (macOS): 101 rows — the ⌘⌫ row is a Mac's — 26 ⌘ variants of them and
+    // 20 aliases under kitty (10 in the legacy encoding, which cannot send ⌘), 7 typed.
+    let count = |pick: fn(&Play) -> bool| plays.iter().filter(|p| pick(p)).count();
+    let cmd_rows = count(|p| p.label.ends_with("(⌘)"));
+    let aliases = count(|p| p.label.starts_with("List Ctrl+") || p.label.starts_with("List ⌘+"));
+    let kitty = enc == Enc::Kitty;
+    assert_eq!(
+        (
+            rows,
+            cmd_rows,
+            aliases,
+            count(|p| p.label.contains("typed"))
+        ),
+        (
+            if HERE { 101 } else { 100 },
+            if kitty { 26 } else { 0 },
+            if kitty { 20 } else { 10 },
+            7
+        ),
+        "{enc:?}: rows, ⌘ variants, aliases, typed"
+    );
+    assert_eq!(plays.len(), rows + cmd_rows + aliases + 7);
     plays
 }
 
@@ -999,7 +1039,7 @@ fn t26_ctrl_is_command_on_every_os_and_cmd_only_under_kitty() {
 
 /// Cmd/Ctrl+X and +C are `Cut` and `Copy` alone, then the letter's release, as egui-winit hands
 /// them over; Cmd/Ctrl+V gives nothing — the terminal's own paste is bracketed `Paste`, its CRLFs
-/// as LFs.
+/// and lone CRs as LFs, then V's release; an empty paste is nothing.
 #[test]
 fn ctrl_x_and_c_are_cut_and_copy_ctrl_v_nothing_the_terminals_paste_a_paste() {
     let mut decoder = Decoder::start();
@@ -1019,11 +1059,50 @@ fn ctrl_x_and_c_are_cut_and_copy_ctrl_v_nothing_the_terminals_paste_a_paste() {
             assert_eq!(play(&v), [], "{enc:?}");
         }
     }
-    let pasted = decoder.decode(b"\x1b[200~a\r\nb \xed\x95\x9c\x1b[201~");
+    let pasted = decoder.decode(b"\x1b[200~a\r\nb\rc \xed\x95\x9c\x1b[201~");
     assert_eq!(
         translated(&mut TermInput::new(HERE), &pasted),
-        [Event::Paste("a\nb 한".to_string())]
+        [
+            Event::Paste("a\nb\nc 한".to_string()),
+            key(Key::V, false, Modifiers::NONE)
+        ]
     );
+    assert_eq!(
+        translated(
+            &mut TermInput::new(HERE),
+            &decoder.decode(b"\x1b[200~\x1b[201~")
+        ),
+        [],
+        "an empty paste"
+    );
+}
+
+/// A window's paste is Cmd/Ctrl+V's `Paste`, then V's key-up, and the image and media windows and
+/// the view keys hold the paste until that release: a terminal's paste ends with it too, so a
+/// second paste is a paste, and F9 then `v` is a key after F9 — it ends the armed F9 — not a
+/// repeat of a V still held.
+#[test]
+fn a_terminals_paste_lets_go_of_v_as_the_windows_does() {
+    use crate::view_keys::{State, ViewKeys};
+    let mut decoder = Decoder::start();
+    for enc in ENCODINGS {
+        let mut input = TermInput::new(HERE);
+        let mut keys = ViewKeys::new(RELEASES, []);
+        let pasted = translated(&mut input, &decoder.decode(b"\x1b[200~notes\x1b[201~"));
+        keys.route(State::Free, &pasted);
+        let f9 = translated(
+            &mut input,
+            &decoder.decode(&sent(Key::F9, PLAIN, enc).unwrap()),
+        );
+        keys.route(State::Free, &f9);
+        assert!(keys.armed(), "{enc:?}: F9 arms");
+        let v = translated(
+            &mut input,
+            &decoder.decode(&sent(Key::V, PLAIN, enc).unwrap()),
+        );
+        keys.route(State::Free, &v);
+        assert!(!keys.armed(), "{enc:?}: v after F9 ends it");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

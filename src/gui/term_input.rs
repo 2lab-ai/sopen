@@ -13,8 +13,14 @@
 //!   repeat. A release the terminal does report would be a second one, so it is not passed on; a
 //!   repeat is a press of its own; a modifier key's own press or release changes only the
 //!   modifiers.
-//!   Cmd/Ctrl+X and +C are `Cut` / `Copy` alone, then the letter's release; Cmd/Ctrl+V gives
-//!   nothing — the terminal's own paste arrives as bracketed `Paste`.
+//! - **The clipboard keys** (egui-winit's shape: the shortcut's event alone, then its letter's
+//!   key-up, which the image and media windows and the view keys wait for before the next).
+//!   Cmd/Ctrl+X and +C are `Cut` / `Copy`, then X's or C's release. The terminal's own paste
+//!   (bracketed) is `Paste`, its CRLFs and lone CRs as LFs, then V's release; Cmd/Ctrl+V itself
+//!   gives nothing, not even a bare V release (a terminal program cannot read the clipboard).
+//!   Residuals, by design: a held Cmd/Ctrl+X auto-repeats as the terminal's repeated presses, so
+//!   as repeated `Cut`s each with its release, where a window gives repeated `Cut`s and one
+//!   release; and a kitty Repeat (flag 2, not pushed) is flattened into a press with its release.
 //! - **Command** (T26). `keys::Mods` matches on egui's `command`. A terminal keeps ⌘ for itself and
 //!   the legacy encoding cannot carry it, so `command` is **Ctrl on every OS**, `ctrl` set too, as
 //!   egui reports Ctrl on Linux. ⌘ — the kitty protocol's SUPER, where the terminal passes it — is
@@ -93,8 +99,24 @@ impl TermInput {
                     press(k.code, mods, &mut out);
                 }
             }
+            // Nothing for an empty paste, as egui-winit gives no `Paste` for an empty clipboard
+            // (and no bare V key-up: Ctrl+V's own is not made either).
             CEvent::Paste(text) if text.is_empty() => {}
-            CEvent::Paste(text) => out.push(Event::Paste(text.replace("\r\n", "\n"))),
+            CEvent::Paste(text) => {
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                // V's key-up after it, as the window's Cmd/Ctrl+V gives: the windows and the view
+                // keys hold a paste until then.
+                out.extend([
+                    Event::Paste(text),
+                    Event::Key {
+                        key: Key::V,
+                        physical_key: None,
+                        pressed: false,
+                        repeat: false,
+                        modifiers: self.modifiers,
+                    },
+                ]);
+            }
             CEvent::Mouse(m) => self.mouse(m, &mut out),
             CEvent::FocusGained | CEvent::FocusLost => {
                 self.focused = matches!(ev, CEvent::FocusGained);
@@ -199,7 +221,7 @@ fn press(code: KeyCode, mods: Modifiers, out: &mut Vec<Event>) {
     };
     // egui-winit: Cmd/Ctrl+X and C are the clipboard's, alone (the letter's release follows, as it
     // comes later in a window); Cmd/Ctrl+V reads the clipboard there — here the terminal's own
-    // paste arrives as `Event::Paste` (bracketed paste), so Ctrl+V gives nothing.
+    // paste arrives as `Event::Paste` (bracketed paste, with V's release), so Ctrl+V gives nothing.
     if let Some(key) = key.filter(|_| mods.command_only()) {
         match key {
             Key::X | Key::C => {
