@@ -33,7 +33,6 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
 | VM-7 | 🔴 open | 08 §13: the egui binding of the view keys and the views; after XW-list (it shares `browser.rs`) | coder |
 | VM-8 | 🔴 open | 08 §13: the terminal binding. Carried: `src/view_keys.rs`'s module doc now names `term_input::RELEASES` (the translator makes every release); VM-8 builds on that | coder |
 | VM-D0 | 🔴 open | 08 §13: 04 §2 and K-R1 brought to the shipped code | orchestrator |
-| X-W1 | 🔴 open | 09 §12: the stream-fed page handler prototype on both engines, before WV-C and WV-0 | research unit |
 | WV-E1 | 🔴 open | 09 §12: the CLI half of the address window (starts at once) | coder |
 | WV-rest | 🔴 open | 09 §12's WV-0, WV-C, WV-A, WV-B, WV-D, WV-E2 and WV-F, in its order after X-W1 | coder |
 | X3-hex | 🔴 open | 10 §16's hex step. Carried from #108's review: point the hex tests' `drawn()` at `texts()` once hex paints cells (`galleys()` then holds one-character glyphs), and note that `rects()` will list cell backgrounds and the caret | coder |
