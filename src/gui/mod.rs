@@ -27,6 +27,7 @@ pub mod term_input;
 #[cfg(test)]
 pub(crate) mod testkit;
 pub mod text;
+pub mod web;
 
 pub use select::{fit, Map, Selection};
 
@@ -772,7 +773,9 @@ pub fn own_keys(ui: &mut egui::Ui, keys: &[chrome::FKey]) {
 /// context, a field's included, and said to the pass ([`switch_asked`]). In the terminal
 /// backend's context only ([`mark_terminal`]) Alt+1…0 are F1…F10 too and Alt+G is the switch
 /// (10 §9, T7, T33): in a window Option+digit and Option+G type characters on macOS. Then
-/// [`help::begin_pass`] before the window's pass and [`help::end_pass`] after it.
+/// [`help::begin_pass`] before the window's pass and [`help::end_pass`] after it, and last the
+/// page views' after-frame step ([`web::after_pass`], 09 §2.2), so that a view under the help or
+/// anything else painted above it is hidden in the same frame.
 #[derive(Debug, Default)]
 pub(crate) struct FKeyInput {
     /// What each digit key (1…9, 0) is while it is down.
@@ -828,6 +831,7 @@ impl egui::Plugin for FKeyInput {
 
     fn on_end_pass(&mut self, ui: &mut egui::Ui) {
         help::end_pass(ui.ctx());
+        web::after_pass(ui.ctx());
     }
 }
 
@@ -1044,6 +1048,9 @@ struct Shot {
     path: PathBuf,
     title: String,
     ready_frames: u32,
+    /// The page views' pictures, asked for once the window is ready (09 §2.2): the read-back is
+    /// requested when every one has answered.
+    pictures: Option<web::Shots>,
     requested: bool,
     done: Arc<AtomicBool>,
     result: Arc<Mutex<Option<Result<String, String>>>>,
@@ -1066,6 +1073,9 @@ struct Shell<W: Window> {
     /// Set once the shell let a close through ([`closing`]): the window ends as asked. Its
     /// runner reads it after the loop ([`Ended::closed`]).
     closed: Arc<AtomicBool>,
+    /// The window's key for its page views (09 §2.1), given with the window's handle at the
+    /// first pass ([`web::set_parent`]); its views are torn down before the window goes.
+    web: Option<web::WindowKey>,
 }
 
 /// The `help=1` receipt: F1 pressed once what the state asked for is on screen, then the
@@ -1157,6 +1167,13 @@ impl<W: Window> Shell<W> {
         if shot.ready_frames < 3 || shot.requested {
             return;
         }
+        // A native page view is not in the read-back (09 §2.2): its picture first.
+        let pictures = shot.pictures.get_or_insert_with(|| web::snapshots(ctx));
+        if !pictures.ready() {
+            return;
+        }
+        let pictures = pictures.take();
+        let pixels_per_point = ctx.pixels_per_point();
         shot.requested = true;
         let (path, done, result) = (shot.path.clone(), shot.done.clone(), shot.result.clone());
         let title = shot.title.clone();
@@ -1164,6 +1181,8 @@ impl<W: Window> Shell<W> {
         let elapsed = self.started.elapsed();
         let ctx2 = ctx.clone();
         ctx.request_screenshot(move |img| {
+            let mut img = Arc::unwrap_or_clone(img);
+            web::compose(&mut img, pixels_per_point, &pictures);
             let [w, h] = img.size;
             let mut rgba = Vec::with_capacity(w * h * 4);
             for p in &img.pixels {
@@ -1196,6 +1215,10 @@ impl<W: Window> Shell<W> {
 /// operations): at most [`CLOSE_WAIT`], the window already closing.
 impl<W: Window> Drop for Shell<W> {
     fn drop(&mut self) {
+        // Its page views, if the window's end left any, and its handle (09 §2.1).
+        if let Some(key) = self.web {
+            web::window_gone(key);
+        }
         if let Some(feed) = &self.fkeys {
             if !feed.closed(CLOSE_WAIT) {
                 crate::debug!("F-key switch: not let go within {CLOSE_WAIT:?} of the window's end");
@@ -1215,6 +1238,14 @@ impl<W: Window> eframe::App for Shell<W> {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(feed) = &self.fkeys {
             feed.pass(ctx);
+        }
+    }
+
+    /// The window is about to go — eframe runs this before it destroys the window and its
+    /// renderer (`save_and_destroy`): its page views first (09 §2.1, §2.5).
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(key) = self.web {
+            web::teardown_window(key);
         }
     }
 
@@ -1238,8 +1269,11 @@ impl<W: Window> eframe::App for Shell<W> {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.web.is_none() {
+            self.web = Some(web::set_parent(&ctx, web_parent(frame)));
+        }
         if self.frames == 0 {
             ctx.options_mut(|o| o.zoom_with_keyboard = false);
             // 10 TW-1's time: from the shell made to its window's first pass.
@@ -1280,6 +1314,9 @@ impl<W: Window> eframe::App for Shell<W> {
         }
         if closing(&ctx, &mut self.inner, self.scripted) {
             self.closed.store(true, Ordering::SeqCst);
+            // Before the window goes: every page view in it (09 §2.1). The window's pass below
+            // may still draw them; they do nothing more.
+            web::teardown(&ctx);
         }
         self.inner.ui(ui);
         if self.press == Press::Waiting && self.inner.ready() {
@@ -1287,6 +1324,16 @@ impl<W: Window> eframe::App for Shell<W> {
             ctx.request_repaint();
         }
         self.screenshot_tick(&ctx);
+    }
+}
+
+/// The window's handle for its page views (09 §2.1): winit's NSView on macOS, else (and when
+/// eframe has none to give, as its test frame) the plain window.
+fn web_parent(frame: &eframe::Frame) -> web::Parent {
+    use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    match frame.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::AppKit(appkit)) => web::Parent::AppKit(appkit.ns_view),
+        _ => web::Parent::Window,
     }
 }
 
@@ -1638,6 +1685,7 @@ pub fn run_window_sized<W: Window + 'static>(
             path,
             title: title.to_string(),
             ready_frames: 0,
+            pictures: None,
             requested: false,
             done: shot_done,
             result: shot_result.clone(),
@@ -1653,6 +1701,7 @@ pub fn run_window_sized<W: Window + 'static>(
         },
         fkeys: this_runs_fkeys(),
         closed: closed.clone(),
+        web: None,
     };
     // The app moves into whichever renderer starts. A renderer that fails before creating the
     // app leaves it here for the next one.
@@ -3098,6 +3147,7 @@ mod tests {
             press: Press::Done,
             fkeys: Some(feed.clone()),
             closed: Arc::default(),
+            web: None,
         }
     }
 
