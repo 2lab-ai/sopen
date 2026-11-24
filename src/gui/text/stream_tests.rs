@@ -46,7 +46,12 @@ fn slow() -> Link {
 }
 
 fn net_polling(bytes: &[u8], link: Link, poll_every: Duration) -> Net {
-    let (transport, control) = fake("/remote/file", FakeFile::bytes(bytes.to_vec()), link);
+    net_on(FakeFile::bytes(bytes.to_vec()), link, poll_every)
+}
+
+/// A Source on the Fake's `file` (its bytes, or [`FakeFile::pattern`] of any size).
+fn net_on(file: FakeFile, link: Link, poll_every: Duration) -> Net {
+    let (transport, control) = fake("/remote/file", file, link);
     let base = transport.now() - control.elapsed();
     let lines = Arc::new(Mutex::new(Vec::new()));
     let down = Arc::new(Mutex::new(None::<String>));
@@ -2553,3 +2558,282 @@ fn a_reload_that_fails_within_its_own_pass_is_not_followed_by_a_retry() {
 }
 
 mod large;
+
+// 08 §7 (VM-2) through the stream: the document reads its lines in an encoding, from the first
+// block on, and every ranged read is held to the whole-file decode (08 §12).
+
+use super::tests::{all_lines, encoded, hangul_lines};
+use crate::encoding::Encoding::{self, *};
+
+/// **EA-1** (VM-2) through the Fake: a preview's pass that stops at an odd byte — inside a
+/// UTF-16 unit, a UTF-32 one — and the hand-over going on from there give the lines, marks and
+/// encoding the local file has: a unit cut by the end of one read is finished by the next.
+#[test]
+fn a_streamed_wide_encoding_cut_inside_a_unit_reads_as_the_local_file() {
+    bounded("a streamed wide encoding cut inside a unit", || {
+        let lines = hangul_lines(3000);
+        let text: String = lines.iter().map(|l| format!("{l}\r\n")).collect();
+        for enc in [Utf16Le, Utf32Be] {
+            let body = encoded(&text, enc, true);
+            let cut = 40_001u64;
+            assert!(body.len() as u64 > 2 * cut);
+            let mut net = net(&body, gate());
+            let mut win = net.window("log.txt");
+            win.preview_index = Some(cut);
+            Window::set_preview(&mut win, true);
+            let mut drv = Driver::new(800.0, 500.0);
+            run(
+                &mut drv,
+                &mut win,
+                &mut net,
+                "the preview's pass",
+                |w, _| w.doc.size() >= cut,
+            );
+            assert_eq!(win.doc.size(), cut, "{enc:?}: stopped inside a unit");
+            Window::set_preview(&mut win, false);
+            run(&mut drv, &mut win, &mut net, "the rest", |w, _| {
+                w.doc.whole() && w.ready()
+            });
+            let tmp = tempfile::tempdir().unwrap();
+            let mut local = twin(tmp.path(), "log.txt", &body);
+            assert_eq!(win.doc.line_count(), 3000, "{enc:?}");
+            assert_eq!(win.doc.marks, local.doc.marks, "{enc:?}");
+            assert_eq!(all_lines(&mut win.doc), lines, "{enc:?}");
+            assert_eq!(all_lines(&mut local.doc), lines);
+            let label = format!("{} (BOM)", enc.label());
+            assert_eq!(win.doc.encoding_label(), Some(label.clone()));
+            drv.idle(&mut win, 1);
+            assert!(says(&drv, &label), "{:?}", painted(&drv));
+            assert!(
+                rows(&win).iter().any(|r| r.contains('갊')),
+                "{:?}",
+                rows(&win)
+            );
+        }
+    });
+}
+
+/// A remote file of nothing but a BOM: once its first block is here it is `empty`, never
+/// `loading…` — it has bytes and no line.
+#[test]
+fn a_streamed_file_of_only_a_bom_is_empty() {
+    bounded("a file of only a BOM", || {
+        let mut net = net(&[0xFF, 0xFE], gate());
+        let mut win = net.window("bom.txt");
+        let mut drv = Driver::new(600.0, 300.0);
+        run(&mut drv, &mut win, &mut net, "the first block", |w, _| {
+            w.doc.size() > 0 && w.ready()
+        });
+        drv.idle(&mut win, 2);
+        assert_eq!(status(&drv), "empty", "{:?}", painted(&drv));
+        assert_eq!(win.doc.encoding_label().as_deref(), Some("UTF-16LE (BOM)"));
+    });
+}
+
+/// **EA-6** (VM-2) through the Fake: `enc=` before the first block costs nothing — the pass
+/// reads in it from block 0, nothing twice; another LF unit later indexes the stream again
+/// from its first block, which the cache still has.
+#[test]
+fn enc_on_a_stream_is_read_from_its_first_block_and_another_lf_unit_reads_it_again() {
+    bounded("enc= on a stream", || {
+        // Korean UTF-16LE with no BOM: no pattern (§7.2), so the default would be UTF-8.
+        let lines: Vec<String> = (0..2000)
+            .map(|i| format!("한글 줄입니다 갊 {}", i % 10))
+            .collect();
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        let body = encoded(&text, Utf16Le, false);
+        assert_eq!(crate::encoding::pick(&body, true).encoding, Utf8);
+        let mut net = net(&body, gate());
+        let mut win = net.window("ko.txt");
+        win.enc_wanted = Some(Utf16Le);
+        let mut drv = Driver::new(800.0, 500.0);
+        run(&mut drv, &mut win, &mut net, "the index", |w, _| {
+            w.doc.whole() && w.ready()
+        });
+        assert_eq!(win.doc.encoding(), Utf16Le);
+        assert_eq!(all_lines(&mut win.doc), lines);
+        assert_eq!(net.fetched(), body.len() as u64, "nothing read twice");
+        assert_eq!(rows(&win)[0], lines[0]);
+        // UTF-8 ends lines at another unit: indexed again, from block 0.
+        win.enc_wanted = Some(Utf8);
+        drv.idle(&mut win, 1);
+        run(&mut drv, &mut win, &mut net, "indexed again", |w, _| {
+            w.doc.encoding() == Utf8 && w.doc.whole() && w.ready()
+        });
+        let utf8 = body.iter().filter(|&&b| b == b'\n').count() as u64;
+        assert_eq!(win.doc.line_count(), utf8 + 1);
+        assert!(net.fetched() <= 2 * body.len() as u64);
+        drv.idle(&mut win, 1);
+        assert!(says(&drv, "UTF-8"), "{:?}", painted(&drv));
+    });
+}
+
+/// **EA-2** (VM-2): the Fake's 24,000,000,000-byte file set to UTF-32LE (`enc=`), Go to
+/// `0x300000003` → the row holding `0x300000000` at the top, every row starting at a multiple
+/// of 4 and showing the core's UTF-32LE decode of the bytes from there; the jump fetches what
+/// a UTF-8 jump to the same place fetches, no more.
+#[test]
+fn ea2_a_24_gb_jump_in_utf32le_lands_on_a_unit_and_fetches_what_utf8_does() {
+    bounded("EA-2", || {
+        let size = 24_000_000_000u64;
+        let jumped = |enc: Option<Encoding>| {
+            let mut net = net_on(FakeFile::pattern(size), gate(), NEVER);
+            let mut win = net.window("data.txt");
+            win.enc_wanted = enc;
+            let mut drv = Driver::new(800.0, 500.0);
+            run(&mut drv, &mut win, &mut net, "the first screen", |w, _| {
+                has_rows(w)
+            });
+            run(&mut drv, &mut win, &mut net, "the pass", |w, _| {
+                w.doc.size() >= HIGHLIGHT_MAX
+            });
+            net.settle();
+            drv.idle(&mut win, 3);
+            net.settle();
+            drv.idle(&mut win, 2);
+            let before = net.fetched();
+            drv.key(&mut win, Key::G, command(false));
+            drv.frame(
+                &mut win,
+                vec![egui::Event::Text("0x300000003".into())],
+                Modifiers::NONE,
+            );
+            drv.key(&mut win, Key::Enter, Modifiers::NONE);
+            run(&mut drv, &mut win, &mut net, "the jump", |w, _| {
+                w.ready() && w.jump.is_none() && has_rows(w)
+            });
+            let rows = win.page.as_ref().unwrap().rows.clone();
+            (rows, net.fetched() - before, win.doc.encoding())
+        };
+        let (rows, fetched, enc) = jumped(Some(Utf32Le));
+        assert_eq!(enc, Utf32Le);
+        let place = 0x3_0000_0000u64;
+        let top = &rows[0];
+        let (from, to) = (
+            top.at + top.start,
+            top.at + top.start + top.cut.bytes as u64,
+        );
+        assert!(
+            from <= place && place < to,
+            "the top row is {from:#x}..{to:#x}"
+        );
+        for row in &rows {
+            let at = row.at + row.start;
+            assert_eq!(at % 4, 0, "a row at {at:#x}");
+            let bytes = crate::remote::pattern(at, row.cut.bytes);
+            let whole: String = Utf32Le
+                .decode(&bytes, true)
+                .0
+                .iter()
+                .map(|c| wrap::face(c.ch))
+                .collect();
+            assert!(whole.starts_with(&row.cut.text()), "a row at {at:#x}");
+        }
+        let (_, by_utf8, enc) = jumped(None);
+        assert_eq!(enc, Utf8);
+        assert!(
+            fetched <= by_utf8,
+            "fetched {fetched}, a UTF-8 jump {by_utf8}"
+        );
+    });
+}
+
+/// **EA-1 and EA-7** (VM-2) past the 16 MiB index, through the Fake: UTF-16LE (BOM) CRLF
+/// Hangul lines to past the cap, then a line longer than REACH + GRID of surrogate pairs — every
+/// grid point it crosses on a pair's low half, its high half at g − 2 — but one grid point
+/// holding a standalone low surrogate, then CRLF lines to the end. End, Go to past the cap
+/// (into that line, whose start is out of reach) and PgUp from there show rows that start at
+/// character starts of the whole-file decode and show its characters: a pair cut by a grid
+/// point is one character in the piece after it, the standalone low surrogate one U+FFFD.
+#[test]
+fn a_wide_encoding_past_the_16_mib_index_reads_as_the_whole_file_decode() {
+    bounded("UTF-16LE past 16 MiB", || {
+        let unit = |text: &str| encoded(text, Utf16Le, false);
+        let mut body = Utf16Le.bom().to_vec();
+        let mut i = 0;
+        while body.len() < HIGHLIGHT_MAX as usize + (1 << 20) {
+            body.extend(unit(&format!("{i:07} 한글 줄 갊 text\r\n")));
+            i += 1;
+        }
+        let line = body.len() as u64;
+        if line.is_multiple_of(4) {
+            // The pairs start at 2 mod 4: each grid point falls on a low half.
+            body.extend(unit("x"));
+        }
+        let pairs = body.len();
+        assert_eq!(pairs % 4, 2);
+        while body.len() < pairs + 160 * 1024 {
+            body.extend(unit("😀"));
+        }
+        // A grid point past the line start's reach: its pair's high half becomes `x`.
+        let lone = (line + REACH + GRID) / GRID * GRID + GRID;
+        assert!((lone as usize) < body.len());
+        body[lone as usize - 2..lone as usize].copy_from_slice(&unit("x"));
+        body.extend(unit("\r\n"));
+        for j in 0..200 {
+            body.extend(unit(&format!("tail {j:03} 끝\r\n")));
+        }
+        // The whole-file decode from the long line's start on.
+        let mut starts = Vec::new();
+        let mut chars = Vec::new();
+        let mut at = line;
+        for c in Utf16Le.decode(&body[line as usize..], true).0 {
+            starts.push(at);
+            chars.push(wrap::face(c.ch));
+            at += u64::from(c.len);
+        }
+        assert_eq!(chars.iter().filter(|&&c| c == '\u{FFFD}').count(), 1);
+        let check = |win: &TextWindow, what: &str| {
+            let page = win.page.as_ref().expect("a page");
+            assert!(!page.rows.is_empty(), "{what}");
+            for row in &page.rows {
+                let at = row.at + row.start;
+                assert_eq!(at % 2, 0, "{what}: a row at {at:#x}");
+                let k = starts
+                    .binary_search(&at)
+                    .unwrap_or_else(|_| panic!("{what}: a row at {at:#x} is no character start"));
+                let want: String = chars[k..].iter().take(row.cut.taken).collect();
+                let shown = row.cut.text();
+                assert!(
+                    want.starts_with(&shown),
+                    "{what}: {at:#x}: {shown:?} / {want:?}"
+                );
+            }
+        };
+        let mut net = net(&body, gate());
+        let mut win = net.window("big.txt");
+        let mut drv = Driver::new(800.0, 500.0);
+        run(&mut drv, &mut win, &mut net, "the first screen", |w, _| {
+            has_rows(w)
+        });
+        run(&mut drv, &mut win, &mut net, "the pass", |w, _| {
+            w.doc.size() >= HIGHLIGHT_MAX
+        });
+        net.settle();
+        drv.idle(&mut win, 3);
+        let settled = |w: &TextWindow, _: &Driver| w.ready() && w.jump.is_none() && has_rows(w);
+        drv.key(&mut win, Key::End, command(false));
+        run(&mut drv, &mut win, &mut net, "End", settled);
+        check(&win, "End");
+        assert_eq!(rows(&win).last().map(String::as_str), Some("tail 199 끝"));
+        assert_eq!(win.doc.encoding_label().as_deref(), Some("UTF-16LE (BOM)"));
+        drv.key(&mut win, Key::G, command(false));
+        let place = format!("0x{:X}", lone + 1);
+        drv.frame(&mut win, vec![egui::Event::Text(place)], Modifiers::NONE);
+        drv.key(&mut win, Key::Enter, Modifiers::NONE);
+        run(&mut drv, &mut win, &mut net, "Go to", settled);
+        check(&win, "Go to");
+        let top = &win.page.as_ref().unwrap().rows[0];
+        assert_eq!(
+            (top.at + top.start, top.loose),
+            (lone, true),
+            "from the grid"
+        );
+        assert!(rows(&win)[0].starts_with('\u{FFFD}'), "{:?}", rows(&win)[0]);
+        for k in 0..3 {
+            drv.key(&mut win, Key::PageUp, Modifiers::NONE);
+            run(&mut drv, &mut win, &mut net, "PgUp", settled);
+            check(&win, &format!("PgUp {k}"));
+        }
+    });
+}

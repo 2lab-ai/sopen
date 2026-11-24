@@ -1677,7 +1677,7 @@ fn a_file_changed_after_it_was_indexed_never_panics_and_is_noticed() {
 fn a_cut_line_drops_its_half_character_even_after_a_bad_byte() {
     let mut bytes = vec![0xff, b'a'];
     bytes.extend_from_slice(&"한".as_bytes()[..2]);
-    let line = shown(bytes, true);
+    let line = shown(Encoding::Utf8, 0, bytes, true);
     assert_eq!(line.text, "\u{FFFD}a");
 }
 
@@ -1770,7 +1770,7 @@ fn a_page_never_reads_past_a_span_when_the_next_mark_is_far() {
 /// surrogate, past U+10FFFF) are bad bytes and show as U+FFFD.
 #[test]
 fn a_cut_line_keeps_bad_bytes_and_drops_only_a_real_half_character() {
-    let cut = |b: &[u8]| shown(b.to_vec(), true).text;
+    let cut = |b: &[u8]| shown(Encoding::Utf8, 0, b.to_vec(), true).text;
     assert_eq!(cut(&[b'a', 0xff]), "a\u{FFFD}");
     assert_eq!(cut(&[b'a', 0xc0]), "a\u{FFFD}");
     assert_eq!(cut(&[b'a', 0xc1]), "a\u{FFFD}");
@@ -1793,7 +1793,10 @@ fn a_cut_line_keeps_bad_bytes_and_drops_only_a_real_half_character() {
     assert_eq!(cut(&[b'a', 0xf0, 0x9f, 0x98]), "a");
     assert_eq!(cut(&[b'a', 0xc3]), "a");
     // A line that is not cut keeps everything.
-    assert_eq!(shown(vec![b'a', 0xe2, 0x82], false).text, "a\u{FFFD}");
+    assert_eq!(
+        shown(Encoding::Utf8, 0, vec![b'a', 0xe2, 0x82], false).text,
+        "a\u{FFFD}"
+    );
 }
 
 /// A save that writes a new file and renames it over the opened one (many editors do), or a
@@ -4369,4 +4372,525 @@ fn a_diff_shown_read_only_is_highlighted_and_writes_nothing() {
     drv.idle(&mut win, 5);
     assert_eq!(listing(), before, "nothing written");
     assert!(crate::gui::Window::close_requested(&mut win));
+}
+
+// 08 §7 (VM-2): the text document read in an encoding. Every ranged result is compared with
+// decoding the whole file (08 §12), not with another way of reaching it.
+
+use crate::encoding::Encoding::{self, *};
+
+/// `text` in `enc` (UTF-8, UTF-16 or UTF-32 of either order, UCS-2 as UTF-16), its BOM first
+/// when `bom`.
+pub(super) fn encoded(text: &str, enc: Encoding, bom: bool) -> Vec<u8> {
+    let mut out = if bom { enc.bom().to_vec() } else { Vec::new() };
+    match enc {
+        Utf16Le | Ucs2Le => text
+            .encode_utf16()
+            .for_each(|u| out.extend(u.to_le_bytes())),
+        Utf16Be | Ucs2Be => text
+            .encode_utf16()
+            .for_each(|u| out.extend(u.to_be_bytes())),
+        Utf32Le => text
+            .chars()
+            .for_each(|c| out.extend(u32::from(c).to_le_bytes())),
+        Utf32Be => text
+            .chars()
+            .for_each(|c| out.extend(u32::from(c).to_be_bytes())),
+        _ => out.extend_from_slice(text.as_bytes()),
+    }
+    out
+}
+
+/// The 44 Hangul syllables whose UTF-16 unit has a 0x0A byte (U+AC0A 갊 … U+D70A): `0a xx` in
+/// UTF-16LE, `xx 0a` in BE (*trace* §3 T2).
+fn syllables_with_lf_byte() -> String {
+    (0xACu32..=0xD7)
+        .map(|hi| char::from_u32(hi << 8 | 0x0A).unwrap())
+        .collect()
+}
+
+/// EA-1's lines: Hangul and ASCII, every 7th holding the syllables with a 0x0A byte.
+pub(super) fn hangul_lines(n: usize) -> Vec<String> {
+    let lf = syllables_with_lf_byte();
+    (0..n)
+        .map(|i| match i % 7 {
+            0 => format!("{i:04} 갊 {lf} 끝"),
+            _ => format!("{i:04} 한글 줄 text"),
+        })
+        .collect()
+}
+
+/// The texts of every line of `doc`.
+pub(super) fn all_lines(doc: &mut TextDoc) -> Vec<String> {
+    let n = doc.line_count() as usize;
+    doc.read_lines(0, n)
+        .unwrap()
+        .into_iter()
+        .map(|l| l.text)
+        .collect()
+}
+
+/// **EA-1** (VM-2), locally: 3,000 CRLF lines of Hangul and ASCII, every 7th holding U+AC0A 갊
+/// and the other syllables with a 0x0A byte, with a BOM, in UTF-16LE, UTF-16BE, UTF-32LE and
+/// UTF-32BE → 3,000 lines, each starting at a multiple of the unit, 갊 inside its line, no CR
+/// and no NUL shown; the encoding is the BOM's.
+#[test]
+fn wide_encodings_end_lines_only_at_their_lf_unit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lines = hangul_lines(3000);
+    let text: String = lines.iter().map(|l| format!("{l}\r\n")).collect();
+    for enc in [Utf16Le, Utf16Be, Utf32Le, Utf32Be] {
+        let name = format!("{}.txt", enc.label());
+        let path = write(tmp.path(), &name, &encoded(&text, enc, true));
+        let mut doc = TextDoc::open(&path).unwrap();
+        assert_eq!(doc.line_count(), 3000, "{name}");
+        assert_eq!(all_lines(&mut doc), lines, "{name}");
+        let unit = enc.unit() as u64;
+        for span in doc.spans(0, 3000).unwrap() {
+            assert_eq!(span.start % unit, 0, "{name}: {span:?}");
+        }
+        assert_eq!(doc.encoding(), enc);
+        let label = format!("{} (BOM)", enc.label());
+        assert_eq!(doc.encoding_label(), Some(label), "{name}");
+    }
+}
+
+/// The index pass fed a wide encoding in pieces that cut its units — as a stream's screen
+/// reads feed it (`grow_from_screen`) — finds the lines one feed finds: a unit cut in two is
+/// finished by the next piece, never a 0x0A byte inside a unit taken for a line end. (Its
+/// first piece is the file's first 8 KiB, the default's sample, as every pass's first read
+/// is: a local pass reads a megabyte, a stream a block.)
+#[test]
+fn a_pass_fed_in_pieces_that_cut_units_finds_the_same_lines() {
+    let lines = hangul_lines(300);
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    for enc in [Utf16Le, Utf16Be, Utf32Le, Utf32Be] {
+        let bytes = encoded(&text, enc, true);
+        let size = bytes.len() as u64;
+        let fresh = || Scan {
+            marks: vec![Mark { line: 0, offset: 0 }],
+            limit: 8,
+            ..Scan::default()
+        };
+        let mut whole = fresh();
+        whole.feed(&bytes, size);
+        assert_eq!(whole.line, 300, "{enc:?}");
+        for piece in [1, 3, 5, 4093] {
+            let mut cut = fresh();
+            cut.feed(&bytes[..crate::kind::SNIFF_BYTES], size);
+            for chunk in bytes[crate::kind::SNIFF_BYTES..].chunks(piece) {
+                cut.feed(chunk, size);
+            }
+            assert_eq!((cut.at, cut.line), (whole.at, whole.line));
+            assert_eq!(cut.marks, whole.marks, "{enc:?} in pieces of {piece}");
+        }
+    }
+}
+
+/// **EA-5** (VM-2's part) and D37: a BOM is skipped only under its own encoding — line 1 starts
+/// after it, so `#!/bin/sh` picks the syntax — and a place inside it is line 1's start, never
+/// the last line read. Under Latin-1 its bytes are text from byte 0; back to UTF-8 it is
+/// skipped again; UTF-16's BOM is UCS-2's too. None of these changes reads the file again.
+#[test]
+fn a_bom_is_skipped_under_its_own_encoding_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "run", b"\xEF\xBB\xBF#!/bin/sh\necho hi\n");
+    let mut doc = TextDoc::open(&path).unwrap();
+    assert_eq!(all_lines(&mut doc), ["#!/bin/sh", "echo hi"]);
+    assert_eq!(doc.encoding_label().as_deref(), Some("UTF-8 (BOM)"));
+    for at in 0..3 {
+        let span = doc.span_at(at).unwrap().unwrap();
+        assert_eq!(
+            (span.line, span.start),
+            (Some(0), 3),
+            "a place inside the BOM"
+        );
+    }
+    let syntax = syntax_of("run", &mut doc).unwrap().expect("a shell script");
+    assert!(syntax.name.contains("Shell"), "{}", syntax.name);
+    let passes = index_reads(&path).len();
+    assert!(!doc.needs_index_for(Latin1));
+    doc.reencode(Latin1);
+    assert_eq!(all_lines(&mut doc), ["ï»¿#!/bin/sh", "echo hi"]);
+    assert_eq!(doc.encoding_label().as_deref(), Some("Latin-1"));
+    assert_eq!(doc.span_at(1).unwrap().unwrap().start, 0);
+    doc.reencode(Utf8);
+    assert_eq!(all_lines(&mut doc), ["#!/bin/sh", "echo hi"]);
+    assert_eq!(doc.encoding_label().as_deref(), Some("UTF-8 (BOM)"));
+    assert_eq!(
+        index_reads(&path).len(),
+        passes,
+        "no pass for the same LF unit"
+    );
+    // UTF-16LE's BOM under UCS-2LE.
+    let path = write(
+        tmp.path(),
+        "u16.txt",
+        &encoded("hi\nthere\n", Utf16Le, true),
+    );
+    let mut doc = TextDoc::open(&path).unwrap();
+    assert!(!doc.needs_index_for(Ucs2Le));
+    doc.reencode(Ucs2Le);
+    assert_eq!(all_lines(&mut doc), ["hi", "there"]);
+    assert_eq!(doc.encoding_label().as_deref(), Some("UCS-2LE (BOM)"));
+    assert_eq!(doc.span_at(1).unwrap().unwrap().start, 2);
+    // A file of only a BOM: no line under its own encoding, one of text under another.
+    let path = write(tmp.path(), "bom-only", b"\xEF\xBB\xBF");
+    let mut doc = TextDoc::open(&path).unwrap();
+    assert_eq!(doc.line_count(), 0);
+    doc.reencode(Latin1);
+    assert_eq!(all_lines(&mut doc), ["ï»¿"]);
+    doc.reencode(Utf8);
+    assert_eq!(doc.line_count(), 0);
+}
+
+/// The bar says the encoding beside the syntax (08 §7.5, D34): the BOM's, the NUL pattern's
+/// guess, and UTF-8 for a UTF-8 file — whose rows are as they were.
+#[test]
+fn the_bar_says_the_encoding_and_the_rows_are_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bar_says =
+        |drv: &Driver, needle: &str| drv.texts().iter().any(|(_, _, t)| t.contains(needle));
+    let lines = hangul_lines(40);
+    let text: String = lines.iter().map(|l| format!("{l}\r\n")).collect();
+    let path = write(tmp.path(), "log.txt", &encoded(&text, Utf16Le, true));
+    let mut win = TextWindow::new(
+        TextDoc::open(&path).unwrap(),
+        "box:log".into(),
+        "log.txt",
+        vec![],
+    );
+    let mut drv = Driver::new(900.0, 500.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    assert!(bar_says(&drv, "40 lines"), "{:?}", drv.texts());
+    assert!(
+        bar_says(&drv, "plain text · UTF-16LE (BOM)"),
+        "{:?}",
+        drv.texts()
+    );
+    for line in &lines[..5] {
+        assert!(drv.find_text(line).is_some(), "{line} whole on one row");
+    }
+    // An English UTF-16LE file without a BOM: the pattern's guess.
+    let path = write(
+        tmp.path(),
+        "en.txt",
+        &encoded("plain English\nlines\n", Utf16Le, false),
+    );
+    let mut win = TextWindow::new(
+        TextDoc::open(&path).unwrap(),
+        "box:en".into(),
+        "en.txt",
+        vec![],
+    );
+    drv.until(&mut win, 10, |w| w.ready());
+    assert!(bar_says(&drv, "UTF-16LE (guessed)"), "{:?}", drv.texts());
+    assert!(drv.find_text("plain English").is_some());
+    let mut win = viewer(tmp.path(), "main.rs", RUST);
+    drv.until(&mut win, 10, |w| w.ready());
+    assert!(bar_says(&drv, "Rust · UTF-8"), "{:?}", drv.texts());
+    assert!(drv.find_text("fn main() {").is_some());
+}
+
+/// `SOPEN_STATE` `enc=NAME` (08 D34) names an encoding the text views decode, in any case;
+/// anything else — CP949 too, until VM-4 decodes it — is refused before a window opens.
+#[test]
+fn sopen_state_enc_names_an_encoding() {
+    use crate::gui::State;
+    assert_eq!(State::parse("enc=utf-16le").unwrap().enc, Some(Utf16Le));
+    let s = State::parse("open=a.txt;enc=Latin-1").unwrap();
+    assert_eq!((s.open.as_deref(), s.enc), (Some("a.txt"), Some(Latin1)));
+    for bad in ["enc=", "enc=EBCDIC", "enc=CP949"] {
+        assert!(State::parse(bad).is_err(), "{bad}");
+    }
+}
+
+/// Lets the next re-read or rebuild worker start only when the returned sender is used.
+fn held_worker(win: &mut TextWindow) -> mpsc::Sender<()> {
+    let (go, wait) = mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    win.reindex_hook = Some(Arc::new(move || {
+        let _ = wait.lock().unwrap().recv();
+    }));
+    go
+}
+
+/// **EA-6** (VM-2), locally: another encoding with the same LF unit (UTF-8 → Latin-1) runs no
+/// index pass; one with another (→ UTF-16LE) runs one, its progress on the status row, the
+/// rows then the whole-file decode; Esc during such a pass keeps the encoding it had. Every
+/// change drops what wrapping found.
+#[test]
+fn a_new_encoding_reads_the_file_again_only_when_its_lf_unit_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let text: String = (0..2000).map(|i| format!("line {i:04} é\n")).collect();
+    let path = write(tmp.path(), "notes.txt", text.as_bytes());
+    let mut win = TextWindow::new(
+        TextDoc::open(&path).unwrap(),
+        "box:n".into(),
+        "notes.txt",
+        vec![],
+    );
+    let mut drv = Driver::new(800.0, 400.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    assert!(drv.find_text("line 0000 é").is_some());
+    // Where the top row is, a page down: the place each change keeps (by its byte).
+    let top = |w: &TextWindow| {
+        let row = &w.page.as_ref().unwrap().rows[0];
+        (
+            row.at + row.start,
+            row.at + row.start + row.cut.bytes as u64,
+        )
+    };
+    drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+    drv.until(&mut win, 10, |w| w.ready());
+    let (place, _) = top(&win);
+    assert!(place > 0);
+    let passes = index_reads(&path).len();
+    win.enc_wanted = Some(Latin1);
+    drv.until(&mut win, 10, |w| w.ready() && w.doc.encoding() == Latin1);
+    assert_eq!(
+        index_reads(&path).len(),
+        passes,
+        "no pass: the same LF unit"
+    );
+    assert_eq!(win.doc.line_count(), 2000);
+    let (from, to) = top(&win);
+    assert!(from <= place && place < to, "{place} on top: {from}..{to}");
+    let line = text[from as usize..].lines().next().unwrap();
+    let latin1: String = line.bytes().map(char::from).collect();
+    assert!(
+        drv.find_text(&latin1).is_some(),
+        "{latin1:?}: {:?}",
+        drv.texts()
+    );
+    // Another LF unit: a pass, and the rows are the whole file as UTF-16LE (no `0a 00` in
+    // it: one line), from the byte the view was at.
+    drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+    drv.until(&mut win, 10, |w| w.ready());
+    let (place, _) = top(&win);
+    win.enc_wanted = Some(Utf16Le);
+    drv.until(&mut win, 10, |w| w.ready() && w.doc.encoding() == Utf16Le);
+    assert!(
+        index_reads(&path).len() > passes,
+        "a pass for another LF unit"
+    );
+    assert_eq!(win.doc.line_count(), 1);
+    let (from, to) = top(&win);
+    assert!(from <= place && place < to, "{place} on top: {from}..{to}");
+    assert_eq!(from % 2, 0);
+    let (starts, chars) = starts_and_chars(Utf16Le, 0, text.as_bytes());
+    let k = starts.binary_search(&from).expect("a character start");
+    let want: String = chars[k..].iter().collect();
+    let shown: String = rows_of(&win).concat();
+    assert!(want.starts_with(&shown), "{shown:?}");
+    assert!(drv.texts().iter().any(|(_, _, t)| t.contains("UTF-16LE")));
+    // Esc while the file is read in another encoding: the one it had stays.
+    let go = held_worker(&mut win);
+    win.enc_wanted = Some(Utf32Le);
+    // (The status row is drawn before the pass that starts it: the next one says it.)
+    drv.idle(&mut win, 2);
+    assert!(win.reindex.as_ref().is_some_and(|r| r.rebuild.is_some()));
+    assert!(
+        drv.texts()
+            .iter()
+            .any(|(_, _, t)| t.contains("reading the lines as UTF-32LE")),
+        "{:?}",
+        drv.texts()
+    );
+    drv.key(&mut win, Key::Escape, Modifiers::NONE);
+    let _ = go.send(());
+    drv.until(&mut win, 10, |w| w.ready());
+    assert_eq!(win.doc.encoding(), Utf16Le);
+    assert!(win.reindex.is_none());
+    assert!(
+        win.status.text.contains("kept UTF-16LE"),
+        "{}",
+        win.status.text
+    );
+}
+
+/// The rows of the page on screen, as text.
+fn rows_of(win: &TextWindow) -> Vec<String> {
+    win.page.as_ref().map_or(Vec::new(), |p| {
+        p.rows.iter().map(|r| r.cut.text()).collect()
+    })
+}
+
+/// Where each character of `bytes` (a line, from file offset `from`) starts in the whole-file
+/// decode, and the characters as painted.
+fn starts_and_chars(enc: Encoding, from: u64, bytes: &[u8]) -> (Vec<u64>, Vec<char>) {
+    let (cells, _) = enc.decode(bytes, true);
+    let mut at = from;
+    let mut starts = Vec::new();
+    for c in &cells {
+        starts.push(at);
+        at += u64::from(c.len);
+    }
+    starts.push(at);
+    (starts, cells.iter().map(|c| wrap::face(c.ch)).collect())
+}
+
+/// **EA-7** (VM-2), locally: in a UTF-16LE line longer than a restart, with emoji (surrogate
+/// pairs) and a standalone low surrogate, every row — wrapped (rows past restarts, reached
+/// going down and by a jump onto a pair's low half), and not wrapped (Right ×1–3, End, a one-byte
+/// sideways place) — starts at a character start of the whole-file decode, a multiple of the
+/// unit, and shows the whole-file decode's characters from there.
+#[test]
+fn rows_start_at_character_starts_of_the_whole_file_decode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut line = String::new();
+    while line.len() < 70_000 {
+        line.push_str("word 😀 é ");
+    }
+    let mut bytes = encoded(&line, Utf16Le, true);
+    // A standalone low surrogate in the middle: one U+FFFD in the whole-file decode.
+    let lone = 20_000usize;
+    bytes[lone..lone + 2].copy_from_slice(&0xDC00u16.to_le_bytes());
+    bytes.extend(encoded("\nnext\n", Utf16Le, false));
+    let path = write(tmp.path(), "emoji.txt", &bytes);
+    let end = bytes.len() - encoded("\nnext\n", Utf16Le, false).len();
+    let (starts, chars) = starts_and_chars(Utf16Le, 2, &bytes[2..end]);
+    let check = |win: &TextWindow, what: &str| {
+        let page = win.page.as_ref().expect("a page");
+        for row in page.rows.iter().filter(|r| r.line == Some(0)) {
+            let at = row.at + row.start;
+            assert_eq!(at % 2, 0, "{what}: row at {at}");
+            let k = starts
+                .binary_search(&at)
+                .unwrap_or_else(|_| panic!("{what}: row at {at} is no character start"));
+            let want: String = chars[k..].iter().take(row.cut.taken).collect();
+            assert!(want.starts_with(&row.cut.text()), "{what}: row at {at}");
+        }
+    };
+    let mut win = TextWindow::new(
+        TextDoc::open(&path).unwrap(),
+        "box:e".into(),
+        "emoji.txt",
+        vec![],
+    );
+    let mut drv = Driver::new(700.0, 400.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    check(&win, "the first page");
+    for _ in 0..40 {
+        drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+        drv.until(&mut win, 10, |w| w.ready());
+        check(&win, "paging down");
+    }
+    // A jump onto a pair's low half (rule 3), and onto the standalone low surrogate.
+    let pair = (0..chars.len())
+        .find(|&k| starts[k] >= 32_000 && starts[k + 1] - starts[k] == 4)
+        .expect("an emoji past two restarts");
+    let low = starts[pair] + 2;
+    for at in [low, low + 1, lone as u64, lone as u64 + 1] {
+        win.jump_to(Jump::Byte(at));
+        drv.idle(&mut win, 1);
+        drv.until(&mut win, 10, |w| w.ready());
+        check(&win, &format!("a jump to {at}"));
+        let page = win.page.as_ref().unwrap();
+        let top = &page.rows[0];
+        let (from, to) = (
+            top.at + top.start,
+            top.at + top.start + top.cut.bytes as u64,
+        );
+        assert!(
+            from <= at && at < to,
+            "a jump to {at}: the top row is {from}..{to}"
+        );
+    }
+    assert!(
+        chars.contains(&'\u{FFFD}'),
+        "the lone surrogate is one U+FFFD"
+    );
+    // Not wrapped: the place within the line by Right, End and a byte the wheel left.
+    drv.key(&mut win, Key::W, Modifiers::NONE);
+    drv.key(&mut win, Key::Home, crate::gui::testkit::command(false));
+    drv.until(&mut win, 10, |w| w.ready());
+    for _ in 0..3 {
+        drv.key(&mut win, Key::ArrowRight, Modifiers::NONE);
+        drv.until(&mut win, 10, |w| w.ready());
+        assert_eq!(win.left % 2, 0);
+        check(&win, "Right");
+    }
+    win.left = 1001;
+    win.stale_page = true;
+    drv.idle(&mut win, 1);
+    drv.until(&mut win, 10, |w| w.ready());
+    assert_eq!(win.left % 2, 0, "a place is a multiple of the unit");
+    check(&win, "a byte the wheel left");
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    drv.until(&mut win, 10, |w| w.ready());
+    assert_eq!(win.left % 2, 0);
+    check(&win, "End");
+}
+
+/// D28 through CP949's slot (VM-4 fills it; today it proves no character start): a row that
+/// starts where nothing proves a character start shows placeholder marks, dim, never
+/// characters, and the status row says why. The line's own start is proven.
+#[test]
+fn where_no_character_start_is_proven_the_row_shows_marks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "k.txt", "가나 다라 ".repeat(4000).as_bytes());
+    let doc = TextDoc::open_encoded(&path, Cp949).unwrap();
+    let mut win = TextWindow::new(doc, "box:k".into(), "k.txt", vec![]);
+    let mut drv = Driver::new(700.0, 300.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    // (The status row is drawn before the page is read: the next pass says why.)
+    drv.idle(&mut win, 1);
+    let page = win.page.as_ref().unwrap();
+    let (first, rest) = page.rows.split_first().unwrap();
+    assert_eq!(
+        (first.start, first.cut.dim),
+        (0, 0),
+        "the line's start is proven"
+    );
+    assert!(!rest.is_empty());
+    for row in rest {
+        assert!(
+            row.cut.shown.iter().all(|&(c, _)| c == wrap::MARK),
+            "{:?}",
+            row.cut.text()
+        );
+        assert_eq!(row.cut.dim, row.cut.shown.len());
+    }
+    let marks = rest[0].cut.text();
+    let (dim, plain) = (
+        drv.colors_of(&marks).unwrap(),
+        drv.colors_of(&first.cut.text()).unwrap(),
+    );
+    assert_ne!(dim[0], plain[0], "marks are dim");
+    assert!(
+        drv.texts()
+            .iter()
+            .any(|(_, _, t)| t.contains("CP949: no character boundary known here")),
+        "{:?}",
+        drv.texts()
+    );
+}
+
+/// D32: a C1 control (U+0080–U+009F, which Latin-1 makes of 0x80–0x9F) is drawn as a dim `·`,
+/// wrapped or not — one cell for the one character, so the bytes each row takes and where the
+/// next line starts are as they were; a real U+00B7 (Latin-1's 0xB7) stays plain.
+#[test]
+fn a_c1_control_is_a_dim_middle_dot_and_moves_no_byte() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "c1.txt", b"ab\x85cd\x9Bef\xB7g\nnext\n");
+    let doc = TextDoc::open_encoded(&path, Latin1).unwrap();
+    let mut win = TextWindow::new(doc, "box:c1".into(), "c1.txt", vec![]);
+    let mut drv = Driver::new(700.0, 300.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    for mode in ["wrapped", "not wrapped"] {
+        let page = win.page.as_ref().unwrap();
+        let (first, second) = (&page.rows[0], &page.rows[1]);
+        assert_eq!(first.cut.text(), "ab·cd·ef·g", "{mode}");
+        assert_eq!((first.at, first.cut.bytes), (0, 10), "{mode}");
+        assert_eq!(second.at, 11, "{mode}: the next line starts where it did");
+        // A section per run of one colour: `ab`, the dim `·` of 0x85, `cd`, that of 0x9B, and
+        // `ef·g` — U+00B7 in the plain run.
+        let colors = drv.colors_of("ab·cd·ef·g").expect("the row is painted");
+        let (plain, dim) = (colors[0], colors[1]);
+        assert_ne!(plain, dim, "{mode}");
+        assert_eq!(colors, [plain, dim, plain, dim, plain], "{mode}");
+        drv.key(&mut win, Key::W, Modifiers::NONE);
+        drv.until(&mut win, 10, |w| w.ready());
+    }
 }

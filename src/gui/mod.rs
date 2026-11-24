@@ -304,6 +304,9 @@ pub struct State {
     /// Hex window: where the cursor starts. The file browser: the first text file it opens (by
     /// `open=` or by hand) starts with the row this byte is in at the top; later ones do not.
     pub at: Option<u64>,
+    /// The file browser: the first text file it opens (as `at=`) reads its lines in this
+    /// encoding (`enc=UTF-16LE`, any case; 08 D34).
+    pub enc: Option<crate::encoding::Encoding>,
     /// Hex window: bytes overwritten at an offset, applied in order (each one an undo step).
     pub patches: Vec<(u64, Vec<u8>)>,
     /// File browser: the entry of the opened folder to open (as Enter would) once it is listed.
@@ -410,6 +413,11 @@ impl State {
                     }
                 }
                 "at" => state.at = Some(hex::parse_offset(value).context("SOPEN_STATE at")?),
+                "enc" => {
+                    let enc = crate::encoding::Encoding::from_label(value)
+                        .ok_or_else(|| anyhow!("SOPEN_STATE enc: '{value}' is not an encoding"))?;
+                    state.enc = Some(enc);
+                }
                 "open" => state.open = Some(value.to_string()),
                 "clips" => {
                     for one in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {

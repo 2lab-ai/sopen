@@ -762,6 +762,9 @@ pub(crate) struct Browser {
     /// row that byte is in at the top) — the one `open=` opens, or else the first the owner
     /// opens; taken by it, so no later viewer gets it.
     open_at: Option<u64>,
+    /// `SOPEN_STATE` `enc=NAME` (08 D34): the encoding the first text viewer opened in this
+    /// browser reads in — handed and taken as `at=` is.
+    open_enc: Option<crate::encoding::Encoding>,
     /// `SOPEN_STATE` `loading=1` (06 §11): handed to the text viewers this browser opens, as
     /// `at=` is. A viewer on a stream is then shot at its first frame with rows.
     open_loading: bool,
@@ -894,6 +897,7 @@ impl Browser {
             open_first: None,
             bar_first: None,
             open_at: None,
+            open_enc: None,
             open_loading: false,
             script: VecDeque::new(),
             script_gap: 0,
@@ -1649,8 +1653,9 @@ impl Browser {
                 let live = claim.is_none() && !doc.is_stream();
                 let at = self.open_at.take();
                 let loading = self.open_loading;
+                let enc = self.open_enc.take();
                 (
-                    super::text::embed_scripted(doc, title, &name, notices, live, at, loading),
+                    super::text::embed_scripted(doc, title, &name, notices, live, at, loading, enc),
                     claim,
                 )
             }
@@ -1669,6 +1674,7 @@ impl Browser {
     fn scripted(&mut self, state: &super::State) {
         self.open_first = state.open.clone();
         self.open_at = state.at;
+        self.open_enc = state.enc;
         self.open_loading = state.loading;
         self.mode = state.mode;
         self.bar_first = state.bar.clone();
@@ -1799,7 +1805,7 @@ impl Browser {
                 // viewer that is told so when it is made (a preview handed over was not).
                 let taken = match self.open_at {
                     Some(_) => preview::Taken::Nothing,
-                    None if self.open_loading => preview::Taken::Nothing,
+                    None if self.open_loading || self.open_enc.is_some() => preview::Taken::Nothing,
                     None => self.preview.take(&path),
                 };
                 match taken {

@@ -90,10 +90,22 @@
 //! runs before its first screen: every line of it has its number (06 Tensions, settled by
 //! W5b). The browser's route still opens a stream only for remote text of at most
 //! [`HIGHLIGHT_MAX`] (06 §13 W8a); W8b routes the larger ones here.
+//!
+//! Lines are read in an encoding (08 §7, [`crate::encoding`]): the default the file's first
+//! 8 KiB pick, in the pass that reads them (a local file's index pass, a stream's first
+//! block), or one chosen for this opening (`SOPEN_STATE` `enc=`), kept by every pass made
+//! again (D21). Every offset the document makes is a multiple of the encoding's unit; a line
+//! ends at its LF unit at an aligned offset, never at a 0x0A byte inside another character, and
+//! its CR is the CR unit before it. A BOM is skipped under its own encoding: line 1 starts after
+//! it. A piece cut on the grid, a wrap restart, a jump and a place inside a line not wrapped
+//! start where the encoding's rules say (08 §7.3); where no rule proves a character start
+//! (CP949, D28), the bytes show as placeholder marks. Changing the encoding reads the file
+//! again only when the LF unit changes (D22).
 
 mod wrap;
 
 use super::{chrome, Embedded, Outcome, Status, Window};
+use crate::encoding::{Around, Encoding, Pick};
 use crate::stream::{Bytes, ReadError, ReaderKind, Source};
 use anyhow::{Context as _, Result};
 use eframe::egui::{self, text::LayoutJob, Color32, FontId, Key, Modifiers, Pos2, Rect};
@@ -160,7 +172,8 @@ struct Mark {
     offset: u64,
 }
 
-/// One line as shown: its text (invalid UTF-8 replaced) and whether it was cut at [`LINE_MAX`].
+/// One line as shown: its text (decoded in the document's encoding, what is not a character
+/// shown as U+FFFD) and whether it was cut at [`LINE_MAX`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
     pub text: String,
@@ -170,6 +183,16 @@ pub struct Line {
 /// A text file opened for viewing: the handle it is read through, and the line index.
 pub struct TextDoc {
     backing: Backing,
+    /// The encoding lines are read in (08 §7): the default the first bytes picked, or the one
+    /// chosen for this opening.
+    enc: Encoding,
+    /// The default (§7.2), once the first bytes were read: the bar's `(guessed)`.
+    pick: Option<Pick>,
+    /// The file's first bytes (four, fewer when it is shorter): which BOM is skipped.
+    head: Vec<u8>,
+    /// The encoding chosen for this opening (`enc=`), if one was: every pass made again —
+    /// a re-read, a reload, a resume — reads in it (D21).
+    chosen: Option<Encoding>,
     /// The bytes the index covers: the file's, or the prefix a stopped or growing pass read.
     size: u64,
     marks: Vec<Mark>,
@@ -316,14 +339,76 @@ impl TextDoc {
     /// said about `shown`, the file as its owner knows it (`host:/abs`) — never about the
     /// copy's path.
     pub fn open_cancellable_as(path: &Path, shown: &str, cancel: &AtomicBool) -> Result<Self> {
-        Self::open_scan(path, shown, &|| None, &|| stopped(cancel), &mut |_| {})
+        Self::open_scan(
+            path,
+            shown,
+            None,
+            &|| None,
+            &|| stopped(cancel),
+            &mut |_| {},
+        )
+    }
+
+    /// [`TextDoc::open`], its lines read in `enc` whatever the first bytes would pick (08 §7.5:
+    /// a choice that overrides any guess).
+    pub fn open_encoded(path: &Path, enc: Encoding) -> Result<Self> {
+        let shown = path.display().to_string();
+        let cancel = AtomicBool::new(false);
+        Self::open_scan(
+            path,
+            &shown,
+            Some(enc),
+            &|| None,
+            &|| stopped(&cancel),
+            &mut |_| {},
+        )
     }
 
     /// [`TextDoc::open_cancellable`], with `on_chunk(bytes indexed so far)` after every chunk
     /// (tests: a cancel, or a writer, in the middle of the pass).
     fn open_with(path: &Path, cancel: &AtomicBool, on_chunk: &mut dyn FnMut(u64)) -> Result<Self> {
+        Self::open_in(path, None, cancel, on_chunk)
+    }
+
+    /// [`TextDoc::open_with`] in the encoding `chosen` for this opening, if one was (D21).
+    fn open_in(
+        path: &Path,
+        chosen: Option<Encoding>,
+        cancel: &AtomicBool,
+        on_chunk: &mut dyn FnMut(u64),
+    ) -> Result<Self> {
         let shown = path.display().to_string();
-        Self::open_scan(path, &shown, &|| None, &|| stopped(cancel), on_chunk)
+        Self::open_scan(
+            path,
+            &shown,
+            chosen,
+            &|| None,
+            &|| stopped(cancel),
+            on_chunk,
+        )
+    }
+
+    /// The same file indexed again from its first byte in `enc` (D22: the LF unit changed), on
+    /// a handle of its own, named as this one is; `on_chunk(bytes indexed so far)` after every
+    /// chunk, stopped when `cancel` is set. A stream has no local pass: it is
+    /// [`TextDoc::streamed_as`] again.
+    fn reencoded(
+        &self,
+        enc: Encoding,
+        cancel: &AtomicBool,
+        on_chunk: &mut dyn FnMut(u64),
+    ) -> Result<TextDoc> {
+        let mut doc = Self::open_scan(
+            &self.path,
+            &self.shown,
+            Some(enc),
+            &|| None,
+            &|| stopped(cancel),
+            on_chunk,
+        )?;
+        // The pass is a re-read: the next change waits as long after it as after the first.
+        doc.indexed_in += self.indexed_in;
+        Ok(doc)
     }
 
     /// Opens `path` and indexes its lines as far as `cap()` says (asked again after every
@@ -348,12 +433,15 @@ impl TextDoc {
         cap: &dyn Fn() -> Option<u64>,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Self> {
-        Self::open_scan(path, shown, cap, check, &mut |_| {})
+        Self::open_scan(path, shown, None, cap, check, &mut |_| {})
     }
 
+    /// The pass over `path`: its lines in `chosen`, or — `None` — in the default its first
+    /// bytes pick (08 §7.2, in the pass itself: the marks depend on it).
     fn open_scan(
         path: &Path,
         shown: &str,
+        chosen: Option<Encoding>,
         cap: &dyn Fn() -> Option<u64>,
         check: &dyn Fn() -> Result<()>,
         on_chunk: &mut dyn FnMut(u64),
@@ -365,7 +453,7 @@ impl TextDoc {
             .metadata()
             .with_context(|| format!("cannot stat {shown}"))?;
         let opened = identity(&meta);
-        let mut scan = Scan::default();
+        let mut scan = Scan::reading(chosen);
         if cap().is_some() {
             // A pass that may stop short hashes what it reads: its resume can then tell the
             // bytes it indexed are still the file's when the file was written to since.
@@ -393,6 +481,10 @@ impl TextDoc {
         // change is noticed later).
         let mut doc = Self {
             backing: Backing::Local(file),
+            enc: scan.enc,
+            pick: None,
+            head: Vec::new(),
+            chosen: scan.chosen,
             size: 0,
             marks: Vec::new(),
             lines: 0,
@@ -432,10 +524,17 @@ impl TextDoc {
     /// from byte 0 ([`TextDoc::grow`]) — the first block through the screen's reader, the rest
     /// through a Bulk reader of its own.
     pub fn streamed(source: Source) -> Self {
+        Self::streamed_as(source, None)
+    }
+
+    /// [`TextDoc::streamed`], its lines read in `chosen` when one was chosen for this opening
+    /// (D21), else in the default its first block picks (08 §7.2: in the pass that shows the
+    /// first screen and picks the syntax).
+    pub fn streamed_as(source: Source, chosen: Option<Encoding>) -> Self {
         let total = source.size();
         let scan = Scan {
             marks: vec![Mark { line: 0, offset: 0 }],
-            ..Scan::default()
+            ..Scan::reading(chosen)
         };
         let stream = Stream {
             reader: Box::new(source.reader(ReaderKind::Interactive)),
@@ -443,7 +542,7 @@ impl TextDoc {
             tail: None,
             source: Some(source),
             total,
-            scan: Scan::default(),
+            scan: Scan::reading(chosen),
             blocking: None,
             cap: HIGHLIGHT_MAX,
             pins: Vec::new(),
@@ -453,6 +552,10 @@ impl TextDoc {
         };
         let mut doc = Self {
             backing: Backing::Stream(Box::new(stream)),
+            enc: scan.enc,
+            pick: None,
+            head: Vec::new(),
+            chosen,
             size: 0,
             marks: Vec::new(),
             lines: 0,
@@ -734,17 +837,83 @@ impl TextDoc {
     fn adopt(&mut self, scan: &Scan) {
         let size = scan.at;
         self.marks.retain(|m| m.line == 0 || m.offset < size);
-        self.open_at = match scan.last_byte {
-            Some(b'\n') | None => size,
-            Some(_) => size - scan.line_len.min(size),
+        // (A unit cut by the end of what was read is the open line's too.)
+        let open = scan.line_len + size % scan.enc.unit() as u64;
+        self.open_at = match scan.last {
+            Some(true) | None => size,
+            Some(false) => size - open.min(size),
         };
         self.first_long = scan.first_long;
         if scan.line_len > LINE_MAX as u64 && self.first_long.is_none() {
             self.first_long = Some(scan.line);
         }
-        self.ends_newline = scan.last_byte == Some(b'\n');
-        self.lines = scan.line + u64::from(scan.last_byte.is_some() && !self.ends_newline);
+        self.ends_newline = scan.last == Some(true);
+        self.lines = scan.line + u64::from(scan.last == Some(false));
         self.size = size;
+        self.enc = scan.enc;
+        if scan.pick.is_some() {
+            self.pick = scan.pick;
+            self.head.clone_from(&scan.head);
+        }
+    }
+
+    /// The encoding the lines are read in (08 §7).
+    pub fn encoding(&self) -> Encoding {
+        self.enc
+    }
+
+    /// The encoding as the bar says it (§7.5): `UTF-16LE (BOM)`, `UTF-8 (guessed)`; `None`
+    /// before the first bytes were read (a stream's first block on its way), when nothing has
+    /// picked it yet — unless it was chosen.
+    pub fn encoding_label(&self) -> Option<String> {
+        match self.pick {
+            Some(pick) => Some(pick.label(self.enc, &self.head)),
+            None => self.chosen.map(|e| e.label().to_string()),
+        }
+    }
+
+    /// Where line 1 starts: after a BOM skipped under the encoding (D26, D37), else at 0.
+    fn first_start(&self) -> u64 {
+        self.enc.bom_len(&self.head) as u64
+    }
+
+    /// Whether reading the lines in `enc` needs a new index (D22): its LF unit is not this
+    /// encoding's. Else [`TextDoc::reencode`] changes it in place.
+    pub fn needs_index_for(&self, enc: Encoding) -> bool {
+        !self.enc.same_lines(enc)
+    }
+
+    /// The lines read in `enc` from now on, chosen for this opening (D21) — one whose LF unit
+    /// is this encoding's (D22: [`TextDoc::needs_index_for`] is false), so the index stays: only
+    /// line 1's start follows the BOM rule (§7.2), and the passes still to run read in it. A
+    /// stream that has read nothing yet takes any encoding so (its pass has not begun).
+    pub fn reencode(&mut self, enc: Encoding) {
+        let fresh = self.is_stream() && self.size == 0;
+        debug_assert!(
+            fresh || !self.needs_index_for(enc),
+            "{enc:?} needs a new index"
+        );
+        self.enc = enc;
+        self.chosen = Some(enc);
+        let first = self.first_start();
+        if let Some(mark) = self.marks.first_mut() {
+            mark.offset = first;
+        }
+        if self.lines <= 1 && !self.ends_newline {
+            // Line 1 is the open line, or there is none: it starts where the BOM rule says now
+            // — a file of only a BOM has one line under another encoding, none under its own.
+            let any = first < self.size;
+            self.lines = u64::from(any);
+            self.open_at = if any { first } else { self.size };
+        }
+        let rest = self.rest.as_mut();
+        let pass = match &mut self.backing {
+            Backing::Stream(stream) => Some(&mut stream.scan),
+            Backing::Local(_) => None,
+        };
+        for scan in [rest, pass].into_iter().flatten() {
+            scan.choose(enc, first);
+        }
     }
 
     /// The index stopped short of the file (a preview's budget): it covers [`TextDoc::size`]
@@ -938,7 +1107,7 @@ impl TextDoc {
                     pass: None,
                     tail: None,
                     total: stream.total,
-                    scan: Scan::default(),
+                    scan: Scan::reading(self.chosen),
                     blocking: None,
                     cap: stream.cap,
                     pins: Vec::new(),
@@ -950,6 +1119,10 @@ impl TextDoc {
         };
         Ok(TextDoc {
             backing,
+            enc: self.enc,
+            pick: self.pick,
+            head: self.head.clone(),
+            chosen: self.chosen,
             size: self.size,
             marks,
             lines: self.lines,
@@ -1071,15 +1244,22 @@ impl TextDoc {
         if first >= last {
             return Ok(out);
         }
+        let enc = self.enc;
+        let unit = enc.unit() as u64;
         let mut idx = self.mark_before(first);
         let (mut line, mut pos) = (self.marks[idx].line, self.marks[idx].offset);
         let mut window = Window_::default();
         while line < last {
             let next = self.next_mark(idx);
             let keep = line >= first;
+            let start = pos;
             if line + 1 == next.line {
                 // It ends where the next mark starts: read only what is shown of it.
-                let newline = u64::from(next.line < self.lines || self.ends_newline);
+                let newline = if next.line < self.lines || self.ends_newline {
+                    unit
+                } else {
+                    0
+                };
                 // Checked: a file changed since it was indexed can put `pos` past the mark.
                 let len = next
                     .offset
@@ -1089,7 +1269,7 @@ impl TextDoc {
                 if keep {
                     let want = len.min(LINE_MAX as u64) as usize;
                     let bytes = window.take(self, pos, want)?;
-                    out.push(shown(bytes, len > LINE_MAX as u64));
+                    out.push(shown(enc, start, bytes, len > LINE_MAX as u64));
                 }
                 pos = next.offset;
                 idx += 1;
@@ -1107,12 +1287,12 @@ impl TextDoc {
                         return Err(anyhow::Error::new(Stale));
                     }
                     let want = room_to_mark.min(CHUNK as u64) as usize;
-                    let avail = window.at(self, pos, want)?;
+                    let avail = window.units(self, pos, want)?;
                     let avail = &avail[..avail.len().min(room_to_mark as usize)];
                     if avail.is_empty() {
                         return Err(anyhow::Error::new(Stale));
                     }
-                    let (body, end) = match avail.iter().position(|&b| b == b'\n') {
+                    let (body, end) = match enc.find_lf(avail, pos) {
                         Some(i) => (&avail[..i], Some(i)),
                         None => (avail, None),
                     };
@@ -1123,14 +1303,14 @@ impl TextDoc {
                     }
                     match end {
                         Some(i) => {
-                            pos += i as u64 + 1;
+                            pos += i as u64 + unit;
                             break;
                         }
                         None => pos += avail.len() as u64,
                     }
                 }
                 if keep {
-                    out.push(shown(text, cut));
+                    out.push(shown(enc, start, text, cut));
                 }
             }
             line += 1;
@@ -1143,7 +1323,7 @@ impl TextDoc {
     /// mark before `first`, then each line that ends before the next mark (such a line is short:
     /// it ends within a span of its block's mark), never past where the index says it must end.
     /// A line ending at a mark is not read at all: not its last byte either, which may be far
-    /// away and not fetched (06 §7.2) — the row that holds its end looks for the `\r`
+    /// away and not fetched (06 §7.2) — the row that holds its end looks for the CR
     /// ([`Span::cr`]).
     fn spans(&mut self, first: u64, count: usize) -> Result<Vec<Span>> {
         let mut out = Vec::new();
@@ -1151,6 +1331,8 @@ impl TextDoc {
         if first >= last {
             return Ok(out);
         }
+        let enc = self.enc;
+        let unit = enc.unit() as u64;
         let mut idx = self.mark_before(first);
         let (mut line, mut pos) = (self.marks[idx].line, self.marks[idx].offset);
         let mut window = Window_::default();
@@ -1158,7 +1340,11 @@ impl TextDoc {
             let next = self.next_mark(idx);
             let keep = line >= first;
             if line + 1 == next.line {
-                let newline = u64::from(next.line < self.lines || self.ends_newline);
+                let newline = if next.line < self.lines || self.ends_newline {
+                    unit
+                } else {
+                    0
+                };
                 // Checked: a file changed since it was indexed can put `pos` past the mark.
                 let len = next
                     .offset
@@ -1174,6 +1360,7 @@ impl TextDoc {
                         loose: false,
                         ends: true,
                         cr: len > 0,
+                        blind: false,
                     });
                 }
                 pos = next.offset;
@@ -1183,25 +1370,26 @@ impl TextDoc {
                 // this block's mark.
                 let end = next.offset.min(self.marks[idx].offset.saturating_add(SPAN));
                 let start = pos;
-                let mut before = None;
+                // The unit before the LF: whether the last read ended with the CR unit.
+                let mut before_cr = false;
                 loop {
                     let room = end.saturating_sub(pos);
                     if room == 0 {
                         return Err(anyhow::Error::new(Stale));
                     }
-                    let avail = window.at(self, pos, room.min(CHUNK as u64) as usize)?;
+                    let avail = window.units(self, pos, room.min(CHUNK as u64) as usize)?;
                     let avail = &avail[..avail.len().min(room as usize)];
                     if avail.is_empty() {
                         return Err(anyhow::Error::new(Stale));
                     }
-                    match avail.iter().position(|&b| b == b'\n') {
+                    match enc.find_lf(avail, pos) {
                         Some(i) => {
                             if i > 0 {
-                                before = Some(avail[i - 1]);
+                                before_cr = enc.ends_with_cr(&avail[..i], pos);
                             }
                             let len = pos + i as u64 - start;
-                            let cr = u64::from(len > 0 && before == Some(b'\r'));
-                            pos += i as u64 + 1;
+                            let cr = if len > 0 && before_cr { unit } else { 0 };
+                            pos += i as u64 + unit;
                             if keep {
                                 out.push(Span {
                                     line: Some(line),
@@ -1211,12 +1399,13 @@ impl TextDoc {
                                     loose: false,
                                     ends: true,
                                     cr: false,
+                                    blind: false,
                                 });
                             }
                             break;
                         }
                         None => {
-                            before = avail.last().copied();
+                            before_cr = enc.ends_with_cr(avail, pos);
                             pos += avail.len() as u64;
                         }
                     }
@@ -1265,6 +1454,9 @@ impl TextDoc {
         if self.lines == 0 {
             return Ok(None);
         }
+        // A place inside a skipped BOM is line 1's start (D37) — never the last line read
+        // below, which no line starting at or before it would be.
+        let at = at.max(self.marks[0].offset);
         let idx = self
             .marks
             .partition_point(|m| m.offset <= at)
@@ -1291,17 +1483,19 @@ impl TextDoc {
         }
     }
 
-    /// The last newline in `[lo, x)`, read backwards a little at a time: a short line's start
-    /// costs a short read.
+    /// The last LF unit in `[lo, x)` — before the unit `x` is in, which ends `x`'s line when it
+    /// is one — read backwards a little at a time: a short line's start costs a short read.
+    /// `lo` is a multiple of the unit, and so is every read's start: no unit is cut in two.
     fn newline_before(&mut self, x: u64, lo: u64, window: &mut Window_) -> Result<Option<u64>> {
-        let (mut hi, mut step) = (x, 1024u64);
+        let enc = self.enc;
+        let (mut hi, mut step) = (enc.align_down(x), 1024u64);
         while hi > lo {
             let from = hi.saturating_sub(step).max(lo);
             let bytes = window.take(self, from, (hi - from) as usize)?;
             if bytes.len() < (hi - from) as usize {
                 return Err(anyhow::Error::new(Stale));
             }
-            if let Some(i) = bytes.iter().rposition(|&b| b == b'\n') {
+            if let Some(i) = enc.rfind_lf(&bytes, from) {
                 return Ok(Some(from + i as u64));
             }
             hi = from;
@@ -1310,12 +1504,34 @@ impl TextDoc {
         Ok(None)
     }
 
-    /// Where a piece cut at grid point `g` begins: at `g`, or up to three bytes before it, at
-    /// the start of the character `g` falls in.
-    fn grid_cut(&mut self, g: u64, lo: u64, window: &mut Window_) -> Result<u64> {
-        let from = g.saturating_sub(4).max(lo);
+    /// Where both pieces cut at grid point `g` meet (08 §7.3 rule 1, D36): at `g`, or up to
+    /// three bytes before it, at the start of the character `g` falls in — found from the
+    /// encoding's look-back before `g` (or from `lo`, a character start, when that is nearer).
+    /// `None`: no character start is proven there (CP949, D28): the piece after it shows its
+    /// bytes as placeholder marks ([`Span::blind`]).
+    fn grid_cut(&mut self, g: u64, lo: u64, window: &mut Window_) -> Result<Option<u64>> {
+        let enc = self.enc;
+        let from = g.saturating_sub(enc.look_back() as u64).max(lo);
         let bytes = window.take(self, from, (g - from) as usize)?;
-        Ok(from + cut_char_start(&bytes) as u64)
+        let near = Around {
+            at: from,
+            bytes: &bytes,
+            anchored: from == lo,
+        };
+        Ok(enc.grid_cut(near, g))
+    }
+
+    /// Rule 3 (08 §7.3), a jump's place `x`: rounded down to the unit, and in UTF-16 back
+    /// across a valid pair's low half — read from the few bytes around it.
+    fn jump_place(&mut self, x: u64, window: &mut Window_) -> Result<u64> {
+        let enc = self.enc;
+        if enc.unit() == 1 {
+            return Ok(x);
+        }
+        let q = enc.align_down(x);
+        let from = q.saturating_sub(enc.look_back() as u64);
+        let bytes = window.take(self, from, (q - from) as usize + crate::encoding::AHEAD)?;
+        Ok(enc.jump_place(Around::new(from, &bytes), x))
     }
 
     /// The line that starts at byte `start`, past the index — or, `loose`, the piece that
@@ -1327,12 +1543,21 @@ impl TextDoc {
     /// never a second ask. A piece from the grid runs to the next grid point.
     fn scan_span(&mut self, start: u64, loose: bool, window: &mut Window_) -> Result<Span> {
         let total = self.total();
+        let enc = self.enc;
+        let unit = enc.unit() as u64;
         let bound = if loose {
             ((start + 3) / GRID + 1) * GRID
         } else {
             start / GRID * GRID + REACH
         };
         let bound = bound.min(total);
+        // A piece from the grid point itself, where no character start was proven (D28; only
+        // an encoding that needs one asks, so the others read nothing more). Nothing before
+        // the grid point is known to be a character start: the look-back is not anchored.
+        let blind = loose
+            && enc.needs_phase()
+            && start.is_multiple_of(GRID)
+            && self.grid_cut(start, 0, window)?.is_none();
         let piece = |len: u64, next: u64, ends: bool, cr: bool| Span {
             line: None,
             start,
@@ -1341,30 +1566,32 @@ impl TextDoc {
             loose,
             ends,
             cr,
+            blind,
         };
-        let (mut pos, mut before) = (start, None);
+        let (mut pos, mut before_cr) = (start, false);
         while pos < bound {
             let room = bound - pos;
-            let avail = window.at(self, pos, room.min(CHUNK as u64) as usize)?;
+            let avail = window.units(self, pos, room.min(CHUNK as u64) as usize)?;
             let avail = &avail[..avail.len().min(room as usize)];
             if avail.is_empty() {
                 return Err(anyhow::Error::new(Stale));
             }
-            if let Some(i) = avail.iter().position(|&b| b == b'\n') {
+            if let Some(i) = enc.find_lf(avail, pos) {
                 if i > 0 {
-                    before = Some(avail[i - 1]);
+                    before_cr = enc.ends_with_cr(&avail[..i], pos);
                 }
                 let len = pos + i as u64 - start;
-                let cr = u64::from(len > 0 && before == Some(b'\r'));
-                return Ok(piece(len - cr, pos + i as u64 + 1, true, false));
+                let cr = if len > 0 && before_cr { unit } else { 0 };
+                return Ok(piece(len - cr, pos + i as u64 + unit, true, false));
             }
-            before = avail.last().copied();
+            before_cr = enc.ends_with_cr(avail, pos);
             pos += avail.len() as u64;
         }
         if bound >= total {
             return Ok(piece(total - start, total, true, total > start));
         }
-        let cut = self.grid_cut(bound, start, window)?;
+        // No character start proven at the grid point: the next piece begins on it, blind.
+        let cut = self.grid_cut(bound, start, window)?.unwrap_or(bound);
         Ok(piece(cut - start, cut, false, false))
     }
 
@@ -1376,7 +1603,7 @@ impl TextDoc {
         let grid = x / GRID * GRID;
         let lo = grid.saturating_sub(REACH).max(known);
         let start = match self.newline_before(x, lo, window)? {
-            Some(newline) => Some(newline + 1),
+            Some(newline) => Some(newline + self.enc.unit() as u64),
             // No newline since the index's end: its last line goes on. While the pass is on
             // its way that line is the pass's to place.
             None if lo == known && self.passing() && !self.ends_newline && known > 0 => {
@@ -1390,7 +1617,8 @@ impl TextDoc {
         let span = match start {
             Some(start) => self.scan_span(start, false, window)?,
             None => {
-                let cut = self.grid_cut(grid, lo, window)?;
+                // (No character start proven at the grid point: the piece begins on it, blind.)
+                let cut = self.grid_cut(grid, lo, window)?.unwrap_or(grid);
                 self.scan_span(cut, true, window)?
             }
         };
@@ -1565,13 +1793,27 @@ fn stopped(cancel: &AtomicBool) -> Result<()> {
 /// An index pass: where it is in the file and what it found so far — every mark (also one at
 /// where it stopped), the line it is in and how long that line is so far, the first long line,
 /// the last byte read.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct Scan {
+    /// Bytes read so far, from byte 0 of the file (a BOM skipped is among them).
     at: u64,
     line: u64,
+    /// Bytes of the line so far, in whole units (a unit cut by the end of a read is not
+    /// counted yet).
     line_len: u64,
     first_long: Option<u64>,
-    last_byte: Option<u8>,
+    /// The last unit of a line read: `Some(true)` when it was the LF unit and nothing came
+    /// after it, `Some(false)` when something did; `None` before any.
+    last: Option<bool>,
+    /// The encoding it reads in, and the one chosen for this opening, if any (else the
+    /// default its first bytes pick).
+    enc: Encoding,
+    chosen: Option<Encoding>,
+    /// The default, once the first bytes were read, and the file's first four of them.
+    pick: Option<Pick>,
+    head: Vec<u8>,
+    /// The unit being read: its bytes so far (a read can end inside it).
+    unit: [u8; 4],
     marks: Vec<Mark>,
     /// Lines between marks now: [`BLOCK_LINES`] (0 stands for it) until the marks were
     /// thinned, doubled each time they were.
@@ -1599,8 +1841,64 @@ struct Scan {
 /// Bytes an index pass reads at a time (the cancel and the cap are looked at between reads).
 const PASS_READ: usize = 1 << 20;
 
+impl Default for Scan {
+    fn default() -> Self {
+        Self {
+            at: 0,
+            line: 0,
+            line_len: 0,
+            first_long: None,
+            last: None,
+            enc: Encoding::Utf8,
+            chosen: None,
+            pick: None,
+            head: Vec::new(),
+            unit: [0; 4],
+            marks: Vec::new(),
+            spacing: 0,
+            limit: 0,
+            held: None,
+            #[cfg(test)]
+            peak: 0,
+            #[cfg(test)]
+            thinned: 0,
+            #[cfg(test)]
+            after_thin: (0, 0),
+            capped: false,
+            hasher: None,
+        }
+    }
+}
+
 impl Scan {
+    /// A pass that reads in `chosen`, or — `None` — in the default its first bytes pick.
+    fn reading(chosen: Option<Encoding>) -> Self {
+        Self {
+            enc: chosen.unwrap_or(Encoding::Utf8),
+            chosen,
+            ..Self::default()
+        }
+    }
+
+    /// Reads in `enc` from now on, chosen for this opening — one with the same LF unit (D22),
+    /// or before the pass has begun; line 1 starts at `first` (the BOM rule).
+    fn choose(&mut self, enc: Encoding, first: u64) {
+        self.enc = enc;
+        self.chosen = Some(enc);
+        if let Some(mark) = self.marks.first_mut() {
+            mark.offset = first;
+        }
+        if self.line == 0 && self.at > 0 {
+            // Line 1 is the line being read: its bytes so far count from its new start.
+            let unit = enc.unit() as u64;
+            self.line_len = (self.at - self.at % unit).saturating_sub(first);
+            self.last = (self.at > first).then_some(false);
+        }
+    }
+
     /// The next bytes of the file (`bytes`, at where the pass is), of a file of `size` bytes.
+    /// The first ones (from byte 0) pick the default (08 §7.2); a BOM skipped under the
+    /// encoding is no line's.
     fn feed(&mut self, bytes: &[u8], size: u64) {
         if bytes.is_empty() {
             return;
@@ -1608,23 +1906,70 @@ impl Scan {
         if let Some(mark) = self.held.take() {
             self.push(mark);
         }
-        let end = self.at + bytes.len() as u64;
-        for (i, &b) in bytes.iter().enumerate() {
-            if b != b'\n' {
-                self.line_len += 1;
-                continue;
+        let mut bytes = bytes;
+        if self.at == 0 && self.pick.is_none() {
+            let pick = crate::encoding::pick(bytes, size > bytes.len() as u64);
+            self.pick = Some(pick);
+            self.enc = self.chosen.unwrap_or(pick.encoding);
+            self.head = bytes[..bytes.len().min(4)].to_vec();
+            let bom = self.enc.bom_len(&self.head);
+            if let Some(mark) = self.marks.first_mut() {
+                mark.offset = bom as u64;
             }
-            if self.line_len > LINE_MAX as u64 && self.first_long.is_none() {
-                self.first_long = Some(self.line);
+            self.at = bom as u64;
+            bytes = &bytes[bom..];
+            if bytes.is_empty() {
+                return;
             }
-            self.line_len = 0;
-            self.line += 1;
-            self.line_start(self.at + i as u64 + 1, end, size);
         }
-        if let Some(&b) = bytes.last() {
-            self.last_byte = Some(b);
+        let end = self.at + bytes.len() as u64;
+        let lf = self.enc.lf();
+        let n = lf.len();
+        if n == 1 {
+            // A one-byte unit: the byte 0x0A (UTF-8, ASCII, Latin-1, CP437, CP949).
+            for (i, &b) in bytes.iter().enumerate() {
+                if b != b'\n' {
+                    self.line_len += 1;
+                    continue;
+                }
+                self.newline(self.at + i as u64 + 1, end, size);
+            }
+            self.last = Some(bytes.last() == Some(&b'\n'));
+        } else {
+            // Units of 2 or 4 bytes, aligned from byte 0: one cut by the end of the last read
+            // is finished by this one's first bytes, never a 0x0A byte inside a unit.
+            let from = self.at;
+            let mut ended = None;
+            for (i, &b) in bytes.iter().enumerate() {
+                let at = from + i as u64;
+                let k = (at % n as u64) as usize;
+                self.unit[k] = b;
+                if k + 1 < n {
+                    continue;
+                }
+                let is_lf = self.unit[..n] == *lf;
+                ended = Some(is_lf);
+                if is_lf {
+                    self.newline(at + 1, end, size);
+                } else {
+                    self.line_len += n as u64;
+                }
+            }
+            // Ended on the LF unit, or on something of a line: a unit, or part of one.
+            let partial = !end.is_multiple_of(n as u64);
+            self.last = Some(!partial && ended == Some(true));
         }
         self.at = end;
+    }
+
+    /// A line ended with its LF unit; the next starts at `start` (in a read ending at `end`).
+    fn newline(&mut self, start: u64, end: u64, size: u64) {
+        if self.line_len > LINE_MAX as u64 && self.first_long.is_none() {
+            self.first_long = Some(self.line);
+        }
+        self.line_len = 0;
+        self.line += 1;
+        self.line_start(start, end, size);
     }
 
     /// Line `self.line` starts at byte `start`, of a file of `size` bytes read as far as `end`:
@@ -1754,7 +2099,7 @@ impl Scan {
         }
         self.line = first + count;
         self.at = end;
-        self.last_byte = Some(b'\n');
+        self.last = Some(true);
     }
 
     /// The pass over `file` (opened at `path`, named `shown` in what is said, `size` bytes as opened) from where it is, to the
@@ -1894,7 +2239,7 @@ pub(crate) fn index_reads(path: &Path) -> Vec<(u64, u64)> {
 }
 
 /// Where a line is, by bytes (06 §7.2): its first byte in the file and how many bytes it shows
-/// (its newline, and a `\r` before it, not counted). Past the index a line whose start is not
+/// (its LF unit, and a CR unit before it, not counted). Past the index a line whose start is not
 /// within reach is given in pieces from the 16 KiB grid (`loose`), and a long one is cut at a
 /// grid point (`ends` is false: what follows is the same line's next piece).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1909,9 +2254,12 @@ pub(crate) struct Span {
     loose: bool,
     /// It ends where its line does.
     ends: bool,
-    /// Its last byte was not looked at and may be the `\r` before its newline: the row that
+    /// Its last unit was not looked at and may be the CR unit before its LF: the row that
     /// holds its end takes it and does not show it.
     cr: bool,
+    /// A piece that begins on the grid where no character start is proven (CP949, D28): its
+    /// bytes show as placeholder marks up to the first start a rule proves.
+    blind: bool,
 }
 
 /// What the file is now, against the index.
@@ -1969,6 +2317,33 @@ impl Window_ {
         Ok(&self.bytes[(pos - self.start) as usize..])
     }
 
+    /// [`Window_::at`] ending on a boundary of the units of `doc`'s encoding (counted from
+    /// byte 0), so an LF unit is in it whole or not at all — unless less than a unit is left
+    /// (the end of the file). Read from a unit boundary `pos`, as the line searches do.
+    fn units(&mut self, doc: &mut TextDoc, pos: u64, want: usize) -> Result<&[u8]> {
+        let n = doc.enc.unit() as u64;
+        let len = self.at(doc, pos, want)?.len() as u64;
+        let from = (pos - self.start) as usize;
+        let over = (pos + len) % n;
+        if over == 0 || len == 0 {
+            return Ok(&self.bytes[from..]);
+        }
+        if len > over {
+            return Ok(&self.bytes[from..from + (len - over) as usize]);
+        }
+        // Less than a unit is left of the last read: read again from here, a unit at least
+        // (into a buffer of its own, as `at` does).
+        let mut bytes = vec![0; want.max(n as usize).clamp(1, CHUNK)];
+        let got = doc.read_at(&mut bytes, pos)?;
+        bytes.truncate(got);
+        self.bytes = bytes;
+        self.start = pos;
+        let len = got as u64;
+        let over = (pos + len) % n;
+        let keep = if len > over { len - over } else { len };
+        Ok(&self.bytes[..keep as usize])
+    }
+
     /// `len` bytes from `pos` (fewer at the end of the file).
     fn take(&mut self, doc: &mut TextDoc, mut pos: u64, len: usize) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(len);
@@ -1985,33 +2360,16 @@ impl Window_ {
     }
 }
 
-/// Where a character cut in two at the end of `bytes` starts (`bytes.len()` when none is),
-/// found from the end alone, whatever comes before: the last up-to-4 bytes from their last
-/// non-continuation byte on must be the start of a real character (`from_utf8` checks the
-/// lead byte, overlongs, surrogates and the U+10FFFF bound) that only lacks its end. Bytes that
-/// can never start a character are not a cut character: they show as U+FFFD.
-fn cut_char_start(bytes: &[u8]) -> usize {
-    let from = bytes.len().saturating_sub(4);
-    let Some(i) = (from..bytes.len()).rev().find(|&i| bytes[i] & 0xC0 != 0x80) else {
-        return bytes.len();
-    };
-    match std::str::from_utf8(&bytes[i..]) {
-        Err(e) if e.valid_up_to() == 0 && e.error_len().is_none() => i,
-        _ => bytes.len(),
+/// A line's shown bytes (from offset `at`, its start) as text in `enc`: a trailing CR unit
+/// dropped; when `cut`, a character cut in two at the end left out; anything else that is not
+/// a character shown as U+FFFD (08 §7.1) — by the one decoder the rows use too.
+fn shown(enc: Encoding, at: u64, mut bytes: Vec<u8>, cut: bool) -> Line {
+    if !cut && enc.ends_with_cr(&bytes, at) {
+        bytes.truncate(bytes.len() - enc.unit());
     }
-}
-
-/// A line's shown bytes as text: a trailing `\r` dropped; when `cut`, a character cut in two
-/// at the end left out; anything else that is not UTF-8 shown as U+FFFD.
-fn shown(mut bytes: Vec<u8>, cut: bool) -> Line {
-    if cut {
-        let keep = cut_char_start(&bytes);
-        bytes.truncate(keep);
-    } else if bytes.last() == Some(&b'\r') {
-        bytes.pop();
-    }
+    let (cells, _) = enc.decode(&bytes, !cut);
     Line {
-        text: String::from_utf8_lossy(&bytes).into_owned(),
+        text: cells.iter().map(|c| c.ch).collect(),
         cut,
     }
 }
@@ -3257,6 +3615,9 @@ struct TextWindow {
     reask: bool,
     /// This pass has a key, a click or a scroll in it (06 §5: what retries a failed stream).
     input: bool,
+    /// `SOPEN_STATE` `enc=` (08 D34): the encoding chosen for this opening, applied on the
+    /// first pass ([`TextWindow::choose`]).
+    enc_wanted: Option<Encoding>,
     /// Called as a re-read's worker starts (tests: hold it).
     #[cfg(test)]
     reindex_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -3282,9 +3643,22 @@ struct Reindex {
     /// The rest of an index a preview stopped short (the hand-over), not a re-read: the bytes
     /// indexed so far and the size as opened, for the status row.
     resume: Option<(Arc<AtomicU64>, u64)>,
+    /// The file indexed again in another encoding whose LF unit is not the one read in now
+    /// (D22), not a re-read: what it is, with its progress; Esc stops it.
+    rebuild: Option<Rebuild>,
     /// The worker's thread ended (tests).
     #[cfg_attr(not(test), allow(dead_code))]
     exited: Arc<AtomicBool>,
+}
+
+/// A local file indexed again in `enc` (D22): the bytes indexed so far and the size as
+/// opened, for the status row, and the byte the view was at, put back at the top once it lands
+/// (line numbers differ between LF units; a byte does not).
+struct Rebuild {
+    enc: Encoding,
+    done: Arc<AtomicU64>,
+    total: u64,
+    place: Option<u64>,
 }
 
 impl Drop for Reindex {
@@ -3356,6 +3730,7 @@ impl TextWindow {
             reindexes: 0,
             preview: false,
             preview_index: None,
+            enc_wanted: None,
             #[cfg(test)]
             reindex_hook: None,
             #[cfg(test)]
@@ -3551,7 +3926,8 @@ impl TextWindow {
         }
         (self.top, self.top_off, self.top_loose, self.line) = (0, 0, false, None);
         self.seeking = None;
-        self.doc = TextDoc::streamed(source);
+        // In the encoding chosen for this opening, if one was (D21).
+        self.doc = TextDoc::streamed_as(source, self.doc.chosen);
         self.syntax_due = syntax_by_name(&self.name).is_none();
         if self.syntax_due {
             self.syntax = None;
@@ -3775,6 +4151,8 @@ impl TextWindow {
             self.doc.path().to_path_buf(),
             ctx.clone(),
         );
+        // In the encoding chosen for this opening, if one was (D21).
+        let chosen = self.doc.chosen;
         #[cfg(test)]
         let (hook, chunk_hook) = (self.reindex_hook.clone(), self.reindex_chunk_hook.clone());
         std::thread::spawn(move || {
@@ -3788,7 +4166,7 @@ impl TextWindow {
                     hook();
                 }
             };
-            let result = TextDoc::open_with(&path, &stop, &mut on_chunk);
+            let result = TextDoc::open_in(&path, chosen, &stop, &mut on_chunk);
             let _ = tx.send(result);
             ex.store(true, Ordering::Relaxed);
             waker.request_repaint();
@@ -3802,6 +4180,109 @@ impl TextWindow {
             rx,
             at_end,
             resume: None,
+            rebuild: None,
+            exited,
+        });
+    }
+
+    /// The lines read in `enc` from now on, chosen for this opening (`SOPEN_STATE` `enc=`;
+    /// 08 §7.5): in place when its LF unit is the one read in now — line 1 follows the BOM
+    /// rule — else the file is indexed again (D22): a stream from its first block, a local
+    /// file by a pass on a worker with its progress on the status row, Esc keeping the
+    /// encoding it had. Wrap's memos and the highlighter's states go either way, and the place
+    /// on screen is kept by its byte (§7.3's jump rule).
+    fn choose(&mut self, ctx: &egui::Context, enc: Encoding) {
+        if self.doc.chosen == Some(enc) {
+            return;
+        }
+        let place = self
+            .page
+            .as_ref()
+            .map(|p| p.top + if p.wrapped { p.top_off } else { 0 })
+            .filter(|&at| at > 0);
+        let fresh = self.doc.is_stream() && self.doc.size() == 0;
+        if fresh || !self.doc.needs_index_for(enc) {
+            self.doc.reencode(enc);
+        } else if let Some(source) = self.doc.source().cloned() {
+            // Its first 16 MiB are read again (from the block cache where they still are).
+            (self.top, self.top_off, self.top_loose, self.line) = (0, 0, false, None);
+            self.seeking = None;
+            self.doc = TextDoc::streamed_as(source, Some(enc));
+            self.regutter = true;
+            self.failure = None;
+            self.streamed = self.doc.source().map(Source::state);
+        } else {
+            return self.rebuild(ctx, enc, place);
+        }
+        self.reread(place);
+        ctx.request_repaint();
+    }
+
+    /// The lines are read another way (another encoding): what wrapping found, the
+    /// highlighting and a syntax the first line picked go, and the view goes back to `place`,
+    /// by its byte, unless the keys asked for another.
+    fn reread(&mut self, place: Option<u64>) {
+        self.memo.reset(self.room);
+        self.worker = None;
+        (self.hl_tried, self.hl_retry) = (false, false);
+        self.syntax_due = syntax_by_name(&self.name).is_none();
+        if self.syntax_due {
+            self.syntax = None;
+        }
+        self.stale_page = true;
+        self.resnap = true;
+        if self.jump.is_none() {
+            if let Some(at) = place {
+                (self.jump, self.restoring) = (Some(Jump::Byte(at)), true);
+            }
+        }
+    }
+
+    /// A local file indexed again in `enc` (D22), on a worker: the page on screen stays, the
+    /// status row counts, and Esc stops it, the encoding left as it was.
+    fn rebuild(&mut self, ctx: &egui::Context, enc: Encoding, place: Option<u64>) {
+        let doc = match self.doc.share() {
+            Ok(doc) => doc,
+            Err(e) => {
+                self.status = Status::error(format!("{e:#}"));
+                return;
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicU64::new(0));
+        let total = self.doc.opened.2;
+        let (stop, ex, counted, waker) =
+            (cancel.clone(), exited.clone(), done.clone(), ctx.clone());
+        #[cfg(test)]
+        let hook = self.reindex_hook.clone();
+        std::thread::spawn(move || {
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook();
+            }
+            let result = doc.reencoded(enc, &stop, &mut |at| {
+                counted.store(at, Ordering::Relaxed);
+                waker.request_repaint();
+            });
+            let _ = tx.send(result);
+            ex.store(true, Ordering::Relaxed);
+            waker.request_repaint();
+        });
+        self.worker = None;
+        self.status = Status::default();
+        self.reindex = Some(Reindex {
+            cancel,
+            rx,
+            at_end: false,
+            resume: None,
+            rebuild: Some(Rebuild {
+                enc,
+                done,
+                total,
+                place,
+            }),
             exited,
         });
     }
@@ -3845,6 +4326,7 @@ impl TextWindow {
             rx,
             at_end: false,
             resume: Some((done, total)),
+            rebuild: None,
             exited,
         });
     }
@@ -3866,6 +4348,7 @@ impl TextWindow {
         };
         let at_end = reindex.at_end;
         let resumed = reindex.resume.is_some();
+        let rebuilt = reindex.rebuild.as_ref().map(|r| (r.enc, r.place));
         self.reindex = None;
         self.index_done = (self.clock)();
         let result = result.map(|doc| {
@@ -3883,6 +4366,10 @@ impl TextWindow {
                 // the old index is not read through either (the file may look grown to it).
                 self.index_took = doc.indexed_in;
                 self.waiting = true;
+                if let Some((enc, _)) = rebuilt {
+                    // Read again in the encoding it was being indexed in.
+                    self.doc.chosen = Some(enc);
+                }
                 self.status = Status::info("the file changed again; re-reading it in a moment…");
             }
             Ok((doc, _)) => {
@@ -3907,12 +4394,20 @@ impl TextWindow {
                 // a row start (the line may have changed).
                 if at_end {
                     (self.jump, self.restoring) = (Some(Jump::FileEnd), true);
+                } else if let Some((_, place)) = rebuilt {
+                    // Read in another encoding (D22): back at the byte it was at — its line
+                    // numbers are not the old ones.
+                    if self.jump.is_none() {
+                        self.jump = place.map(Jump::Byte);
+                        self.restoring = place.is_some();
+                    }
+                    self.resnap = true;
                 } else if self.jump.is_none() {
                     let line = self.line.unwrap_or(0).min(lines.saturating_sub(1));
                     (self.jump, self.restoring) = (Some(Jump::Line(line, self.top_off)), true);
                 }
                 (self.top, self.top_loose) = (0, false);
-                self.status = if resumed {
+                self.status = if resumed || rebuilt.is_some() {
                     opening_status(self.syntax, &self.doc)
                 } else {
                     Status::info(if grew && at_end {
@@ -3971,6 +4466,12 @@ impl TextWindow {
                 // This pass's input is the reload: it retries nothing besides (below).
                 self.input = false;
             }
+        }
+        if self.reindex.as_ref().is_some_and(|r| r.rebuild.is_some()) && pressed(Key::Escape) {
+            // Esc stops indexing the file in another encoding (D22): the index and the
+            // encoding stay as they were.
+            self.reindex = None;
+            self.status = Status::info(format!("kept {}", self.doc.encoding().label()));
         }
         if self.waiting || self.reindex.is_some() || self.stream_frozen() {
             // Scrolling waits for the new index (the page on screen stays meanwhile).
@@ -4071,7 +4572,7 @@ impl TextWindow {
             }
             return;
         }
-        if self.doc.is_stream() && self.doc.line_count() == 0 && self.doc.total() > 0 {
+        if self.doc.is_stream() && self.doc.size() == 0 && self.doc.total() > 0 {
             // A stream's first block is on its way, or failed (the status row says why): no
             // page yet — never an empty one.
             self.pending = self.failure.is_none() && !self.stream_down();
@@ -4212,7 +4713,8 @@ impl TextWindow {
         let cell = ctx.fonts_mut(|f| f.glyph_width(font, '0'));
         let columns = (self.room / cell.max(1.0)).floor().max(1.0) as u64;
         let wrap = self.wrap;
-        let mut left = self.left;
+        // A place inside a line is a multiple of the unit (08 §7.3 rule 4).
+        let mut left = self.doc.encoding().align_down(self.left);
         let mut w = Wrapper {
             doc: &mut self.doc,
             memo: &mut self.memo,
@@ -4447,6 +4949,9 @@ impl TextWindow {
                 syntax,
             ]
         };
+        // Its encoding beside its syntax (08 §7.5, D34): `UTF-16LE (BOM)`, `UTF-8 (guessed)`.
+        let mut parts = parts;
+        parts.extend(self.doc.encoding_label());
         ui.horizontal(|ui| {
             super::one_line(ui, &self.title, p.text);
             ui.separator();
@@ -4519,7 +5024,10 @@ impl TextWindow {
             _ if stream && lines == 0 && (self.failure.is_some() || self.stream_down()) => {
                 String::new()
             }
-            _ if stream && self.doc.total() > 0 && (lines == 0 || self.pending) => self.loading(),
+            // (Nothing indexed yet: a file of only a BOM has bytes and no line.)
+            _ if stream && self.doc.total() > 0 && (self.doc.size() == 0 || self.pending) => {
+                self.loading()
+            }
             _ if lines == 0 => "empty".to_string(),
             _ => {
                 let top = self.line.unwrap_or(0);
@@ -4527,14 +5035,28 @@ impl TextWindow {
                 format!("lines {}–{last} of {lines}", top + 1)
             }
         };
-        let status = match self.reindex.as_ref().and_then(|r| r.resume.as_ref()) {
-            Some((done, total)) => Status::info(format!(
+        let rebuild = self.reindex.as_ref().and_then(|r| r.rebuild.as_ref());
+        let marks = self
+            .page
+            .as_ref()
+            .is_some_and(|p| p.rows.iter().any(|r| r.cut.dim > 0));
+        let resume = self.reindex.as_ref().and_then(|r| r.resume.as_ref());
+        let status = match (resume, rebuild) {
+            (Some((done, total)), _) => Status::info(format!(
                 "indexing the rest of the file… {} of {}",
                 crate::human(done.load(Ordering::Relaxed)),
                 crate::human(*total)
             )),
+            // Indexed again in another encoding (D22): how far, and that Esc keeps this one.
+            (None, Some(r)) => Status::info(format!(
+                "reading the lines as {}… {} of {} · Esc keeps {}",
+                r.enc.label(),
+                crate::human(r.done.load(Ordering::Relaxed)),
+                crate::human(r.total),
+                self.doc.encoding().label()
+            )),
             // A stream's own state first (06 §5), then why its last read failed.
-            None => match self.streamed.as_ref().and_then(|s| s.status()) {
+            (None, None) => match self.streamed.as_ref().and_then(|s| s.status()) {
                 Some(text) => Status::error(text),
                 None => match &self.failure {
                     Some(text) => Status::error(text.clone()),
@@ -4543,6 +5065,12 @@ impl TextWindow {
                         "indexing… {} of {} · Esc stops",
                         crate::human(self.doc.size()),
                         crate::human(self.doc.total())
+                    )),
+                    // Placeholder marks on screen (08 §7.4): why.
+                    None if marks && self.status.text.is_empty() => Status::info(format!(
+                        "{}: no character boundary known here — shown from the next space or \
+                         punctuation",
+                        self.doc.encoding().label()
                     )),
                     None => self.status.clone(),
                 },
@@ -4644,6 +5172,9 @@ impl TextWindow {
             hook();
         }
         self.poll_stream(&ctx);
+        if let Some(enc) = self.enc_wanted.take() {
+            self.choose(&ctx, enc);
+        }
         if self.input && self.stream_down() {
             // A key, a click or a scroll retries a failed stream (06 §5) — also one whose page
             // is cached, which reads without asking. At most one attempt a second is made.
@@ -4845,9 +5376,11 @@ impl TextWindow {
                         .shown
                         .iter()
                         .any(|&(c, _)| direction(c) == Some(true));
+                    // Placeholder marks and C1 controls' `·` are dim (08 §7.4, D32).
+                    let marked = row.cut.dim > 0 || !row.cut.dots.is_empty();
                     let plain = || {
-                        if rtl {
-                            let job = directed_job(row_chars(row, None, p.text), &font);
+                        if rtl || marked {
+                            let job = directed_job(row_chars(row, None, p.text, p.dim), &font);
                             ctx.fonts_mut(|f| f.layout_job(job))
                         } else {
                             measured()
@@ -4855,7 +5388,8 @@ impl TextWindow {
                     };
                     let mut galley = match colors {
                         Some(colors) => {
-                            let job = directed_job(row_chars(row, Some(colors), p.text), &font);
+                            let job =
+                                directed_job(row_chars(row, Some(colors), p.text, p.dim), &font);
                             ctx.fonts_mut(|f| f.layout_job(job))
                         }
                         None => plain(),
@@ -4865,7 +5399,7 @@ impl TextWindow {
                     if galley.size().x > page.width + 0.5 && colors.is_some() {
                         galley = plain();
                     }
-                    if galley.size().x > page.width + 0.5 && rtl {
+                    if galley.size().x > page.width + 0.5 && (rtl || marked) {
                         galley = measured();
                     }
                     overflow |= galley.size().x > page.width + 0.5;
@@ -4885,7 +5419,7 @@ impl TextWindow {
                         let line = page.colors.get(n.checked_sub(page.top_line?)? as usize)?;
                         Some((first, line.as_slice()))
                     });
-                    let mut shown = row_chars(row, colors, p.text);
+                    let mut shown = row_chars(row, colors, p.text, p.dim);
                     shown.truncate(columns);
                     let galley = ctx.fonts_mut(|f| f.layout_job(directed_job(shown, &font)));
                     text_painter.galley(
@@ -4970,17 +5504,23 @@ impl TextWindow {
 }
 
 /// A wrapped row's characters as painted (a tab as its spaces), each in its colour: by
-/// `colors`, the line's colour per character with the row's first at index `first`, else plain.
+/// `colors`, the line's colour per character with the row's first at index `first`, else plain;
+/// its placeholder marks and C1 controls' `·` `dim` (08 §7.4, D32).
 fn row_chars(
     row: &wrap::Row,
     colors: Option<(usize, &[Color32])>,
     plain: Color32,
+    dim: Color32,
 ) -> Vec<(char, Color32)> {
     let mut out = Vec::with_capacity(row.cut.shown.len());
     for (i, &(c, n)) in row.cut.shown.iter().enumerate() {
-        let color = colors
-            .and_then(|(first, colors)| colors.get(first + i).copied())
-            .unwrap_or(plain);
+        let color = if i < row.cut.dim || row.cut.dots.binary_search(&i).is_ok() {
+            dim
+        } else {
+            colors
+                .and_then(|(first, colors)| colors.get(first + i).copied())
+                .unwrap_or(plain)
+        };
         out.extend(std::iter::repeat_n((c, color), usize::from(n)));
     }
     out
@@ -5221,12 +5761,15 @@ pub fn embed(
     live: bool,
     at: Option<u64>,
 ) -> Embedded {
-    embed_scripted(doc, title, name, notices, live, at, false)
+    embed_scripted(doc, title, name, notices, live, at, false, None)
 }
 
 /// [`embed`] for the viewer a scripted run opens: `loading` is `SOPEN_STATE`'s `loading=1`
 /// (06 §11), as the window that hosts the viewer parsed it — a viewer on a stream is then
 /// ready to be shot at its first frame drawn with rows, what is still on its way shot as it is.
+/// `enc`: its `enc=NAME` (08 D34), the encoding chosen for this opening — read in from the
+/// first pass on, the file indexed again only when the LF unit changes (D22).
+#[allow(clippy::too_many_arguments)]
 pub fn embed_scripted(
     doc: TextDoc,
     title: String,
@@ -5235,10 +5778,12 @@ pub fn embed_scripted(
     live: bool,
     at: Option<u64>,
     loading: bool,
+    enc: Option<Encoding>,
 ) -> Embedded {
     let mut window = TextWindow::new(doc, title, name, notices);
     window.live = live;
     window.shoot_loading = loading;
+    window.enc_wanted = enc;
     #[cfg(test)]
     EMBEDDED_LOADING.with(|l| l.set(Some(loading)));
     if let Some(at) = at {

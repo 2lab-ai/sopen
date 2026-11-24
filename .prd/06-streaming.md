@@ -519,6 +519,9 @@ One pass indexed the whole file at open. So the work was split in two units (§1
 streamable for files of any size it already handled, and W5b removed the line-number keying for
 large files. What follows is the contract both left.
 
+Every rule here holds in every encoding of 08 §7: lines end at the LF unit at an aligned offset;
+cuts, restarts and jumps follow 08 §7.3 (08 VM-2).
+
 **W5a — reads through `Bytes`, first screen first.**
 
 - **Reads go through `Bytes`** (§5). A read that is not cached returns `Pending`, which travels up

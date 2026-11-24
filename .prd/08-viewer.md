@@ -210,12 +210,13 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
   then starts after it, so `#!/bin/sh` after a UTF-8 BOM picks the syntax (*trace* §3 T14). Under any
   other encoding its bytes are text from byte 0 (Latin-1 shows `EF BB BF` as `ï»¿`); switching back
   skips it again. Go to `0x…` counts file bytes either way. A place inside a skipped BOM is line 1's start:
-  `span_at` falls back to the last line it read (`.or(spans.last())`, `text.rs:1274-1279`), so VM-2
-  guards it.
+  `span_at` would fall back to the last line it read (`.or(spans.last())`), so since VM-2 it looks
+  for a place no earlier than line 1's start (`TextDoc::span_at`).
 - **The label**: `(BOM)` while a BOM is skipped; `(guessed)` while the encoding on screen is the one step
   2 or 3 picked, also after switching back to it; nothing otherwise.
-- **It runs inside the text document**, so preview and viewer agree (*trace* §1.2): for a stream in the
-  pass that picks the syntax (06 §7.2); for a local file before its index pass, whose marks depend on it.
+- **It runs inside the text document**, so preview and viewer agree (*trace* §1.2): in the index
+  pass, on the first bytes it is fed — a stream's first block, in the pass that picks the syntax (06
+  §7.2); a local file's first read — before any mark, since the marks depend on it (`Scan::feed`).
 - **Routing** (D18): a file whose kind the sniff decides (no known extension, `kind.rs:238-243`) is text
   when step 1 or 2 finds UTF-16 or UTF-32; `kind.rs:331`'s assertion that a UTF-16LE BOM is not text
   inverts. Step 3 does not route: an extension-less CP949 file fails the sniff's UTF-8 test, stays Other
@@ -226,27 +227,31 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
 - **Every offset the text model makes is a multiple of the unit**, counted from byte 0 (a skipped BOM's
   length is one).
 - **A line ends at the LF unit at an aligned offset** — `0a 00` (UTF-16LE), `00 0a` (UTF-16BE),
-  `0a 00 00 00` / `00 00 00 0a` (UTF-32) — **never at a 0x0A byte inside another unit**: today's byte
-  search starts UTF-16LE's next line on the `00` byte, and 44 of the 11,172 Hangul syllables carry a
-  0x0A byte in UTF-16 (U+AC0A 갊 = `0a ac` LE, `ac 0a` BE: *trace* §3 T2). **A CR is the CR unit just
-  before the LF unit** (UTF-16LE `\r\n` = `0d 00 0a 00`, T5). Only LF and CR LF end a line, as today. In
-  UTF-8, ASCII, Latin-1, CP437 and CP949, LF and CR are the bytes, as today.
+  `0a 00 00 00` / `00 00 00 0a` (UTF-32) — **never at a 0x0A byte inside another unit**: the byte
+  search before VM-2 started UTF-16LE's next line on the `00` byte, and 44 of the 11,172 Hangul
+  syllables carry a 0x0A byte in UTF-16 (U+AC0A 갊 = `0a ac` LE, `ac 0a` BE: *trace* §3 T2). **A CR
+  is the CR unit just before the LF unit** (UTF-16LE `\r\n` = `0d 00 0a 00`, T5). Only LF and CR LF
+  end a line, as today. In UTF-8, ASCII, Latin-1, CP437 and CP949, LF and CR are the bytes, as
+  today.
 - **The index pass** (local and streamed) steps by units; its marks, `SPAN`, `CHUNK`, the 16 KiB grid,
-  `LINE_MAX` and the 16 MiB cap stay byte bounds, all multiples of 4 (T16). VM-2 turns every hard-coded
-  one-byte newline into the encoding's unit: the `b'\n'` / `b'\r'` tests at `text.rs:738, 745, 1115,
-  1197-1204, 1304-1305, 1353-1359, 1613, 1757, 2010` and the one-byte newline lengths at `text.rs:1082,
-  1126, 1161, 1379, 1622`, and in `wrap.rs` the span's unread `\r` tested as the byte 0x0D and popped as
-  one byte (`wrap.rs:697-704, 866-868, 1022-1023`).
+  `LINE_MAX` and the 16 MiB cap stay byte bounds, all multiples of 4 (T16). VM-2 turned every
+  hard-coded one-byte newline into the encoding's unit — the `b'\n'` / `b'\r'` tests of the index
+  pass (`Scan::feed`, which finishes a unit a read cut in two), the line reads, the spans, the
+  look-back for a line start and a line's shown text, the one-byte newline lengths, and in `wrap.rs`
+  the span's unread CR tested and popped as a byte (`Wrapper::cut`, `ended`, `end_left`, `flat`) —
+  through `Encoding::find_lf`, `rfind_lf`, `ends_with_cr` and `unit`; a read the line searches make
+  ends on a unit boundary (`Window_::units`), so an LF unit is in it whole or not at all.
 - **Four rules place a character start**, each one function per encoding in VM-1:
   1. **A grid cut** (D36) — a piece boundary at grid point g (a block edge, a GRID point of a line whose
      start is not known, `LINE_MAX`) — is one cut, used by the piece before and the piece after, in
-     [g − 3, g]. UTF-8: `cut_char_start` over the bytes before g, as today (`grid_cut`, `text.rs:1313-1319`,
-     looks back only). UTF-16: g − 2 when the unit at g − 2 is a high surrogate, else g. UTF-32, UCS-2
-     and the one-byte encodings: g. CP949: §7.4. VM-1 says how many bytes before g each rule reads (3,
-     2, 0; CP949's W = 256), so VM-2 supplies them without knowing the encoding.
+     [g − 3, g]. UTF-8: `cut_char_start` over the bytes before g, as before VM-2 (it looks back only;
+     `TextDoc::grid_cut` hands VM-1's rule the look-back). UTF-16: g − 2 when the unit at g − 2 is a
+     high surrogate, else g. UTF-32, UCS-2 and the one-byte encodings: g. CP949: §7.4. VM-1 says how
+     many bytes before g each rule reads (3, 2, 0; CP949's W = 256), so VM-2 supplies them without
+     knowing the encoding.
   2. **A restart's start** — wrap's restart near a 16 KiB multiple only (`wrap.rs:596-656`), forward in
-     its window: UTF-8 skips up to 3 continuation bytes, as today (`wrap.rs:615-621`); UTF-16 takes the
-     window's first unit, and moves past it only when it is a low surrogate whose preceding unit is a
+     its window: UTF-8 skips up to 3 continuation bytes, as before VM-2 (`Wrapper::restart`); UTF-16
+     takes the window's first unit, and moves past it only when it is a low surrogate whose preceding unit is a
      high surrogate (D38); UTF-32, UCS-2 and the one-byte encodings take the first aligned offset; CP949
      the window's first sync byte, or the exact start a known phase gives (§7.4).
   3. **A jump's place** — End, Go to `0x…`, `at=`, the scroll bar by bytes, the hex view's place — is
@@ -258,7 +263,7 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
   4. **A place inside a line, not wrapped** — the byte `left` that every row is shown from (Right/Left
      by `SIDEWAYS`, End's `end_left`, the sideways wheel: `text.rs:4019-4024, 4277, 4723`) — is aligned
      down to the unit, then moved to the first character start at or after it: UTF-8 skips up to 3
-     continuation bytes, as today (`wrap.rs:870-878, 1025-1034`); UTF-16 moves past a low surrogate whose
+     continuation bytes, as before VM-2 (`Wrapper::start_at`); UTF-16 moves past a low surrogate whose
      preceding unit is a high surrogate; CP949 decodes forward from §7.4's proof before `left` (the line
      start within REACH, else a checkpoint, else the last sync byte within W), else shows the
      placeholders.
@@ -518,9 +523,9 @@ Model units are ready to build; screen units wait for XR-T. Files are disjoint e
 | ID | Unit | Owns | After | When |
 |---|---|---|---|---|
 | VM-1 | **Encoding core**: §7.1's list; §7.2's steps 1, 2 and 4 with step 3's slot empty, and the BOM rule; one decoder per encoding (characters and byte lengths); LF/CR unit search; §7.3's four rules, the grid cut's look-back W exposed; a phase slot (a no-op but for CP949) | `src/encoding.rs`, `src/encoding/tests.rs` (new); `src/lib.rs` (`mod` line) | — | ready |
-| VM-2 | **Text document per encoding**: index pass, line reads, spans, look-back, grid pieces, restarts and jumps through VM-1; §7.3's newline sites; the BOM skip and `span_at`'s guard; a rebuild only when the LF unit changes; lazy checkpoints through VM-1's phase slot, and the placeholder marks; the bar's encoding and `SOPEN_STATE enc=` (D34) | `src/gui/text.rs`, `src/gui/text/wrap.rs`, `src/gui/text/tests.rs`, `src/gui/text/stream_tests.rs`; `src/gui/mod.rs` (`State`'s `enc` only); `src/gui/browser.rs` (handing `enc` on, as `at`) | VM-1 | ready |
+| VM-2 | **Text document per encoding**: index pass, line reads, spans, look-back, grid pieces, restarts and jumps through VM-1; §7.3's newline sites; the BOM skip and `span_at`'s guard; a rebuild only when the LF unit changes; the placeholder marks (the lazy checkpoints moved to VM-4: `phase()` is `None` for every encoding until CP949); a C1 control as a dim `·` (D32); the bar's encoding and `SOPEN_STATE enc=` (D34) | `src/gui/text.rs`, `src/gui/text/wrap.rs`, `src/gui/text/tests.rs`, `src/gui/text/stream_tests.rs`; `src/gui/mod.rs` (`State`'s `enc` only); `src/gui/browser.rs` (handing `enc` on, as `at`) | VM-1 | ready |
 | VM-3 | **Kind sniff**: UTF-16/32 → text (D18) | `src/kind.rs` | VM-2 (before it, such a file would open misaligned) | ready |
-| VM-4 | **CP949 / EUC-KR**: its decoder, sync bytes, grid cut and phase; step 3 of the pick (D39); `encoding_rs`; the binary-size measure | `src/encoding/cp949.rs`, `src/encoding/cp949_tests.rs` (new); `src/encoding.rs` (the entry, the step-3 slot and the `mod` line only); `Cargo.toml`, `Cargo.lock` | VM-1, VM-2 | ready |
+| VM-4 | **CP949 / EUC-KR**: its decoder, sync bytes, grid cut and phase; step 3 of the pick (D39); `encoding_rs`; the binary-size measure; the lazy phase checkpoints (§7.4), the slot VM-2 left | `src/encoding/cp949.rs`, `src/encoding/cp949_tests.rs` (new); `src/encoding.rs` (the entry, the step-3 slot and the `mod` line only); `src/gui/text.rs` (the checkpoint slot only); `Cargo.toml`, `Cargo.lock` | VM-1, VM-2 | ready |
 | VM-5 | **The view set**: §3's table, §5's switch rules, §6's kept means, screen-free | `src/views.rs`, `src/views/tests.rs` (new); `src/lib.rs` (`mod` line) | — | ready |
 | VM-6 | **The view keys**: §4 as a function of (state, armed, input) → command, the hex view's viewing and editing included | `src/view_keys.rs`, `src/view_keys/tests.rs` (new); `src/lib.rs` (`mod` line) | — | ready |
 | VM-7 | **egui binding** (§8), if XR-T keeps egui windows | `src/gui/browser.rs`, `src/gui/browser/prepare.rs`, `src/gui/browser/keys.rs`, `src/gui/mod.rs` (the input hook, `view=`), `src/gui/chrome.rs`, `src/gui/testkit.rs`, a hook each in the hex (viewing and editing, D35), image, media and text windows; README, AGENTS.md | VM-2…VM-6, XR-T | after XR-T |
@@ -533,10 +538,14 @@ Model units are ready to build; screen units wait for XR-T. Files are disjoint e
 - **Why VM-2 carries a screen piece before XR-T** (D34): without the bar's label and `enc=` the model is
   reachable only by tests — the default pick cannot be seen and no receipt can be taken. Both are one
   field and one key of state, which any screen keeps; the F8 list, the strip and the keys wait.
-- VM-2's one line in each of `src/gui/mod.rs` and `src/gui/browser.rs`, and VM-7's larger share, meet
+- VM-2's few lines in `src/gui/mod.rs` (`State`'s `enc` and its parse) and `src/gui/browser.rs`
+  (`enc` handed on as `at` is, and past a preview's hand-over, as `at` is), and VM-7's larger share, meet
   the browser workstream's input-hook round, the web view and the F4 editor there: sequenced; a
   conflict goes to the dispatcher. The text document stays in `src/gui/text.rs` until XR-T moves it
   (D31 covers the new modules).
+- **CP949's proofs as VM-2 left them** (§7.4): a row start inside a line is decoded forward from
+  the line start within REACH (`Wrapper::start_at`), but a grid cut gets the W bytes before its
+  grid point only (`TextDoc::grid_cut`) — VM-4 closes that, with the checkpoints.
 
 ## 14. Text this amends
 
