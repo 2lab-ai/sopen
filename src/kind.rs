@@ -1,7 +1,7 @@
 //! Routing (spec §3): directory by stat, image/video/audio by extension, text by extension or a
-//! sniff of the first 8 KiB (no NUL, valid UTF-8), everything else "other". `.ts` is both
-//! TypeScript and MPEG-TS: text by the sniff, else video when it looks like a transport stream
-//! (ffprobe has the last word once the file is local).
+//! sniff of the first 8 KiB (UTF-8 with no NUL, or UTF-16/32 by 08 D18), else "other". `.ts` is
+//! both TypeScript and MPEG-TS: text by the sniff, else video when it looks like a transport
+//! stream (ffprobe has the last word once the file is local).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -152,16 +152,23 @@ pub fn by_extension(name: &str) -> Option<Kind> {
     }
 }
 
-/// No NUL and valid UTF-8. `truncated` = the buffer stops before the end of the file, so a
-/// multi-byte character cut at the boundary does not count against it.
+/// No NUL and valid UTF-8, or UTF-16 / UTF-32 by the text view's default (08 D18: §7.2's step 1,
+/// a BOM, or step 2, the NUL pattern) — [`crate::encoding::pick`] itself, so a file routed to
+/// text this way is decoded by the encoding that routed it (D27). Its other answers do not route:
+/// a CP949 guess (step 3) or a UTF-8 BOM before bytes that are not UTF-8 stay "other".
+/// `truncated` = the buffer stops before the end of the file, so a multi-byte character cut at
+/// the boundary does not count against it.
 pub fn looks_like_text(head: &[u8], truncated: bool) -> bool {
-    if head.contains(&0) {
-        return false;
-    }
-    match std::str::from_utf8(head) {
-        Ok(_) => true,
-        Err(e) => truncated && e.error_len().is_none(),
-    }
+    use crate::encoding::Encoding::{Utf16Be, Utf16Le, Utf32Be, Utf32Le};
+    let utf8 = !head.contains(&0)
+        && match std::str::from_utf8(head) {
+            Ok(_) => true,
+            Err(e) => truncated && e.error_len().is_none(),
+        };
+    utf8 || matches!(
+        crate::encoding::pick(head, truncated).encoding,
+        Utf16Le | Utf16Be | Utf32Le | Utf32Be
+    )
 }
 
 /// Extensions shared by text and video (`.ts`: TypeScript or MPEG-TS); the content decides.
@@ -297,6 +304,7 @@ pub(crate) fn refine_input_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{pick, Encoding};
 
     #[test]
     fn extension_table() {
@@ -328,7 +336,6 @@ mod tests {
         assert!(looks_like_text(b"", false));
         assert!(looks_like_text("한글 텍스트".as_bytes(), false));
         assert!(!looks_like_text(b"ELF\x00\x01", false));
-        assert!(!looks_like_text(b"\xff\xfe\x41", false));
         // "한" is 3 bytes; cut after 2 at the sniff boundary.
         let cut = &"a한".as_bytes()[..3];
         assert!(looks_like_text(cut, true));
@@ -379,5 +386,278 @@ mod tests {
             Kind::Audio
         );
         assert_eq!(refine_after_fetch("a.ts", Kind::Text, None), Kind::Text);
+    }
+
+    // 08 D18: UTF-16 / UTF-32 with no known extension is text, by §7.2's steps 1–2.
+
+    /// `text` in a UTF-16 or UTF-32 encoding, no BOM.
+    fn wide(e: Encoding, text: &str) -> Vec<u8> {
+        let units: Vec<u32> = match e {
+            Encoding::Utf16Le | Encoding::Utf16Be => text.encode_utf16().map(u32::from).collect(),
+            _ => text.chars().map(u32::from).collect(),
+        };
+        units
+            .iter()
+            .flat_map(|&u| match e {
+                Encoding::Utf16Le => (u as u16).to_le_bytes().to_vec(),
+                Encoding::Utf16Be => (u as u16).to_be_bytes().to_vec(),
+                Encoding::Utf32Le => u.to_le_bytes().to_vec(),
+                _ => u.to_be_bytes().to_vec(),
+            })
+            .collect()
+    }
+
+    /// `text` in `e` after its BOM.
+    fn with_bom(e: Encoding, text: &str) -> Vec<u8> {
+        let mut out = e.bom().to_vec();
+        out.extend(wide(e, text));
+        out
+    }
+
+    const WIDE: [Encoding; 4] = [
+        Encoding::Utf16Le,
+        Encoding::Utf16Be,
+        Encoding::Utf32Le,
+        Encoding::Utf32Be,
+    ];
+
+    /// §7.2's Korean-and-ASCII log: 79 % ASCII units in UTF-16LE.
+    fn korean_log() -> String {
+        (0..400)
+            .map(|i| {
+                format!(
+                    "2026-11-24 10:{:02}:{:02} INFO user={i:04} 사용자가 로그인 성공함\r\n",
+                    i / 60 % 60,
+                    i % 60
+                )
+            })
+            .collect()
+    }
+
+    /// The kind as the sniff reads it: the first [`SNIFF_BYTES`] of a file of `bytes`.
+    fn sniffed(name: &str, bytes: &[u8]) -> Kind {
+        let head = bytes[..bytes.len().min(SNIFF_BYTES)].to_vec();
+        classify(name, || head, bytes.len() as u64)
+    }
+
+    #[test]
+    fn d18_utf16_and_utf32_with_no_known_extension_are_text() {
+        let english = "The quick brown fox jumps over the lazy dog, again and again.\n".repeat(200);
+        let korean = "안녕하세요 오늘은 날씨가 좋습니다. 내일 다시 만나요.\n".repeat(200);
+        for e in WIDE {
+            for name in ["notes.dat", "NOTES", "x.bin"] {
+                // Step 1: a BOM, whatever follows.
+                let bytes = with_bom(e, &korean);
+                assert_eq!(sniffed(name, &bytes), Kind::Text, "{name} {e:?} with a BOM");
+                assert_eq!(pick(&bytes, true).encoding, e, "{e:?}: the viewer agrees");
+                // Step 2: no BOM, ASCII-heavy.
+                let bytes = wide(e, &english);
+                assert_eq!(sniffed(name, &bytes), Kind::Text, "{name} {e:?}, no BOM");
+                assert_eq!(pick(&bytes, true).encoding, e, "{e:?}: the viewer agrees");
+            }
+        }
+        let log = wide(Encoding::Utf16Le, &korean_log());
+        assert_eq!(sniffed("notes.dat", &log), Kind::Text);
+        // `kind.rs:331`'s old assertion inverts: a UTF-16LE BOM is text, whatever the size (D37).
+        assert!(looks_like_text(b"\xff\xfe\x41", false));
+        assert_eq!(classify("x.dat", || vec![0xFF, 0xFE], 2), Kind::Text);
+        assert_eq!(classify("x.dat", || vec![0xFE, 0xFF], 2), Kind::Text);
+        assert_eq!(
+            classify("x.dat", || vec![0x00, 0x00, 0xFE, 0xFF], 4),
+            Kind::Text
+        );
+        // At least 4 whole units: three ASCII units are not enough, four are.
+        let three = wide(Encoding::Utf16Le, "abc");
+        assert_eq!(classify("x.dat", || three, 6), Kind::Other);
+        let four = wide(Encoding::Utf16Le, "abcd");
+        assert_eq!(classify("x.dat", || four, 8), Kind::Text);
+        let four = wide(Encoding::Utf32Be, "abcd");
+        assert_eq!(classify("x.dat", || four, 16), Kind::Text);
+        // The default's other answers do not route: a UTF-8 BOM before bytes that are not UTF-8.
+        let bad = vec![0xEF, 0xBB, 0xBF, b'a', 0xFF, 0x00];
+        assert_eq!(pick(&bad, false).encoding, Encoding::Utf8);
+        assert_eq!(classify("x.dat", || bad, 6), Kind::Other);
+    }
+
+    #[test]
+    fn d18_a_truncated_sniff_is_still_text() {
+        let log = wide(Encoding::Utf16Le, &korean_log());
+        assert!(log.len() > 2 * SNIFF_BYTES);
+        let size = log.len() as u64;
+        // The first 8 KiB of a longer file; an odd head ends in half a unit.
+        for cut in [SNIFF_BYTES, SNIFF_BYTES - 1, 4096 + 1] {
+            let head = log[..cut].to_vec();
+            assert_eq!(classify("notes.dat", || head, size), Kind::Text, "{cut}");
+        }
+        // A pair cut in two by the head's end: 40 times 20 bytes, then 8 ASCII units and the
+        // high half.
+        let emoji = wide(Encoding::Utf16Le, &"abcdefgh😀".repeat(1000));
+        let head = emoji[..40 * 20 + 16 + 2].to_vec();
+        assert_eq!(
+            head[head.len() - 2..],
+            [0x3D, 0xD8],
+            "a high surrogate last"
+        );
+        assert_eq!(
+            classify("notes.dat", || head, emoji.len() as u64),
+            Kind::Text
+        );
+        // UTF-32 cut inside a unit.
+        let utf32 = wide(Encoding::Utf32Le, &"wide text\n".repeat(1000));
+        let head = utf32[..SNIFF_BYTES - 2].to_vec();
+        assert_eq!(
+            classify("notes.dat", || head, utf32.len() as u64),
+            Kind::Text
+        );
+        // The pattern's sample is the 8 KiB (D27): binary after it does not count.
+        let mut file = wide(Encoding::Utf16Le, &"wide text\n".repeat(1000));
+        file.extend(std::iter::repeat_n(0xFF, 64 * 1024));
+        assert_eq!(sniffed("notes.dat", &file), Kind::Text);
+    }
+
+    /// The sniff before D18 (`looks_like_text` at 1c6fa00), the oracle of its UTF-8 half: no NUL
+    /// and valid UTF-8, a character cut by the end of a truncated head allowed.
+    fn utf8_before_d18(head: &[u8], truncated: bool) -> bool {
+        !head.contains(&0)
+            && match std::str::from_utf8(head) {
+                Ok(_) => true,
+                Err(e) => truncated && e.error_len().is_none(),
+            }
+    }
+
+    /// A small deterministic generator (splitmix64), as `encoding/tests.rs` has.
+    fn noise(seed: u64, n: usize) -> Vec<u8> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                (z ^ (z >> 31)) as u8
+            })
+            .collect()
+    }
+
+    /// §7.2's corpus for steps 1–2, routed (EA-5): text where the text view's default finds
+    /// UTF-16 or UTF-32 or the file is UTF-8, else other — CP949 and Latin-1 included (step 3 does
+    /// not route) and every binary but the two the pattern takes for text.
+    #[test]
+    fn d18_the_corpus_routes_as_section_7_2_says() {
+        use Encoding::*;
+        let english = "The quick brown fox jumps over the lazy dog, again and again.\n".repeat(200);
+        let korean = "안녕하세요 오늘은 날씨가 좋습니다. 내일 다시 만나요.\n".repeat(200);
+        let rnd = noise(0x0857_0003, 8192);
+        let cp949: Vec<u8> = (0..4096)
+            .flat_map(|i| match i % 5 {
+                0 => vec![b' '],
+                _ => vec![0xB0 + rnd[2 * i] % 0x19, 0xA1 + rnd[2 * i + 1] % 0x5E],
+            })
+            .collect();
+        let latin1: Vec<u8> = "Café crème, déjà vu: naïve façade à la française. "
+            .repeat(200)
+            .chars()
+            .map(|c| c as u8)
+            .collect();
+        let float32: Vec<u8> = (0..2048)
+            .flat_map(|i| (i as f32 * 0.01).sin().to_le_bytes())
+            .collect();
+        let int16 =
+            |top: u16| -> Vec<u8> { (0..4096u16).flat_map(|i| (i % top).to_le_bytes()).collect() };
+        let int32 = |lo: u32, top: u32| -> Vec<u8> {
+            (0..2048u32)
+                .flat_map(|i| (lo + i % (top - lo)).to_le_bytes())
+                .collect()
+        };
+        let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let font: &[u8] = include_bytes!("../assets/fonts/PxPlus_IBM_VGA_8x16.ttf");
+
+        let (text, other) = (Kind::Text, Kind::Other);
+        let corpus: Vec<(&str, Vec<u8>, Kind)> = vec![
+            ("English UTF-16LE", wide(Utf16Le, &english), text),
+            ("English UTF-16BE", wide(Utf16Be, &english), text),
+            ("English UTF-32LE", wide(Utf32Le, &english), text),
+            ("English UTF-32BE", wide(Utf32Be, &english), text),
+            ("a Korean-and-ASCII log", wide(Utf16Le, &korean_log()), text),
+            ("Korean UTF-16LE", wide(Utf16Le, &korean), other),
+            ("Korean UTF-32LE", wide(Utf32Le, &korean), other),
+            ("English UTF-8", english.clone().into_bytes(), text),
+            ("Korean UTF-8", korean.clone().into_bytes(), text),
+            ("CP949", cp949, other),
+            ("Latin-1", latin1, other),
+            ("random bytes", rnd, other),
+            ("zeros", vec![0; 8192], other),
+            ("float32", float32, other),
+            ("this test's executable", exe, other),
+            ("a TrueType font", font.to_vec(), other),
+            ("int16 0–1023", int16(1024), other),
+            ("int32 0–4095", int32(0, 4096), other),
+            // Taken for text: such an extension-less binary opens as text; 2 shows it.
+            ("int16 0–127", int16(128), text),
+            ("int32 0x20–0x7E", int32(0x20, 0x7F), text),
+        ];
+        for (name, bytes, want) in corpus {
+            let got = sniffed("blob.dat", &bytes);
+            assert_eq!(got, want, "{name}");
+            // The sniff and the text view's default agree: what the UTF-8 test does not take is
+            // text exactly when the default is UTF-16 or UTF-32.
+            let head = &bytes[..bytes.len().min(SNIFF_BYTES)];
+            let truncated = bytes.len() > SNIFF_BYTES;
+            if !utf8_before_d18(head, truncated) {
+                let wide = WIDE.contains(&pick(head, truncated).encoding);
+                assert_eq!(got == Kind::Text, wide, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn d18_known_extensions_are_unchanged() {
+        let never = || -> Vec<u8> { panic!("extension decides, no sniff") };
+        for name in ["a.png", "a.mp4", "a.mp3", "a.txt", "a.rs"] {
+            assert_eq!(classify(name, never, 1 << 20), by_extension(name).unwrap());
+        }
+        // `.ts` is sniffed: UTF-16 TypeScript is text, a transport stream still video.
+        let typescript = with_bom(Encoding::Utf16Le, "export const x: number = 1;\n");
+        assert_eq!(classify("a.ts", || typescript, 58), Kind::Text);
+        let mut mpegts = vec![0u8; 188 * 4];
+        for packet in mpegts.chunks_mut(188) {
+            packet[0] = 0x47;
+            packet[1] = 0x40;
+        }
+        assert_eq!(classify("clip.ts", || mpegts.clone(), 1 << 20), Kind::Video);
+        assert_eq!(classify("clip.dat", || mpegts, 1 << 20), Kind::Other);
+    }
+
+    /// The route `main.rs` and the browser take (`detect_sniffed`), on a file on disk.
+    #[test]
+    fn d18_detect_reads_8_kib_and_routes_utf16_to_text() {
+        use crate::remote::RemoteFs as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fs = crate::remote::LocalFs::new();
+        let files = [
+            (
+                "notes.dat",
+                wide(Encoding::Utf16Le, &korean_log()),
+                Kind::Text,
+            ),
+            (
+                "bom.dat",
+                with_bom(Encoding::Utf16Be, "안녕하세요\n"),
+                Kind::Text,
+            ),
+            (
+                "korean.dat",
+                wide(Encoding::Utf16Le, &"안녕하세요 오늘은\n".repeat(600)),
+                Kind::Other,
+            ),
+        ];
+        for (name, bytes, want) in files {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            let abs = path.to_str().unwrap();
+            let stat = fs.stat(abs).unwrap();
+            let read = bytes.len().min(SNIFF_BYTES) as u64;
+            assert_eq!(detect_sniffed(&mut fs, abs, &stat).unwrap(), (want, read));
+        }
     }
 }

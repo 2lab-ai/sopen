@@ -72,7 +72,7 @@ inferred, not read in code or measured. What it amends in 01, 04, 06, 07, the RE
 | any other file (binary) | Hex (the same view as 2) | Hex | Text, decoded by §7.2's default |
 | an empty file that is not media | as its kind | Hex | as its kind |
 | a file at a revision, a diff (03 §6.2) | as its kind, read-only | Hex, read-only | as its kind, read-only |
-| a `.ts` | as its refined kind (`kind.rs:167-194`) | Hex | as that kind |
+| a `.ts` | as its refined kind (`kind::classify`, `kind::refine_after_fetch`) | Hex | as that kind |
 | a folder, fifo, socket, device, dangling link, a name that is not UTF-8 | not opened, as today (`browser.rs:1780-1783, 1824-1831`) | — | — |
 
 - **none**: the key does nothing and the strip shows no 3 (D7).
@@ -184,7 +184,7 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
    — in UTF-16 a printable byte beside one 0x00, in UTF-32 beside three. In the order UTF-32LE,
    UTF-32BE, UTF-16LE, UTF-16BE, the first whose sample holds at least 4 whole units, at least **3/4**
    of them ASCII units, is the default.
-3. **Else CP949**, when all of these hold (D39): (a) the sample is not valid UTF-8, with `kind.rs:163`'s
+3. **Else CP949**, when all of these hold (D39): (a) the sample is not valid UTF-8, with `kind::looks_like_text`'s
    allowance (a character cut by the sample's end is no error when the file goes on); (b) it decodes as
    CP949 with no error (a lead as its last byte is none either when the file goes on); (c) it holds at
    least 4 Hangul syllables (U+AC00–U+D7A3); (d) they are at least **3/4** of its decoded non-ASCII
@@ -217,9 +217,9 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
 - **It runs inside the text document**, so preview and viewer agree (*trace* §1.2): in the index
   pass, on the first bytes it is fed — a stream's first block, in the pass that picks the syntax (06
   §7.2); a local file's first read — before any mark, since the marks depend on it (`Scan::feed`).
-- **Routing** (D18): a file whose kind the sniff decides (no known extension, `kind.rs:238-243`) is text
-  when step 1 or 2 finds UTF-16 or UTF-32; `kind.rs:331`'s assertion that a UTF-16LE BOM is not text
-  inverts. Step 3 does not route: an extension-less CP949 file fails the sniff's UTF-8 test, stays Other
+- **Routing** (D18): a file whose kind the sniff decides (no known extension, `kind::detect_sniffed`) is
+  text when step 1 or 2 finds UTF-16 or UTF-32 — `kind::looks_like_text` asks `encoding::pick` itself
+  (VM-3), so a UTF-16LE BOM is text where it was not. Step 3 does not route: an extension-less CP949 file fails the sniff's UTF-8 test, stays Other
   and opens in Hex; its view 3 decodes it as CP949 by step 3.
 
 ### 7.3 Lines and characters over byte ranges
@@ -397,7 +397,7 @@ Every decision is reversible; the owner may change any of them.
 | D15 | ASCII, UTF-8, UTF-16LE/BE, UCS-2LE/BE, UTF-32LE/BE (= UCS-4), Latin-1, CP437, CP949 / EUC-KR | message 20's list and its "등"; the owner is Korean; CP949 resynchronises (§7.4); Latin-1 and CP437 cost a table each | leave CP949 out |
 | D16 | UCS-4 is one entry with UTF-32 | they decode alike for every value that is a character | — |
 | D17 | Default: BOM (D37), then the NUL pattern (8 KiB, ≥ 4 units, ≥ 3/4 ASCII units), then CP949 (D39), then UTF-8 | a BOM is certain; the pattern finds ASCII-heavy UTF-16/32 and rejects all but two of §7.2's binaries | other thresholds |
-| D18 | UTF-16/32 files with no known extension route to text — the CLI route too (`main.rs:681`) | today they open in hex (`kind.rs:157-165, 331`) | keep hex; 3 shows them |
+| D18 | UTF-16/32 files with no known extension route to text — the CLI route too (`main.rs:681`) | before VM-3 they opened in hex (`kind::looks_like_text` was UTF-8 only) | keep hex; 3 shows them |
 | D19 | F8 `Encode` (and `E`) opens the list | F8 is free in the text view; `E` mirrors `W`/F2 | another key |
 | D20 | One U+FFFD per invalid unit or sequence, never counted | no extra pass | count them on the bar |
 | D21 | The chosen encoding lasts for this opening only | nothing is stored about files today | remember per path in the state folder |

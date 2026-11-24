@@ -5038,10 +5038,20 @@ impl TextWindow {
         // Its encoding beside its syntax (08 §7.5, D34): `UTF-16LE (BOM)`, `UTF-8 (guessed)`.
         let mut parts = parts;
         parts.extend(self.doc.encoding_label());
-        ui.horizontal(|ui| {
-            super::one_line(ui, &self.title, p.text);
-            ui.separator();
+        // The stats whole at the right first, then the title in the room left, cut from the left
+        // as a path is: a long path never hides the size, the syntax or the encoding.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             super::one_line(ui, &parts.join(" · "), p.dim);
+            ui.separator();
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let room = ui.available_width();
+            let title = chrome::fit_left(ui.ctx(), &self.title, &font, room);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let label = ui.add(egui::Label::new(egui::RichText::new(&title).color(p.text)));
+                if title != self.title {
+                    label.on_hover_text(&self.title);
+                }
+            });
         });
     }
 

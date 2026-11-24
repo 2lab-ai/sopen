@@ -131,7 +131,7 @@ each window (§3a, §5–§8):
 | Kind | Detected by | Opens in |
 |---|---|---|
 | directory | remote `stat` | sopen's file browser (§3a, msg 12); F4 there opens VS Code remote (`code --folder-uri vscode-remote://ssh-remote+[user@]host/abs`), else Zed remote (`ssh://[user@]host[:port]/abs`) |
-| text | extension list, else first 8 KiB has no NUL and is valid UTF-8 | VS Code remote (`code --file-uri vscode-remote://…`), else Zed remote |
+| text | extension list, else first 8 KiB has no NUL and is valid UTF-8, or is UTF-16/32 by a BOM or the NUL pattern ([08](08-viewer.md) §7.2 steps 1–2, D18) | VS Code remote (`code --file-uri vscode-remote://…`), else Zed remote |
 | image | `png jpg jpeg webp bmp gif tif tiff` | image window |
 | video | `mp4 mov m4v mkv webm avi` (and ffprobe says it has a video stream); `ts` only when it is not text and ffprobe sees a video stream (`.ts` is also TypeScript) | media window |
 | audio | `mp3 wav flac m4a aac ogg opus` | media window |

@@ -4592,6 +4592,55 @@ fn the_bar_says_the_encoding_and_the_rows_are_whole() {
     assert!(drv.find_text("fn main() {").is_some());
 }
 
+/// A long path never hides the bar's stats: they are laid out whole at the right first, and the
+/// title gets the rest, cut from the left as a path is (`chrome::fit_left`).
+#[test]
+fn a_long_title_is_cut_before_the_bar_s_stats() {
+    let tmp = tempfile::tempdir().unwrap();
+    // 84 % ASCII units: the NUL pattern's UTF-16LE.
+    let text = "2026-11-25 10:00:00 INFO user=0001 사용자가 로그인\r\n".repeat(30);
+    let path = write(tmp.path(), "notes.dat", &encoded(&text, Utf16Le, false));
+    let title = format!("box:/{}/notes.dat", "a-long-folder-name".repeat(8));
+    let mut win = TextWindow::new(
+        TextDoc::open(&path).unwrap(),
+        title.clone(),
+        "notes.dat",
+        vec![],
+    );
+    let stats = |win: &TextWindow| {
+        format!(
+            "{} lines · {} · plain text · UTF-16LE (guessed)",
+            win.doc.line_count(),
+            crate::human(win.doc.size())
+        )
+    };
+    let mut drv = Driver::new(700.0, 400.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    let whole = stats(&win);
+    let shown = drv.find_text(&whole);
+    assert!(shown.is_some(), "{whole} whole: {:?}", drv.texts());
+    assert!(drv.find_text(&title).is_none(), "the title is cut");
+    let cut: Vec<String> = drv
+        .texts()
+        .into_iter()
+        .map(|(_, _, t)| t)
+        .filter(|t| t.starts_with('…') && t.ends_with("/notes.dat"))
+        .collect();
+    assert_eq!(cut.len(), 1, "{:?}", drv.texts());
+    let at = drv
+        .find_text(&cut[0])
+        .expect("the cut title whole on screen");
+    assert!(
+        at.right() <= shown.unwrap().left(),
+        "the title before the stats"
+    );
+    // Wide enough, the title is whole and the stats still are.
+    let mut drv = Driver::new(2400.0, 400.0);
+    drv.idle(&mut win, 2);
+    assert!(drv.find_text(&title).is_some(), "{:?}", drv.texts());
+    assert!(drv.find_text(&whole).is_some());
+}
+
 /// `SOPEN_STATE` `enc=NAME` (08 D34) names an encoding the text views decode, in any case;
 /// anything else — CP949 too, until VM-4 decodes it — is refused before a window opens.
 #[test]
