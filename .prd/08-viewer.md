@@ -175,7 +175,7 @@ inferred, not read in code or measured. What it amends in 01, 04, 06, 07, the RE
 
 One function picks it from the file's first **8 KiB**, the kind sniff's own sample (`SNIFF_BYTES`,
 `kind.rs:30`), so a file routed to text by its pattern is decoded by it (D27). VM-1 builds steps 1, 2
-and 4 with step 3's slot empty; VM-4 fills step 3.
+and 4 with step 3's slot empty; VM-4 filled step 3 (`src/encoding/cp949.rs`).
 
 1. **A BOM, the longest first** (D37): `FF FE 00 00` UTF-32LE, `00 00 FE FF` UTF-32BE, `EF BB BF`
    UTF-8, `FF FE` UTF-16LE, `FE FF` UTF-16BE — whatever the file's size. A partial last unit is one
@@ -295,9 +295,14 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
   2. a **phase checkpoint** of a line longer than REACH: one bit per GRID point, whether a lead is
      pending there;
   3. the last sync byte within W = 256 bytes before the place;
-  and decoding runs forward from it. With none of these — past 16 MiB with no sync byte inside W, or a
-  checkpoint not made yet — the bytes up to the first sync byte show as dim `░` placeholder marks, one
-  per byte, never as characters. The status row says `CP949: no character boundary known here — shown
+  and decoding runs forward from it. Each gives the same characters from a sync byte on, so VM-4
+  decodes from the nearest: the sync byte within W when there is one, else the line start, else the
+  checkpoint. (The phase is a parity: a lead is pending exactly after an odd run of 0x81–0xFE,
+  `cp949_tests.rs` holding it to encoding_rs's own state. So after any byte outside 0x81–0xFE a
+  character starts, whatever came before; the rules do not take such a byte as a proof — only the
+  sync bytes, at which a character also starts.) With none of
+  these — past 16 MiB with no sync byte inside W, or a checkpoint not made yet — the bytes up to the
+  first sync byte show as dim `░` placeholder marks, one per byte, never as characters. The status row says `CP949: no character boundary known here — shown
   from the next space or punctuation`.
 - **Checkpoints are made lazily** (D22, D28). Switching into CP949 from UTF-8, ASCII, Latin-1 or CP437,
   by F8 or by step 3, rebuilds no index: CP949's LF byte is theirs (from UTF-16 or UTF-32 the LF unit
@@ -307,15 +312,30 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
   the line's bytes before the place, inside the indexed prefix: ≤ 16 MiB through a stream (all 16 MiB
   take 2–8 s on 06's rig), fewer when the block cache still holds them `[추정]`; a local file is read in
   place. A line shorter than REACH needs none, since its start is within REACH. Until the read ends,
-  rule 3 or the placeholders apply.
+  rule 3 or the placeholders apply. VM-4 keeps the bits per line start (`text.rs`'s `Phases`, at
+  most 64 lines), reads them on a worker through a handle of the document's own (`PhaseRead`; a
+  stream's waits for its bytes), never from a preview, and drops them with the document (a re-read, a
+  reload, another index); `ready` waits for a read the page asked for, so a screenshot shows its rows,
+  and the page is read again from the same place once the bits are in.
 - **The grid cut** (§7.3 rule 1): decode forward from the line start within REACH, else the checkpoint
   at g, else the last sync byte in [g − W, g); the cut is g − 1 when a lead is pending there, else g. With neither, the placeholders
-  above. **A restart's start** (rule 2) is the window's first sync byte, or the exact start a line start
+  above. "Within REACH" is a line start less than REACH before g — the bound a jump's look-back
+  (`piece_holding`) has, so the cut at g is the same whichever way g is reached (D36); only a line's
+  own first piece is anchored at its start, never a piece from the grid. Grid cuts are of pieces past
+  the lines known, so the checkpoint there is the index's open line's (its start is the index's),
+  inside the indexed prefix, read to the grid point that ends the piece holding the place (at most
+  GRID past it); past the prefix no line start is known. A piece that ends at a grid point
+  nothing proves stops before a lead pending there (decoded from the piece's own proof): the piece
+  after begins blind, so neither shows that character, never as a U+FFFD the whole decode lacks. **A restart's start** (rule 2) is the window's first sync byte, or the exact start a line start
   or checkpoint gives; "first sync byte in the window" is for restarts only.
 - **The new dependency**: `encoding_rs = "0.8.35"`, for CP949 only (VM-4): its 17,048-pair table is data
   sopen should not write by hand, and encoding_rs is the WHATWG decoder Gecko uses (since Firefox 56, its
   README). Its one required dependency, `cfg-if`, is in `Cargo.lock` already; licence `(Apache-2.0 OR
-  MIT) AND BSD-3-Clause`; a stripped release toy calling it grew by 183,104 bytes (macOS arm64). Not for
+  MIT) AND BSD-3-Clause` (its notices, the WHATWG data's among them, are THIRD-PARTY-NOTICES's
+  section 6a); a stripped release toy calling it grew by 183,104 bytes (macOS arm64), and
+  sopen's own stripped release binary grew by 166,136 bytes with VM-4 (42,251,648 → 42,417,784; macOS
+  arm64, `cargo build --release --locked` at 1c6fa00 and with VM-4, encoding_rs and VM-4's code
+  together; 2026-11-25). Not for
   the rest: std decodes UTF-8 and UTF-16, encoding_rs has no UTF-32 (its `lib.rs` docs), and its
   `iso-8859-1` label is windows-1252, not Latin-1 (measured with `Encoding::for_label`).
 
@@ -544,9 +564,13 @@ Model units are ready to build; screen units wait for XR-T. Files are disjoint e
   the browser workstream's input-hook round, the web view and the F4 editor there: sequenced; a
   conflict goes to the dispatcher. The text document stays in `src/gui/text.rs` until XR-T moves it
   (D31 covers the new modules).
-- **CP949's proofs as VM-2 left them** (§7.4): a row start inside a line is decoded forward from
-  the line start within REACH (`Wrapper::start_at`), but a grid cut gets the W bytes before its
-  grid point only (`TextDoc::grid_cut`) — VM-4 closes that, with the checkpoints.
+- **CP949's proofs, closed by VM-4** (§7.4): VM-2 decoded a row start forward from the line start
+  within REACH (`Wrapper::start_at`) but gave a grid cut only the W bytes before its grid point
+  (`TextDoc::grid_cut`), and a restart only its window (`Wrapper::restart`). Now all three take the
+  same proofs — a sync byte within W, the line's (or a proven piece's) start less than REACH back, a
+  phase checkpoint — through `TextDoc::proof_in` and `TextDoc::grid_cut`; VM-4's few lines in
+  `src/gui/text/wrap.rs` (those two calls) and its new test files under `src/gui/text/tests/` and
+  `src/gui/text/stream_tests/` (each one `mod` line) are outside its row above.
 
 ## 14. Text this amends
 
@@ -572,7 +596,9 @@ Model units are ready to build; screen units wait for XR-T. Files are disjoint e
   pretty-printed or tree view as JSON's 1 would make "raw" mean "as stored". The owner's call.
 - **CP949's guess has narrow margins** (D39). A GB2312 text whose characters all decode in CP949 is
   66–68 % Hangul against the 3/4 bar, and hiragana-only Shift-JIS is stopped only by (e). Korean thick
-  with hanja (47 % Hangul) is not picked: F8 picks it.
+  with hanja (47 % Hangul) is not picked: F8 picks it. VM-4's generated corpus agrees, but for one
+  sample: a kana-and-kanji EUC-JP text decodes in CP949 with no error (its kanji as Hangul and hanja)
+  and is stopped by (d) alone, at 36 % Hangul — not the CP949 error §7.2's corpus found.
 - **SVG is text** (`kind.rs:62`) though it is a picture: its 1 is the highlighted source. 09 leaves
   `.svg` as 01 §3 makes it (09's scope), and the `image` crate's features in `Cargo.toml` decode no SVG.
 - **F9 and message 19.** A Mac's top row sends media keys unless fn is held; message 19's outcome decides

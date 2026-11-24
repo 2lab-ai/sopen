@@ -25,8 +25,8 @@
 //! unit. Where no rule proves a character start (CP949, D28) the bytes show as placeholder
 //! marks ([`MARK`], dim) up to the first start one proves, never as characters.
 
-use super::{chrome, Span, Stale, TextDoc, Window_, LINE_MAX, REACH, TAB};
-use crate::encoding::{Around, Encoding, AHEAD, W};
+use super::{chrome, Span, Stale, TextDoc, Window_, LINE_MAX, TAB};
+use crate::encoding::{Around, Encoding, AHEAD};
 use anyhow::Result;
 use eframe::egui::{self, Color32, FontId};
 use std::collections::HashMap;
@@ -630,11 +630,16 @@ impl Wrapper<'_> {
         let bytes = self
             .doc
             .span_bytes(span, from, n, &mut Window_::default(), false)?;
-        // From the first character start in what was read (08 §7.3 rule 2). None proven there
-        // (CP949, D28): the restart is at the point itself, its row shown from the first start
+        // From the first character start in what was read (08 §7.3 rule 2) — in CP949 with no
+        // sync byte there, the exact one its line start or a checkpoint gives (§7.4). None
+        // proven (D28): the restart is at the point itself, its row shown from the first start
         // a rule proves ([`Wrapper::cells`]).
         let near = Around::new(from, &bytes);
-        let Some(lead) = enc.restart_start(near, from) else {
+        let lead = match enc.restart_start(near, from) {
+            None if enc.needs_phase() => self.proven(span, from, Encoding::restart_start)?,
+            lead => lead,
+        };
+        let Some(lead) = lead else {
             let r = at.min(span.len);
             remember(&mut self.memo.restarts, (span.start, k), r);
             return Ok(r);
@@ -736,22 +741,15 @@ impl Wrapper<'_> {
     }
 
     /// 08 §7.3 rule 4: the first character start of `span` at or after its byte `x` (a place
-    /// inside the line, a row start), from [`Encoding::look_back`] bytes before it — or, in an
-    /// encoding that needs a proof (CP949, §7.4), from its line start within [`REACH`], else
-    /// [`W`] bytes before it. `None`: nothing proves one.
+    /// inside the line, a row start), from [`Encoding::look_back`] bytes before it — in CP949
+    /// ([`W`](crate::encoding::W): its last sync byte there, §7.4), else from the proof further
+    /// back the document has ([`Wrapper::proven`]). `None`: nothing proves one.
     fn start_at(&mut self, span: Span, x: u64) -> Result<Option<u64>> {
         let enc = self.doc.enc;
         if x == 0 && !span.blind {
             return Ok(Some(0));
         }
-        let back = if !enc.needs_phase() {
-            enc.look_back() as u64
-        } else if !span.blind && x <= REACH {
-            x
-        } else {
-            W as u64
-        };
-        let from = enc.align_down(x).saturating_sub(back);
+        let from = enc.align_down(x).saturating_sub(enc.look_back() as u64);
         let n = (x - from) as usize + AHEAD;
         let window = &mut self.memo.window;
         let bytes = self.doc.span_bytes(span, from, n, window, false)?;
@@ -760,7 +758,29 @@ impl Wrapper<'_> {
             bytes: &bytes,
             anchored: from == 0 && !span.blind,
         };
-        Ok(enc.left_start(near, x))
+        match enc.left_start(near, x) {
+            None if enc.needs_phase() => self.proven(span, x, Encoding::left_start),
+            found => Ok(found),
+        }
+    }
+
+    /// CP949 (§7.4): `rule` at byte `x` of `span`, decoded from the proof the document has before
+    /// it further back than W — the line's or the piece's start within [`REACH`](super::REACH),
+    /// else a phase checkpoint, asked for when it is not made ([`TextDoc::proof_in`]). `None`
+    /// without one.
+    fn proven(
+        &mut self,
+        span: Span,
+        x: u64,
+        rule: fn(Encoding, Around, u64) -> Option<u64>,
+    ) -> Result<Option<u64>> {
+        let Some(p) = self.doc.proof_in(&span, x) else {
+            return Ok(None);
+        };
+        let n = (x - p) as usize + AHEAD;
+        let window = &mut self.memo.window;
+        let bytes = self.doc.span_bytes(span, p, n, window, false)?;
+        Ok(rule(self.doc.enc, Around::anchored(p, &bytes), x))
     }
 
     /// `bytes` of `span` from its byte `s` as characters, decoded from the first character
@@ -1190,7 +1210,7 @@ mod tests {
         assert_eq!((used, marks), (6, 3));
         let text: String = cells.iter().map(|c| c.ch).collect();
         assert_eq!(text, "░░░def");
-        // CP949's slot proves nothing (VM-4 fills it): every byte a mark.
+        // In CP949 a letter proves nothing (it may be a lead's trail): every byte a mark.
         let (cells, used, marks) = marked(Encoding::Cp949, 10, bytes, true, None);
         assert_eq!((used, marks), (6, 6));
         assert!(cells.iter().all(|c| c.ch == MARK && c.len == 1));

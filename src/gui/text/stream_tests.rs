@@ -2557,6 +2557,7 @@ fn a_reload_that_fails_within_its_own_pass_is_not_followed_by_a_retry() {
     );
 }
 
+mod cp949;
 mod large;
 
 // 08 §7 (VM-2) through the stream: the document reads its lines in an encoding, from the first
