@@ -19,7 +19,7 @@ use crate::kind::SNIFF_BYTES;
 pub enum Encoding {
     /// One byte, 0x00–0x7F; every byte from 0x80 up is one U+FFFD.
     Ascii,
-    /// 1–4 bytes; each maximal bad sequence is one U+FFFD, as today (`wrap.rs:47-80`).
+    /// 1–4 bytes; each maximal bad sequence is one U+FFFD, as before VM-2.
     Utf8,
     /// 2-byte units, low byte first, and surrogate pairs; an unpaired surrogate is one U+FFFD.
     Utf16Le,
@@ -43,7 +43,7 @@ pub enum Encoding {
 }
 
 /// A character as decoded: what it is (U+FFFD for bytes that are not one) and the bytes it takes
-/// in the file — the shape of the text view's `wrap::Cell` (`wrap.rs:40-45`).
+/// in the file — the text view's `wrap::Cell` (it is this one since VM-2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     pub ch: char,
@@ -56,7 +56,7 @@ pub struct Cell {
 /// knows — a line's or a piece's start (a grid cut), or a CP949 checkpoint's
 /// ([`Encoding::phase`]) — so nothing before it is looked for, and a rule asked about `at` itself
 /// answers `at` (a stray UTF-8 continuation byte that starts a line or a piece is its own U+FFFD,
-/// not skipped: `left` 0 of a span, `wrap.rs:871-878, 1026-1033`).
+/// not skipped: `left` 0 of a span, `Wrapper::start_at`).
 #[derive(Debug, Clone, Copy)]
 pub struct Around<'a> {
     pub at: u64,
@@ -377,7 +377,7 @@ impl Encoding {
     /// piece runs to the end of what it is cut from (the line, or a restart point), so a
     /// character cut in two at its end is bad bytes and a partial last unit one U+FFFD; otherwise
     /// they are left for the next piece. Returns the characters and the bytes they cover. UTF-8
-    /// is today's `wrap::decode` (`wrap.rs:52-84`).
+    /// is the text view's `wrap::decode` before VM-2.
     pub fn decode(self, bytes: &[u8], whole: bool) -> (Vec<Cell>, usize) {
         let be = self.big_endian();
         match self {
@@ -410,8 +410,8 @@ impl Encoding {
 
     /// How many bytes before a place the rules read (D36), so the text model supplies them
     /// without knowing the encoding: 3 in UTF-8 (a character cut at a grid point lacks at least
-    /// one of its at most four bytes; today's `grid_cut` reads 4, `text.rs:1316`, and the fourth
-    /// never moves the cut), 2 in UTF-16 (the unit before), 0 in UCS-2, UTF-32 and the one-byte
+    /// one of its at most four bytes; the text view's `grid_cut` before VM-2 read 4, and the
+    /// fourth never moves the cut), 2 in UTF-16 (the unit before), 0 in UCS-2, UTF-32 and the one-byte
     /// encodings, [`W`] in CP949 — more there when anchored at a line start within REACH (§7.4).
     pub fn look_back(self) -> usize {
         match self {
@@ -426,7 +426,7 @@ impl Encoding {
     /// GRID point of a line whose start is not known, `LINE_MAX` — meet, in [g − 3, g]. `g` is
     /// aligned; `near` holds [`Self::look_back`] bytes before it (fewer only when anchored at a
     /// line start closer than that). UTF-8: the start of a character cut in two at `g`, found
-    /// from the bytes before it alone, as today (`cut_char_start`, `text.rs:1993-2002`); UTF-16:
+    /// from the bytes before it alone, as before VM-2 (`cut_char_start` below); UTF-16:
     /// g − 2 when the unit there is a high surrogate; the rest: `g`. The piece before decoded
     /// not `whole` ends at the same place.
     ///
@@ -453,10 +453,10 @@ impl Encoding {
         })
     }
 
-    /// §7.3 rule 2, a restart's start (wrap's restart near a 16 KiB multiple, `wrap.rs:596-656`):
+    /// §7.3 rule 2, a restart's start (wrap's restart near a 16 KiB multiple, `Wrapper::restart`):
     /// the first character start in a window that starts at `x`, forward. `x` is rounded up to
-    /// the unit (the window's first unit); then UTF-8 skips up to 3 continuation bytes, as today
-    /// (`wrap.rs:615-621, 648-652`); UTF-16 moves past that unit only when it is a low surrogate
+    /// the unit (the window's first unit); then UTF-8 skips up to 3 continuation bytes, as before
+    /// VM-2 (`Wrapper::restart`); UTF-16 moves past that unit only when it is a low surrogate
     /// whose preceding unit is a high surrogate (D38); the rest take it. `near` holds
     /// [`Self::look_back`] bytes before `x` rounded down to the unit, and [`AHEAD`] from `x`.
     /// `None`: CP949 with no sync byte in the window and no phase known, as for
@@ -487,7 +487,7 @@ impl Encoding {
     /// §7.3 rule 4, a place inside a line not wrapped — the byte `left` every row is shown from
     /// (Right/Left by `SIDEWAYS`, End's `end_left`, the sideways wheel): `left` rounded down to
     /// the unit, then moved to the first character start at or after it — UTF-8 skips up to 3
-    /// continuation bytes, as today (`wrap.rs:870-878, 1025-1034`); UTF-16 moves past a low
+    /// continuation bytes, as before VM-2 (`Wrapper::start_at`); UTF-16 moves past a low
     /// surrogate whose preceding unit is a high surrogate. `near` as for
     /// [`Self::restart_start`]. `None`: CP949 with no proof before `left` (§7.4), placeholders.
     pub fn left_start(self, near: Around, left: u64) -> Option<u64> {
@@ -623,8 +623,8 @@ fn decode_utf16(bytes: &[u8], whole: bool, be: bool) -> (Vec<Cell>, usize) {
     (out, end)
 }
 
-/// UTF-8, as `from_utf8_lossy` does (each maximal bad sequence one U+FFFD) — today's
-/// `wrap::decode` (`wrap.rs:52-84`), whose `whole` it shares.
+/// UTF-8, as `from_utf8_lossy` does (each maximal bad sequence one U+FFFD) — the text view's
+/// `wrap::decode` before VM-2, whose `whole` it shares.
 fn decode_utf8(bytes: &[u8], whole: bool) -> (Vec<Cell>, usize) {
     let end = if whole {
         bytes.len()
@@ -663,8 +663,8 @@ fn decode_utf8(bytes: &[u8], whole: bool) -> (Vec<Cell>, usize) {
 /// found from the end alone, whatever comes before: the last up-to-4 bytes from their last
 /// non-continuation byte on must be the start of a real character (`from_utf8` checks the lead
 /// byte, overlongs, surrogates and the U+10FFFF bound) that only lacks its end. Bytes that can
-/// never start a character are not a cut character: they show as U+FFFD. Today's
-/// `cut_char_start` (`text.rs:1993-2002`).
+/// never start a character are not a cut character: they show as U+FFFD. The text view's
+/// `cut_char_start` before VM-2.
 fn cut_char_start(bytes: &[u8]) -> usize {
     let from = bytes.len().saturating_sub(4);
     let Some(i) = (from..bytes.len()).rev().find(|&i| bytes[i] & 0xC0 != 0x80) else {

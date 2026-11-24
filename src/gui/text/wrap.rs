@@ -937,13 +937,15 @@ impl Wrapper<'_> {
     pub fn end_left(&mut self, span: Span, columns: usize) -> Result<u64> {
         let enc = self.doc.enc;
         let unit = enc.unit();
-        let n = span.len.min(self.read as u64);
-        let from = span.len - n;
+        // The line's last bytes, from a unit's start: a line of an odd length (its last unit
+        // cut by the file's end) has its suffix start a byte earlier.
+        let from = enc.align_down(span.len - span.len.min(self.read as u64));
+        let n = span.len - from;
         // From a character's start (rule 4); a place none is proven at shows no character.
         let Some(lead) = self.start_at(span, from)? else {
             return Ok(from);
         };
-        let lead = (lead - from).min(n) as usize;
+        let lead = lead.saturating_sub(from).min(n) as usize;
         let window = &mut self.memo.window;
         let mut bytes = self.doc.span_bytes(span, from, n as usize, window, true)?;
         let mut end = span.len;

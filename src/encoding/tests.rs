@@ -12,7 +12,7 @@ const FFFD: char = char::REPLACEMENT_CHARACTER;
 // copied verbatim as the oracle the core must equal: it is private to the view. VM-2 moves the
 // view onto the core, so a drift would show there as well.
 
-/// `text.rs:1993-2002`.
+/// `text.rs:1993-2002` at 77b0beb (before VM-2).
 fn today_cut_char_start(bytes: &[u8]) -> usize {
     let from = bytes.len().saturating_sub(4);
     let Some(i) = (from..bytes.len()).rev().find(|&i| bytes[i] & 0xC0 != 0x80) else {
@@ -24,7 +24,7 @@ fn today_cut_char_start(bytes: &[u8]) -> usize {
     }
 }
 
-/// `wrap.rs:52-84`.
+/// `wrap.rs:52-84` at 77b0beb (before VM-2).
 fn today_decode(bytes: &[u8], whole: bool) -> (Vec<Cell>, usize) {
     let end = if whole {
         bytes.len()
@@ -58,14 +58,14 @@ fn today_decode(bytes: &[u8], whole: bool) -> (Vec<Cell>, usize) {
     (out, end)
 }
 
-/// `text.rs:1315-1319`, over a file: the cut at `g` of a piece that starts at `lo` (four bytes
+/// `text.rs:1315-1319` at 77b0beb (before VM-2), over a file: the cut at `g` of a piece that starts at `lo` (four bytes
 /// read, where the core reads three).
 fn today_grid_cut(file: &[u8], g: usize, lo: usize) -> usize {
     let from = g.saturating_sub(4).max(lo);
     from + today_cut_char_start(&file[from..g])
 }
 
-/// `wrap.rs:615-620` and `648-652` (a restart), `870-878` and `1026-1033` (a place not wrapped,
+/// At 77b0beb (before VM-2), `wrap.rs:615-620` and `648-652` (a restart), `870-878` and `1026-1033` (a place not wrapped,
 /// past the line's first byte): the continuation bytes skipped from `x`.
 fn today_skip(file: &[u8], x: usize) -> usize {
     file[x..]

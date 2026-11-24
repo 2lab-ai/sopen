@@ -4894,3 +4894,154 @@ fn a_c1_control_is_a_dim_middle_dot_and_moves_no_byte() {
         drv.until(&mut win, 10, |w| w.ready());
     }
 }
+
+/// The default (§7.2) and the BOM are decided from the file's first 8 KiB (or all of it),
+/// whatever sizes the first reads come in: `FF FE 0A AC 0A 00` — UTF-16LE's BOM, 갊 (`0a ac`),
+/// its LF unit — fed a byte at a time, or cut inside the BOM, is UTF-16LE with its BOM skipped,
+/// one line, as fed whole; and so is a chosen UTF-16LE.
+#[test]
+fn the_default_and_the_bom_come_from_the_first_8_kib_whatever_the_reads() {
+    let small = vec![0xFF, 0xFE, 0x0A, 0xAC, 0x0A, 0x00];
+    let lines = hangul_lines(300);
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    let big = encoded(&text, Utf16Le, true);
+    for (body, chosen, count) in [
+        (&small, None, 1),
+        (&small, Some(Utf16Le), 1),
+        (&big, None, 300),
+    ] {
+        let size = body.len() as u64;
+        let fresh = || Scan {
+            marks: vec![Mark { line: 0, offset: 0 }],
+            ..Scan::reading(chosen)
+        };
+        let mut whole = fresh();
+        whole.feed(body, size);
+        assert_eq!((whole.enc, whole.line), (Utf16Le, count), "{chosen:?}");
+        assert_eq!(whole.marks[0].offset, 2, "the BOM skipped");
+        for piece in [1, 2, 3, 5] {
+            let mut cut = fresh();
+            for chunk in body.chunks(piece) {
+                cut.feed(chunk, size);
+            }
+            let what = format!("{chosen:?} in pieces of {piece}");
+            assert_eq!(
+                (cut.enc, cut.pick, &cut.head),
+                (whole.enc, whole.pick, &whole.head)
+            );
+            assert_eq!(
+                (cut.at, cut.line, cut.last),
+                (whole.at, whole.line, whole.last),
+                "{what}"
+            );
+            assert_eq!(cut.marks, whole.marks, "{what}");
+        }
+    }
+}
+
+/// Fonts are loaded on `drv`'s context (a viewer has drawn), so a [`wrap::Measure`] works.
+fn warmed(drv: &mut Driver) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut warm = viewer(tmp.path(), "warm.txt", "x\n");
+    drv.until(&mut warm, 10, |w| w.ready());
+}
+
+/// End, not wrapped, on a UTF-16 line of an odd length (its last unit cut by the file's end):
+/// the suffix it is measured from starts on a unit, so the place is a character start — with
+/// the smallest read, and at a window's real read size.
+#[test]
+fn end_on_an_odd_length_utf16_line_lands_on_a_character_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "odd.txt", b"A\0A\0A\0A\0A");
+    let mut doc = TextDoc::open_encoded(&path, Utf16Le).unwrap();
+    let mut drv = Driver::new(600.0, 300.0);
+    warmed(&mut drv);
+    let mut memo = wrap::Memo::default();
+    let mut w = wrap::Wrapper {
+        doc: &mut doc,
+        memo: &mut memo,
+        m: wrap::Measure::new(&drv.ctx, FontId::monospace(14.0), egui::Color32::WHITE),
+        width: 1000.0,
+        read: 8,
+    };
+    let span = w.line(0).unwrap();
+    assert_eq!(span.len, 9);
+    assert_eq!(
+        w.end_left(span, 100).unwrap(),
+        0,
+        "the line fits: from its start"
+    );
+    // A window's own read size, past an odd suffix origin.
+    let mut body = encoded(&"A".repeat(1500), Utf16Le, false);
+    body.push(b'A');
+    let path = write(tmp.path(), "long-odd.txt", &body);
+    let doc = TextDoc::open_encoded(&path, Utf16Le).unwrap();
+    let mut win = TextWindow::new(doc, "box:o".into(), "long-odd.txt", vec![]);
+    drv.until(&mut win, 10, |w| w.ready());
+    drv.key(&mut win, Key::W, Modifiers::NONE);
+    drv.until(&mut win, 10, |w| w.ready());
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    drv.until(&mut win, 10, |w| w.ready());
+    assert!(win.left > 0);
+    assert_eq!(win.left % 2, 0);
+    let row = rows_of(&win).remove(0);
+    assert!(row.ends_with("AA\u{FFFD}"), "{row:?}");
+}
+
+/// A choice made while the file is still being indexed in another encoding wins: the pass out
+/// is dropped and the newest choice is the one the lines are read in, at the place the view was.
+#[test]
+fn a_newer_choice_wins_over_a_rebuild_still_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let text: String = (0..2000).map(|i| format!("line {i:04} é\n")).collect();
+    let path = write(tmp.path(), "n.txt", text.as_bytes());
+    let doc = TextDoc::open(&path).unwrap();
+    let mut win = TextWindow::new(doc, "box:n".into(), "n.txt", vec![]);
+    let mut drv = Driver::new(800.0, 400.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    drv.key(&mut win, Key::PageDown, Modifiers::NONE);
+    drv.until(&mut win, 10, |w| w.ready());
+    let top = |w: &TextWindow| {
+        let row = &w.page.as_ref().unwrap().rows[0];
+        (
+            row.at + row.start,
+            row.at + row.start + row.cut.bytes as u64,
+        )
+    };
+    let (place, _) = top(&win);
+    let go = held_worker(&mut win);
+    win.enc_wanted = Some(Utf16Le);
+    drv.idle(&mut win, 1);
+    assert!(win.reindex.as_ref().is_some_and(|r| r.rebuild.is_some()));
+    win.enc_wanted = Some(Latin1);
+    drv.idle(&mut win, 1);
+    drop(go);
+    drv.until(&mut win, 10, |w| w.ready() && w.reindex.is_none());
+    drv.idle(&mut win, 3);
+    assert_eq!(win.doc.encoding(), Latin1, "the newest choice");
+    let (from, to) = top(&win);
+    assert!(from <= place && place < to, "{place} on top: {from}..{to}");
+}
+
+/// A UTF-8 file with a BOM opens with line 1 at the top from its first byte after the BOM: the
+/// place on screen is line 1's start, as every line's is, not the BOM's first byte.
+#[test]
+fn the_top_of_a_file_with_a_bom_is_line_1s_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "bom.txt", b"\xEF\xBB\xBFone\ntwo\n");
+    let mut win = TextWindow::new(
+        TextDoc::open(&path).unwrap(),
+        "box:b".into(),
+        "bom.txt",
+        vec![],
+    );
+    let mut drv = Driver::new(600.0, 300.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    assert_eq!(rows_of(&win)[..2], ["one", "two"]);
+    assert_eq!(win.top, 3);
+    drv.key(&mut win, Key::End, crate::gui::testkit::command(false));
+    drv.until(&mut win, 10, |w| w.ready());
+    drv.key(&mut win, Key::Home, crate::gui::testkit::command(false));
+    drv.until(&mut win, 10, |w| w.ready());
+    assert_eq!(win.top, 3);
+}

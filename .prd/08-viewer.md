@@ -125,8 +125,8 @@ inferred, not read in code or measured. What it amends in 01, 04, 06, 07, the RE
   views show the file as stored, and a file has one journal at a time (07 §3; *trace* §4).
 - **The place follows the owner between byte views** (D11). Text → Hex: the cursor on the first byte of
   the top row, that row at the top. Hex → Text: the text view at the cursor's byte, by §7.3's jump rule,
-  as `at=` opens it (`text.rs:5244-5246`). Text ↔ Raw: one view state. From Image, Video, Audio or Page
-  (no byte place) a byte view keeps its own last place, byte 0 the first time.
+  as `at=` opens it (`embed_scripted`'s `Jump::Byte`). Text ↔ Raw: one view state. From Image,
+  Video, Audio or Page (no byte place) a byte view keeps its own last place, byte 0 the first time.
 - **Selections stay in their view** (the image's rectangle, the media view's marks; text and hex have
   none: *trace* §4.1). **Leaving** (Esc, F3) asks the view on screen; hidden views close with it.
 - **A Save or a reload that lands in one view makes every hidden view stale** (D25): a hex Save reloads
@@ -155,7 +155,7 @@ inferred, not read in code or measured. What it amends in 01, 04, 06, 07, the RE
 | Shown as | Unit | A character | Each shown as one U+FFFD |
 |---|---|---|---|
 | ASCII | 1 byte | 0x00–0x7F | every byte 0x80–0xFF |
-| UTF-8 | 1 byte | 1–4 bytes | each maximal bad sequence, as today (`wrap.rs:47-80`) |
+| UTF-8 | 1 byte | 1–4 bytes | each maximal bad sequence, as before VM-2 (`Encoding::decode`) |
 | UTF-16LE, UTF-16BE | 2 bytes | a unit, or a surrogate pair | an unpaired surrogate, per unit |
 | UCS-2LE, UCS-2BE | 2 bytes | a unit; no pairs | every surrogate unit (D800–DFFF) |
 | UTF-32LE, UTF-32BE (UCS-4) | 4 bytes | a unit | a value above 10FFFF or a surrogate, per unit |
@@ -249,11 +249,11 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
      high surrogate, else g. UTF-32, UCS-2 and the one-byte encodings: g. CP949: §7.4. VM-1 says how
      many bytes before g each rule reads (3, 2, 0; CP949's W = 256), so VM-2 supplies them without
      knowing the encoding.
-  2. **A restart's start** — wrap's restart near a 16 KiB multiple only (`wrap.rs:596-656`), forward in
+  2. **A restart's start** — wrap's restart near a 16 KiB multiple only (`Wrapper::restart`), forward in
      its window: UTF-8 skips up to 3 continuation bytes, as before VM-2 (`Wrapper::restart`); UTF-16
-     takes the window's first unit, and moves past it only when it is a low surrogate whose preceding unit is a
-     high surrogate (D38); UTF-32, UCS-2 and the one-byte encodings take the first aligned offset; CP949
-     the window's first sync byte, or the exact start a known phase gives (§7.4).
+     takes the window's first unit, and moves past it only when it is a low surrogate whose preceding
+     unit is a high surrogate (D38); UTF-32, UCS-2 and the one-byte encodings take the first aligned
+     offset; CP949 the window's first sync byte, or the exact start a known phase gives (§7.4).
   3. **A jump's place** — End, Go to `0x…`, `at=`, the scroll bar by bytes, the hex view's place — is
      aligned down to the unit. In UTF-16 it moves back one unit only across a valid pair: a low
      surrogate whose preceding unit is a high surrogate. A standalone low surrogate stays and shows as
@@ -261,15 +261,16 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
      place ("the row that byte is in at the top", AGENTS.md's `at=`). Rule 3 picks which row; the row's
      own start comes from the line start, a grid cut (rule 1) or a restart (rule 2), never from the jump.
   4. **A place inside a line, not wrapped** — the byte `left` that every row is shown from (Right/Left
-     by `SIDEWAYS`, End's `end_left`, the sideways wheel: `text.rs:4019-4024, 4277, 4723`) — is aligned
-     down to the unit, then moved to the first character start at or after it: UTF-8 skips up to 3
-     continuation bytes, as before VM-2 (`Wrapper::start_at`); UTF-16 moves past a low surrogate whose
-     preceding unit is a high surrogate; CP949 decodes forward from §7.4's proof before `left` (the line
-     start within REACH, else a checkpoint, else the last sync byte within W), else shows the
-     placeholders.
+     by `SIDEWAYS`, End's `end_left`, the sideways wheel: `TextWindow::keys`, `Wrapper::end_left`,
+     `TextWindow::body`) — is aligned down to the unit, then moved to the first character start at or
+     after it: UTF-8 skips up to 3 continuation bytes, as before VM-2 (`Wrapper::start_at`); UTF-16
+     moves past a low surrogate whose preceding unit is a high surrogate; CP949 decodes forward from
+     §7.4's proof before `left` (the line start within REACH, else a checkpoint, else the last sync
+     byte within W), else shows the placeholders.
 - **One decoder per encoding** gives a piece's characters and their byte lengths, in the shape of
-  `wrap::Cell { ch, len }` (`wrap.rs:40-45`); the line text, the row text, the highlighter's input and the
-  per-character colour count all come from it, so they cannot disagree (T10, T13).
+  `encoding::Cell { ch, len }` (`wrap.rs`'s `Cell` since VM-2); the line text, the row text, the
+  highlighter's input and the per-character colour count all come from it, so they cannot disagree
+  (T10, T13).
 
 ### 7.4 CP949 / EUC-KR
 
@@ -289,7 +290,7 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
   texts and 2,000 random byte strings, decoding in two pieces cut at a sync byte equalled decoding whole
   at all 302,874 cuts; cut at a byte ≥ 0x81 inside Korean text, it differed at 163,747 of 404,209.
 - **Never out of phase** (D28). A character start is taken only from what proves it, in this order:
-  1. a known line start within REACH (64 KiB, `text.rs:146-150`) before the place — the index's, or an LF
+  1. a known line start within REACH (64 KiB, `text.rs`'s `REACH`) before the place — the index's, or an LF
      found that far back;
   2. a **phase checkpoint** of a line longer than REACH: one bit per GRID point, whether a lead is
      pending there;
@@ -414,7 +415,7 @@ Every decision is reversible; the owner may change any of them.
 | D33 | An armed F9 lasts one key, no timeout | a timeout is a race with a slow hand | 2 s |
 | D34 | The bar's encoding label and `SOPEN_STATE enc=` ship with VM-2, before XR-T | the only way to see the default pick and take receipts; one bar field, the same on any screen | wait for the binding |
 | D35 | In the browser's viewer the hex view opens viewing; Enter or Insert starts editing; Esc or F9 ends it; `--hex` and the binary dialog keep today's typing | today the grid always has focus and digits write nibbles (`hex.rs:4013-4018`, `3650-3660`), so image 1→2→1 would edit a byte | DigitsAreData in every hex view (F9 only) |
-| D36 | One grid-cut function per encoding, used by both pieces, in [g − 3, g]; VM-1 exposes its look-back | today's `grid_cut` looks back only (`text.rs:1313-1319`); two pieces that cut apart show a character twice or lose it | a forward skip at each piece |
+| D36 | One grid-cut function per encoding, used by both pieces, in [g − 3, g]; VM-1 exposes its look-back | the text view's `grid_cut` before VM-2 looked back only; two pieces that cut apart show a character twice or lose it | a forward skip at each piece |
 | D37 | BOM: the longest first, whatever the size; skipped only under its own encoding (UTF-16's for UCS-2, UTF-32's for UCS-4); a place inside it is line 1's start | `FF FE 00 00` is UTF-32LE's BOM before UTF-16LE's; under another encoding it is bytes like any other; `span_at`'s fallback would show the last line | the draft's size-dependent pick |
 | D38 | UTF-16 resync looks at the preceding unit and moves only across a valid pair; a standalone low surrogate is one U+FFFD | a low surrogate pairs only with the high one right before it, so one unit of look-back equals whole-file decoding | skip every low surrogate (hides a standalone one) |
 | D39 | CP949 is the default's step 3, by (a)–(e), shown `(guessed)`, F8 overriding; routing unchanged | the owner is Korean; over §7.2's corpus it picks every Korean CP949/EUC-KR sample up to 8 % hanja and nothing else; (e) alone stops hiragana-only Shift-JIS | never a default (F8 only) |

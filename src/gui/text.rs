@@ -718,6 +718,10 @@ impl TextDoc {
                 break;
             }
         }
+        if stream.scan.at >= end {
+            // (A cap below the default's sample: it is picked from what was read.)
+            stream.scan.settle(stream.total);
+        }
         if stream.scan.at == from {
             return match failed {
                 Some(e) => Err(e),
@@ -835,7 +839,7 @@ impl TextDoc {
 
     /// [`TextDoc::install`] without the marks (the document has them already).
     fn adopt(&mut self, scan: &Scan) {
-        let size = scan.at;
+        let size = scan.indexed();
         self.marks.retain(|m| m.line == 0 || m.offset < size);
         // (A unit cut by the end of what was read is the open line's too.)
         let open = scan.line_len + size % scan.enc.unit() as u64;
@@ -1814,6 +1818,9 @@ struct Scan {
     head: Vec<u8>,
     /// The unit being read: its bytes so far (a read can end inside it).
     unit: [u8; 4],
+    /// The file's first bytes, while fewer than the default's sample (8 KiB, or the whole file)
+    /// have come: nothing is indexed until they have (§7.2).
+    sample: Vec<u8>,
     marks: Vec<Mark>,
     /// Lines between marks now: [`BLOCK_LINES`] (0 stands for it) until the marks were
     /// thinned, doubled each time they were.
@@ -1854,6 +1861,7 @@ impl Default for Scan {
             pick: None,
             head: Vec::new(),
             unit: [0; 4],
+            sample: Vec::new(),
             marks: Vec::new(),
             spacing: 0,
             limit: 0,
@@ -1888,7 +1896,7 @@ impl Scan {
         if let Some(mark) = self.marks.first_mut() {
             mark.offset = first;
         }
-        if self.line == 0 && self.at > 0 {
+        if self.pick.is_some() && self.line == 0 && self.at > 0 {
             // Line 1 is the line being read: its bytes so far count from its new start.
             let unit = enc.unit() as u64;
             self.line_len = (self.at - self.at % unit).saturating_sub(first);
@@ -1897,30 +1905,64 @@ impl Scan {
     }
 
     /// The next bytes of the file (`bytes`, at where the pass is), of a file of `size` bytes.
-    /// The first ones (from byte 0) pick the default (08 §7.2); a BOM skipped under the
-    /// encoding is no line's.
+    /// The file's first 8 KiB (or all of it, when shorter) pick the default and say which BOM is
+    /// skipped (08 §7.2) whatever sizes they come in: until they are here they are kept, not
+    /// indexed ([`Scan::indexed`] is 0); a BOM skipped under the encoding is no line's.
     fn feed(&mut self, bytes: &[u8], size: u64) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.pick.is_none() {
+            self.sample.extend_from_slice(bytes);
+            self.at += bytes.len() as u64;
+            if (self.sample.len() as u64) >= (crate::kind::SNIFF_BYTES as u64).min(size) {
+                self.begin(size);
+            }
+            return;
+        }
+        self.index(bytes, size);
+    }
+
+    /// The default's sample is in: the encoding is picked from it (or was chosen), line 1
+    /// starts after a BOM skipped under it, and the sample's bytes are indexed.
+    fn begin(&mut self, size: u64) {
+        let sample = std::mem::take(&mut self.sample);
+        let pick = crate::encoding::pick(&sample, size > sample.len() as u64);
+        self.pick = Some(pick);
+        self.enc = self.chosen.unwrap_or(pick.encoding);
+        self.head = sample[..sample.len().min(4)].to_vec();
+        let bom = self.enc.bom_len(&self.head);
+        if let Some(mark) = self.marks.first_mut() {
+            mark.offset = bom as u64;
+        }
+        self.at = bom as u64;
+        self.index(&sample[bom..], size);
+    }
+
+    /// A pass that ends before the default's sample is whole (the file ended sooner than its
+    /// size said, or a cap below 8 KiB) picks from what it read.
+    fn settle(&mut self, size: u64) {
+        if self.pick.is_none() && !self.sample.is_empty() {
+            self.begin(size);
+        }
+    }
+
+    /// The bytes the index covers: none while the default's sample is still coming in.
+    fn indexed(&self) -> u64 {
+        if self.pick.is_some() {
+            self.at
+        } else {
+            0
+        }
+    }
+
+    /// Indexes the next bytes, read in the encoding: [`Scan::feed`] once the default is known.
+    fn index(&mut self, bytes: &[u8], size: u64) {
         if bytes.is_empty() {
             return;
         }
         if let Some(mark) = self.held.take() {
             self.push(mark);
-        }
-        let mut bytes = bytes;
-        if self.at == 0 && self.pick.is_none() {
-            let pick = crate::encoding::pick(bytes, size > bytes.len() as u64);
-            self.pick = Some(pick);
-            self.enc = self.chosen.unwrap_or(pick.encoding);
-            self.head = bytes[..bytes.len().min(4)].to_vec();
-            let bom = self.enc.bom_len(&self.head);
-            if let Some(mark) = self.marks.first_mut() {
-                mark.offset = bom as u64;
-            }
-            self.at = bom as u64;
-            bytes = &bytes[bom..];
-            if bytes.is_empty() {
-                return;
-            }
         }
         let end = self.at + bytes.len() as u64;
         let lf = self.enc.lf();
@@ -2100,6 +2142,11 @@ impl Scan {
         self.line = first + count;
         self.at = end;
         self.last = Some(true);
+        // (Lines given without their bytes: UTF-8's, the default no sample is needed for.)
+        self.pick.get_or_insert(Pick {
+            encoding: Encoding::Utf8,
+            guessed: false,
+        });
     }
 
     /// The pass over `file` (opened at `path`, named `shown` in what is said, `size` bytes as opened) from where it is, to the
@@ -2131,6 +2178,7 @@ impl Scan {
                 Some(cap) if cap < size => {
                     if self.at >= cap {
                         self.capped = true;
+                        self.settle(size);
                         return Ok(());
                     }
                     cap
@@ -2139,6 +2187,7 @@ impl Scan {
             };
             let want = (end.saturating_sub(self.at) as usize).min(buf.len());
             if want == 0 {
+                self.settle(size);
                 return Ok(());
             }
             #[cfg(test)]
@@ -2152,6 +2201,7 @@ impl Scan {
             };
             let n = read.with_context(|| format!("cannot read {shown}"))?;
             if n == 0 {
+                self.settle(size);
                 return Ok(());
             }
             #[cfg(test)]
@@ -4200,8 +4250,16 @@ impl TextWindow {
             .as_ref()
             .map(|p| p.top + if p.wrapped { p.top_off } else { 0 })
             .filter(|&at| at > 0);
+        // A pass still out — a re-read in the encoding chosen before, a rebuild — would land
+        // over a change made in place: the file is indexed again in the newest choice instead
+        // (the pass out is dropped), at the place an earlier rebuild was keeping.
+        let out = self
+            .reindex
+            .as_ref()
+            .map(|r| r.rebuild.as_ref().and_then(|b| b.place));
+        let place = place.or(out.flatten());
         let fresh = self.doc.is_stream() && self.doc.size() == 0;
-        if fresh || !self.doc.needs_index_for(enc) {
+        if out.is_none() && (fresh || !self.doc.needs_index_for(enc)) {
             self.doc.reencode(enc);
         } else if let Some(source) = self.doc.source().cloned() {
             // Its first 16 MiB are read again (from the block cache where they still are).
@@ -4366,9 +4424,14 @@ impl TextWindow {
                 // the old index is not read through either (the file may look grown to it).
                 self.index_took = doc.indexed_in;
                 self.waiting = true;
-                if let Some((enc, _)) = rebuilt {
-                    // Read again in the encoding it was being indexed in.
+                if let Some((enc, place)) = rebuilt {
+                    // Read again in the encoding it was being indexed in, back at the byte the
+                    // view was at (line numbers differ between LF units).
                     self.doc.chosen = Some(enc);
+                    if self.jump.is_none() {
+                        self.jump = place.map(Jump::Byte);
+                        self.restoring = place.is_some();
+                    }
                 }
                 self.status = Status::info("the file changed again; re-reading it in a moment…");
             }
@@ -4806,6 +4869,12 @@ impl TextWindow {
                     }
                 }
             };
+            // The file's start is line 1's: after a BOM skipped (D37), so the place on screen
+            // is a line's start as every other is (and wrapping's memos find it).
+            let first = w.doc.first_start();
+            if pos.at < first {
+                pos = Pos { at: first, ..pos };
+            }
             let n = self.moved.unsigned_abs();
             pos = match (self.moved.signum(), wrap) {
                 (1, true) => w.forward(pos, n)?,

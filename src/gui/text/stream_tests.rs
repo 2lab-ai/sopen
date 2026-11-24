@@ -2662,7 +2662,8 @@ fn enc_on_a_stream_is_read_from_its_first_block_and_another_lf_unit_reads_it_aga
         });
         let utf8 = body.iter().filter(|&&b| b == b'\n').count() as u64;
         assert_eq!(win.doc.line_count(), utf8 + 1);
-        assert!(net.fetched() <= 2 * body.len() as u64);
+        // Its one block is still in the cache: nothing is fetched again.
+        assert_eq!(net.fetched(), body.len() as u64);
         drv.idle(&mut win, 1);
         assert!(says(&drv, "UTF-8"), "{:?}", painted(&drv));
     });
@@ -2835,5 +2836,58 @@ fn a_wide_encoding_past_the_16_mib_index_reads_as_the_whole_file_decode() {
             run(&mut drv, &mut win, &mut net, "PgUp", settled);
             check(&win, &format!("PgUp {k}"));
         }
+    });
+}
+
+/// A `Bytes` that gives at most `most` bytes a read — a pass whose first reads are smaller
+/// than the default's 8 KiB sample.
+struct Trickle {
+    inner: Box<dyn Bytes + Send>,
+    most: usize,
+}
+
+impl Bytes for Trickle {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+
+    fn try_read(&mut self, off: u64, len: usize) -> Poll<crate::stream::Result<bytes::Bytes>> {
+        self.inner.try_read(off, len.min(self.most))
+    }
+
+    fn read_at(
+        &mut self,
+        off: u64,
+        buf: &mut [u8],
+        cancel: &AtomicBool,
+    ) -> crate::stream::Result<usize> {
+        self.inner.read_at(off, buf, cancel)
+    }
+}
+
+/// Through the Fake, a pass whose reads come a byte at a time picks the default and the BOM
+/// from the first 8 KiB as a block-sized read does: a UTF-16LE file with a BOM, its Hangul
+/// holding 0x0A bytes, has the lines and the label the local file has.
+#[test]
+fn a_pass_read_a_byte_at_a_time_picks_as_a_whole_block_does() {
+    bounded("a pass read a byte at a time", || {
+        let lines = hangul_lines(300);
+        let text: String = lines.iter().map(|l| format!("{l}\r\n")).collect();
+        let body = encoded(&text, Utf16Le, true);
+        assert!(body.len() > crate::kind::SNIFF_BYTES);
+        let mut net = net(&body, gate());
+        let mut win = net.window("log.txt");
+        let Backing::Stream(stream) = &mut win.doc.backing else {
+            unreachable!("a streamed document");
+        };
+        let inner = stream.pass.take().expect("the pass's reader");
+        stream.pass = Some(Box::new(Trickle { inner, most: 1 }));
+        let mut drv = Driver::new(800.0, 500.0);
+        run(&mut drv, &mut win, &mut net, "the index", |w, _| {
+            w.doc.whole() && w.ready()
+        });
+        assert_eq!(win.doc.encoding_label().as_deref(), Some("UTF-16LE (BOM)"));
+        assert_eq!(all_lines(&mut win.doc), lines);
+        assert_eq!(rows(&win)[0], lines[0]);
     });
 }
