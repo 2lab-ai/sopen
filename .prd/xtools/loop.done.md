@@ -106,6 +106,13 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
   - WV-C: per-view handles, the block cache, checks plus the first piece in one turn. Batching is still to decide.
   - WV-A: the tombstone, and the stop that can come after the last byte.
   - WV-B: a GInputStream subclass, and a request stopped before its head. Linux sends no cancel then; the only signal is `resource-load-started`/`failed`.
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| X-W1 | ✅ done 2026-11-25 | 09 §12: the stream-fed page handler prototype on both engines, before WV-C and WV-0 | research unit |
+
 ## R1 (part 3) — XR-E and X-SPEC closed 2026-11-25
 
 - **XR-E.** Research in `../research/editor.md`, from primary references:
@@ -123,13 +130,10 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
   - **The fix-check was FIX.** 4 + 7 gaps in the new mechanisms' failure states: a failed swap-back, an interrupted remote check, journal generations and durability, the CRLF boundary, the column's delete dialog, "Shift known" expiring, and the prompt lines.
   - **The orchestrator checked those fixes at their lines.**
 - **Items 2, 4 and 5 were written earlier** (10, 08, 09; #100). With this, every item of `ssot.md` has its contract.
+
 ### Closed rows
 
 | ID | Status | What | Who |
 |---|---|---|---|
-<<<<<<< HEAD
 | XR-E | ✅ done 2026-11-25 | The editor of message 21: the PC Tools / Turbo C IDE editor's look and keys from primary references, the F4 layout, the left panel's tabs, the text buffer for local and remote files, saving through 07's safe paths, VS Code / Zed kept reachable. Result: `../research/editor.md`. | research unit |
 | X-SPEC | ✅ done 2026-11-25 | The numbered document for item 3 (the editor), after XR-E, reviewed by two engines before any code. Items 2, 4 and 5 are written: 10, 08 and 09, merged 2026-11-24 (#100); item 1 shipped as #96. | orchestrator |
-=======
-| X-W1 | ✅ done 2026-11-25 | 09 §12: the stream-fed page handler prototype on both engines, before WV-C and WV-0 | research unit |
->>>>>>> origin/main
