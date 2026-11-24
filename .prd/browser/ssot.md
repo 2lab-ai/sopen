@@ -73,7 +73,7 @@ repo):
 6. **Function keys act as F1…F12 inside sopen (message 15).**
    - Wherever an OS allows it, sopen switches the keyboard to standard function keys only while sopen is focused, and it restores the setting on focus loss, quit and crash recovery.
    - Wherever an OS does not allow it, a fallback works everywhere: a clickable F-key row and alternate keys. The feasibility research is in `.prd/research/keys.md`.
-   - **Message 19** asks for this by default on every OS sopen runs on, without changing the OS, Linux included, where `04-file-keys.md` §6.4 found no per-app mechanism. A feasibility gate (K-L1 in `loop.md`) checks again with a prototype before anything is specified. The workstream's reading, made on 2026-11-24, which the owner may change: macOS's switch, made only while sopen is in front and always restored (04 §6.2–6.3), leaves the OS's setting the owner's. Windows is outside sopen (01 §9).
+   - **Message 19** asks for this by default on every OS sopen runs on, without changing the OS, Linux included. `04-file-keys.md` §6.4 first found no per-app mechanism; the feasibility gate K-L1 (2026-11-24) found one for the GUI on KDE Wayland, and §6.4 now specifies it (off until the owner's key table, K-L2). The workstream's reading, made on 2026-11-24, which the owner may change: macOS's switch, made only while sopen is in front and always restored (04 §6.2–6.3), leaves the OS's setting the owner's. Windows is outside sopen (01 §9).
 7. **Directory tree (message 16).**
    - A key opens a directory tree. The key is chosen by the key survey.
    - The root is the home directory when the current folder is under it, otherwise `/`. The same rule applies to the remote user's home on a remote folder.

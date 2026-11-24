@@ -2442,7 +2442,8 @@ pub fn run_stoppable(
     let _guard = Orphan::guard(&child, &tools.ffmpeg);
     let errors = ErrorTail::spawn(child.stderr.take().expect("piped"));
     // A small queue: while the callback runs (the export-hold hook sleeps in it), the reader
-    // stops and ffmpeg blocks on its progress pipe, as it did when this thread read it.
+    // stops, as it did when this thread read it. ffmpeg goes on until its progress pipe is full
+    // too (64 KiB, minutes of reports): a shorter render runs to its end unread.
     let (tx, rx) = sync_channel::<std::io::Result<String>>(16);
     let stdout = child.stdout.take().expect("piped");
     std::thread::spawn(move || {
@@ -2572,6 +2573,8 @@ pub fn name_time(s: f64) -> String {
 pub fn cut_name(stem: &str, in_s: f64, out_s: f64, ext: &str) -> String {
     format!("{stem}.cut-{}-{}.{ext}", name_time(in_s), name_time(out_s))
 }
+
+pub mod mp3;
 
 #[cfg(test)]
 pub(crate) mod fixtures;
