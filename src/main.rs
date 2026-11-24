@@ -67,6 +67,9 @@ struct Cli {
     /// Open the file in the xtools hex editor, whatever its type (no dialog first)
     #[arg(long, conflicts_with = "app")]
     hex: bool,
+    /// Open the http(s):// address in the default browser of the machine it opens on
+    #[arg(long)]
+    browser: bool,
     /// Internal (HOST's half of `sopen URL` through a tunnel, spec §4a): once the address is
     /// open, wait for the input's end — the other machine's sopen ending — then exit 0.
     #[arg(long, hide = true, requires = "here", conflicts_with_all = ["app", "hex"])]
@@ -264,6 +267,7 @@ fn main() -> ExitCode {
                 cli.target.as_deref(),
                 cli.here,
                 cli.hold_until_eof,
+                cli.browser,
                 cli.app.as_deref(),
                 cli.hex,
                 dirs,
@@ -509,6 +513,7 @@ fn run_source(
     flag: Option<&str>,
     here: bool,
     hold: bool,
+    browser: bool,
     app_name: Option<&str>,
     hex: bool,
     dirs: &Dirs,
@@ -516,12 +521,17 @@ fn run_source(
 ) -> Result<u8> {
     // An address before anything reads SOURCE as a path or `host:path` (`http` would be a host).
     if let Some(url) = sopen::url::parse(source) {
-        return run_url(source, url, flag, here, hold, app_name, hex, dirs, rec);
-    }
-    if hold {
-        return Err(
-            Usage("--hold-until-eof is for an http(s):// address, not a file".to_string()).into(),
+        return run_url(
+            source, url, flag, here, hold, browser, app_name, hex, dirs, rec,
         );
+    }
+    for (given, flag_name) in [(hold, forward::HOLD_FLAG), (browser, forward::BROWSER_FLAG)] {
+        if given {
+            return Err(Usage(format!(
+                "{flag_name} is for an http(s):// address, not a file"
+            ))
+            .into());
+        }
     }
     let chosen = forward::choose(here, flag, forward::target_env, || {
         Ok(config::load(&config::path()?)?.target)
@@ -541,7 +551,7 @@ fn run_source(
     rec.action = Some("open");
     rec.target = Some(host.clone());
     sopen::debug!("opening {there} on {host}");
-    let code = forward::run(&host, &there, app_name, hex, &dirs.state)?;
+    let code = forward::run(&host, &there, app_name, hex, false, &dirs.state)?;
     // HOST refused a write because the file changed (spec §5): a conflict here too (§10).
     rec.conflict = code == EXIT_CONFLICT;
     Ok(code)
@@ -549,7 +559,8 @@ fn run_source(
 
 /// `sopen URL` (spec §4a): opened in this machine's browser; with a HOST, in HOST's — a
 /// loopback address served from here through a tunnel that lives as long as this sopen, any
-/// other passed to HOST's sopen as it is.
+/// other passed to HOST's sopen as it is. `browser` (`--browser`, 09 §7) goes to HOST's sopen on
+/// both routes; here the system browser is the only route there is yet.
 #[allow(clippy::too_many_arguments)]
 fn run_url(
     source: &str,
@@ -557,6 +568,7 @@ fn run_url(
     flag: Option<&str>,
     here: bool,
     hold: bool,
+    browser: bool,
     app_name: Option<&str>,
     hex: bool,
     dirs: &Dirs,
@@ -584,17 +596,19 @@ fn run_url(
     rec.target = Some(host.clone());
     if url.is_loopback() {
         sopen::debug!("opening {} on {host} through a tunnel", url.shown());
-        forward::tunnel(&host, &url, &dirs.state)
+        forward::tunnel(&host, &url, browser, &dirs.state)
     } else {
         sopen::debug!("opening {} on {host}", url.shown());
-        forward::run(&host, url.as_str(), None, false, &dirs.state)
+        forward::run(&host, url.as_str(), None, false, browser, &dirs.state)
     }
 }
 
 /// Opens `url` in this machine's browser and says so. With `hold` (HOST's half of a tunnel) it
 /// first checks that the tunnel's port — the address's — listens on loopback only here, and
 /// refuses otherwise; then says [`sopen::url::TUNNEL_OPEN`] and waits for the input's end —
-/// the other side's sopen ending, however it ends.
+/// the other side's sopen ending, however it ends. It opens the system browser, `--browser` or
+/// not: it never says [`sopen::url::TUNNEL_WINDOW`], so the other side says today's line (09 §7,
+/// whose window is WV-E2's).
 fn open_url(url: &sopen::url::Url, hold: bool) -> Result<()> {
     if hold {
         forward::tunnel_port_is_private(url.port())?;
@@ -604,8 +618,8 @@ fn open_url(url: &sopen::url::Url, hold: bool) -> Result<()> {
         println!("{}", sopen::url::opened_line(&url.shown()));
         return Ok(());
     }
-    println!("{}", sopen::url::TUNNEL_OPEN);
-    let _ = std::io::stdout().flush();
+    // Ignoring a write error: the other side may be gone already — its end is seen below.
+    sopen::url::write_cue(&mut std::io::stdout(), sopen::url::TUNNEL_OPEN);
     // The end of the input, or an error reading it: either way the other side is gone.
     let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
     Ok(())
@@ -1587,6 +1601,13 @@ mod tests {
         assert_eq!(cli.source.as_deref(), Some("src:/a.png"));
         assert!(Cli::try_parse_from(["sopen", "--here", "--target", "box", "a"]).is_err());
         assert!(Cli::try_parse_from(["sopen", "--target", "box", "cut", "a", "1", "2"]).is_err());
+        // `--browser` (09 §7), as typed and as HOST's half of a tunnel is given it.
+        let cli = Cli::try_parse_from(["sopen", "--browser", "http://x/"]).unwrap();
+        assert!(cli.browser && !cli.hold_until_eof);
+        let held = ["--here", "--hold-until-eof", "--browser", "--", "http://x/"];
+        let cli = Cli::try_parse_from(std::iter::once("sopen").chain(held)).unwrap();
+        assert!(cli.browser && cli.hold_until_eof && cli.here);
+        assert_eq!(cli.source.as_deref(), Some("http://x/"));
         // What HOST's sopen is given: after `--`, even a subcommand's name or a leading `-` is
         // SOURCE, and so is an empty SOURCE (HOST's home).
         for source in ["cut", "config", "-x.png", ""] {
