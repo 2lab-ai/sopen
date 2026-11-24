@@ -5,8 +5,13 @@
 //! What a pass paints in cells ([`super::cells`]) is read from its cells (10 §15): the text queries
 //! answer from the galleys egui drew and from the cell layers alike, in painting order, and leave
 //! out the glyphs the cell painter drew one per cell. A cell text is a stretch of one row of a
-//! layer ([`cells::find`]): looser than a galley's whole text, as part of a longer text is found too,
-//! and never across two layers. [`Driver::column`] reads cells by where they stand.
+//! layer ([`cells::find`]), never across two layers. An exact query — [`Driver::find_text`], the
+//! colour and row queries, the clicks — takes from the cells only a whole text of its row: from a
+//! run's first cell to a run's last ([`cells::runs`]), never a part of a longer run, as a galley
+//! answers only for all of its text — a status row in cells that names a button never stands in
+//! for the button. A prefix query keeps the galleys' rule, the text from where the prefix stands
+//! to the end of its run; a prefix in the middle of a run answers only when nothing starts with
+//! it. [`Driver::column`] reads cells by where they stand.
 
 mod meter;
 
@@ -96,6 +101,47 @@ fn merged<T>(mut shapes: Vec<(usize, T)>, cells: Vec<(usize, T)>) -> Vec<T> {
     shapes.extend(cells);
     shapes.sort_by_key(|&(at, _)| at);
     shapes.into_iter().map(|(_, t)| t).collect()
+}
+
+/// An exact query's answers: the shapes' and those of the cells that are a whole text of their
+/// row ([`whole_text`]), in painting order — a part of a longer run never answers.
+fn exact<T>(shapes: Vec<(usize, T)>, cells: Vec<(usize, bool, T)>) -> Vec<T> {
+    let whole = (cells.into_iter()).filter(|&(_, whole, _)| whole);
+    merged(shapes, whole.map(|(at, _, t)| (at, t)).collect())
+}
+
+/// A prefix query's answers, as [`merged`], each cell answer marked as starting a run or not:
+/// those in the middle of a run answer only when no shape and no cell text that starts a run
+/// does (see the module's header).
+fn ranked<T>(shapes: Vec<(usize, T)>, cells: Vec<(usize, bool, T)>) -> Vec<T> {
+    let (whole, part): (Vec<_>, Vec<_>) = cells.into_iter().partition(|&(_, whole, _)| whole);
+    let strip = |v: Vec<(usize, bool, T)>| v.into_iter().map(|(at, _, t)| (at, t)).collect();
+    let exact = merged(shapes, strip(whole));
+    if exact.is_empty() {
+        merged(vec![], strip(part))
+    } else {
+        exact
+    }
+}
+
+/// Whether `text`, found at `hit` in `l`, is a whole text of its row: without its blanks at
+/// either end — measured in cells, as the buffer lays them out (U+3000 is two) — it starts where
+/// a run starts and ends where a run ends ([`cells::runs`]: the same run, or runs a change of
+/// colours or a frame glyph apart) — not part of a longer run.
+fn whole_text(l: &Layer, hit: Cells, text: &str) -> bool {
+    let lead = cells::width(&text[..text.len() - text.trim_start().len()]) as u16;
+    let trail = cells::width(&text[text.trim_end().len()..]) as u16;
+    let (first, end) = (hit.x + lead, hit.right().saturating_sub(trail));
+    let runs = cells::runs(&l.buf);
+    let row = || runs.iter().filter(|r| r.cells.y == hit.y);
+    first < end && row().any(|r| r.cells.x == first) && row().any(|r| r.cells.right() == end)
+}
+
+/// Whether `prefix`, found at `hit` in `l`, starts a run of its row ([`cells::runs`]): its first
+/// cell that is not a blank — its leading blanks measured in cells — is a run's first.
+fn starts_a_run(l: &Layer, hit: Cells, prefix: &str) -> bool {
+    let lead = cells::width(&prefix[..prefix.len() - prefix.trim_start().len()]) as u16;
+    (cells::runs(&l.buf).iter()).any(|r| r.cells.y == hit.y && r.cells.x == hit.x + lead)
 }
 
 impl Driver {
@@ -493,12 +539,14 @@ impl Driver {
     }
 
     /// Every place the cells of the last pass show `text` where it can be seen, with its place in
-    /// painting order and its rect on screen.
-    fn cell_hits(&self, placed: &Placed, text: &str) -> Vec<(usize, cells::Hit, Rect)> {
+    /// painting order, whether it is a whole text of its row there ([`whole_text`]) and its rect
+    /// on screen.
+    fn cell_hits(&self, placed: &Placed, text: &str) -> Vec<(usize, bool, cells::Hit, Rect)> {
         let hits = cells::find(&self.layers, text).into_iter();
         hits.filter_map(|hit| {
             let (at, rect, seen) = self.on_screen(placed, hit.layer, hit.cells)?;
-            seen.then_some((at, hit, rect))
+            let whole = whole_text(&self.layers[hit.layer], hit.cells, text);
+            seen.then_some((at, whole, hit, rect))
         })
         .collect()
     }
@@ -522,9 +570,9 @@ impl Driver {
             _ => None,
         });
         let cells = self.cell_hits(&placed, text);
-        merged(
+        exact(
             shapes.into_iter().map(|(at, (r, ()))| (at, r)).collect(),
-            cells.into_iter().map(|(at, _, r)| (at, r)).collect(),
+            cells.into_iter().map(|(at, w, _, r)| (at, w, r)).collect(),
         )
     }
 
@@ -538,9 +586,9 @@ impl Driver {
     ) -> Option<Vec<Color32>> {
         let cells = self.cell_hits(placed, text).into_iter();
         let cells =
-            cells.map(|(at, hit, _)| (at, cells::colors(&self.layers[hit.layer], hit.cells)));
+            cells.map(|(at, w, hit, _)| (at, w, cells::colors(&self.layers[hit.layer], hit.cells)));
         let shapes = shapes.into_iter().map(|(at, (_, c))| (at, c)).collect();
-        merged(shapes, cells.collect()).into_iter().next()
+        exact(shapes, cells.collect()).into_iter().next()
     }
 
     /// The colour of each section of the galley the last pass drew for exactly `text`, where it
@@ -611,18 +659,19 @@ impl Driver {
             _ => None,
         });
         let cells = self.cell_texts_from(&placed, prefix);
-        merged(shapes, cells)
+        ranked(shapes, cells)
     }
 
     /// The cells' answers to [`Driver::texts_starting_with`], each with its place in painting
-    /// order: for no prefix, every run where it can be seen.
-    fn cell_texts_from(&self, placed: &Placed, prefix: &str) -> Vec<(usize, (Rect, String))> {
+    /// order and whether `prefix` starts a run there ([`starts_a_run`]): for no prefix, every run
+    /// where it can be seen.
+    fn cell_texts_from(&self, placed: &Placed, prefix: &str) -> Vec<(usize, bool, (Rect, String))> {
         let mut out = vec![];
         if prefix.is_empty() {
             for (li, l) in self.layers.iter().enumerate() {
                 for run in cells::runs(&l.buf) {
                     if let Some((at, rect, true)) = self.on_screen(placed, li, run.cells) {
-                        out.push((at, (rect, run.text)));
+                        out.push((at, true, (rect, run.text)));
                     }
                 }
             }
@@ -649,7 +698,7 @@ impl Driver {
             while x < a.right() {
                 let (s, w) = (at(x), wide(x));
                 let two_blanks = blank(x) && x + w < a.right() && blank(x + w);
-                let framed = s.symbol.chars().any(cells::frame_glyph);
+                let framed = cells::frame_cell(&s.symbol, s.fg, s.bg);
                 if framed || (s.fg, s.bg) != colours || two_blanks {
                     break;
                 }
@@ -664,7 +713,8 @@ impl Driver {
             }
             let run = Cells::new(hit.cells.x, hit.cells.y, end - hit.cells.x, 1);
             if let Some((at, rect, true)) = self.on_screen(placed, hit.layer, run) {
-                out.push((at, (rect, text)));
+                let starts = starts_a_run(l, hit.cells, prefix);
+                out.push((at, starts, (rect, text)));
             }
         }
         out
@@ -798,7 +848,7 @@ impl Driver {
             .map(|(at, (_, rows))| (at, rows))
             .collect();
         let cells = self.cell_hits(&placed, text).into_iter();
-        merged(shapes, cells.map(|(at, _, _)| (at, 1)).collect())
+        exact(shapes, cells.map(|(at, w, _, _)| (at, w, 1)).collect())
             .first()
             .copied()
     }
@@ -1195,7 +1245,8 @@ mod tests {
 
     /// A run stops at a frame glyph, though its colours go on, and at two blanks; a prefix comes
     /// back whole with the rest of its run in the colours of its last cell, across a change of
-    /// colours inside it.
+    /// colours inside it. A text across the frame glyph is whole from a run's start to a run's
+    /// end, and not when it ends inside a run.
     #[test]
     fn a_run_stops_at_a_frame_glyph() {
         let dim = Pen::new(PALETTE.dim, PALETTE.back);
@@ -1216,7 +1267,8 @@ mod tests {
         assert_eq!(drv.text_starting_with("cd"), Some("cd x y".to_string()));
         let crossing = drv.texts_starting_with("bcd");
         assert_eq!(crossing, vec![(at(1, 1, 8), "bcdefghi".to_string())]);
-        assert_eq!(drv.find_text("ab│cd"), Some(at(0, 0, 5)));
+        assert_eq!(drv.find_text("ab│cd x y"), Some(at(0, 0, 9)));
+        assert_eq!(drv.find_text("ab│cd"), None, "a part of the run \"cd x y\"");
     }
 
     /// The column query reads cells by where they stand: a list's Name and Ext columns one blank
@@ -1309,18 +1361,19 @@ mod tests {
         assert_eq!(drv.labelled("abc"), vec![at(0, 0, 3)]);
     }
 
-    /// A text that runs past its layer's clip is not found, as a galley that does is not; the
-    /// part of its row inside the clip is.
+    /// A text that runs past its layer's clip is not found, as a galley that does is not; a text
+    /// of its row inside the clip is (a part of the cut one is not: a part never answers).
     #[test]
     fn a_text_across_its_clips_edge_is_not_found() {
-        let buf = buffer(10, 1, &[(3, 0, "abcdef", body())]);
+        let buf = buffer(10, 1, &[(0, 0, "x", body()), (3, 0, "abcdef", body())]);
         let mut drv = Driver::new(600.0, 400.0);
         drv.idle(&mut Screen::of(vec![(ORIGIN, at(0, 0, 5), buf)]), 1);
         assert_eq!(drv.find_text("abcdef"), None);
         assert_eq!(drv.colors_of("abcdef"), None);
         assert_eq!(drv.rows_of("abcdef"), None);
         assert_eq!(drv.text_starting_with("ab"), None, "its run goes on past");
-        assert_eq!(drv.find_text("ab"), Some(at(3, 0, 2)));
+        assert_eq!(drv.find_text("x"), Some(at(0, 0, 1)));
+        assert_eq!(drv.find_text("ab"), None);
     }
 
     /// Paints "abc" in cells on a layer of its own that egui moves by `by` (a layer transform
@@ -1520,6 +1573,85 @@ mod tests {
             drv.click_text_on_top(&mut win, "Copy");
             assert_eq!(drv.pointer, order[1].center());
         }
+    }
+
+    /// A word of a longer text in cells — a status row naming a button, painted before the
+    /// button — never answers an exact query, label or no label (DEC 2026-11-25); a prefix in the
+    /// middle of a run answers a prefix query only when nothing starts with it.
+    #[test]
+    fn part_of_a_cell_text_never_answers_an_exact_query() {
+        let dim = Pen::new(PALETTE.dim, PALETTE.back);
+        let status = (
+            ORIGIN,
+            Rect::EVERYTHING,
+            buffer(30, 1, &[(1, 0, "M Amend · Copy the tag", dim)]),
+        );
+        let mut drv = Driver::new(600.0, 400.0);
+        let mut win = Screen {
+            layers: vec![status.clone()],
+            after: Some("Copy"),
+            ..Screen::default()
+        };
+        drv.idle(&mut win, 1);
+        let label = drv.find_text("Copy").expect("the label");
+        assert_ne!(label, at(11, 0, 4), "the label, not the status row's word");
+        assert_eq!(drv.labelled("Copy"), vec![label]);
+        assert_eq!(drv.painted_colors_of("Copy"), Some(vec![PALETTE.text]));
+        let starting: Vec<Rect> = (drv.texts_starting_with("Cop").into_iter())
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(starting, vec![label], "a prefix in the middle of the run");
+        drv.click_text_on_top(&mut win, "Copy");
+        assert_eq!(drv.pointer, label.center());
+        // The whole status row, and its start, are whole cell texts: they answer beside a label.
+        assert_eq!(drv.find_text("M Amend · Copy the tag"), Some(at(1, 0, 22)));
+        assert_eq!(
+            drv.text_starting_with("M Amend"),
+            Some("M Amend · Copy the tag".to_string())
+        );
+        // Without the label, the word in the cells is still not an answer — the prefix is.
+        let mut alone = Screen::of(vec![status]);
+        drv.idle(&mut alone, 1);
+        assert_eq!(drv.find_text("Copy"), None);
+        assert_eq!(drv.colors_of("Copy"), None);
+        assert_eq!(drv.rows_of("Copy"), None);
+        assert_eq!(
+            drv.text_starting_with("Cop"),
+            Some("Copy the tag".to_string())
+        );
+    }
+
+    /// The blanks around a text are measured in cells, as the cells lay them out: a leading or
+    /// trailing ideographic space (U+3000) is two cells, a space one, beside a wide glyph or not.
+    /// A whole text with them is found, and a prefix that starts with one starts its run — it
+    /// answers beside a label that starts the same way.
+    #[test]
+    fn blanks_around_a_text_are_measured_in_cells() {
+        let buf = buffer(
+            12,
+            2,
+            &[(1, 0, "\u{3000}abc\u{3000}", body()), (2, 1, "한", body())],
+        );
+        let mut drv = Driver::new(600.0, 400.0);
+        let mut win = Screen {
+            layers: vec![(ORIGIN, Rect::EVERYTHING, buf)],
+            before: Some("\u{3000}ab, a label"),
+            ..Screen::default()
+        };
+        drv.idle(&mut win, 1);
+        assert_eq!(drv.find_text("\u{3000}abc"), Some(at(1, 0, 5)));
+        assert_eq!(drv.find_text("abc\u{3000}"), Some(at(3, 0, 5)));
+        assert_eq!(drv.find_text("\u{3000}abc\u{3000}"), Some(at(1, 0, 7)));
+        assert_eq!(drv.find_text(" 한"), Some(at(1, 1, 3)));
+        assert_eq!(drv.find_text("한 "), Some(at(2, 1, 3)));
+        let label = drv.find_text("\u{3000}ab, a label").expect("the label");
+        assert_eq!(
+            drv.texts_starting_with("\u{3000}ab"),
+            vec![
+                (label, "\u{3000}ab, a label".to_string()),
+                (at(1, 0, 5), "\u{3000}abc".to_string())
+            ]
+        );
     }
 
     /// Without cells the answers are the shapes' alone, as before: a label's are the same with
