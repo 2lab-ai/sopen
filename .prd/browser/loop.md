@@ -15,7 +15,7 @@ WU row is in [`loop.done.md`](loop.done.md). Target: [`ssot.md`](ssot.md). Contr
 
 | ID | Status | What | Who |
 |---|---|---|---|
-| K-L1 | 🟡 running | Feasibility gate for message 19 on Linux (KDE Plasma 6 Wayland): with a keyboard-shortcuts inhibitor on a focused sopen-like surface, does a globally bound top-row key (screen brightness) reach the client, can it be read under eframe, what else stops while sopen is focused, and is the inhibitor dropped when the client dies. A prototype in a private headless compositor, never on the owner's display. It reverses 04 §6.4 only if it passes; the owner decides any side effect (e.g. Alt+Tab inside sopen). | research unit |
+| K-L1 | 🟡 running | Feasibility gate for message 19 on Linux (KDE Plasma 6 Wayland): with a keyboard-shortcuts inhibitor on a focused sopen-like surface, does a globally bound top-row key (screen brightness) reach the client, can it be read under eframe, what else stops while sopen is focused, and is the inhibitor dropped when the client dies. A prototype in a private headless compositor, never on the owner's display. It reverses 04 §6.4 only if it passes; the owner decides any side effect (e.g. Alt+Tab inside sopen). Its verdict covers GUI mode, where sopen owns the window; in a terminal (message 23 makes the TUI the default) sopen owns no window, which the xtools workstream's XR-T answers. | research unit |
 | K-L2 | 🔴 open | The owner-assisted receipt K-L1 designs: the owner presses F1…F12 in a logging mode on the Linux laptop, so the top row's real codes are measured, not recalled (this account cannot read input devices). Batched with K-F3. | the owner, at the Linux laptop |
 
 ## Build facts
