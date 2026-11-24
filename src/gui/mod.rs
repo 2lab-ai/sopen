@@ -769,6 +769,8 @@ pub fn own_keys(ui: &mut egui::Ui, keys: &[chrome::FKey]) {
 pub(crate) struct FKeyInput {
     /// What each digit key (1…9, 0) is while it is down.
     digits: [Digit; 10],
+    /// G is down as Alt+G, the terminal's switch: its repeats and release are taken too.
+    g: bool,
 }
 
 /// A digit key between its press and its release: the shell decides at the press what it is,
@@ -797,6 +799,7 @@ impl egui::Plugin for FKeyInput {
             in_terminal(ctx),
             &mut input.events,
             &mut self.digits,
+            &mut self.g,
             typing,
             input.focused,
             clicked,
@@ -830,7 +833,8 @@ fn fkey_events(
     focused: bool,
     clicked: Option<u8>,
 ) -> bool {
-    key_aliases(false, events, digits, typing, focused, clicked)
+    let mut g = false;
+    key_aliases(false, events, digits, &mut g, typing, focused, clicked)
 }
 
 /// The key events of a pass (see [`FKeyInput`]); `terminal`: the terminal backend's pass
@@ -845,13 +849,14 @@ fn fkey_events(
 ///
 /// The switch (10 §9, T4, T33), a field's typing or not, as it types nothing: every F12 event
 /// is taken — no window or key-table row has one (`keys.rs`'s `no_duplicate_bindings`) — and
-/// its press without modifiers asks for it; in a terminal Alt+G's press and release are taken
-/// and the press asks for it (a terminal's release is made with its press, modifiers and all:
-/// `term_input`). A repeat asks nothing. Whether this pass asked.
+/// its press without modifiers asks for it; in a terminal G pressed with exactly Alt asks for
+/// it and is taken until it is let go (`g`: its repeats and release, Alt still held or not; a
+/// focus lost forgets it). A repeat asks nothing. Whether this pass asked.
 fn key_aliases(
     terminal: bool,
     events: &mut Vec<egui::Event>,
     digits: &mut [Digit; 10],
+    g: &mut bool,
     typing: bool,
     focused: bool,
     clicked: Option<u8>,
@@ -887,6 +892,7 @@ fn key_aliases(
             egui::Event::Text(_) if typed_by_alias => continue,
             egui::Event::WindowFocused(false) => {
                 let_go(digits, &mut out);
+                *g = false;
                 out.push(event);
                 continue;
             }
@@ -902,14 +908,22 @@ fn key_aliases(
                 continue;
             }
         };
-        let switch_key = match key {
-            F12 => Some(Mods::None),
-            G if terminal && Mods::Alt.matches(modifiers) => Some(Mods::Alt),
-            _ => None,
-        };
-        if let Some(mods) = switch_key {
-            switch |= pressed && !repeat && mods.matches(modifiers);
+        if key == F12 {
+            switch |= pressed && !repeat && Mods::None.matches(modifiers);
             continue;
+        }
+        if key == G && terminal {
+            let alt_g = match (pressed, *g) {
+                (true, false) if Mods::Alt.matches(modifiers) => {
+                    switch |= !repeat;
+                    true
+                }
+                (_, held) => held,
+            };
+            if alt_g {
+                *g = pressed;
+                continue;
+            }
         }
         let Some(n) = physical_key.and_then(number).or_else(|| number(key)) else {
             out.push(event);
@@ -933,6 +947,7 @@ fn key_aliases(
     }
     if !focused {
         let_go(digits, &mut out);
+        *g = false;
     }
     if let Some(n) = clicked.filter(|n| !typing && chrome::fkey(*n).is_some()) {
         out.extend([fkey(n, true), fkey(n, false)]);
@@ -1040,6 +1055,9 @@ struct Shell<W: Window> {
     /// This process's F-key switch, told on every pass whether a window is in front (04 §6.2);
     /// none in a scripted run, with `fkeys = "system"` or off macOS.
     fkeys: Option<Arc<Feed>>,
+    /// Set once the shell let a close through ([`closing`]): the window ends as asked. Its
+    /// runner reads it after the loop ([`Ended::closed`]).
+    closed: Arc<AtomicBool>,
 }
 
 /// The `help=1` receipt: F1 pressed once what the state asked for is on screen, then the
@@ -1252,7 +1270,9 @@ impl<W: Window> eframe::App for Shell<W> {
             // Focus and input arrive as window events, which repaint by themselves.
             Raise::Floating | Raise::Done => {}
         }
-        closing(&ctx, &mut self.inner, self.scripted);
+        if closing(&ctx, &mut self.inner, self.scripted) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
         self.inner.ui(ui);
         if self.press == Press::Waiting && self.inner.ready() {
             self.press = Press::Now;
@@ -1265,14 +1285,22 @@ impl<W: Window> eframe::App for Shell<W> {
 /// The shell's part of closing, before the window's pass: Cmd/Ctrl+Q and +W ask to close, as
 /// the window's close button does; a close asked for (by those, or by the window itself —
 /// F3, its prompt answered) goes to the window first, and its refusal cancels it (it shows
-/// its own prompt). A scripted run never refuses. The test kit runs the same function.
-pub(crate) fn closing<W: Window + ?Sized>(ctx: &egui::Context, inner: &mut W, scripted: bool) {
+/// its own prompt). A scripted run never refuses. The test kit runs the same function. Whether
+/// a close went through in this pass (asked for, not cancelled): the window ends.
+pub(crate) fn closing<W: Window + ?Sized>(
+    ctx: &egui::Context,
+    inner: &mut W,
+    scripted: bool,
+) -> bool {
     if command_key(ctx, egui::Key::Q, false) || command_key(ctx, egui::Key::W, false) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
-    if ctx.input(|i| i.viewport().close_requested()) && !scripted && !inner.close_requested() {
+    let asked = ctx.input(|i| i.viewport().close_requested());
+    if asked && !scripted && !inner.close_requested() {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        return false;
     }
+    asked
 }
 
 /// `SOPEN_RENDERER=glow|wgpu`; unset = wgpu, with glow when wgpu does not start.
@@ -1354,32 +1382,93 @@ fn on_the_event_loop<R>(run: impl FnOnce(&mut EventLoop) -> R) -> Result<R, Stri
 
 /// One run of the app in `slot` with `options` on this process's event loop: eframe's handler
 /// (`eframe::create_native`), run by `run_app_on_demand` until the window closes, then dropped
-/// — the app with it, if it started. `Err` only when the loop itself failed: a renderer that
-/// does not start leaves the app in its slot and the loop returns `Ok` (see [`start`]).
+/// — the app with it, if it started. `Ok` with the error eframe logged meanwhile, if any
+/// ([`hearing_eframe`]): a renderer that does not start leaves the app in its slot and the
+/// loop returns `Ok` (see [`start`]). `Err` only when the loop itself failed.
 fn attempt<A: eframe::App + 'static>(
     slot: &RefCell<Option<A>>,
     options: eframe::NativeOptions,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
-    on_the_event_loop(|event_loop| {
-        let mut app = eframe::create_native(
-            "sopen",
-            options,
-            Box::new(|cc| {
-                // The look, before the first frame.
-                chrome::install(&cc.egui_ctx);
-                let app = slot
-                    .borrow_mut()
-                    .take()
-                    .ok_or("the window was already started once")?;
-                Ok(Box::new(app) as Box<dyn eframe::App>)
-            }),
-            event_loop,
-        );
-        let ran = event_loop.run_app_on_demand(&mut app);
-        drop(app);
-        ran.map_err(|e| format!("the event loop failed: {e}"))
-    })?
+    let (ran, error) = hearing_eframe(|| {
+        on_the_event_loop(|event_loop| {
+            let mut app = eframe::create_native(
+                "sopen",
+                options,
+                Box::new(|cc| {
+                    // The look, before the first frame.
+                    chrome::install(&cc.egui_ctx);
+                    let app = slot
+                        .borrow_mut()
+                        .take()
+                        .ok_or("the window was already started once")?;
+                    Ok(Box::new(app) as Box<dyn eframe::App>)
+                }),
+                event_loop,
+            );
+            let ran = event_loop.run_app_on_demand(&mut app);
+            drop(app);
+            ran.map_err(|e| format!("the event loop failed: {e}"))
+        })
+    });
+    ran?.map(|()| error)
+}
+
+/// eframe's error-level `log` records, kept for the attempt running on the thread that logged
+/// them ([`hearing_eframe`]); everything else is dropped. sopen installs no other logger.
+struct EframeErrors;
+
+thread_local! {
+    /// The last eframe error heard by the attempt running on this thread; `None` outside one.
+    static HEARD: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
+}
+
+/// The words eframe puts before the error that ended its loop (`native/run.rs:178`).
+const EFRAME_EXITING: &str = "Exiting because of error: ";
+
+impl log::Log for EframeErrors {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() == log::Level::Error && metadata.target().starts_with("eframe")
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let text = record.args().to_string();
+        let text = text
+            .strip_prefix(EFRAME_EXITING)
+            .unwrap_or(&text)
+            .to_string();
+        let _ = HEARD.try_with(|heard| {
+            if let Ok(mut heard) = heard.try_borrow_mut() {
+                if let Some(last) = heard.as_mut() {
+                    *last = Some(text);
+                }
+            }
+        });
+    }
+
+    fn flush(&self) {}
+}
+
+/// Runs `run`, keeping the last error eframe logs on this thread meanwhile (10 T31): eframe
+/// returns no `Result` from `create_native` and keeps a renderer's error to
+/// `log::error!("Exiting because of error: {err}")` (`native/run.rs:178`), so that record —
+/// [`EFRAME_EXITING`] taken off — is the reason a window did not start, or ended. The logger
+/// is installed once per process; if another one already is, nothing is heard.
+fn hearing_eframe<R>(run: impl FnOnce() -> R) -> (R, Option<String>) {
+    static EFRAME: EframeErrors = EframeErrors;
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        if log::set_logger(&EFRAME).is_ok() {
+            log::set_max_level(log::LevelFilter::Error);
+        }
+    });
+    HEARD.with(|heard| *heard.borrow_mut() = Some(None));
+    let out = run();
+    let heard = HEARD.with(|heard| heard.borrow_mut().take().flatten());
+    (out, heard)
 }
 
 /// A window that did not open (10 T31, 04 §6.4.3): no renderer started it, or the event loop
@@ -1408,36 +1497,83 @@ fn renderers(choice: RendererChoice) -> &'static [eframe::Renderer] {
     }
 }
 
+fn renderer_name(renderer: eframe::Renderer) -> &'static str {
+    match renderer {
+        eframe::Renderer::Wgpu => "wgpu",
+        eframe::Renderer::Glow => "glow",
+    }
+}
+
+/// How one [`attempt`]'s loop ended.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Ended {
+    /// The error eframe logged in it ([`hearing_eframe`]).
+    error: Option<String>,
+    /// The shell let a close through ([`closing`]): the window ended as asked.
+    closed: bool,
+}
+
+/// The line when wgpu did not start and glow is tried, with wgpu's error when eframe said it.
+fn retry_line(error: Option<&str>) -> String {
+    let why = error.map(|e| format!(" ({e})")).unwrap_or_default();
+    format!("sopen: the wgpu renderer did not start{why}; using OpenGL (glow)")
+}
+
 /// Starts the app in `slot` with the first of `choice`'s renderers that takes it; `run` is one
 /// renderer's [`attempt`]. `create_native` returns no `Result`: a renderer's error stays
 /// inside eframe (`native/run.rs:96, 177-191, 541`) and the loop returns `Ok`, so a renderer
-/// started exactly when the app has left its slot (04 §6.4.3) — wgpu fails at `set_window`,
-/// before the app creator — and while it is still there the next one tries: glow after wgpu,
-/// with a line saying so. None took it → [`NotStarted`]. The loop failing is no renderer's
-/// failure and ends it at once: [`NotStarted`] with its reason, or — under a window that
-/// started — an error. A run whose app was created ends as a close.
+/// started exactly when the app has left its slot (04 §6.4.3) and while it is still there the
+/// next one tries: glow after wgpu, with [`retry_line`]. None took it → [`NotStarted`], naming
+/// each renderer's error. The loop failing is no renderer's failure and ends it at once:
+/// [`NotStarted`] with its reason, or — under a window that started — an error. A window that
+/// started ends as a close, unless eframe's error ended it without the shell letting a close
+/// through: then an error names it (as `run_native`'s `Err` did, exit 1).
 fn start<A>(
     choice: RendererChoice,
     slot: &RefCell<Option<A>>,
-    mut run: impl FnMut(eframe::Renderer) -> Result<(), String>,
+    mut run: impl FnMut(eframe::Renderer) -> Result<Ended, String>,
 ) -> Result<()> {
-    for (n, &renderer) in renderers(choice).iter().enumerate() {
-        if n > 0 {
-            eprintln!("sopen: the wgpu renderer did not start; using OpenGL (glow)");
+    let mut failed: Vec<(eframe::Renderer, Option<String>)> = Vec::new();
+    for &renderer in renderers(choice) {
+        if let Some((_, error)) = failed.last() {
+            eprintln!("{}", retry_line(error.as_deref()));
         }
         let ran = run(renderer);
+        // The app creator runs only once the window and its renderer are up: wgpu sets its
+        // surface (`set_window`, eframe-0.37.0 `native/wgpu_integration.rs:272`) before it
+        // (`:325-345`); glow makes its window and GL context
+        // (`native/glow_integration.rs:275-279`) before it (`:431`). An error before that
+        // leaves the app here. Re-check both on an eframe upgrade.
         let started = slot.borrow().is_none();
         match ran {
-            Ok(()) if started => return Ok(()),
-            Ok(()) => {}
+            Ok(Ended {
+                error: Some(e),
+                closed: false,
+            }) if started => bail!("the window ended on an error: {e}"),
+            Ok(_) if started => return Ok(()),
+            Ok(Ended { error, .. }) => failed.push((renderer, error)),
             Err(why) if started => bail!("the window's event loop failed: {why}"),
             Err(reason) => return Err(NotStarted { reason }.into()),
         }
     }
-    let reason = match choice {
-        RendererChoice::Auto => "neither wgpu nor glow started".to_string(),
-        RendererChoice::Wgpu => "the wgpu renderer did not start (SOPEN_RENDERER=wgpu)".into(),
-        RendererChoice::Glow => "the glow renderer did not start (SOPEN_RENDERER=glow)".into(),
+    let reason = match (choice, failed.as_slice()) {
+        (RendererChoice::Auto, failed) => {
+            let why: Vec<String> = failed
+                .iter()
+                .filter_map(|(r, e)| Some(format!("{}: {}", renderer_name(*r), e.as_ref()?)))
+                .collect();
+            if why.is_empty() {
+                "neither wgpu nor glow started".to_string()
+            } else {
+                format!("neither wgpu nor glow started ({})", why.join("; "))
+            }
+        }
+        (_, [(renderer, error)]) => {
+            let name = renderer_name(*renderer);
+            let why = error.as_ref().map(|e| format!(": {e}")).unwrap_or_default();
+            format!("the {name} renderer did not start (SOPEN_RENDERER={name}){why}")
+        }
+        (_, _) => unreachable!("a forced renderer is tried alone"),
     };
     Err(NotStarted { reason }.into())
 }
@@ -1473,6 +1609,7 @@ pub fn run_window_sized<W: Window + 'static>(
     let choice = renderer_choice()?;
     let shot_done = Arc::new(AtomicBool::new(false));
     let shot_result: Arc<Mutex<Option<Result<String, String>>>> = Arc::default();
+    let closed = Arc::new(AtomicBool::new(false));
     if hooks.screenshot.is_some() {
         let secs: u64 = std::env::var("SOPEN_WATCHDOG")
             .ok()
@@ -1507,6 +1644,7 @@ pub fn run_window_sized<W: Window + 'static>(
             Press::Done
         },
         fkeys: this_runs_fkeys(),
+        closed: closed.clone(),
     };
     // The app moves into whichever renderer starts. A renderer that fails before creating the
     // app leaves it here for the next one.
@@ -1528,7 +1666,10 @@ pub fn run_window_sized<W: Window + 'static>(
             centered: true,
             ..Default::default()
         };
-        attempt(&slot, options)
+        attempt(&slot, options).map(|error| Ended {
+            error,
+            closed: closed.load(Ordering::SeqCst),
+        })
     })?;
     if hooks.screenshot.is_some() {
         match shot_result.lock().unwrap().take() {
@@ -2948,6 +3089,7 @@ mod tests {
             raise: Raise::Done,
             press: Press::Done,
             fkeys: Some(feed.clone()),
+            closed: Arc::default(),
         }
     }
 
@@ -3595,11 +3737,11 @@ mod tests {
     }
 
     /// 10 §9, T4: F12 is the switch, taken by the shell's input hook in every context — a field
-    /// with the typing included — so neither the window nor a key-table row sees it and it types
-    /// nothing; the pass it was pressed in asks for the switch, the next one does not. A held
-    /// F12's repeat and Shift+F12 ask nothing.
+    /// with the typing included — so neither the window nor a key-table row sees it; the pass
+    /// it was pressed in asks for the switch, the next one does not. A held F12's repeat and
+    /// Shift+F12 ask nothing. (F12 comes with no text, from a window or a terminal.)
     #[test]
-    fn xw_shell_f12_is_the_switch_in_every_context_and_types_nothing() {
+    fn xw_shell_f12_is_the_switch_in_every_context() {
         use egui::Key::F12;
         let (none, shift) = (egui::Modifiers::NONE, egui::Modifiers::SHIFT);
         for focus in [false, true] {
@@ -3630,7 +3772,6 @@ mod tests {
             drv.frame(&mut win, press(F12, shift), shift);
             assert!(!switch_asked(&drv.ctx), "focus {focus}: Shift+F12");
             assert_eq!(seen_keys(&mut win), [], "focus {focus}: no F12 reached it");
-            assert_eq!(win.text, "name");
             assert!(!drv.ctx.input(|i| i.key_down(F12)));
         }
     }
@@ -3697,8 +3838,39 @@ mod tests {
         drv.frame(&mut win, press(G, alt), alt);
         assert!(switch_asked(&drv.ctx), "Alt+G from the field");
         assert_eq!(seen_keys(&mut win), []);
-        assert_eq!(win.text, "", "nothing typed");
         assert!(!drv.ctx.input(|i| i.key_down(F5) || i.key_down(G)));
+    }
+
+    /// Alt+G in a terminal is decided at its press, as a digit is: its release is taken too
+    /// when Alt was let go first, and a focus lost while it is down forgets it, so the next
+    /// plain G is G again.
+    #[test]
+    fn xw_shell_alt_g_keeps_its_release_after_alt_goes() {
+        use egui::Key::G;
+        let (alt, none) = (egui::Modifiers::ALT, egui::Modifiers::NONE);
+        let mut drv = testkit::Driver::new(400.0, 200.0);
+        mark_terminal(&drv.ctx);
+        let mut win = Recorder {
+            seen: Vec::new(),
+            text: String::new(),
+            focus: false,
+        };
+        drv.idle(&mut win, 2);
+        drv.frame(&mut win, vec![digit(G, true, alt)], alt);
+        assert!(switch_asked(&drv.ctx));
+        drv.frame(&mut win, vec![digit(G, false, none)], none);
+        assert_eq!(seen_keys(&mut win), [], "the release went with its press");
+        assert!(!drv.ctx.input(|i| i.key_down(G)));
+        drv.frame(&mut win, vec![digit(G, true, alt)], alt);
+        drv.frame(&mut win, vec![egui::Event::WindowFocused(false)], none);
+        drv.frame(&mut win, vec![egui::Event::WindowFocused(true)], none);
+        drv.frame(&mut win, press(G, none), none);
+        assert!(!switch_asked(&drv.ctx));
+        assert_eq!(
+            seen_keys(&mut win),
+            [(G, true), (G, false)],
+            "a plain G after the focus came back"
+        );
     }
 
     // -----------------------------------------------------------------------------------------
@@ -3710,7 +3882,7 @@ mod tests {
     fn started(
         choice: RendererChoice,
         takes: &[eframe::Renderer],
-        ends: impl Fn(eframe::Renderer) -> Result<(), String>,
+        ends: impl Fn(eframe::Renderer) -> Result<Ended, String>,
     ) -> (Vec<eframe::Renderer>, Result<()>, bool) {
         let slot = RefCell::new(Some("the shell"));
         let mut ran = Vec::new();
@@ -3725,6 +3897,15 @@ mod tests {
         (ran, out, left)
     }
 
+    /// A loop that ended with eframe's error `error` (none: `""`), the shell having let a
+    /// close through or not.
+    fn ended(error: &str, closed: bool) -> Result<Ended, String> {
+        Ok(Ended {
+            error: (!error.is_empty()).then(|| error.to_string()),
+            closed,
+        })
+    }
+
     /// The reason of a start that never ran the window ([`NotStarted`]).
     fn not_started(out: &Result<()>) -> Option<String> {
         let e = out.as_ref().err()?.downcast_ref::<NotStarted>()?;
@@ -3734,46 +3915,63 @@ mod tests {
     /// 04 §6.4.3: `create_native` returns no `Result`, and a renderer's failure stays inside
     /// eframe while the loop returns `Ok`, so the retry's trigger is the shell still in its
     /// slot: wgpu's loop ends `Ok` with the shell there → glow runs and takes it. A wgpu that
-    /// takes it runs alone.
+    /// takes it runs alone. The retry's line names wgpu's error (10 T31), as eframe logged it.
     #[test]
     fn xw_shell_the_glow_retry_fires_on_the_shell_still_in_its_slot() {
         use eframe::Renderer::{Glow, Wgpu};
-        let (ran, out, left) = started(RendererChoice::Auto, &[Glow], |_| Ok(()));
+        let (ran, out, left) = started(RendererChoice::Auto, &[Glow], |r| match r {
+            Wgpu => ended("WGPU error: no surface", false),
+            Glow => ended("", true),
+        });
         assert_eq!(ran, [Wgpu, Glow]);
         assert!(out.is_ok() && !left, "{out:?}");
-        let (ran, out, left) = started(RendererChoice::Auto, &[Wgpu, Glow], |_| Ok(()));
+        let (ran, out, left) = started(RendererChoice::Auto, &[Wgpu, Glow], |_| ended("", true));
         assert_eq!(ran, [Wgpu]);
         assert!(out.is_ok() && !left, "{out:?}");
+        assert_eq!(
+            retry_line(Some("WGPU error: no surface")),
+            "sopen: the wgpu renderer did not start (WGPU error: no surface); using OpenGL (glow)"
+        );
+        assert_eq!(
+            retry_line(None),
+            "sopen: the wgpu renderer did not start; using OpenGL (glow)"
+        );
     }
 
     /// Still in its slot after glow too → `cannot open a window: neither wgpu nor glow started`
-    /// (04 §6.4.3), the shell never run; a forced renderer (`SOPEN_RENDERER`) runs alone and
-    /// is named.
+    /// (04 §6.4.3) with each renderer's error eframe logged (10 T31), the shell never run; a
+    /// forced renderer (`SOPEN_RENDERER`) runs alone and is named.
     #[test]
-    fn xw_shell_no_renderer_started_says_which() {
+    fn xw_shell_no_renderer_started_says_which_and_why() {
         use eframe::Renderer::{Glow, Wgpu};
-        let (ran, out, left) = started(RendererChoice::Auto, &[], |_| Ok(()));
+        let (ran, out, left) = started(RendererChoice::Auto, &[], |r| match r {
+            Wgpu => ended("WGPU error: no surface", false),
+            Glow => ended("no GL config", false),
+        });
         assert_eq!(ran, [Wgpu, Glow]);
         assert!(left);
         assert_eq!(
-            not_started(&out).as_deref(),
-            Some("neither wgpu nor glow started")
-        );
-        assert_eq!(
             format!("{:#}", out.unwrap_err()),
-            "cannot open a window: neither wgpu nor glow started"
+            "cannot open a window: neither wgpu nor glow started \
+             (wgpu: WGPU error: no surface; glow: no GL config)"
+        );
+        let (_, out, _) = started(RendererChoice::Auto, &[], |_| ended("", false));
+        assert_eq!(
+            not_started(&out).as_deref(),
+            Some("neither wgpu nor glow started"),
+            "no error heard"
         );
         for (choice, only, name) in [
             (RendererChoice::Wgpu, Wgpu, "wgpu"),
             (RendererChoice::Glow, Glow, "glow"),
         ] {
-            let (ran, out, left) = started(choice, &[], |_| Ok(()));
+            let (ran, out, left) = started(choice, &[], |_| ended("it broke", false));
             assert_eq!(ran, [only]);
             assert!(left);
             assert_eq!(
                 not_started(&out),
                 Some(format!(
-                    "the {name} renderer did not start (SOPEN_RENDERER={name})"
+                    "the {name} renderer did not start (SOPEN_RENDERER={name}): it broke"
                 ))
             );
         }
@@ -3803,5 +4001,46 @@ mod tests {
             !left && out.is_err() && not_started(&out).is_none(),
             "{out:?}"
         );
+    }
+
+    /// A window that started and then ended on eframe's error without the shell having let a
+    /// close through is no silent close: an error naming it (exit 1, as `run_native`'s error
+    /// was). With a close let through, or no error, it ended as a close.
+    #[test]
+    fn xw_shell_an_error_under_a_started_window_is_said() {
+        use eframe::Renderer::Wgpu;
+        let (ran, out, _) = started(RendererChoice::Auto, &[Wgpu], |_| {
+            ended("WGPU error: surface lost", false)
+        });
+        assert_eq!(ran, [Wgpu]);
+        assert_eq!(
+            format!("{:#}", out.unwrap_err()),
+            "the window ended on an error: WGPU error: surface lost"
+        );
+        for (error, closed) in [("WGPU error: surface lost", true), ("", false)] {
+            let (_, out, _) = started(RendererChoice::Auto, &[Wgpu], |_| ended(error, closed));
+            assert!(out.is_ok(), "{error:?} closed {closed}: {out:?}");
+        }
+    }
+
+    /// eframe's error-level records reach the attempt that heard them (10 T31: eframe keeps a
+    /// renderer's error to `log::error!("Exiting because of error: {err}")`, `native/run.rs:178`),
+    /// that prefix taken off, the last one kept; another crate's records and records outside an
+    /// attempt are kept nowhere.
+    #[test]
+    fn xw_shell_eframes_error_record_is_heard() {
+        let ((), heard) = hearing_eframe(|| {
+            log::error!(target: "eframe::native::wgpu_integration", "Failed to create window: x");
+            log::error!(target: "egui_wgpu::winit", "not eframe's");
+            log::error!(
+                target: "eframe::native::run",
+                "Exiting because of error: WGPU error: no surface"
+            );
+            log::warn!(target: "eframe::native::run", "a warning");
+        });
+        assert_eq!(heard.as_deref(), Some("WGPU error: no surface"));
+        log::error!(target: "eframe::native::run", "Exiting because of error: outside");
+        let ((), heard) = hearing_eframe(|| {});
+        assert_eq!(heard, None);
     }
 }

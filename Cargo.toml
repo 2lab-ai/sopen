@@ -48,6 +48,14 @@ serde_json = "1.0.150"
 sha2 = "0.10.9"
 # The image and media windows (spec §6, §7): wgpu renderer by default, glow as the fallback.
 eframe = { version = "0.37.0", features = ["glow"] }
+# The windows' one event loop per process (10 §4, T34; 04 §6.4.3): the shell builds it and runs
+# each window on it (`run_app_on_demand`); on macOS it also turns the app menu's Quit off (it would
+# end the process past the unsaved-changes prompt; sopen handles Cmd+Q itself). eframe's own
+# features pick the platform backends. Already in the tree (eframe's), at the same version.
+winit = { version = "0.30.13", default-features = false }
+# eframe keeps a renderer's start-up error to its `log` record (`native/run.rs:178`); the shell
+# reads that record back to say why a window did not start (10 T31). Already in the tree.
+log = "0.4.35"
 # Image window: decode, crop/pixelize, re-encode in the source format (spec §6).
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tiff", "gif"] }
 # The image window's picture of a PNG still arriving (06 §7.3): rows as they come, through the
@@ -120,10 +128,7 @@ fancy-regex = "0.16.2"
 # timeout tests run on paused time (`test-util`), so a slow machine cannot reorder them.
 tokio = { version = "1.54.1", features = ["process", "io-util", "test-util"] }
 
-# macOS: the app menu's Quit item would end the process past the unsaved-changes prompt; sopen
-# turns the default menu off and handles Cmd+Q itself.
 [target.'cfg(target_os = "macos")'.dependencies]
-winit = { version = "0.30.13", default-features = false }
 # The F-key switch hears the Mac sleep, wake and switch sessions (NSWorkspace's notifications,
 # `.prd/04-file-keys.md` §6.2). Already in the tree (eframe, egui-winit, rfd → objc2-app-kit
 # 0.3), at these exact versions; only features nothing else enabled are new (`NSOperation`).
