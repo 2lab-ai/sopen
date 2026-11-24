@@ -13,14 +13,15 @@ is a TUI first; a page, like an image, is GUI-only content) and item 4 (message 
 Enter viewer). Measurements and prototypes: [`research/web-view.md`](research/web-view.md), cited
 *web* §n. "08" is [`08-viewer.md`](08-viewer.md): its model units VM-5 (the view set) and VM-6 (the
 view keys) and its GUI binding VM-7. "10" is the screen spec being written from XR-T
-([`research/tui-gui.md`](research/tui-gui.md), cited *XR-T* §n). Code citations are at e7df2f0 (in
-`main`). **[추정]** = inferred here, not measured; **[미측정]** = the research names it as not
-measured; **[decision]** = this document's reversible choice.
+([`research/tui-gui.md`](research/tui-gui.md), cited *XR-T* §n). Code citations are at e7df2f0, except
+`main.rs`, cited at the branch base 05752c4 (one line later there). **[추정]** = inferred here, not
+measured; **[미측정]** = the research names it as not measured; **[decision]** = this document's
+reversible choice.
 
-Amends, when it lands: 01 A10a and §4a, the CLI help (main.rs:39, :42-44), README's `sopen URL`
+Amends, when it lands: 01 A10a and §4a, the CLI help (main.rs:40, :43-45), README's `sopen URL`
 paragraph, AGENTS.md's `SOPEN_BROWSER` and `--hold-until-eof` rows plus new rows for `--browser`
 (WV-E1), `SOPEN_WEB` (WV-0) and `SOPEN_REQUIRE_WEBKIT` (WV-A); 02 §4.2–§4.3 and 06 §6's channel table
-(WV-D); 08 §3's HTML/HTM/XML row, D7, D9 and D30 (WV-F).
+(WV-D); 08 D30 once the page view lands (WV-F) — 08 already carries §6's table as its D40.
 
 ## 1. Scope
 
@@ -134,9 +135,9 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   reach egui (*web* §1.4) — and Cmd/Ctrl+1…0, 04 §6.1's F-key aliases **[decision; 추정: not in the
   measured set]**. macOS: the monitor hands them to winit's view (`makeFirstResponder`). Linux: never
   forwarded.
-- **Esc while the page has the keyboard only takes it back** — the monitor consumes it **[decision;
-  추정: the prototype passed it on]**; a second Esc leaves the viewer (or closes the address window,
-  §7). The other always-sopen keys take the keyboard back and act.
+- **Esc while the page has the keyboard takes it back; otherwise it leaves the viewer** (or closes
+  the address window, §7). The monitor consumes the first **[decision; 추정: the prototype passed it
+  on]**. The other always-sopen keys take the keyboard back and act.
 - While the page has the keyboard every other key is its own: typing, Tab (form fields), Cmd/Ctrl+C/V/A
   (copy from the page; *web* §1.4's decisions). macOS IME: WKWebView takes input methods as first
   responder **[추정: Korean not measured]**; Linux: §2.3's gap.
@@ -147,12 +148,15 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   second at Enter, §6) — plus, after WV-F, one hidden page view per opened file in 08's set. One per
   address window.
 - **Processes** **[추정: the model is WebKit's, not measured here]**. macOS: each WKWebView renders in
-  a WebContent XPC process; sopen gives every view its own configuration and process pool, so a view's
-  WebContent process is its own; networking runs in WebKit's Networking process. Linux: WebKitGTK runs
+  a WebContent XPC process — "each web view is given its own web content process until an
+  implementation-defined process limit is reached" — and separate `WKProcessPool` instances have had
+  no effect since macOS 12 (the SDK's `WKProcessPool.h:30-37`), so sopen does not try to make one per
+  view; networking runs in WebKit's Networking process. Linux: WebKitGTK runs
   a web process (and a network process) per `WebKitWebContext`; every view has its own ephemeral
-  context, so its processes are its own. **Contract**: after a view closes, after the address half's
-  input reaches EOF (§7), and after sopen itself dies (SIGKILL included), no web or network process
-  of that view survives and nothing more reaches the network — WV-L1, measured by WV-A and WV-B.
+  context, so its processes are its own. **Contract**: after a view closes, its web content process
+  ends (the macOS Networking process may stay for other views) and nothing more of that view reaches
+  the network; after the address half's input reaches EOF (§7), and after sopen itself dies (SIGKILL
+  included), no web or network process of sopen's survives — WV-L1, measured by WV-A and WV-B.
 - **No stored data**: `WKWebsiteDataStore.nonPersistentDataStore`; on Linux the ephemeral context.
   The content rule lists (§3.3) are compiled into a **per-process temp folder** of sopen's own
   (`WKContentRuleListStore storeWithURL:`, `webkit_user_content_filter_store_new(path)`), never the
@@ -204,8 +208,7 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   first 8 KiB is valid UTF-8 — a character cut at the 8 KiB edge accepted, as `kind::looks_like_text`
   does (kind.rs:157-165) — and names no charset itself (`<meta charset`, `http-equiv`, `encoding=`);
   else none, and the engine decides as a browser does **[decision; that the engine honours the header
-  추정]**. The server marks every XML-family response (xml, svg, xsl) whose first 8 KiB holds
-  `<?xml-stylesheet` as **styled** (§3.4 reads the mark).
+  추정]**.
 - **Cancel**: the engine's stop (`webView:stopURLSchemeTask:`; the request's cancellable on Linux)
   ends the request after the piece in flight; nothing is sent to a stopped task (WebKit throws on
   that **[추정]**); closing the view stops all.
@@ -241,6 +244,12 @@ the engine has one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it
   view's row says `N outside requests blocked`; outside CSS, images and fonts therefore do not load,
   and a page that needs them looks unstyled. The lists were prototyped only as `^https?:` blocks
   **[미측정]**; WV-S2 goes through the channels.
+- **Scripts off has non-URL channels too.** An XSLT can build host names from a file it read into
+  `<link rel=dns-prefetch|preconnect>` or an `<a href>`: a DNS lookup, or a TCP connect with no
+  request, would carry them. The rule list is what contains them — a blocked load is never resolved
+  or connected **[추정]** — and WV-S2's logging resolver and TCP listener measure it (how, below). **If that scripts-off part of WV-S2 fails on a backend, file pages on that backend show
+  their source**, with §4's line (`the page view is not contained here (<channel>): showing the
+  source`), until a measurement shows containment.
 - **Scripts are off by default**: `WKWebpagePreferences.allowsContentJavaScript = false`;
   `enable-javascript-markup = FALSE` (*web* §4.1-5).
 - **F2** turns scripts on for this view and off again, reloading the document on screen. Its label
@@ -250,24 +259,31 @@ the engine has one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it
   and TURN over UDP, DNS (a `<link rel=dns-prefetch>` or any name a script makes the engine resolve),
   anything else WV-S2 finds — is either turned off by a setting that WV-S2 shows works, or **file-view
   scripts are unavailable on that backend**: F2 there says `scripts are not available here: <channel>
-  is not contained` and does nothing. **Until WV-S2 has passed on a backend, F2 is off on it.** How
-  each is measured (WV-S2): WebRTC by a UDP listener on loopback named as the STUN and TURN server;
-  DNS by a logging resolver as the engine's only resolver (Linux: a private network namespace whose
-  resolver is that logger; macOS: a per-domain resolver for a test domain pointing at it), names under
-  that domain; an HTTP server that saw nothing is never the evidence for DNS or UDP.
+  is not contained` and does nothing. **F2 turns scripts on only on an engine version WV-S2 passed
+  on**: the version is read when the engine loads (WebKitGTK's `webkit_get_major_version` and its
+  minor and micro; on macOS WebKit.framework's bundle version) and compared with the list of versions
+  that passed, kept in the code; any other version — a new one included — has F2 off, saying `scripts
+  are not available with this WebKit (<version>): not yet checked` **[decision]**.
+- **How each channel is measured** (WV-S2): WebRTC by a UDP listener on loopback named as the STUN
+  and TURN server; TCP by a listener that logs every accepted connection, a request or not (a
+  preconnect opens one without a request); DNS by a logging resolver as the engine's only resolver
+  (Linux: a private network namespace whose resolver is that logger; macOS: a per-domain resolver for
+  a test domain pointing at it), names under that domain. An HTTP server that saw no request is never
+  the evidence for DNS, a bare connection or UDP.
 
 ### 3.4 Links and navigation
 
-- Top-level navigation within the view's own scheme host is followed in the view.
-- A clicked link out (`WKNavigationTypeLinkActivated`, `WEBKIT_NAVIGATION_TYPE_LINK_CLICKED`): http/https
-  → the target's system browser (`url::open`, url.rs:316) **only while scripts are off and neither the
-  top document nor the frame the link is in is styled** (§3.1's mark). Otherwise it is refused with a
-  line — with scripts on, `scripts are on: links out of the page are not followed — F2 turns them
-  off`; in styled XML, `links out of a styled XML page are not followed`. A script can make a link and
-  click it (`a.click()` **[추정: read as link-activated]**), and an XSLT can write what it read into
-  a link's URL; either click would carry it out. Any other scheme is refused with a line.
-- Every other navigation out (a redirect, a meta refresh, `location=`, a form) is cancelled; the row
-  says where it went, shown as `url::redacted` shows an address.
+- A link inside the scheme (the view's own scheme host) navigates within the root, in the view.
+- **A file view never sends a link out.** A clicked link whose target is outside the scheme — http,
+  https, `data:`, any scheme — is not followed: the row shows the target as `url::redacted` shows an
+  address, with `link not followed from a file view — F5 copies it`. **F5** (`5Link` on the F-key row
+  while there is one) copies the whole URL to the clipboard and the row says `copied — it may carry
+  what the page read`; opening it is then the owner's own act **[decision]**. No test of the page
+  decides this — not scripts, not whether the document is styled XML (the stylesheet instruction can
+  sit past any byte limit, or in UTF-16, and a styled page can build a `data:` or `srcdoc` frame
+  whose link would be clicked).
+- Every other navigation out (a redirect, a meta refresh, `location=`, a form, a script's `a.click()`)
+  is cancelled; the row says where it went, redacted the same way.
 - No back or forward (non-scope): a link followed inside the root is left with Esc; Enter opens the
   file again.
 
@@ -278,14 +294,13 @@ the engine has one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it
 | `sopen-page:` under the root, `data:`, `blob:` | shown (`<img>`, `<iframe>`, links, XSLT `document()`) | shown, and readable by script |
 | files outside the root, `file:` | no (`realpath` checks, the index's included; no file URLs) | no |
 | anything outside the scheme, by any element, stylesheet or XSLT | no (blocked; counted on the row) | no |
-| DNS, WebRTC, other non-URL channels | none known (no scripts) | contained per §3.3, else scripts unavailable |
-| navigation out | the owner's click only, to the system browser, never from styled XML | none |
+| DNS, bare TCP connects, WebRTC, other non-URL channels | XSLT runs with scripts off: the rule list contains it; WV-S2's resolver and listener measure it, else the source shows (§3.3) | contained per §3.3, else scripts unavailable |
+| navigation out | none: a link out is shown and can be copied, never followed | none |
 | native code, devtools, storage, downloads | none | none |
 
-Nothing outside the root is ever served, and nothing outside the scheme is ever loaded by a file view,
-so what a page can read it can only show. The residual is the owner's own click on a link out of an
-unstyled page with scripts off: its URL is what the file's author wrote, carrying nothing the page
-read.
+Nothing outside the root is ever served, nothing outside the scheme is ever loaded, and no link is
+ever sent out by a file view, so what a page can read it can only show. The residual is the owner's
+own act: copying a link the row showed (F5) and opening it themselves.
 
 ## 4. Fallbacks
 
@@ -295,6 +310,8 @@ read.
     engine here (<reason>): showing the source`.
   - An address → the system browser (`url::open`), as `--browser`, after one stderr line `sopen: no
     web engine here (<reason>); opening <shown> in the system browser`.
+- A backend whose scripts-off containment WV-S2 did not show (§3.3): page views show the source the
+  same way, the reason naming the channel; the address window is not affected.
 - No display (Linux, `display_available`, gui/mod.rs:1206): an address goes to the system browser as
   today. The reason is found once per process; the hook `SOPEN_WEB=off` (WV-0) makes it "turned off
   (SOPEN_WEB=off)" on both systems, for fallback tests and receipts **[decision]**.
@@ -326,13 +343,14 @@ read.
   budget lifts (a view the budget cut reloads once, §3.1), §2.4 applies, the scroll stays.
 - **The Enter viewer** opens a page file in the page view, filling the viewer's area. Top bar: the
   document on screen (`host:/abs`), `scripts off|ON`, loading, the counts of refused and of outside
-  requests blocked. F-key row `1Help 2JS on 3Exit 4Edit` (F4 = 01 A2's editor on the file, as now;
+  requests blocked, and a link not followed (§3.4). F-key row `1Help 2JS on 3Exit 4Edit`, plus `5Link`
+  while a not-followed link is on the row (F4 = 01 A2's editor on the file, as now;
   keys.rs:499-503). Cmd/Ctrl+R reloads; Esc leaves (§2.4).
 - **Until WV-F, the gap**: in xtools a page file shows only as the page; its source and hex are
   reached through F4 (the editor), not inside sopen. The view keys are 08's (§4, D3–D4) and reach the
   GUI with its binding VM-7; binding digits here first would pre-empt them.
-- **The views, settled here** (they supersede 08's D7 for these files; WV-F amends 08 §3, D7, D9,
-  D30):
+- **The views, settled here** (they supersede 08's D7 for these files; 08 already carries this table
+  as its D40, and WV-F retires 08's D30 when the page view lands):
 
 | Files | 1 | 2 | 3 |
 |---|---|---|---|
@@ -346,8 +364,8 @@ read.
 
 ## 7. The address window, and #82's contract
 
-**Today (#82).** `open_url` (main.rs:597-611) opens the system browser (`url::open`, url.rs:316) and
-prints `opened … in the browser`; as HOST's half (`--hold-until-eof`, main.rs:69-72) it checks the
+**Today (#82).** `open_url` (main.rs:598-612) opens the system browser (`url::open`, url.rs:316) and
+prints `opened … in the browser`; as HOST's half (`--hold-until-eof`, main.rs:70-73) it checks the
 port is private, opens the browser, prints `sopen-tunnel-open` (url.rs:288) and holds until its input
 ends. The remote side prints `… is open on HOST through a tunnel — Ctrl-C closes it`
 (forward.rs:649-668). When HOST's command ends first, the remote exits with HOST's code if ssh exits
@@ -355,16 +373,17 @@ within 2 s, else 1 with `… ended while ssh stayed for the browser's connection
 01 §4a).
 
 **From 09, on each route to an address:**
-1. **Here** (no HOST, or HOST is this machine; main.rs:581): an xtools window with the address view;
+1. **Here** (no HOST, or HOST is this machine; main.rs:582): an xtools window with the address view;
    `opened <shown> in xtools` once it is up; sopen returns when it is closed (exit 0). A change: today
    the command returns at once.
-2. **A tunnel** (loopback with HOST; main.rs:584-586). HOST's half checks the port as today and opens
-   the window; then it prints the fixed cue `sopen-tunnel-window` (`url::TUNNEL_WINDOW`), then
-   `sopen-tunnel-open` once the load has started. A thread reads its input; at EOF the window closes
-   and HOST exits 0. **Closing the window** prints `sopen-tunnel-closed` (`url::TUNNEL_CLOSED`),
-   tears the view down (its processes end, §2.5) and exits 0. Cues carry nothing of the address and
-   are written ignoring write errors — never `println!`, which panics on a closed stdout (today's
-   cue, main.rs:606) **[decision]**.
+2. **A tunnel** (loopback with HOST; main.rs:585-587). HOST's half checks the port as today and opens
+   the window. **Only once the view's engine has started** (`Web::new` succeeded) it prints the fixed
+   cue `sopen-tunnel-window` (`url::TUNNEL_WINDOW`) — an engine that fails takes §4's system-browser
+   fallback with no window cue — then `sopen-tunnel-open` once the load has started. A thread reads
+   its input; at EOF the window closes and HOST exits 0. **Closing the window** prints
+   `sopen-tunnel-closed` (`url::TUNNEL_CLOSED`), tears the view down (its processes end, §2.5) and
+   exits 0. Cues carry nothing of the address and are written ignoring write errors — never
+   `println!`, which panics on a closed stdout (today's cue, main.rs:607) **[decision]**.
    - The remote side prints `<shown> is open on HOST through a tunnel — closing its window there, or
      Ctrl-C here, closes it` **only after it saw `sopen-tunnel-window`**; else today's `… — Ctrl-C
      closes it` (a HOST on §4's fallback, or an older HOST). The fallback-port forms alike.
@@ -373,7 +392,7 @@ within 2 s, else 1 with `… ended while ssh stayed for the browser's connection
      it the remote closes the tunnel at once (its input closed, the guard ends ssh: forward.rs:534-544),
      prints `<shown>: its window on HOST was closed; the tunnel is closed` and exits 0. Any other end
      of HOST's sopen keeps today's rule above.
-3. **Forwarded as written** (not loopback; main.rs:589): HOST's sopen opens the window as in 1; the
+3. **Forwarded as written** (not loopback; main.rs:590): HOST's sopen opens the window as in 1; the
    remote's run lasts until it closes, as any window opened with `--target`.
 
 **The address window's screen.**
@@ -395,7 +414,7 @@ within 2 s, else 1 with `… ended while ssh stayed for the browser's connection
   `the page's process ended — Cmd/Ctrl+R reloads`; ATS refusing plain http (§2.2) → naming
   `--browser`.
 - **`--browser`** (new, public): today's behaviour exactly, every route. With a file SOURCE a usage
-  error (exit 2), as `--hold-until-eof` (main.rs:520-524). Passed to HOST on both forwarded routes
+  error (exit 2), as `--hold-until-eof` (main.rs:521-525). Passed to HOST on both forwarded routes
   (`tunnel_words`, forward.rs:361-364, and the run's words); an older HOST sopen does not know it and
   exits 2 with its own line.
 - **Version skew**: cues are matched exactly (forward.rs:634). An older remote prints
@@ -404,7 +423,8 @@ within 2 s, else 1 with `… ended while ssh stayed for the browser's connection
   (`SOPEN_TARGET_BIN`, the tap).
 - **Tests** **[decision]**: tests/cli.rs's `sopen URL` tests use a `SOPEN_BROWSER` stand-in
   (cli.rs:3255-3262) and pass `--browser` from WV-E1, keeping every assertion; AGENTS.md's
-  `SOPEN_BROWSER` row then serves `--browser`, the fallbacks and outside links.
+  `SOPEN_BROWSER` row then serves `--browser`, the fallbacks and the address window's outside links
+  (a file view sends none, §3.4).
 
 ## 8. The TUI
 
@@ -416,8 +436,9 @@ terminal form of every key here, are 10's. `sopen URL` with only a terminal: §4
 
 ## 9. Decisions
 
-1–9 are the orchestrator's first round (2026-11-24), with 4 and 5 as the review round revised them;
-R1–R9 are the review round's (the coordinator, 2026-11-24); 10–14 are this document's choices that
+1–9 are the orchestrator's first round (2026-11-24), with 4 as review round 1 revised it and 5 as the
+fix-check replaced it; R1–R9 are review round 1's and R10–R12 the fix-check's (the coordinator,
+2026-11-24); 10–14 are this document's choices that
 change a decision or a shipped contract (the smaller ones are marked **[decision]** where they are
 made). All reversible.
 
@@ -427,7 +448,7 @@ made). All reversible.
 | 2 | Without WebKitGTK sopen still starts: a page falls back to its source with a line, an address to the system browser | an optional library must not break sopen (ci.yml:146-164) |
 | 3 | Pages load through an in-process scheme fed by the stream layer, never a port; root = the opened folder when the file is in it, else its folder; nothing outside; no `file:` | no local process can reach it; generated docs reference parents (*web* §4, §4.1-1) |
 | 4 | Scripts off by default, F2 per view; **every file view, scripts on or off, loads nothing outside the scheme** (revised: the first round allowed outside http(s) subresources with scripts off); no bridge, devtools, storage | XSLT runs without scripts and its `document()` can put root files into an outside URL — top level, in an iframe, in an SVG, in the preview without a click |
-| 5 | A clicked link out: http(s) → system browser only while scripts are off and the page (top document and the link's frame) is not styled XML; otherwise refused (revised) | a script or an XSLT can write what it read into a link's URL |
+| 5 | **A file view never sends a link out**: a clicked link outside the scheme is not followed; the row shows it redacted, F5 copies it; links inside the scheme navigate within the root (replaced: the first round sent http(s) to the system browser, review round 1 did so only with scripts off outside styled XML) | the styled test leaks — a stylesheet instruction past 8 KiB or in UTF-16 escapes it, and a styled page can build a `data:`/`srcdoc` frame whose link is clicked; deleting the rule closes every path at once |
 | 6 | Styled `.xml` defaults to the page, plain XML/RSS to the source (page as view 3); `.html`/`.htm` to the page | engines show plain XML as run-on text (*web* §5) |
 | 7 | The preview shows the page, scripts off, after the rest, by 02 §4; views and scripts are chosen in the Enter viewer | message 20: modes in the viewer, not the preview |
 | 8 | `sopen URL` → an xtools window on the target, limited to its origin; closing it ends the target's half and the tunnel; `--browser` keeps the old route | message 18 item 1 |
@@ -435,15 +456,18 @@ made). All reversible.
 | R1 | Scripts-on channels fail closed: off by a setting shown to work, or file-view scripts unavailable on that backend; F2 off until WV-S2 passes there | an HTTP server seeing nothing is no evidence for DNS or UDP |
 | R2 | The index file gets the same resolution, containment and regular-file checks | an `index.html` that links out of the root would otherwise be served |
 | R3 | A view's web and network processes end with it, with the address half's EOF and with sopen's death | a page left running keeps fetching after the owner closed it |
-| R4 | Views: HTML/HTM and styled XML 1 Page · 2 Hex · 3 source; plain XML/RSS 1 source · 2 Hex · 3 Page (supersedes 08 D7 here) | decision 6's "the page as another view"; one table, no "unsettled" |
-| R5 | `sopen-tunnel-window` before `sopen-tunnel-open`; the window line only after it | the remote cannot otherwise know whether HOST fell back to the system browser or is older |
+| R4 | Views: HTML/HTM and styled XML 1 Page · 2 Hex · 3 source; plain XML/RSS 1 source · 2 Hex · 3 Page (supersedes 08 D7 here; 08's D40) | decision 6's "the page as another view"; one table, no "unsettled" |
+| R5 | `sopen-tunnel-window` before `sopen-tunnel-open`, sent only once `Web::new` succeeded; the window line only after it | the remote cannot otherwise know whether HOST fell back to the system browser or is older |
 | R6 | The closed cue counts before or after ssh's exit, read after `ended()`; cues written ignoring errors | a fast ssh exit would race the relay; `println!` panics on a closed stdout |
 | R7 | The page server resolves and checks on the `RemoteFs`, then `into_ranged`; later turns `reopen`; fingerprint compared at every reopen; `Throttled` under the hook | a `Ranged` resolves and stats nothing but its own file (sftp/ranged.rs:392-393) |
 | R8 | The hand-over lifts the preview budget; a cut view reloads once | as Enter lifts a preparation's budget (preview.rs:50); the viewer shows the whole page |
-| R9 | The address window: Esc twice closes it; redacted URLs everywhere; a line for each failure; never accept an untrusted certificate | a dev server not up yet, a bad certificate and a crash are its common states; addresses carry secrets (url.rs:14-15) |
+| R9 | The address window: Esc takes the keyboard back, else closes it; redacted URLs everywhere; a line for each failure; never accept an untrusted certificate | a dev server not up yet, a bad certificate and a crash are its common states; addresses carry secrets (url.rs:14-15) |
+| R10 | Scripts-off non-URL channels (DNS, bare TCP connects built by an XSLT) are measured by WV-S2's resolver and listener; a backend that fails shows file pages as source until contained | XSLT runs with scripts off; zero HTTP requests says nothing about a lookup or a connect |
+| R11 | F2 turns scripts on only on an engine version WV-S2 passed on, read at load | containment shown on one WebKit says nothing about the next |
+| R12 | WV-L1's close case checks the view's WebContent process and no further network activity, not one process pool per view | separate `WKProcessPool`s have no effect since macOS 12 (SDK `WKProcessPool.h:37`) |
 | 10 | Scripts **on** by default in the address window | decision 4's reason (the root) does not apply: no root, the owner's own server; a dev server's page is usually a script app **[추정]** |
 | 11 | Requests served in turns of one piece each | a long response must not hold back the CSS behind it |
-| 12 | Esc with the page holding the keyboard only takes it back; Cmd/Ctrl+1…0 reserved too | one press, one action (08 §4); on macOS 04 §6.1's aliases would be lost |
+| 12 | Esc with the page holding the keyboard takes it back, otherwise it leaves; Cmd/Ctrl+1…0 reserved too | one press, one action (08 §4); on macOS 04 §6.1's aliases would be lost |
 | 13 | `sopen-tunnel-closed` and the remote's exit 0; local `sopen URL` returns when its window closes | a window closed is the normal end (decision 8); today that path is HOST's code or an error |
 | 14 | The standalone `sopen x.html` is unchanged | ssot item 5 names xtools; the editor spec owns the standalone route |
 
@@ -461,8 +485,8 @@ page (*web* §1.1), so automated runs drive `makeFirstResponder` and `hitTest`; 
   open; Esc → it closes. With the page holding the keyboard: F3 → leaves; Cmd/Ctrl+1 → help; Cmd+W →
   the close path; Cmd+Q → the quit path. macOS with the monitor off → none reach sopen.
 - **WV-4 [owner, macOS, real clicks]** A click into a field, then typing → typed there; a link inside
-  the root → followed; an outside https link in an HTML page with scripts off → the system browser;
-  the Korean input source in a field → composed Hangul.
+  the root → followed; an outside https link in an HTML page → not followed, the row shows it
+  redacted, F5 copies the whole URL; the Korean input source in a field → composed Hangul.
 - **WV-5 [owner, the Linux laptop, a real scaled output at 2×, 1.25×, 1.5×]** → crisp text at device
   resolution, 1×'s layout, a checkbox click toggles. Korean into a page field: record the result.
 - **WV-6** Linux, a headless private compositor (*web* §9's isolation) → a screenshot holds the page's
@@ -477,23 +501,32 @@ page (*web* §1.1), so automated runs drive `makeFirstResponder` and `hitTest`; 
   at the preview's centre is the shield, after the hand-over the page; the preview's view is never
   first responder. **[owner, real clicks]** a click and a wheel on the preview change nothing (scroll
   offset, a click counter); the same after Enter act (the control).
-- **WV-L1** (WV-A, WV-B) Note the web and network processes a view starts (the process list before
-  and after it opens). Close the view; end the address half's input (EOF); `kill -9` sopen with a
-  view open → each time, within 2 s, none of those processes is left (process list), and a page that
-  polls a test server (scripts on, `setInterval` fetch to its own origin) sends nothing more (the
-  server's log).
+- **WV-L1** (WV-A, WV-B) Note the processes a view starts (the process list before and after it
+  opens), and let its page poll (scripts on, a `setInterval` fetch to its own origin). Within 2 s of
+  each event:
+  - a file view closed → its web content process is gone, and the page server's own request log
+    shows nothing after the close (the macOS Networking process may stay for other views);
+  - the address window closed, and the address half's input ended (EOF) → its web content process is
+    gone and the test HTTP server behind the address logs nothing more;
+  - `kill -9` of sopen with both open → no web or network process of sopen's is left, and neither
+    log shows anything more.
 - **WV-S1** Fixtures with `../`, `%2e%2e`, a link inside the root pointing out, `sub/index.html` a link
   pointing out of the root (requested as `sub/`), an `/etc/hostname` iframe, a `file:` iframe → none
   served (server log: 403 or never asked); locally and through `local_server()`.
-- **WV-S2** Outside channels, against a test HTTP server on 127.0.0.1:P, a UDP listener and a logging
-  resolver (§3.3):
+- **WV-S2** Outside channels, against a test HTTP server on 127.0.0.1:P whose listener logs every
+  accepted TCP connection, a UDP listener, and a logging resolver (§3.3):
   - scripts off: `<img>`, CSS `url()`, `@font-face`, `<link rel=stylesheet|prefetch|preconnect|
     dns-prefetch>` to the server and to names under the test domain; styled XML whose XSLT reads a
     root file with `document()` and writes it into an outside `<img>` URL — at the top level, inside an
-    HTML `<iframe>`, and as an SVG carrying the stylesheet instruction in an iframe; the same in the
-    preview → **zero** HTTP requests, zero resolver queries for the test domain; the row counts the
-    blocked ones; a link out of the styled page clicked (owner, or `hitTest` + a synthesized click
-    where it reaches) → refused, the `SOPEN_BROWSER` stand-in never called;
+    HTML `<iframe>`, and as an SVG carrying the stylesheet instruction in an iframe; an XSLT that
+    builds host names under the test domain from a file it read into `<a href>` and `<link
+    rel=dns-prefetch|preconnect>`; the same in the preview → **zero** HTTP requests, **zero** accepted
+    TCP connections, **zero** resolver lookups for the test domain; the row counts the blocked ones.
+    A backend that fails any of these shows file pages as source (R10);
+  - links out, clicked (owner, or `hitTest` + a synthesized click where it reaches) → **not
+    followed**, the row shows the URL, the `SOPEN_BROWSER` stand-in never called: from an HTML page;
+    from an XML whose `<?xml-stylesheet` sits past the first 8 KiB; from a UTF-16 styled XML; from a
+    `data:` frame and a `srcdoc` frame a styled XML built;
   - scripts on: fetch, XHR, WebSocket, EventSource, `sendBeacon`, a form POST, `location=`,
     `window.open`, `a.click()` → zero HTTP requests, the stand-in never called; `RTCPeerConnection`
     with the listener as STUN and TURN server → zero datagrams; names built by script under the test
@@ -516,7 +549,9 @@ page (*web* §1.1), so automated runs drive `makeFirstResponder` and `hitTest`; 
 - **WV-P2** A rustdoc-shaped remote tree opened from its top → styled pages; the same file from a
   browser opened inside its subfolder → root = that folder, the upward CSS 403 and counted on the row.
 - **WV-A1** `sopen --here http://127.0.0.1:P/` → the window shows the page (screenshot), `opened … in
-  xtools`; Esc, Esc → it closes, exit 0. Nothing listening on P → the cannot-load line; Cmd/Ctrl+R after
+  xtools`. The page holding the keyboard (macOS: `makeFirstResponder`; Linux: a forwarded click) → Esc
+  takes it back, the window stays; Esc again → it closes, exit 0. A window where sopen holds the
+  keyboard → one Esc closes it. Nothing listening on P → the cannot-load line; Cmd/Ctrl+R after
   the server starts → the page. A self-signed `https` server → the certificate line, nothing loaded.
   A URL with a password and a query → no shown line or title carries either.
 - **WV-A2** A stand-in ssh whose HOST half prints the window cue, the open cue, then the closed cue:
@@ -559,14 +594,14 @@ handle; §3.1's ~4 and ~2 RTT. Its result goes into §3.1.
 
 | ID | Unit | Owns | After |
 |---|---|---|---|
-| WV-C | **Page server**: root, request steps (index included), turns, `reopen`, fingerprint, Range, type and charset tables, the styled mark, cancel, budget and its lift | `src/stream/page.rs`, `src/stream/page/tests.rs` (new); `src/stream/mod.rs` (the `mod` line) | X-W1; WV-0's `src/scheme.rs` (the trait) |
+| WV-C | **Page server**: root, request steps (index included), turns, `reopen`, fingerprint, Range, type and charset tables, cancel, budget and its lift | `src/stream/page.rs`, `src/stream/page/tests.rs` (new); `src/stream/mod.rs` (the `mod` line) | X-W1; WV-0's `src/scheme.rs` (the trait) |
 | WV-0 | **Component core**: `Web`, `Engine`, the scheme trait, placement, the after-frame hide check, key states, scripts and F2's availability, `SOPEN_WEB`, `FakeEngine`, the compose call; the shell's part (§2.1) | `src/scheme.rs`, `src/gui/web/mod.rs`, `src/gui/web/fake.rs`, `src/gui/web/tests.rs` (new); `src/lib.rs` (the `mod` line); `src/gui/mod.rs` (`mod web`, `Shell`'s handle, after-frame check, teardown, monitor install, the compose call); AGENTS.md's `SOPEN_WEB` row | X-W1 (the trait first, so WV-C builds beside it) |
 | WV-A | **macOS engine**: WKWebView, process pool per view, monitor, shield, `takeSnapshot`, scheme glue, rule list in the temp store, ATS measurement | `src/gui/web/mac.rs`, `src/gui/web/mac/tests.rs` (new); `Cargo.toml`, `Cargo.lock` (objc2-web-kit; objc2-app-kit features); `.github/workflows/ci.yml` (one macOS-only line: `SOPEN_REQUIRE_WEBKIT=1`); AGENTS.md's `SOPEN_REQUIRE_WEBKIT` row | WV-0, X-W1 |
 | WV-B | **Linux engine**: loader, GTK thread, context per view, offscreen copy, input, HiDPI, scheme glue, rules, settings | `src/gui/web/gtk.rs`, `src/gui/web/gtk/api.rs`, `src/gui/web/gtk/tests.rs` (new); `.github/workflows/ci.yml` (the Linux steps) | WV-0, X-W1 |
 | WV-D | **Page view in the browser**: `page_default`, `Prepared::Page`, preview, viewer, root, F2, the rows, fallback | `src/kind.rs`; `src/gui/web/page.rs` (new); `src/gui/web/mod.rs` (`mod` line); `src/gui/browser/prepare.rs`; `src/gui/browser/preview.rs`; `src/gui/browser.rs`; `src/gui/browser/keys.rs`; `src/gui/chrome.rs` (`PAGE_KEYS`); `src/gui/browser/tests/page.rs` (new); `.prd/02-architecture.md` §4.2–§4.3; `.prd/06-streaming.md` §6 | WV-C, WV-0; each platform's receipts after WV-A / WV-B |
 | WV-E1 | **The CLI half**: `--browser`, the three cues and their writes, the remote's lines, the closed-cue race, version skew — all on the fake ssh; HOST still opens the system browser | `src/main.rs`, `src/url.rs`, `src/forward.rs`, `tests/cli.rs`; AGENTS.md's `--browser` and `--hold-until-eof` rows | — (starts at once) |
 | WV-E2 | **The address view**: the window, its screen, navigation, failures, scripts on, HOST's half opening it | `src/gui/web/address.rs` (new); `src/gui/web/mod.rs` (`mod` line); `src/main.rs` (`open_url`'s window route); `.prd/01-spec.md` (A10a, §4a); `README.md`; AGENTS.md's `SOPEN_BROWSER` row | WV-E1; WV-0, WV-A, WV-B |
-| WV-F | **Page in 08's view set** (= 08's VM-9): §6's table, hidden page views paused and their session given back, the pixel region per 10 | `src/gui/web/page.rs`; with 08 VM-7's binding files (`src/gui/browser.rs`, `src/gui/browser/keys.rs`); 08 §3, D7, D9, D30 | WV-D; 08's VM-5, VM-6, VM-7; 10 |
+| WV-F | **Page in 08's view set** (= 08's VM-9): §6's table, hidden page views paused and their session given back, the pixel region per 10 | `src/gui/web/page.rs`; with 08 VM-7's binding files (`src/gui/browser.rs`, `src/gui/browser/keys.rs`); 08 D30 retired (08 §3 and D40 already match §6) | WV-D; 08's VM-5, VM-6, VM-7; 10 |
 
 **Order**: X-W1 → WV-0 (trait first) ∥ WV-C → WV-A ∥ WV-B → WV-D ∥ WV-E2 → WV-F; WV-E1 from the
 start. **Only WV-F waits on 08's model** (VM-5 the view set, VM-6 the keys, VM-7 the binding) and on
@@ -583,11 +618,9 @@ looked at (06 §13).
 
 ## Tensions
 
-- **08 §3, D7, D9, D30 vs R4.** 08's HTML, HTM, XML row makes every XML a page once 09 lands, gives
-  Raw as view 3 where 1 is text (D7), and shows HTML as 1 Text, 3 Raw before 09 (D30). §6's table
-  settles these files (plain XML's 3 is the Page, so it has no Raw); WV-F amends 08 to match.
-- **08 D30 vs WV-D before WV-F.** WV-D makes the page view 1 before 08's keys reach the GUI, so the
-  in-sopen source waits for WV-F (§6's gap).
+- **08 D30 vs WV-D before WV-F.** D30 shows HTML/HTM/XML as 1 Text, 3 Raw until 09's page view
+  lands; WV-D makes the page view 1 before 08's keys reach the GUI, so the in-sopen source waits for
+  WV-F (§6's gap). (08's D40 already carries §6's table.)
 - ***web* §8-6 and decision 4.** The research defaulted to blocking outside subresources; the first
   round allowed them with scripts off; the review round (decision 4 revised) blocks them in every file
   view, for XSLT's sake. Outside CSS and fonts therefore never style a file page.
