@@ -63,3 +63,31 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
 | ID | Status | What | Who |
 |---|---|---|---|
 | XR-T | ✅ done 2026-11-24 | The architecture of message 23 with a running prototype: TUI first and a GUI that is the same screen 1:1, the gap in today's GUI, the TUI→GUI switch, terminal graphics, video in a terminal, the migration order. Output: `../research/tui-gui.md`. | research unit |
+
+## R1 (part 1) — the first code units, closed 2026-11-25
+
+- Merged on 2026-11-24 and 2026-11-25. Each unit had one review round, and every must-fix was
+  fixed before merge. CI passed on macOS and Linux for each merge commit's PR head.
+  - Model units of 08: VM-6 the view keys (#97), VM-5 the view set (#98), VM-1 the encoding core
+    (#99).
+  - TUI floor of 10: XW-0 the crates (#104), XW-cells the cell core (#105), XW-input the terminal
+    translator (#106), XW-help one help text (#107).
+- Review fixes that changed a contract:
+  - **#104.** unicode-width is pinned to 0.2.2. ratatui-core's halfwidth sound-mark compensation
+    double-counts on 0.2.3, so `ﾊﾟ` took 3 cells against a terminal's 2.
+  - **#106.** A terminal paste gives V's release after `Paste`, as a window's Cmd/Ctrl+V does.
+  - **#107.** Help lists only the rows this machine can press. Key names stay neutral (`Ctrl/⌘+…`).
+- Prerelease with VM-1, VM-5 and VM-6 and the specs: `preview-2026-11-24-1548-e974df9fc18e`,
+  installed on both machines. The TUI floor ships with XW-kit's prerelease.
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| VM-1 | ✅ done 2026-11-25 | 08 §13: the encoding core (#99) | coder |
+| VM-5 | ✅ done 2026-11-24 | 08 §13: the view set (#98) | coder |
+| VM-6 | ✅ done 2026-11-24 | 08 §13: the view keys (#97) | coder |
+| XW-0 | ✅ done 2026-11-25 | 10 §17: ratatui-core, crossterm, unicode-width; the empty modules (#104) | coder |
+| XW-cells | ✅ done 2026-11-25 | 10 §17: the cell core shared by the window and the terminal (#105) | coder |
+| XW-input | ✅ done 2026-11-25 | 10 §17: crossterm events become egui events, as the window sends them (#106) | coder |
+| XW-help | ✅ done 2026-11-25 | 10 §17: one help text on every machine, `Ctrl/⌘+…` (#107) | coder |
