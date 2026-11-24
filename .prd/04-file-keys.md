@@ -947,6 +947,7 @@ hand-over (§3 rule 5). The gate is `just check` with `SOPEN_REQUIRE_FFMPEG=1` a
   - capture of `dbus-monitor` and `WAYLAND_DEBUG`.
 - **Tests:** K-L6 (f) first. K-L5 and K-L6 (a)–(e) are added once KL-W4 lands, through this unit's
   own hand-over.
+- No path of a run (the private session's folders, logs) is printed into the repo.
 
 ### KL-W2 — the hand-back
 
@@ -968,7 +969,7 @@ hand-over (§3 rule 5). The gate is `just check` with `SOPEN_REQUIRE_FFMPEG=1` a
   - **The thread:**
     - the guest queue on winit's display;
     - the manager and the seat bound only after `Ready`;
-    - `inhibit` after each fresh snapshot, and `destroy` at focus-out, at a `Destroy` and on a stall
+    - `inhibit` only under §6.4.2's one rule, and `destroy` at focus-out, at a `Destroy` and on a stall
       (the window's 500 ms marks);
     - the guard that destroys on every exit, unwinding included;
     - `poll` on the display's fd and a stop pipe.
@@ -979,9 +980,12 @@ hand-over (§3 rule 5). The gate is `just check` with `SOPEN_REQUIRE_FFMPEG=1` a
 
 - **Owns:** `src/gui/mod.rs`, by hand-over from spec 10's shell work (X1) once X1 has merged.
 - **Implements:**
-  - **The run.** `create_native`, with one `EventLoop` per process kept for every window and for the
-    glow retry. Its handler wrapper calls `decide` on key, modifier, pointer-button and focus events,
-    and marks the start and end of each event for the stall check.
+  - **The run.** `create_native`, with one `EventLoop<eframe::UserEvent>` per process, built by the
+    shell with `event_loop_hook()` applied, kept for every window and for the glow retry; the retry
+    fires when the shell is still in its slot as the loop returns (§6.4.3). Its handler wrapper calls
+    `decide` on key, modifier, pointer-button and focus events, and marks the start and end of every
+    handler callback (`new_events` included: eframe runs overdue logic passes there, `run.rs:401-407`)
+    for the stall check.
   - **Before the window.** `run_window_sized` parses the table before the window opens.
   - **The creation closure** starts the threads, and the window never waits on them.
   - **`on_exit`** runs `end()`.
@@ -991,7 +995,8 @@ hand-over (§3 rule 5). The gate is `just check` with `SOPEN_REQUIRE_FFMPEG=1` a
 - **Tests:**
   - the hook, `logic` and `ui` in that order (K-L7);
   - a scripted run, `"system"` or an empty table → nothing starts (K-F4);
-  - the glow retry on the same event loop.
+  - a wgpu that fails before the app → glow on the same loop; on macOS, the loop is built with the
+    default menu off.
 
 ### KL-W6 — the docs
 
