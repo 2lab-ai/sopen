@@ -257,8 +257,12 @@ ms on Linux.
   because WebKit drained at once. A reader that stops pulling would let it grow **[미측정]**.
 - **The head comes first, on both**: `didReceiveResponse:` precedes any data; WebKitGTK takes status,
   length and headers in the response object at finish. A request's first message is therefore its
-  complete head (status, type, length, `Content-Range`), sent when the steps end; 403, 404 and 416 are
-  a head with no body.
+  complete head (status, type, length, `Content-Range`); 403, 404 and 416 are a head with no body. The
+  prototype did not sniff: it sent text types with no charset, so its head went when the steps ended.
+  In sopen the head of a text type waits for the first read when the charset rule above needs its
+  first 8 KiB (they come in that first 64 KiB read): it goes at 5 RTT together with the first bytes,
+  not at 4 — the first byte stays at 5 RTT, so the page loses nothing; every other head goes when the
+  steps end **[추정: derived from the measured RTTs]**.
 - **Stop mid-response — held, both.** Mac: navigating away gave `stopURLSchemeTask` on the main thread
   9 ms after `loadRequest` (one run; 2 MiB of 20 MiB delivered); later pieces were dropped at the
   tombstone. Negative control (one run): one `didReceiveData:` after stop raised
@@ -307,9 +311,10 @@ ms on Linux.
 - **RTT.** A new request: realpath, stat, open, fstat = 4 RTT before the head (200.4–208.4 ms Linux),
   its first bytes 1 more — 5 RTT to the first byte, 60–200 ms at the reference rig's 12–40 ms, not
   48–160. A folder adds the index's realpath and stat: 6 RTT (one run: 300.7 ms Linux, 338.6 ms
-  Mac). `reopen`: 2 RTT. **A page with N subresources costs (N+2) × 5 RTT, strictly in series on one
-  handle**: N = 1, 5, 20 → 757–761, 1766–1771, 5522–5536 ms Linux (Mac 845–1091, 1945–2436,
-  6160–7621 ms); at 12–40 ms, 1.3–4.4 s for N = 20 **[추정: scaled]**.
+  Mac). `reopen`: 2 RTT. **A page of R requests — the HTML and its subresources — costs R × 5 RTT,
+  strictly in series on one handle.** The fixture was the HTML, one stylesheet and N images, R = N + 2
+  (no favicon or redirect was requested): N = 1, 5, 20 → 757–761, 1766–1771, 5522–5536 ms Linux (Mac
+  845–1091, 1945–2436, 6160–7621 ms); at 12–40 ms, 1.3–4.4 s for R = 22 **[추정: scaled]**.
 - **The main-thread rule** (§12's X-W1 brief, *web* §4: "back on the main thread"). On macOS 26.7.1
   WebKit accepted task calls from the worker thread — whole requests answered off-main, 0.02–0.9 ms a
   call, no exception, pages loaded (negative control, two runs). Main-only stays sopen's rule for
@@ -331,14 +336,16 @@ ms on Linux.
    The glue keeps a tombstone per request and drops late messages; the server ends a stopped request
    after the 64 KiB read in flight, or after the steps in progress.
 4. **The scheme trait (WV-0)**: in `start(id, path, range)`, `stop(id)`; out a complete `head`, then
-   `data`*, then `done` or `fail`, each delivered by the engine glue on the engine's thread (Mac main
-   queue, Linux GTK context by idle). The Linux glue owns a per-request buffer that WebKit pulls in
-   8 KiB reads and bounds it by credit to the server **[추정: the bound not built]**.
-5. **Open for WV-C**: N small files cost (N+2) × 5 RTT on one handle. Pipelining the realpath and stat
-   of every queued new request, and several handles open on the channel (open, fstat, read
-   pipelined), would bring a page to ~5 RTT plus transfer **[추정: not built]** — it needs a batched
-   `RemoteFs` call and a several-handle `Ranged`. A turn makes the request behind it wait one piece
-   (0.52 s at 2 MB/s); pieces sized by link time (~100 ms) would cut that **[추정]**.
+   `data`*, then `done` or `fail` (a sniffed text type's head waits for its first read, above), each
+   delivered by the engine glue on the engine's thread (Mac main queue, Linux GTK context by idle).
+   The Linux glue owns a per-request buffer that WebKit pulls in 8 KiB reads and bounds it by credit
+   to the server **[추정: the bound not built]**.
+5. **Open for WV-C**: a page of R small files (the HTML and its subresources) costs R × 5 RTT on one
+   handle. Pipelining the realpath and stat of every queued new request, and several handles open on
+   the channel (open, fstat, read pipelined), would bring a page to ~5 RTT plus transfer **[추정: not
+   built]** — it needs a batched `RemoteFs` call and a several-handle `Ranged`. A turn makes the
+   request behind it wait one piece (0.52 s at 2 MB/s); pieces sized by link time (~100 ms) would cut
+   that **[추정]**.
 
 Per unit: WV-C takes 1, 2, 3's server half and 5; WV-0 takes 4; WV-A retains each task, calls it only
 from the main queue behind the tombstone, and expects the after-the-last-byte stop; WV-B builds the
