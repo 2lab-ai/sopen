@@ -325,3 +325,20 @@ changes. Rows here are snapshots taken when they were moved.
 | ID | Status | What | Who |
 |---|---|---|---|
 | K-L1 | ✅ done 2026-11-24 | Feasibility gate for message 19 on Linux (KDE Plasma 6 Wayland): with a keyboard-shortcuts inhibitor on a focused sopen-like surface, does a globally bound top-row key (screen brightness) reach the client, can it be read under eframe, what else stops while sopen is focused, and is the inhibitor dropped when the client dies. Verdict: feasible in GUI mode with side effects; not in TUI mode. Output: `../research/fkeys-linux.md`. | research unit |
+
+## R3 (part 2) — K-S4 closed 2026-11-25
+
+- 04 §6.4 (Linux and Windows) and §7 are rewritten from K-L1. On KDE Wayland, while an xtools window
+  has focus, sopen holds a keyboard-shortcuts inhibitor for it and maps the top row's codes to
+  F1…F12. Every other key that a global shortcut owns goes back to KDE through kglobalaccel. Route B
+  (the shell owns winit's handler) is the one key source, and there is one creation rule for the
+  inhibitor. A failed check falls back to KDE's behaviour. The switch ships off until K-L2's table
+  exists, and TUI mode has no per-app route.
+- Reviewed by two engines, plus one fix-check. Merged with 08, 09 and 10 on 2026-11-24 (#100). The
+  work units are 04 §9's KL-W1…KL-W7, open in `loop.md` as KL-W.
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| K-S4 | ✅ done 2026-11-25 | Rewrite 04 §6.4 and §7 from K-L1: on KDE Wayland, while an xtools window has focus, sopen holds a keyboard-shortcuts inhibitor for it and maps the top row's codes (K-L2's table) to F1…F12; every other key a global shortcut owns is handed back to KDE (kglobalaccel `invokeShortcut`, measured for Alt+Tab), so only the top row changes; `fkeys = "system"` turns it off; TUI mode cannot (KWin takes media keys before the terminal). Reviewed by two engines, then its work units. | orchestrator |

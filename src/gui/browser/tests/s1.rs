@@ -476,7 +476,7 @@ fn p1_the_other_side_previews_the_file_under_the_bar() {
     fx.bar_on("notes.txt");
     assert!(fx.on_right("plain notes"), "the text, on the other side");
     assert!(!fx.on_right("alpha"), "in place of that side's list");
-    let title = fx.framed(&format!("{}/notes.txt", fx.root));
+    let title = fx.framed_right(&format!("{}/notes.txt", fx.root));
     assert!(fx.on_right(&title), "the side's frame names the file");
     assert!(fx.b.viewer.is_none(), "a preview, not a viewer");
     assert_eq!(fx.b.active, 0, "the keyboard stays in the list");
@@ -664,7 +664,7 @@ fn p5_a_preview_takes_no_input_and_the_list_keeps_its_keys() {
     assert_eq!(fx.drv.pictures(), before, "the picture did not move");
     assert!(fx.b.viewer.is_none());
     assert_eq!((fx.b.active, fx.current().as_str()), (0, "photo.png"));
-    let title = fx.framed(&format!("{}/photo.png", fx.root));
+    let title = fx.framed_right(&format!("{}/photo.png", fx.root));
     assert_eq!(
         fx.drv.colors_of(&title),
         Some(vec![chrome::PALETTE.frame_idle.color]),
@@ -1881,7 +1881,7 @@ fn the_hex_preview_fits_the_side() {
     assert!(fx.on_right("0008(0008)"));
     let ascii: String = (0x30..0x38u8).map(chrome::cp437).collect();
     assert!(fx.on_right(&ascii), "the ASCII column is whole");
-    let title = fx.framed(&format!("{}/data.bin", fx.root));
+    let title = fx.framed_right(&format!("{}/data.bin", fx.root));
     let named = fx.drv.texts_starting_with(&title).len();
     assert_eq!(named, 1, "the file is named once, in the side's frame");
 }

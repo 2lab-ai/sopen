@@ -205,7 +205,8 @@ fn k_r3_f8_asks_for_the_trash_and_shift_f8_is_permanent() {
         (Key::F7, Modifiers::SHIFT, None),
     ] {
         press(&mut fx, key, mods);
-        fx.drv.idle(&mut fx.b, 2);
+        // Until the dialog says where things go: this machine's Trash is asked on a worker.
+        wait(&mut fx, |b| !b.ops.checking_trash());
         let asked = fx.drv.find_text("Delete zeta.md?").is_some();
         assert_eq!(asked, opens.is_some(), "{key:?} {mods:?}");
         assert!(
@@ -307,13 +308,15 @@ fn k_k1_f7_on_a_remote_is_one_mkdir() {
 /// K-D1 on this machine: F8 on a file → the dialog says `to the Trash`; Enter → it is in the
 /// Trash with its bytes (the tests' stand-in; the system Trash is the by-hand receipt). A folder
 /// goes whole. Shift+F8 → gone, not in the Trash. Where this machine has no Trash for the folder,
-/// F8 says `permanent — no Trash here` before anything is removed, and removes permanently.
+/// F8 says `permanent — no Trash here` before anything is removed, and removes permanently. Each
+/// F8's line is read once its Trash check (on a worker) has answered.
 #[test]
 fn k_d1_f8_here_goes_to_the_trash_and_shift_f8_does_not() {
     let mut fx = fixture();
     let path = |fx: &Fx, n: &str| format!("{}/{n}", fx.root);
     fx.select("notes.txt");
     fx.key(Key::F8);
+    wait(&mut fx, |b| !b.ops.checking_trash());
     assert!(fx.drv.find_text("Delete notes.txt?").is_some());
     assert!(fx.drv.find_text("to the Trash").is_some());
     fx.key(Key::Enter);
@@ -326,6 +329,7 @@ fn k_d1_f8_here_goes_to_the_trash_and_shift_f8_does_not() {
 
     fx.select("alpha");
     fx.key(Key::F8);
+    wait(&mut fx, |b| !b.ops.checking_trash());
     assert!(fx
         .drv
         .find_text("Delete alpha and everything inside it?")
@@ -351,6 +355,7 @@ fn k_d1_f8_here_goes_to_the_trash_and_shift_f8_does_not() {
     fx.b.trash_check = Arc::new(|_: &str| false);
     fx.select("zeta.md");
     fx.key(Key::F8);
+    wait(&mut fx, |b| !b.ops.checking_trash());
     assert!(in_error_colour(&fx, "permanent — no Trash here"));
     assert!(Path::new(&path(&fx, "zeta.md")).exists(), "asked first");
     fx.key(Key::Enter);

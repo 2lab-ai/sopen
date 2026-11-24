@@ -334,7 +334,8 @@ impl Window for Host {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
-                let rect = ui.max_rect().shrink(2.0);
+                let grid = crate::gui::cells::Grid::over(ui.max_rect());
+                let rect = grid.rect(grid.all());
                 let mut body = rect;
                 if let Some(b) = &self.banner {
                     let h = chrome::CELL.y * b.rows() as f32;
