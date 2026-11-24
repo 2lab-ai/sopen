@@ -236,7 +236,9 @@ fn tree_at_root(fx: &mut Fx) -> TreePool {
 /// Q1 (TS-8): the keyboard moves between the grid's list and egui — F2's field in the row's
 /// cells, F7's dialog over the grid, the viewer at all of it (its keys its own; the hex viewer's
 /// Go to field keeps its Esc) — and a click on a cell row puts the bar there, a double click
-/// opens it.
+/// opens it. Each with its negative control: the key a field or a dialog took jumps once it is
+/// gone, a click a row lower puts the bar on that row, and a second click on another row opens
+/// nothing.
 #[test]
 fn q1_the_keyboard_moves_between_the_grid_and_egui_fields_dialogs_and_the_viewer() {
     let mut fx = fixture();
@@ -256,6 +258,13 @@ fn q1_the_keyboard_moves_between_the_grid_and_egui_fields_dialogs_and_the_viewer
     fx.key(Key::Escape);
     assert_eq!(fx.b.ops.renaming(), None);
     assert!(!fx.drv.ctx.text_edit_focused());
+    fx.typed("z");
+    assert_eq!(
+        fx.current(),
+        "zeta.md",
+        "the control: without the field, z jumps"
+    );
+    fx.select("main.rs");
     fx.key(Key::ArrowDown);
     assert_eq!(fx.current(), "notes.txt", "the list has the keyboard back");
     // F7: an egui dialog over the grid holds the keyboard; Esc gives it back.
@@ -265,6 +274,13 @@ fn q1_the_keyboard_moves_between_the_grid_and_egui_fields_dialogs_and_the_viewer
     assert_eq!(fx.current(), "notes.txt");
     fx.key(Key::Escape);
     assert!(!fx.b.ops.holds_keyboard());
+    fx.typed("p");
+    assert_eq!(
+        fx.current(),
+        "photo.png",
+        "the control: without the dialog, p jumps"
+    );
+    fx.select("notes.txt");
     fx.key(Key::ArrowUp);
     assert_eq!(fx.current(), "main.rs");
     // Enter: the text viewer at the central area's cells, no list under it, the title row in
@@ -296,10 +312,15 @@ fn q1_the_keyboard_moves_between_the_grid_and_egui_fields_dialogs_and_the_viewer
     assert!(fx.b.viewer.is_some(), "the field's Esc did not leave");
     fx.key(Key::Escape);
     assert!(fx.b.viewer.is_none());
-    // A click on a cell row puts the bar there; a second one right after opens it.
+    // A click on a cell row puts the bar there; a second one right after opens it — on that
+    // row only: a click a row lower is that row's, and a second click on another row opens
+    // nothing.
     let beta = fx.drv.find_text("beta").expect("beta's cells").center();
+    fx.drv.click(&mut fx.b, beta + Vec2::new(0.0, CELL));
+    assert_eq!(fx.current(), ".hidden", "the control: the row below");
     fx.drv.click(&mut fx.b, beta);
     assert_eq!(fx.current(), "beta");
+    assert_eq!(fx.b.panels[0].dir, fx.root, "a second click on another row");
     fx.drv.click(&mut fx.b, beta);
     fx.settle();
     assert_eq!(
@@ -310,7 +331,8 @@ fn q1_the_keyboard_moves_between_the_grid_and_egui_fields_dialogs_and_the_viewer
 }
 
 /// Q1 (TS-8): Tab and clicks move the keyboard between the cell list and the git panel (egui at
-/// the right side's cells), and back.
+/// the right side's cells), and back. The negative controls: Down in the list leaves the git
+/// panel's bar, and a click a cell left of the git panel's side is the list's.
 #[test]
 fn q1_tab_and_clicks_move_the_keyboard_between_the_cell_list_and_the_git_panel() {
     let Some(git) = crate::git::history::fixture::git() else {
@@ -333,9 +355,23 @@ fn q1_tab_and_clicks_move_the_keyboard_between_the_cell_list_and_the_git_panel()
     g.key(Key::Tab);
     g.settle();
     assert!(g.b().git_focused().is_none(), "Tab back to the cell list");
+    let git_bar = g.panel().view.bar_place();
     g.key(Key::ArrowDown);
     assert_ne!(g.fx.current(), list_bar, "the list's keys again");
-    // Clicks: in the git panel the keyboard goes there; on a cell row of the list, back.
+    assert_eq!(
+        g.panel().view.bar_place(),
+        git_bar,
+        "the control: not the git panel's"
+    );
+    // Clicks: in the git panel the keyboard goes there — not a cell left of its side — and on a
+    // cell row of the list, back.
+    let beside = Pos2::new(right.left() - chrome::CELL.x / 2.0, right.center().y);
+    g.fx.drv.click(&mut g.fx.b, beside);
+    g.settle();
+    assert!(
+        g.b().git_focused().is_none(),
+        "the control: a click left of its side"
+    );
     g.fx.drv.click(&mut g.fx.b, right.center());
     g.settle();
     assert!(g.b().git_focused().is_some(), "a click in the git panel");

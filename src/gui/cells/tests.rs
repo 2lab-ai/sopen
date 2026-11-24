@@ -931,7 +931,31 @@ fn the_read_back_finds_text_its_cells_and_colours() {
             (Cells::new(11, 1, 8, 1), "사진.png".to_string()),
         ]
     );
-    assert!(frame_glyph('║') && frame_glyph('░') && frame_glyph('↑') && !frame_glyph('…'));
+    assert!(frame_glyph('║') && frame_glyph('░') && !frame_glyph('↑') && !frame_glyph('…'));
+}
+
+/// An arrow is a frame glyph only where a scroll bar draws it, in the scroll bar's colours: a
+/// status row's "↑ ↓ choose" is one text, and a text in the scroll bar's colours beside its ↓ is
+/// not joined to it.
+#[test]
+fn an_arrow_is_text_outside_a_scroll_bar() {
+    let p = PALETTE;
+    let all = Cells::new(0, 0, 16, 3);
+    let mut buf = Buffer::empty(all);
+    fill(&mut buf, all, Pen::new(p.text, p.back));
+    scroll_bar(&mut buf, 0, 0, 3, None);
+    put(&mut buf, 2, 0, "↑ ↓ choose", 14, Pen::new(p.text, p.back));
+    put(&mut buf, 1, 2, "ab", 2, Pen::new(p.track, p.track_back));
+    let runs: Vec<(Cells, String)> = (runs(&buf).into_iter())
+        .map(|r| (r.cells, r.text))
+        .collect();
+    assert_eq!(
+        runs,
+        vec![
+            (Cells::new(2, 0, 10, 1), "↑ ↓ choose".to_string()),
+            (Cells::new(1, 2, 2, 1), "ab".to_string()),
+        ]
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

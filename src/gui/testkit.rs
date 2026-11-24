@@ -125,12 +125,12 @@ fn ranked<T>(shapes: Vec<(usize, T)>, cells: Vec<(usize, bool, T)>) -> Vec<T> {
 }
 
 /// Whether `text`, found at `hit` in `l`, is a whole text of its row: without its blanks at
-/// either end it starts where a run starts and ends where a run ends ([`cells::runs`]: the same
-/// run, or runs a change of colours or a frame glyph apart) — not part of a longer run.
+/// either end — measured in cells, as the buffer lays them out (U+3000 is two) — it starts where
+/// a run starts and ends where a run ends ([`cells::runs`]: the same run, or runs a change of
+/// colours or a frame glyph apart) — not part of a longer run.
 fn whole_text(l: &Layer, hit: Cells, text: &str) -> bool {
-    let blanks = |cs: &mut dyn Iterator<Item = char>| cs.take_while(|c| c.is_whitespace()).count();
-    let lead = blanks(&mut text.chars()) as u16;
-    let trail = blanks(&mut text.chars().rev()) as u16;
+    let lead = cells::width(&text[..text.len() - text.trim_start().len()]) as u16;
+    let trail = cells::width(&text[text.trim_end().len()..]) as u16;
     let (first, end) = (hit.x + lead, hit.right().saturating_sub(trail));
     let runs = cells::runs(&l.buf);
     let row = || runs.iter().filter(|r| r.cells.y == hit.y);
@@ -138,9 +138,9 @@ fn whole_text(l: &Layer, hit: Cells, text: &str) -> bool {
 }
 
 /// Whether `prefix`, found at `hit` in `l`, starts a run of its row ([`cells::runs`]): its first
-/// cell that is not a blank is a run's first.
+/// cell that is not a blank — its leading blanks measured in cells — is a run's first.
 fn starts_a_run(l: &Layer, hit: Cells, prefix: &str) -> bool {
-    let lead = (prefix.chars()).take_while(|c| c.is_whitespace()).count() as u16;
+    let lead = cells::width(&prefix[..prefix.len() - prefix.trim_start().len()]) as u16;
     (cells::runs(&l.buf).iter()).any(|r| r.cells.y == hit.y && r.cells.x == hit.x + lead)
 }
 
@@ -698,7 +698,7 @@ impl Driver {
             while x < a.right() {
                 let (s, w) = (at(x), wide(x));
                 let two_blanks = blank(x) && x + w < a.right() && blank(x + w);
-                let framed = s.symbol.chars().any(cells::frame_glyph);
+                let framed = cells::frame_cell(&s.symbol, s.fg, s.bg);
                 if framed || (s.fg, s.bg) != colours || two_blanks {
                     break;
                 }
@@ -1618,6 +1618,39 @@ mod tests {
         assert_eq!(
             drv.text_starting_with("Cop"),
             Some("Copy the tag".to_string())
+        );
+    }
+
+    /// The blanks around a text are measured in cells, as the cells lay them out: a leading or
+    /// trailing ideographic space (U+3000) is two cells, a space one, beside a wide glyph or not.
+    /// A whole text with them is found, and a prefix that starts with one starts its run — it
+    /// answers beside a label that starts the same way.
+    #[test]
+    fn blanks_around_a_text_are_measured_in_cells() {
+        let buf = buffer(
+            12,
+            2,
+            &[(1, 0, "\u{3000}abc\u{3000}", body()), (2, 1, "한", body())],
+        );
+        let mut drv = Driver::new(600.0, 400.0);
+        let mut win = Screen {
+            layers: vec![(ORIGIN, Rect::EVERYTHING, buf)],
+            before: Some("\u{3000}ab, a label"),
+            ..Screen::default()
+        };
+        drv.idle(&mut win, 1);
+        assert_eq!(drv.find_text("\u{3000}abc"), Some(at(1, 0, 5)));
+        assert_eq!(drv.find_text("abc\u{3000}"), Some(at(3, 0, 5)));
+        assert_eq!(drv.find_text("\u{3000}abc\u{3000}"), Some(at(1, 0, 7)));
+        assert_eq!(drv.find_text(" 한"), Some(at(1, 1, 3)));
+        assert_eq!(drv.find_text("한 "), Some(at(2, 1, 3)));
+        let label = drv.find_text("\u{3000}ab, a label").expect("the label");
+        assert_eq!(
+            drv.texts_starting_with("\u{3000}ab"),
+            vec![
+                (label, "\u{3000}ab, a label".to_string()),
+                (at(1, 0, 5), "\u{3000}abc".to_string())
+            ]
         );
     }
 
