@@ -4,7 +4,10 @@ Single source of truth for anyone (human or agent) changing this repo. `CLAUDE.m
 
 ## What sopen is
 
-`sopen [user@]host:path` opens a remote file or folder as if it were local. A folder opens in sopen's own file
+`sopen` is the command; xtools is the multi-function tool it opens — the file browser, the viewers, the image,
+media and hex windows, the git panel, the directory tree and the dialogs (owner message 22, `.prd/01-spec.md`).
+
+`sopen [user@]host:path` opens a remote file or folder as if it were local. A folder opens in the xtools file
 browser (two panels, Total Commander-like; in preview mode, the default, the side opposite the active list previews
 the file under the bar, and F9 switches to two lists; Enter shows a file in the viewer for its kind in the same
 window — a read-only text viewer with syntax highlighting, or the image, media or hex window below; F2 renames, F5
@@ -19,12 +22,12 @@ commit's quick edits, the planner (Cmd/Ctrl+E), an edit stop's Amend and Split, 
 `git rebase -i` with sopen's own todo — running the host's own git, `.prd/03-git-panel.md`).
 Text goes to VS Code when it
 is installed (remote ones only with its Remote - SSH extension), otherwise Zed's remote mode; images, video and
-audio open in sopen's own small window with exactly these edits: rectangle crop, rectangle pixelize and clipboard
+audio open in a small xtools window with exactly these edits: rectangle crop, rectangle pixelize and clipboard
 copy / cut / paste (images: cut leaves the background colour; paste lays a picture — stretched, fitted or 1:1 — or
 text into the rectangle), rectangle crop, time cut and cut / copy / paste on the timeline (video), time cut,
 cut / copy / paste and Mono → Stereo (audio), and — as a command, `sopen stems` — voice / music separation into
 two new files (spec §7a). Any other file (a zip, any binary) opens a dialog before
-anything is downloaded: sopen's hex window (the default; byte overwrite only) or "Save to…" a chosen path;
+anything is downloaded: the xtools hex window (the default; byte overwrite only) or "Save to…" a chosen path;
 `--hex` opens any file in the hex window. It opens on the machine it was typed on, or — with `--target HOST`,
 `SOPEN_TARGET` or `target` in sopen's config — on HOST's screen, by running HOST's installed sopen with `--here`
 over ssh: HOST
@@ -32,14 +35,14 @@ is a machine the owner uses sopen on, not a file's remote, which still needs onl
 `https://` address as SOURCE opens in the default browser of the machine that shows things; on HOST a loopback one is
 served from this machine through an ssh tunnel of its own that lives exactly as long as this sopen (spec §4a,
 `src/url.rs`, `forward::tunnel`). On macOS,
-while a sopen window is in front, the top row is meant to send F1–F12 without fn (the key half is the owner's
+while an xtools window is in front, the top row is meant to send F1–F12 without fn (the key half is the owner's
 receipt K-F3, still open): `fkeys` in sopen's config —
 `"function"` (the default) or `"system"` (never touched), set by `sopen config fkeys function|system` — and
 sopen sets the global `HIDFKeyMode` to 1 and puts back what it found once none of its windows is in front,
 even when it dies (lock, state file, watchdog child; `.prd/04-file-keys.md` §6, `src/fnkeys/`); a run a hook
 drives (`SOPEN_SCREENSHOT`, `SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`, `SOPEN_LIST`, `SOPEN_KEYS`) and the tests never
 touch it, and Linux has no such switch. A remote
-file that one of sopen's own windows shows is read as a stream, never downloaded first, whatever its size
+file that one of the xtools windows shows is read as a stream, never downloaded first, whatever its size
 ([`.prd/06-streaming.md`](.prd/06-streaming.md)); its edits live in memory and in a local journal until they
 are saved, and Save writes to the remote by default, Save As to a local path
 ([`.prd/07-streaming-edit.md`](.prd/07-streaming-edit.md)). Spec and

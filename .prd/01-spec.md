@@ -15,6 +15,11 @@ actually need are one drag away, and any other file (a zip, a binary) asks first
 built-in hex editor, or save it where I choose — on the machine I typed it on, or with
 `--target` on another machine's screen.
 
+Naming (owner message 22, 2026-11-24): the project and its command are `sopen`; the multi-function
+tool it opens — the file browser, the viewers, the image, media and hex windows, the git panel, the
+directory tree and the dialogs — is xtools, the name in the title row's red program block. Message
+22 is quoted verbatim in [`xtools/ssot.md`](xtools/ssot.md).
+
 ## 1. Owner intent (verbatim, in order — the SSOT for scope)
 
 1. "scp 처럼 그냥 `snote <host>:/tmp/a.sh` 로 리모트 파일을 그냥 로컬처럼 사용하고 싶은거야. … 디렉토리 폴더 프로젝트로 볼수 있게하고 파일 편집할수 있고 신택스 하일라이트 볼수 있고 이미지나 영상도 볼수 있는 … rust면 좋겠고 linux, macos에서 다 지원되고 brew install .../snote 로 설치하고 즉시 `snote <host>:/tmp/a.mp3` 를 쓸수 있으면 좋겠음. llmux 오픈소스 처럼 개발 해줬으면 좋겠고"

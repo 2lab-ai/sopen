@@ -1,4 +1,4 @@
-//! The skin: every sopen window looks like PC Shell, the file manager of PC Tools Deluxe 5.5 / 6
+//! The skin: every xtools window looks like PC Shell, the file manager of PC Tools Deluxe 5.5 / 6
 //! (Central Point Software) — the VGA text font on a grid of 8×16 cells, light grey text on DOS
 //! blue, windows framed in box lines (a white double line around the active one, a light grey
 //! single line around the others) with their title in the top border, the white-on-light-red
@@ -225,8 +225,9 @@ pub fn merged(keys: &[FKey], more: &[FKey]) -> Vec<FKey> {
     all
 }
 
-/// The program's name, in the red block of the title row.
-pub const PROGRAM: &str = "sopen";
+/// The tool's name, in the red block of the title row: xtools, the multi-function tool the
+/// `sopen` command opens (spec, owner message 22).
+pub const PROGRAM: &str = "xtools";
 
 /// What each part of a window is painted in.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -708,8 +709,8 @@ fn row(ui: &mut egui::Ui) -> Rect {
         .0
 }
 
-/// The top row: the program's name in its red block, then where the browser is, black on cyan,
-/// and the clock at the right end after a `│`.
+/// The top row: the tool's name ([`PROGRAM`]) in its red block, then where the browser is, black
+/// on cyan, and the clock at the right end after a `│`.
 pub fn title_row(ui: &mut egui::Ui, place: &str) {
     let p = PALETTE;
     let rect = row(ui);

@@ -1,5 +1,5 @@
 //! F1's key help (04 §2 slot 1, §6.1): a read-only screen listing the keys of where the keyboard
-//! is — the list, a viewer, the git panel, the tree — in every sopen window, in the skin of
+//! is — the list, a viewer, the git panel, the tree — in every xtools window, in the skin of
 //! [`super::chrome`].
 //!
 //! - **What it lists** comes from the browser's one key table ([`for_context`]: its landed rows
