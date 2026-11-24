@@ -2539,8 +2539,7 @@ mod tests {
     /// the help, and F3 then closes the window. The Help slot and Cmd/Ctrl+1 open it too.
     #[test]
     fn f1_shows_the_key_help_over_a_window_of_its_own() {
-        let cmd = browser::keys::command_name();
-        let save = format!("Save (as {cmd}+S)");
+        let save = "Save (as Ctrl/⌘+S)";
         let mut drv = testkit::Driver::new(800.0, 400.0);
         let mut win = Own {
             f8: 0,
@@ -2552,7 +2551,7 @@ mod tests {
         let button = drv.find_text("press me").unwrap().center();
         drv.key(&mut win, egui::Key::F1, egui::Modifiers::NONE);
         assert!(help::is_open(&drv.ctx));
-        assert!(drv.find_text(&save).is_some(), "{:?}", drv.texts());
+        assert!(drv.find_text(save).is_some(), "{:?}", drv.texts());
         assert!(drv.find_text("Keys").is_some(), "the title");
         drv.key(&mut win, egui::Key::F8, egui::Modifiers::NONE);
         drv.frame(
@@ -2564,7 +2563,7 @@ mod tests {
         assert_eq!((win.f8, win.typed.as_str(), win.clicks), (0, "", 0));
         drv.key(&mut win, egui::Key::Escape, egui::Modifiers::NONE);
         assert!(!help::is_open(&drv.ctx));
-        assert!(drv.find_text(&save).is_none());
+        assert!(drv.find_text(save).is_none());
         drv.key(&mut win, egui::Key::F8, egui::Modifiers::NONE);
         drv.click(&mut win, button);
         assert_eq!((win.f8, win.clicks), (1, 1), "the window has its keys back");

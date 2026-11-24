@@ -662,7 +662,7 @@ fn the_history_row_offers_its_ids_where_they_apply() {
         .iter()
         .map(|i| (i.label.as_str(), i.key.as_deref()))
         .collect();
-    let plan_key = format!("{}+E", keys::command_name());
+    let plan_key = "Ctrl/⌘+E";
     assert_eq!(
         words,
         [
@@ -676,7 +676,7 @@ fn the_history_row_offers_its_ids_where_they_apply() {
             ("Stop here to edit…", None),
             ("Split…", None),
             ("Fold the staged changes into this commit…", None),
-            ("Edit history from here…", Some(plan_key.as_str())),
+            ("Edit history from here…", Some(plan_key)),
         ]
     );
 }
@@ -757,7 +757,7 @@ fn the_commit_menu_draws_its_history_row_and_gives_the_choice() {
     ] {
         fx.assert_shows(text);
     }
-    fx.assert_shows(&format!("{}+E", keys::command_name()));
+    fx.assert_shows("Ctrl/⌘+E");
     let (tag, reword, repository) = (
         fx.top_of("Tag…"),
         fx.top_of("Reword…"),
