@@ -10,7 +10,8 @@
 //! auto-repeats. The egui binding (VM-7) calls [`ViewKeys::take`] in the shell's input hook, after
 //! the Cmd/Ctrl+digit aliases (`fkey_events`, `gui/mod.rs:815`): Cmd/Ctrl+1…3 reach it as F1…F3,
 //! Cmd/Ctrl+9 and a click on slot 9 as F9. A terminal binding (VM-8) sends the character `1` alone,
-//! which is a press of its own here. A window on its own (`--hex`, the binary dialog, the image and
+//! which is a press of its own here, and no key releases (`ViewKeys::new(false, [])`). A window on
+//! its own (`--hex`, the binary dialog, the image and
 //! media windows) has no views and no view keys (D24).
 
 use eframe::egui::{Event, ImeEvent, Key, Modifiers};
@@ -88,9 +89,13 @@ pub enum Press {
 }
 
 impl Press {
-    /// A key event's press. Only a key pressed with no modifier is a view key, and a digit is
-    /// its physical key's first, else its logical key's — as the Cmd/Ctrl+digit aliases read it
-    /// (`gui/mod.rs:866`), so a key is one digit to both.
+    /// A key event's press. Only a key pressed with no modifier is a view key. A logical key that
+    /// names a key — End, ArrowDown, Insert, an F-key — is that key whatever its physical key: the
+    /// numpad's 1 with NumLock off is End and its 0 Insert (winit's xkb keymap), though egui-winit
+    /// gives them the physical keys Num1 and Num0 (`lib.rs:1720-1722`). A character key — a digit,
+    /// a letter, punctuation, or egui's fallback to the physical key where the layout has no
+    /// logical one — is a digit by its physical key first, else by its logical key (D3): the key
+    /// printed 1 is 1 on any layout.
     pub fn of_key(key: Key, physical_key: Option<Key>, modifiers: Modifiers) -> Press {
         if !modifiers.is_none() {
             return Press::Other;
@@ -101,7 +106,12 @@ impl Press {
                 .iter()
                 .position(|k| *k == key)
         };
-        if let Some(n) = physical_key.and_then(number).or_else(|| number(key)) {
+        let digit = if is_character(key) {
+            physical_key.and_then(number).or_else(|| number(key))
+        } else {
+            None
+        };
+        if let Some(n) = digit {
             return match n {
                 1..=3 => Press::Digit(n as u8),
                 _ => Press::Other,
@@ -129,6 +139,66 @@ impl Press {
     }
 }
 
+/// Whether egui's `key` stands for a character — a digit, a letter, punctuation, space — and
+/// types it (egui-winit sends its text after it); every other key names a key and types nothing.
+fn is_character(key: Key) -> bool {
+    use Key::*;
+    matches!(
+        key,
+        Space
+            | Colon
+            | Comma
+            | Backslash
+            | Slash
+            | Pipe
+            | Questionmark
+            | Exclamationmark
+            | OpenBracket
+            | CloseBracket
+            | OpenCurlyBracket
+            | CloseCurlyBracket
+            | Backtick
+            | Minus
+            | Period
+            | Plus
+            | Equals
+            | Semicolon
+            | Quote
+            | IntlBackslash
+    ) || (Num0..=Num9).contains(&key)
+        || (A..=Z).contains(&key)
+}
+
+/// Whether egui's `key` is a modifier's own key (egui 0.37 sends Shift, Ctrl, Alt and Super
+/// presses as keys; a Mac's fn is held to make the top row send F9): part of a chord, never the
+/// next key an armed F9 waits for.
+fn is_modifier(key: Key) -> bool {
+    use Key::*;
+    matches!(
+        key,
+        ShiftLeft
+            | ShiftRight
+            | ControlLeft
+            | ControlRight
+            | AltLeft
+            | AltRight
+            | SuperLeft
+            | SuperRight
+            | Key::Fn
+    )
+}
+
+/// The key a hardware Cut, Copy or Paste key's shortcut is held as (its event is the one the
+/// Cmd/Ctrl+X, C or V shortcut sends).
+fn clipboard_letter(key: Key) -> Option<Key> {
+    match key {
+        Key::Cut => Some(Key::X),
+        Key::Copy => Some(Key::C),
+        Key::Paste => Some(Key::V),
+        _ => None,
+    }
+}
+
 /// What becomes of one event of an input: passed on to the view ([`Command::Pass`],
 /// [`Command::Leave`]) or taken from it (every other command; [`Command::taken`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,9 +206,10 @@ pub enum Command {
     /// Passed on, as today: not a view key here (a digit typed as data or into a field, a key of
     /// the view or of the question, a release, the pointer).
     Pass,
-    /// Passed on, and it leaves the viewer: Esc or F3 goes its way — the view's own Esc first
-    /// (stopping a Save, clearing the image's rectangle), then the browser's row asking the view on
-    /// screen (`keys.rs:501-502`, §5). No view is chosen in the same input (Leave wins, §4).
+    /// Esc or F3, passed on; the viewer leaves unless the view consumed it (the view's own Esc
+    /// comes first: stopping a Save, clearing the image's rectangle), by the browser's row asking
+    /// the view on screen (`keys.rs:501-502`, §5). No view is chosen in the same input (Leave
+    /// wins, §4).
     Leave,
     /// Show the view in slot 1, 2 or 3. The view on screen chosen again, or a slot with no view,
     /// does nothing; unsaved edits ask first (the view set's rules, §3, §5).
@@ -233,10 +304,13 @@ pub fn decide(state: State, armed: bool, press: Press) -> (Command, bool) {
 
 /// The view keys of one viewer: F9 armed or not, and the keys held down. Made when the viewer
 /// opens ([`ViewKeys::new`]) and fed every input until it closes.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ViewKeys {
     armed: bool,
-    /// The keys down, by the physical key first (as the digits are read) and matched by either
+    /// Whether the source sends key releases (egui-winit does; a terminal does not, §9). Without
+    /// them no key is known to be held: every press is decided.
+    releases: bool,
+    /// The keys down (none without releases), by the physical key first (as the digits are read) and matched by either
     /// key — Shift changes a digit's logical key between its press and its release — and whether
     /// their press was taken. A press of a key already down is its auto-repeat — egui-winit 0.37
     /// sends every press with `repeat: false` and egui marks repeats only after the input hook
@@ -250,7 +324,7 @@ pub struct ViewKeys {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Now {
     Known(State),
-    /// A view was chosen or a field closed: which view, in which state, the rest of the input
+    /// A view was chosen or a field closed (by F9 or by its own Esc): which view, in which state, the rest of the input
     /// meets is not known (made, shown again, or the close prompt). Esc and F3 leave; any other
     /// press is dropped — never typed into a view it was not meant for, never a second switch.
     Unknown,
@@ -259,19 +333,30 @@ enum Now {
 }
 
 impl ViewKeys {
-    /// The view keys of a viewer opened while `down` were held (egui's `keys_down`, the Enter
-    /// that opened it among them): their repeats and releases are passed on, never decided, so a
-    /// held Enter does not start editing the hex view it opened.
-    pub fn new(down: impl IntoIterator<Item = Key>) -> ViewKeys {
+    /// The view keys of a viewer whose input source sends key releases (`releases`: the GUI) or
+    /// not (a terminal), opened while `down` were held (egui's `keys_down`, the Enter that opened
+    /// it among them): their repeats and releases are passed on, never decided, so a held Enter
+    /// does not start editing the hex view it opened. Without releases `down` is not kept.
+    pub fn new(releases: bool, down: impl IntoIterator<Item = Key>) -> ViewKeys {
         ViewKeys {
             armed: false,
-            held: down.into_iter().map(|key| (key, false)).collect(),
+            releases,
+            held: down
+                .into_iter()
+                .filter(|_| releases)
+                .map(|key| (key, false))
+                .collect(),
         }
     }
 
     /// F9 armed: the strip is warn-coloured (§8).
     pub fn armed(&self) -> bool {
         self.armed
+    }
+
+    /// Not armed any more: a view chosen otherwise (a click on the strip) ends an armed F9.
+    pub fn disarm(&mut self) {
+        self.armed = false;
     }
 
     /// One command per event of one input, in order. A key's typed text follows the key; typed
@@ -297,6 +382,8 @@ impl ViewKeys {
                     Some(false) => Command::Pass,
                     None => self.step(&mut now, Press::of_text(text)),
                 },
+                // A modifier's own key is part of a chord: the view's, deciding nothing.
+                (Event::Key { key, .. }, None) if is_modifier(*key) => Command::Pass,
                 (
                     Event::Key {
                         key,
@@ -315,14 +402,12 @@ impl ViewKeys {
                         None => self.step(&mut now, press),
                     };
                     if at.is_none() {
-                        self.held
-                            .push((physical_key.unwrap_or(*key), command.taken()));
+                        self.hold(physical_key.unwrap_or(*key), command.taken());
                     }
-                    // F9, Esc, F3, Enter and Insert type nothing (egui-winit sends no text for
-                    // them): text right after one is a press of its own, as a terminal's F9
+                    // Only a character key types (egui-winit sends its text right after it): text
+                    // after any other key is a press of its own, as a terminal's F9 or ArrowDown
                     // then `2` is.
-                    let types = matches!(press, Press::Digit(_) | Press::Other);
-                    text_of = types.then_some(command.taken());
+                    text_of = is_character(*key).then_some(command.taken());
                     out.push(command);
                     continue;
                 }
@@ -332,7 +417,10 @@ impl ViewKeys {
                     },
                     None,
                 ) => {
-                    let at = self.held_at(*key, *physical_key);
+                    // A hardware Cut, Copy or Paste key lets go of its shortcut's letter.
+                    let at = self.held_at(*key, *physical_key).or_else(|| {
+                        clipboard_letter(*key).and_then(|letter| self.held_at(letter, None))
+                    });
                     match at.map(|at| self.held.remove(at)) {
                         Some((_, true)) => Command::Drop,
                         _ => Command::Pass,
@@ -352,7 +440,7 @@ impl ViewKeys {
                         None => self.step(&mut now, Press::Other),
                     };
                     if at.is_none() {
-                        self.held.push((key, command.taken()));
+                        self.hold(key, command.taken());
                     }
                     command
                 }
@@ -395,6 +483,13 @@ impl ViewKeys {
             .position(|(k, _)| *k == key || Some(*k) == physical_key)
     }
 
+    /// Keeps `key` as held until its release — when the source sends releases.
+    fn hold(&mut self, key: Key, taken: bool) {
+        if self.releases {
+            self.held.push((key, taken));
+        }
+    }
+
     /// A press of a key already down, its auto-repeat: dropped when its press was taken; else
     /// passed on as today, but never while armed (it is not the next key, and it is never typed)
     /// or past what the input can know — and never a view key.
@@ -428,6 +523,8 @@ impl ViewKeys {
         *now = match (command, *now, state) {
             (Command::Leave, ..) => Now::Leaving,
             (Command::Choose(_) | Command::Arm(Ending::Field), ..) => Now::Unknown,
+            // A field's own Esc closes it, as F9 does.
+            (Command::Pass, _, State::Field) if press == Press::Esc => Now::Unknown,
             (_, Now::Unknown, _) => Now::Unknown,
             (Command::StartEditing, _, State::Hex(hex)) => Now::Known(State::Hex(Hex {
                 editing: true,

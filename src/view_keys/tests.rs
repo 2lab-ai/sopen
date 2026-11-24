@@ -123,9 +123,30 @@ fn cat(parts: &[&[Event]]) -> Vec<Event> {
     parts.concat()
 }
 
+/// The GUI's view keys: egui-winit sends releases; nothing held at open.
+fn gui() -> ViewKeys {
+    ViewKeys::new(true, [])
+}
+
+/// A terminal's: no releases, so nothing is ever held.
+fn terminal() -> ViewKeys {
+    ViewKeys::new(false, [])
+}
+
+/// A terminal's key: no physical key, never a release.
+fn term(key: Key) -> Event {
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: NONE,
+    }
+}
+
 /// View keys with F9 armed and let go.
 fn armed() -> ViewKeys {
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(
         keys.route(State::Free, &tap(Key::F9, None)),
         [Arm(Ending::Nothing)]
@@ -214,11 +235,7 @@ fn a_press_is_passed_or_taken_with_its_text_and_release() {
     for state in STATES {
         for is_armed in [false, true] {
             for press in PRESSES {
-                let mut keys = if is_armed {
-                    armed()
-                } else {
-                    ViewKeys::default()
-                };
+                let mut keys = if is_armed { armed() } else { gui() };
                 let (key, pressed) = events_of(press);
                 let input = cat(&[&pressed, &[up(key)]]);
                 let label = format!("{state:?} armed={is_armed} {press:?}");
@@ -256,7 +273,7 @@ fn a_press_is_passed_or_taken_with_its_text_and_release() {
 /// D3: the plain digit, by physical key; its typed text is not the digit on every layout.
 #[test]
 fn a_view_key_is_the_plain_digit_by_physical_key() {
-    let choose = |events: &[Event]| ViewKeys::default().route(State::Free, events);
+    let choose = |events: &[Event]| gui().route(State::Free, events);
     // AZERTY: the key printed 1 types `&`; egui has no `&` key, so the logical key is the
     // physical one.
     assert_eq!(
@@ -327,7 +344,7 @@ fn a_digit_with_a_modifier_is_no_view_key() {
         for (key, mods, text) in shapes {
             let input = down(key, Some(Key::Num1), mods, Some(text));
             let mut left = input.clone();
-            let acts = ViewKeys::default().take(state, &mut left);
+            let acts = gui().take(state, &mut left);
             assert!(acts.is_empty(), "{state:?} {mods:?}: {acts:?}");
             assert_eq!(left, input, "{state:?} {mods:?}");
         }
@@ -341,7 +358,7 @@ fn a_digit_with_a_modifier_is_no_view_key() {
         repeat: false,
         modifiers: NONE,
     };
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(keys.route(State::Free, &[alias(Key::F1)]), [Pass]);
     assert_eq!(keys.route(State::Free, &[alias(Key::F2)]), [Pass]);
     assert_eq!(keys.route(State::Free, &[alias(Key::F3)]), [Leave]);
@@ -355,7 +372,7 @@ fn a_digit_with_a_modifier_is_no_view_key() {
 /// VA-2 at the model: hex viewing, editing and a switch, each press with its typed text.
 #[test]
 fn hex_viewing_editing_and_a_switch() {
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     let mut run = |state: State, input: Vec<Event>| {
         let mut left = input;
         let acts = keys.take(state, &mut left);
@@ -376,9 +393,9 @@ fn hex_viewing_editing_and_a_switch() {
     assert_eq!(run(VIEWING, vec![up(Key::F9)]), (vec![], vec![]));
     assert_eq!(run(VIEWING, digit(1)), (vec![Choose(1)], vec![]));
     // Cancel: Hex, viewing, the edit kept; plain 1 asks again.
-    assert!(run(State::Question, vec![up(Key::Num1)]).0.is_empty());
+    assert_eq!(run(State::Question, vec![up(Key::Num1)]), (vec![], vec![]));
     assert_eq!(run(VIEWING, digit(1)), (vec![Choose(1)], vec![]));
-    assert!(run(State::Question, vec![up(Key::Num1)]).0.is_empty());
+    assert_eq!(run(State::Question, vec![up(Key::Num1)]), (vec![], vec![]));
     // Viewing during a Save, 1: chosen (the set says `saving…`); editing, held back as today.
     assert_eq!(run(VIEWING_SAVING, digit(1)).0, [Choose(1)]);
     assert!(run(VIEWING_SAVING, vec![up(Key::Num1)]).1.is_empty());
@@ -405,7 +422,7 @@ fn hex_viewing_editing_and_a_switch() {
 #[test]
 fn f9_fields_questions_and_leave_wins() {
     // F9 then x while editing hex: nothing typed, editing ended, no switch.
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(
         keys.route(EDITING, &tap(Key::F9, None)),
         [Arm(Ending::Editing)]
@@ -416,7 +433,7 @@ fn f9_fields_questions_and_leave_wins() {
     assert!(left.is_empty(), "{left:?}");
     assert!(!keys.armed());
     // Go to open: 1 goes into the field; F9 closes it and arms; then 2 chooses.
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(keys.route(State::Field, &digit(1)), [Pass, Pass]);
     assert_eq!(
         keys.route(State::Field, &cat(&[&tap(Key::F9, None), &digit(2)])),
@@ -442,7 +459,7 @@ fn f9_fields_questions_and_leave_wins() {
     ] {
         for state in [State::Free, VIEWING] {
             let mut left = input.clone();
-            let mut keys = ViewKeys::default();
+            let mut keys = gui();
             assert_eq!(keys.clone().route(state, &input), want, "{state:?}");
             assert_eq!(keys.take(state, &mut left), [Leave], "{state:?}");
             assert_eq!(left.len(), 1, "only the leaving key is left: {left:?}");
@@ -497,7 +514,7 @@ fn armed_has_no_timeout() {
 #[test]
 fn a_held_key_repeats_where_its_press_went() {
     // F9 held: armed once, not toggled.
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(
         keys.route(State::Free, &tap(Key::F9, None)),
         [Arm(Ending::Nothing)]
@@ -509,16 +526,16 @@ fn a_held_key_repeats_where_its_press_went() {
     assert_eq!(keys.route(State::Free, &[up(Key::F9)]), [Drop]);
     assert_eq!(keys.route(State::Free, &tap(Key::F9, None)), [Disarm]);
     // Esc held in an editing hex view: editing ends, and the repeat does not leave.
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(keys.route(EDITING, &tap(Key::Escape, None)), [EndEditing]);
     assert_eq!(keys.route(VIEWING, &tap(Key::Escape, None)), [Drop]);
     assert_eq!(keys.route(VIEWING, &[up(Key::Escape)]), [Drop]);
     // 2 held: one switch, its repeats and their text dropped in the view it chose.
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(keys.route(State::Free, &digit(2)), [Choose(2), DropText]);
     assert_eq!(keys.route(VIEWING, &digit(2)), [Drop, DropText]);
     // 4 held while editing: typed, as today; once F9 arms, its repeats are never typed.
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(keys.route(EDITING, &digit(4)), [Pass, Pass]);
     assert_eq!(keys.route(EDITING, &digit(4)), [Pass, Pass]);
     assert_eq!(
@@ -537,13 +554,13 @@ fn a_held_key_repeats_where_its_press_went() {
         repeat: true,
         modifiers: NONE,
     };
-    assert_eq!(ViewKeys::default().route(VIEWING, &[repeat]), [Pass]);
+    assert_eq!(gui().route(VIEWING, &[repeat]), [Pass]);
 }
 
 /// The Enter that opened the viewer, held: its repeats do not start editing the hex view.
 #[test]
 fn keys_down_at_open_are_passed() {
-    let mut keys = ViewKeys::new([Key::Enter]);
+    let mut keys = ViewKeys::new(true, [Key::Enter]);
     assert_eq!(keys.route(VIEWING, &tap(Key::Enter, None)), [Pass]);
     assert_eq!(keys.route(VIEWING, &[up(Key::Enter)]), [Pass]);
     assert_eq!(keys.route(VIEWING, &tap(Key::Enter, None)), [StartEditing]);
@@ -569,7 +586,7 @@ fn a_taken_press_takes_its_release() {
     assert!(!keys.armed(), "a clipboard shortcut is any other key");
     assert_eq!(keys.route(State::Free, &[up(Key::V)]), [Drop]);
     // Unarmed, the shortcut and its release are the view's.
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(keys.route(State::Free, &[paste, up(Key::V)]), [Pass, Pass]);
     for event in [Event::Copy, Event::Cut] {
         let mut keys = armed();
@@ -599,12 +616,12 @@ fn a_release_matches_its_press_by_physical_key() {
         repeat: false,
         modifiers: Modifiers::SHIFT,
     };
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(keys.route(State::Free, &digit(1)), [Choose(1), DropText]);
     assert_eq!(keys.route(State::Free, &[shifted_up]), [Drop]);
     assert_eq!(keys.route(State::Free, &digit(1)), [Choose(1), DropText]);
     // Held by the physical key, a press under Shift is the same key's repeat.
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(keys.route(State::Free, &digit(1)), [Choose(1), DropText]);
     let shifted = down(
         Key::Exclamationmark,
@@ -618,7 +635,7 @@ fn a_release_matches_its_press_by_physical_key() {
 /// Losing the window's focus forgets the keys held (winit may never send their releases).
 #[test]
 fn focus_loss_forgets_held_keys() {
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(keys.route(State::Free, &digit(2)), [Choose(2), DropText]);
     assert_eq!(keys.route(VIEWING, &[Event::WindowFocused(false)]), [Pass]);
     assert_eq!(keys.route(VIEWING, &digit(2)), [Choose(2), DropText]);
@@ -628,7 +645,7 @@ fn focus_loss_forgets_held_keys() {
 #[test]
 fn typed_text_alone_is_a_press() {
     let text = |t: &str| Event::Text(t.to_string());
-    let mut keys = ViewKeys::default();
+    let mut keys = gui();
     assert_eq!(keys.route(State::Free, &[text("1")]), [Choose(1)]);
     assert_eq!(keys.route(EDITING, &[text("1")]), [Pass]);
     assert_eq!(keys.route(State::Field, &[text("2")]), [Pass]);
@@ -644,17 +661,14 @@ fn typed_text_alone_is_a_press() {
     assert_eq!(keys.route(State::Free, &[text("x")]), [Drop]);
     assert!(!keys.armed());
     let commit = Event::Ime(ImeEvent::Commit("3".to_string()));
-    assert_eq!(
-        ViewKeys::default().route(State::Free, &[commit]),
-        [Choose(3)]
-    );
+    assert_eq!(gui().route(State::Free, &[commit]), [Choose(3)]);
 }
 
 /// Inside one input the hex view's own mode changes take effect at once; once a view is chosen
 /// or a field closed, the rest is dropped (but Esc and F3, which leave); once leaving, all of it.
 #[test]
 fn one_input_after_each_command() {
-    let route = |state: State, input: &[Event]| ViewKeys::default().route(state, input);
+    let route = |state: State, input: &[Event]| gui().route(state, input);
     let enter = tap(Key::Enter, None);
     let esc = tap(Key::Escape, None);
     let f9 = tap(Key::F9, None);
@@ -703,4 +717,160 @@ fn one_input_after_each_command() {
         route(State::Free, &cat(&[&esc, &x, &esc])),
         [Leave, Drop, DropText, Drop]
     );
+}
+
+/// A terminal sends no releases (§9): with `releases` false nothing is held, so every press is
+/// decided, each in its own input. From a source that does send releases, the same presses with
+/// none between them are repeats — the GUI's contract, which a terminal would break.
+#[test]
+fn a_terminal_without_releases_decides_every_press() {
+    let text = |t: &str| Event::Text(t.to_string());
+    let mut keys = terminal();
+    assert_eq!(
+        keys.route(State::Free, &[term(Key::F9)]),
+        [Arm(Ending::Nothing)]
+    );
+    assert_eq!(keys.route(State::Free, &[text("2")]), [Choose(2)]);
+    assert_eq!(
+        keys.route(VIEWING, &[term(Key::F9)]),
+        [Arm(Ending::Nothing)]
+    );
+    assert_eq!(keys.route(VIEWING, &[term(Key::Escape)]), [Disarm]);
+    assert_eq!(keys.route(VIEWING, &[term(Key::Escape)]), [Leave]);
+    let mut keys = terminal();
+    assert_eq!(keys.route(VIEWING, &[term(Key::Enter)]), [StartEditing]);
+    assert_eq!(keys.route(EDITING, &[term(Key::Escape)]), [EndEditing]);
+    assert_eq!(keys.route(VIEWING, &[term(Key::Enter)]), [StartEditing]);
+    let mut keys = gui();
+    assert_eq!(keys.route(VIEWING, &[term(Key::Enter)]), [StartEditing]);
+    assert_eq!(keys.route(EDITING, &[term(Key::Escape)]), [EndEditing]);
+    assert_eq!(keys.route(VIEWING, &[term(Key::Enter)]), [Drop]);
+    // A key that types nothing, then a character, in one batch: the character is its own press.
+    assert_eq!(
+        terminal().route(State::Free, &[term(Key::ArrowDown), text("2")]),
+        [Pass, Choose(2)]
+    );
+    assert_eq!(
+        terminal().route(State::Free, &[term(Key::F9), text("2")]),
+        [Arm(Ending::Nothing), Choose(2)]
+    );
+}
+
+/// The numpad with NumLock off: its logical key names a key (winit's xkb keymap) while
+/// egui-winit gives it the physical key Num0…Num9 (`lib.rs:1720-1722`) — never a view key; its 0
+/// is Insert. With NumLock on it is the digit, as the top row's.
+#[test]
+fn the_numpad_with_numlock_off_is_its_named_key() {
+    for (key, physical) in [
+        (Key::End, Key::Num1),
+        (Key::ArrowDown, Key::Num2),
+        (Key::PageDown, Key::Num3),
+    ] {
+        let press = down(key, Some(physical), NONE, None);
+        assert_eq!(gui().route(State::Free, &press), [Pass], "{key:?}");
+        assert_eq!(armed().route(State::Free, &press), [Drop], "{key:?}");
+    }
+    assert_eq!(
+        gui().route(VIEWING, &down(Key::Insert, Some(Key::Num0), NONE, None)),
+        [StartEditing]
+    );
+    assert_eq!(
+        gui().route(
+            State::Free,
+            &down(Key::Num2, Some(Key::Num2), NONE, Some("2"))
+        ),
+        [Choose(2), DropText]
+    );
+}
+
+/// The keys that stand for a character: space, egui's 18 punctuation keys, the ISO key, 10
+/// digits, 26 letters — egui's groups, so a key egui adds shows here.
+#[test]
+fn character_keys_are_space_punctuation_digits_and_letters() {
+    let characters: Vec<Key> = Key::ALL
+        .iter()
+        .copied()
+        .filter(|k| is_character(*k))
+        .collect();
+    assert_eq!(characters.len(), 1 + 18 + 1 + 10 + 26, "{characters:?}");
+    for key in [
+        Key::End,
+        Key::Insert,
+        Key::Enter,
+        Key::Tab,
+        Key::F9,
+        Key::ShiftLeft,
+    ] {
+        assert!(!is_character(key), "{key:?}");
+    }
+}
+
+/// egui 0.37 sends a modifier's own key as a press (`Key::ShiftLeft` …): part of a chord, it
+/// decides nothing — a Mac's fn held for F9 does not disarm before the F9 arrives.
+#[test]
+fn a_modifier_key_is_no_press() {
+    let mut keys = armed();
+    for key in [
+        Key::ShiftLeft,
+        Key::ControlRight,
+        Key::AltLeft,
+        Key::SuperLeft,
+        Key::Fn,
+    ] {
+        let input = cat(&[&tap(key, None), &[up(key)]]);
+        assert_eq!(keys.route(State::Free, &input), [Pass, Pass], "{key:?}");
+        assert!(keys.armed(), "{key:?}");
+    }
+    assert_eq!(
+        keys.route(
+            State::Free,
+            &cat(&[&tap(Key::Fn, None), &tap(Key::F9, None)])
+        ),
+        [Pass, Disarm]
+    );
+}
+
+/// A hardware Cut, Copy or Paste key sends the shortcut's event and lets go as itself: its
+/// release lets go of the letter the shortcut is held as, so that letter's next press is fresh.
+#[test]
+fn a_hardware_clipboard_key_lets_its_letter_go() {
+    for (event, key, letter) in [
+        (Event::Paste("p".to_string()), Key::Paste, Key::V),
+        (Event::Cut, Key::Cut, Key::X),
+        (Event::Copy, Key::Copy, Key::C),
+    ] {
+        let mut keys = armed();
+        assert_eq!(keys.route(State::Free, &[event]), [Drop], "{key:?}");
+        assert_eq!(keys.route(State::Free, &[up(key)]), [Drop], "{key:?}");
+        assert_eq!(
+            keys.route(State::Free, &tap(letter, Some("v"))),
+            [Pass, Pass],
+            "{key:?}"
+        );
+    }
+}
+
+/// A field's own Esc closes it, as F9 does: the rest of that input meets a view not known yet.
+#[test]
+fn a_fields_own_esc_ends_the_input() {
+    let esc = tap(Key::Escape, None);
+    let x = tap(Key::X, Some("x"));
+    assert_eq!(
+        gui().route(State::Field, &cat(&[&esc, &digit(1), &x])),
+        [Pass, Drop, DropText, Drop, DropText]
+    );
+    assert_eq!(
+        gui().route(State::Field, &cat(&[&esc, &[up(Key::Escape)], &esc])),
+        [Pass, Pass, Leave]
+    );
+}
+
+/// A view chosen otherwise — a click on the strip — disarms: the next key is the view's again.
+#[test]
+fn disarm_ends_an_armed_f9() {
+    let mut keys = armed();
+    keys.disarm();
+    assert!(!keys.armed());
+    assert_eq!(keys.route(VIEWING, &tap(Key::X, Some("x"))), [Pass, Pass]);
+    assert_eq!(keys.route(VIEWING, &digit(3)), [Choose(3), DropText]);
 }
