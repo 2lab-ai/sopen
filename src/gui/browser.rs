@@ -37,6 +37,7 @@ mod preview;
 mod tree;
 pub(crate) mod view;
 
+use super::cells::{self, Grid};
 use super::chrome::{self, FKey};
 use super::{help, Embedded, Hooks, Outcome, Status, Window};
 use crate::fileops::{self, Item, ItemOutcome, Report};
@@ -837,6 +838,22 @@ fn second_click(resp: &egui::Response, row: egui::Id) -> bool {
         d.insert_temp(last, if opens { egui::Id::NULL } else { row });
         opens
     })
+}
+
+/// Whether `p` is on `pane`, a pane's rect on the grid, its right and bottom edges outside it
+/// as a cell's are ([`Grid::at`]): a point on the edge two sides share is one side's, the right
+/// one's, never both — egui's `Rect::contains` holds both edges (10 §4).
+fn on_pane(pane: Rect, p: Pos2) -> bool {
+    pane.min.x <= p.x && p.x < pane.max.x && pane.min.y <= p.y && p.y < pane.max.y
+}
+
+/// Whether the pointer is over `pane` as [`egui::Ui::rect_contains_pointer`] says (in the clip,
+/// on `ui`'s layer), its right and bottom edges outside it ([`on_pane`]).
+fn pointer_on_pane(ui: &egui::Ui, pane: Rect) -> bool {
+    ui.rect_contains_pointer(pane)
+        && ui
+            .input(|i| i.pointer.interact_pos())
+            .is_some_and(|p| on_pane(pane, p))
 }
 
 /// The keys the status row names when nothing else is to be said.
@@ -2382,7 +2399,9 @@ impl Browser {
     }
 
     /// The two sides, side by side: each its list, or — the side opposite the active list, in
-    /// preview mode — the preview of the file under the bar ([`view`]).
+    /// preview mode — the preview of the file under the bar ([`view`]). They are the halves of
+    /// the area's cell grid, the odd column the right side's, each pane at its side's cells
+    /// (10 §4).
     fn panels_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let area = ui.max_rect();
@@ -2410,20 +2429,16 @@ impl Browser {
                 },
             )
         });
+        let grid = Grid::over(area);
         // Wide (Cmd/Ctrl+Shift+G): the git panel over both sides.
         if let Some([view::Content::Git(a), view::Content::Git(b)]) = self.shown.clone() {
             if a == b {
-                self.git_ui(ui, 1 - self.active, area.shrink(2.0), &a);
+                self.git_ui(ui, 1 - self.active, grid.rect(grid.all()), &a);
                 return;
             }
         }
-        let half = (area.width() / 2.0).floor();
-        for i in 0..2 {
-            let rect = Rect::from_min_size(
-                Pos2::new(area.left() + half * i as f32, area.top()),
-                Vec2::new(half, area.height()),
-            )
-            .shrink(2.0);
+        for (i, side) in cells::halves(grid.all()).into_iter().enumerate() {
+            let rect = grid.rect(side);
             match self.shown.as_ref().map(|s| s[i].clone()) {
                 Some(view::Content::Preview(_)) => self.preview.ui(ui, rect),
                 Some(view::Content::Tree) => self.tree_ui(ui, i, rect),
@@ -2498,7 +2513,7 @@ impl Browser {
         let mut field = None;
         let panel = &mut self.panels[i];
         // The wheel scrolls the rows (the bar stays where it is).
-        if ui.rect_contains_pointer(rect) {
+        if pointer_on_pane(ui, rect) {
             let lines: f32 = ctx.input(|inp| {
                 inp.events
                     .iter()
@@ -2800,7 +2815,13 @@ impl Window for Browser {
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 if self.viewer.is_some() {
-                    self.viewer_ui(ui, esc_was_a_fields);
+                    // The viewer over both sides: at all of the area's cells (10 §4).
+                    let grid = Grid::over(ui.max_rect());
+                    let rect = grid.rect(grid.all());
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        ui.shrink_clip_rect(rect);
+                        self.viewer_ui(ui, esc_was_a_fields);
+                    });
                 } else {
                     self.panels_ui(ui);
                 }

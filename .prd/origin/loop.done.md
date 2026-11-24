@@ -30,3 +30,30 @@ changes. Rows here are snapshots, frozen when they moved.
 | ID | Status | What | Who |
 |---|---|---|---|
 | OR-R | ✅ done 2026-11-24 | Research with a running prototype: how sopen on B reaches A when only A→B ssh exists, what `sopen allow B` sets up, the threat model, and the fit with message 23's TUI. Output: `../research/origin.md`. | research unit |
+
+## R0 (part 2) — OR-SPEC closed 2026-11-25
+
+- Written as `../11-origin.md`. It specifies:
+  - the protocol on the forwarded socket;
+  - what B may read;
+  - opening on A's screen;
+  - the agent and its supervisor;
+  - how B finds origin;
+  - `sopen allow`;
+  - the threat model, acceptance, the test plan and the work units, with the OR-0 spike first.
+- Reviewed by two engines.
+  - **Round 1 was FIX.** 9 + 13 must-fixes; merged, 18 items.
+  - **Orchestrator decisions D13–D17:**
+    - D13: non-local objects are refused.
+    - D14: B's opens start no git. A's sopen may start only the viewers' ffmpeg and ffprobe, and A's ssh to the pinned B.
+    - D15: `--repin`.
+    - D16: the pin holds on every A→B connection made for B.
+    - D17: a supervisor bounds a single stall. A double stall is an accepted residual.
+  - **The fix-check was FIX: 3 + 7 gaps in the fixes.** They covered DNS-vouched host keys, masters reused across a re-pin, socket name lengths, O26 in practice, the descriptor budget, test placement, the mount oracle and later cache folders.
+  - **No third review round.** The orchestrator checked those fixes at their cited lines on 2026-11-25. O31's arithmetic holds: `R + 4·C + P = F`, with a floor that keeps every pool positive.
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| OR-SPEC | ✅ done 2026-11-25 | The numbered document for route a2 (sopen's own agent behind `ForwardAgent <path>` in the owner's plain `ssh B`), with the orchestrator's decisions below, reviewed by two engines before any code; work units. | orchestrator |

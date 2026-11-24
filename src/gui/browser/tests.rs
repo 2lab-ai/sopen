@@ -135,10 +135,20 @@ impl Fx {
         panic!("{name} not reached by typing; at {}", self.current());
     }
 
-    /// `path` as a panel's frame shows it (a 1000-point window: two 496-point panels): whole,
-    /// or its end after "…".
+    /// `path` as the left side's frame shows it (a 1000-point window is 125 cells: the left side
+    /// 62 of them, 496 points): whole, or its end after "…".
     fn framed(&self, path: &str) -> String {
         chrome::frame_title(&self.drv.ctx, path, 496.0)
+    }
+
+    /// `path` as the right side's frame shows it: that side has the odd column, 63 cells (504
+    /// points). The frame the last pass drew there is held to that first, so the check is the
+    /// 504-point side's whatever the path's length — a short path is whole in a 496-point frame
+    /// too.
+    fn framed_right(&self, path: &str) -> String {
+        let right = panes(self).last().map(|r| (r.left(), r.width()));
+        assert_eq!(right, Some((496.0, 504.0)), "the right side: 63 cells");
+        chrome::frame_title(&self.drv.ctx, path, 504.0)
     }
 
     /// Opens `name` (Enter) and waits until its viewer is on screen and ready.
@@ -537,6 +547,200 @@ fn f3_in_a_viewers_text_field_does_not_leave_the_viewer() {
     assert!(fx.b.viewer.is_none(), "F3 leaves the viewer");
 }
 
+/// The panes the last pass drew in the central area: the bodies a frame fills in the skin's
+/// background, the outermost ones — a preview's or a viewer's own frame inside a side is not
+/// one — from the left.
+fn panes(fx: &Fx) -> Vec<Rect> {
+    let bodies: Vec<Rect> = (fx.drv.rects().into_iter())
+        .filter(|&(r, fill, _)| fill == chrome::PALETTE.back && r.width() >= 200.0)
+        .map(|(r, _, _)| r)
+        .collect();
+    let mut out: Vec<Rect> = (bodies.iter().copied())
+        .filter(|r| !bodies.iter().any(|o| o != r && o.contains_rect(*r)))
+        .collect();
+    out.sort_by(|a, b| a.left().total_cmp(&b.left()));
+    out.dedup();
+    out
+}
+
+/// Columns `x..x + w` of a 1000 × 700 window's grid in points (10 §4): the central area, under
+/// the title row (a cell) and above the status bar (a cell and 4 points) and the F-key row (a
+/// cell), is 648 points tall from y 16 — 40 rows of cells, the 8 points left at its foot the
+/// background.
+fn grid_columns(x: u16, w: u16) -> Rect {
+    let (left, width) = (f32::from(x) * 8.0, f32::from(w) * 8.0);
+    Rect::from_min_size(Pos2::new(left, 16.0), Vec2::new(width, 40.0 * 16.0))
+}
+
+/// The sides stand on the central area's cell grid (10 §4): each side half its columns, the odd
+/// one the right side's, a pane at its side's cells with no inset — in a 1000-point window, 125
+/// columns: the left side 62 cells (496 points), the right 63 (504), lists and a preview alike;
+/// the Enter viewer at all of the grid; 126 columns are two halves of 63.
+#[test]
+fn the_sides_and_the_viewer_stand_on_the_cell_grid() {
+    let mut fx = fixture();
+    let on_grid = |r: &Rect| {
+        let whole = |v: f32, cell: f32| (v / cell).fract() == 0.0;
+        let from = r.min - Pos2::new(0.0, 16.0);
+        whole(from.x, 8.0)
+            && whole(from.y, 16.0)
+            && whole(r.width(), 8.0)
+            && whole(r.height(), 16.0)
+    };
+    let sides = [grid_columns(0, 62), grid_columns(62, 63)];
+    // Dual mode: two lists.
+    fx.key(Key::F9);
+    fx.settle();
+    assert_eq!(fx.b.mode, view::Mode::Dual);
+    let shown = panes(&fx);
+    assert!(
+        shown.iter().all(on_grid),
+        "every pane at whole cells: {shown:?}"
+    );
+    assert_eq!(shown, sides, "two lists, 496 and 504 points");
+    // Preview mode: the file under the bar on the right side, at its cells.
+    fx.key(Key::F9);
+    fx.select("notes.txt");
+    fx.drv.idle(&mut fx.b, 12);
+    fx.settle();
+    fx.drv.idle(&mut fx.b, 2);
+    let display = fx.b.shown.clone().expect("a display");
+    assert!(matches!(&display[1], view::Content::Preview(p) if p.ends_with("/notes.txt")));
+    assert_eq!(
+        panes(&fx),
+        sides,
+        "a list and a preview, 496 and 504 points"
+    );
+    // The viewer: the whole grid — its own bar on top and status bar below inside it (a cell
+    // and 4 points each), its frame between them.
+    fx.key(Key::Enter);
+    fx.settle();
+    assert!(fx.b.viewer.is_some(), "the viewer");
+    let (all, bar) = (grid_columns(0, 125), Vec2::new(0.0, chrome::CELL.y + 4.0));
+    assert_eq!(
+        panes(&fx),
+        [Rect::from_min_max(all.min + bar, all.max - bar)],
+        "the viewer at all the cells"
+    );
+    fx.key(Key::Escape);
+    fx.settle();
+    assert!(fx.b.viewer.is_none());
+    // An even count of columns, with 4 points to spare: two equal halves.
+    fx.drv.resize(1012.0, 700.0);
+    fx.drv.idle(&mut fx.b, 3);
+    let halves = [grid_columns(0, 63), grid_columns(63, 63)];
+    assert_eq!(panes(&fx), halves, "126 columns: two of 63");
+}
+
+/// A window hosted as the viewer that keeps the room and the clip its last pass was given.
+struct Probe(Arc<Mutex<Option<(Rect, Rect)>>>);
+
+impl Window for Probe {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        *self.0.lock().unwrap() = Some((ui.max_rect(), ui.clip_rect()));
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// The viewer is given all of the grid's cells and is clipped to them: what a viewer draws past
+/// its room is cut at the grid, never in the 8 points at its foot (10 §4).
+#[test]
+fn the_viewer_is_given_the_grid_and_clipped_to_it() {
+    let mut fx = fixture();
+    let given = Arc::new(Mutex::new(None));
+    let probe = Embedded {
+        window: Box::new(Probe(given.clone())),
+        settle: Box::new(|_| Some(Outcome::default())),
+    };
+    let (ctx, abs) = (fx.drv.ctx.clone(), format!("{}/notes.txt", fx.root));
+    fx.b.view(&ctx, probe, None, abs, None, false);
+    fx.drv.idle(&mut fx.b, 2);
+    let all = grid_columns(0, 125);
+    assert_eq!(
+        *given.lock().unwrap(),
+        Some((all, all)),
+        "its room, its clip"
+    );
+}
+
+/// The git panel over both sides (Cmd/Ctrl+Shift+G) is at all of the grid's cells, as the
+/// viewer is (10 §4).
+#[test]
+fn the_wide_git_panel_is_the_whole_grid() {
+    let Some(git) = crate::git::history::fixture::git() else {
+        return;
+    };
+    let mut g = s2::Gx::new(s2::small(&git));
+    g.wait_for_the_panel();
+    g.tab_into_git();
+    g.with(Key::G, Modifiers::COMMAND | Modifiers::SHIFT);
+    g.settle();
+    assert_eq!(
+        g.shown(),
+        [g.git(), g.git()],
+        "the git panel over both sides"
+    );
+    assert_eq!(panes(&g.fx), [grid_columns(0, 125)], "at all the cells");
+}
+
+/// The two sides share an edge (10 §4), and a point on it is one side's — the right one's, as a
+/// cell's left edge is the cell's: one wheel notch at x 496 scrolls the right list alone, and
+/// at y 656, the grid's foot, neither.
+#[test]
+fn a_point_on_the_edge_two_sides_share_is_one_sides() {
+    let mut fx = fixture();
+    fx.key(Key::F9);
+    fx.settle();
+    let many = format!("{}/alpha", fx.root);
+    for i in 0..200 {
+        std::fs::write(format!("{many}/f{i:03}.txt"), "x").unwrap();
+    }
+    fx.b.list(None, many, None, None);
+    fx.settle();
+    // The rows one notch scrolls at `x`, `y`, in the left list and the right one.
+    let notch = |fx: &mut Fx, x: f32, y: f32| {
+        let before = [fx.b.panels[0].top, fx.b.panels[1].top];
+        fx.drv.wheel(&mut fx.b, Pos2::new(x, y), -1.0);
+        [
+            fx.b.panels[0].top - before[0],
+            fx.b.panels[1].top - before[1],
+        ]
+    };
+    let seen = [(496.0, 300.0), (250.0, 656.0), (495.0, 655.0)].map(|(x, y)| notch(&mut fx, x, y));
+    assert_eq!(
+        seen,
+        [[0, 3], [0, 0], [3, 0]],
+        "the edge the right side's, the grid's foot neither side's, the left side's last \
+         point its own"
+    );
+}
+
+/// A press on the edge the git panel on the left shares with the list on the right is the
+/// list's: the keyboard does not go into the git panel (10 §4).
+#[test]
+fn a_press_on_the_edge_beside_the_git_panel_is_not_the_git_panels() {
+    let Some(git) = crate::git::history::fixture::git() else {
+        return;
+    };
+    let mut g = s2::Gx::new(s2::small(&git));
+    g.wait_for_the_panel();
+    // The right list active, its bar on `..`: the git panel on the left.
+    g.fx.b.active = 1;
+    let git_side = g.git();
+    g.until("the git panel on the left", |b| {
+        b.shown.as_ref().is_some_and(|s| s[0] == git_side)
+    });
+    g.settle();
+    assert!(!g.fx.b.git.focus);
+    g.fx.drv.click(&mut g.fx.b, Pos2::new(496.0, 300.0));
+    assert!(!g.fx.b.git.focus, "the edge is the list's");
+    g.fx.drv.click(&mut g.fx.b, Pos2::new(495.0, 300.0));
+    assert!(g.fx.b.git.focus, "the git panel's last column is its own");
+}
+
 /// The panel's foot never hides its count: on the narrowest window, and with a total too long
 /// for the panel, "N Listed" is drawn whole inside each panel's frame — the free space gives
 /// way first, then the end of the total.
@@ -549,11 +753,11 @@ fn the_foot_always_shows_the_count_inside_the_frame() {
     assert!(fx.drv.find_text(&whole).is_some(), "{whole}");
     fx.drv.resize(480.0, 320.0);
     fx.drv.idle(&mut fx.b, 3);
-    // Two panels of 240 points; inside each frame: 10..230 and 250..470.
+    // Two panels of 30 cells (240 points); inside each frame: 8..232 and 248..472.
     let feet = |fx: &Fx| {
         let feet = fx.drv.texts_starting_with("8 Listed = ");
         assert_eq!(feet.len(), 2, "both counts whole on screen: {feet:?}");
-        for ((rect, _), (left, right)) in feet.iter().zip([(10.0, 230.0), (250.0, 470.0)]) {
+        for ((rect, _), (left, right)) in feet.iter().zip([(8.0, 232.0), (248.0, 472.0)]) {
             assert!(
                 rect.left() >= left - 0.5 && rect.right() <= right + 0.5,
                 "inside the frame: {rect:?}"
@@ -612,12 +816,12 @@ fn cells_fit_their_columns_at_a_glyph_boundary() {
     }
     fx.drv.resize(480.0, 320.0);
     fx.drv.idle(&mut fx.b, 3);
-    // The left panel's inside is 10..230: 27 cells — Name 5, a gap, Ext 5, a gap, Size 14.
+    // The left panel's inside is 8..232: 28 cells — Name 6, a gap, Ext 5, a gap, Size 14.
     let cell = 8.0;
     let (name, ext, size) = (
-        (10.0, 10.0 + 5.0 * cell),
-        (10.0 + 6.0 * cell, 10.0 + 11.0 * cell),
-        (10.0 + 12.0 * cell, 10.0 + 26.0 * cell),
+        (8.0, 8.0 + 6.0 * cell),
+        (8.0 + 7.0 * cell, 8.0 + 12.0 * cell),
+        (8.0 + 13.0 * cell, 8.0 + 27.0 * cell),
     );
     let inside =
         |r: Rect, (left, right): (f32, f32)| r.left() >= left - 0.5 && r.right() <= right + 0.5;
