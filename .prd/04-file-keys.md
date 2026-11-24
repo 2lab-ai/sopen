@@ -529,6 +529,14 @@ everywhere.
     thread, unwinding included.
   - The window holds a handle to the same inhibitor. It sends `destroy` when the owning thread
     disappears (its channel closes).
+  - **One rule for creating it.** The inhibitor thread sends `inhibit_shortcuts` only when all
+    hold: the window has the keyboard; this focus-in's snapshot is read; nothing has failed since
+    this focus-in; no window call is past 500 ms; and it holds none. Every other path only
+    destroys. A second inhibitor for the surface is `already_inhibited`
+    (`wayland-protocols-0.32.13/…/keyboard-shortcuts-inhibit-unstable-v1.xml:61,71-73`), and any
+    protocol error ends the whole connection, winit's window included (`wayland.xml:73`).
+  - The guest backend never outlives winit's display (`wayland-backend-0.3.17/src/sys/mod.rs:98-101`);
+    it holds because the one event loop, and its display, live for the whole process.
 - **The window's end.** In `App::on_exit` the window sends `destroy` unconditionally, then stops and
   joins the thread. eframe calls `on_exit` while the window still exists
   (`eframe-0.37.0/src/native/glow_integration.rs:508-520`, `wgpu_integration.rs:593-607`).
@@ -546,6 +554,16 @@ everywhere.
   - One `EventLoop` per process, kept for every window and for the glow retry. winit refuses a
     second one (`winit-0.30.13/src/event_loop.rs:119`); each window uses `run_app_on_demand`
     (`platform/run_on_demand.rs:70`).
+  - `create_native` returns no `Result`: a renderer's error stays inside eframe
+    (`native/run.rs:96, 177-191, 541`), and `run_app_on_demand` returns `Ok(())`. The retry's
+    trigger is the shell still in its slot when the loop returns — wgpu fails at `set_window`
+    (`wgpu_integration.rs:272`), before the app creator (`:325-345`). Still in its slot after glow
+    too → `cannot open a window: neither wgpu nor glow started`, exit 1. A run whose app was created
+    ends as a close.
+  - The shell builds its one `EventLoop<eframe::UserEvent>` itself, on every OS, and applies
+    `event_loop_hook()` to that builder: `create_native` never runs `NativeOptions::event_loop_builder`
+    (`run.rs:54-56`), and on macOS the default menu's Quit would skip the unsaved-changes prompt
+    (`src/gui/mod.rs:1216-1224`).
   - The wrapper sees each `WindowEvent::KeyboardInput` and `ModifiersChanged` before eframe. A key
     event's code is its evdev code (`PhysicalKeyExtScancode::to_scancode`). E5 *measured* the
     brightness key as `scancode=Some(224)`, `logical=Named(BrightnessDown)`, which egui alone never
@@ -609,13 +627,13 @@ for brightness, Meta, Alt+Tab and Alt+F4, E1).
 - **The inhibitor goes at once when there is any doubt.** Each of these is a doubt:
   - a snapshot that cannot be read;
   - a call that times out or fails;
-  - the hand-back thread or the inhibitor thread ending;
-  - a protocol error.
+  - the hand-back thread or the inhibitor thread ending.
 
   The status row then says `the F-key switch did not take effect: <reason>` (`NOT_IN_EFFECT`,
   `src/fnkeys/mod.rs:62`). The reason goes through the feed's `Said` and `publish`
   (`src/gui/mod.rs:1404-1409`, `:1702-1714`), because `Feed::pass` rewrites the window's line on
-  every pass (`:1541-1551`). The window asks for no new inhibitor until its next focus-in.
+  every pass (`:1541-1551`). No new inhibitor is made until the next focus-in. A protocol error is
+  not survivable: the window ends, and KWin drops the inhibitor with the client (§6.4.2).
 - **A stalled window.** The window's thread marks the start and the end of each event it handles. If
   one call lasts 500 ms, the inhibitor thread destroys the inhibitor until that call returns. A
   frame that blocks for seconds then costs the top row, never Alt+Tab or Meta+L.
@@ -874,7 +892,8 @@ and never in the owner's session. They keep the isolation of study §1:
   - **The window's handle.** The thread gone → the window's handle sends `destroy`.
   - **`on_exit`.** It sends `destroy` even when the thread already did, before the surface goes.
   - **A stall.** A window call of 500 ms → `destroy`. The inhibitor is asked for again once the
-    call returns.
+    call returns, under §6.4.2's one rule: a stall that ends after a failure since focus-in → no
+    inhibitor; a fresh snapshot and a stall ending at the same moment → one `inhibit_shortcuts`.
   - **No waiting.** The creation closure returns at once, against a compositor and a bus that answer
     after 2 s.
   - **The status line.** The hook, then `logic`, then `ui` run in that order, and the status line
