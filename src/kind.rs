@@ -166,11 +166,11 @@ pub fn utf8_text(head: &[u8], truncated: bool) -> bool {
 
 /// Signatures of binary formats, each at its offset, whose fields and samples the NUL pattern
 /// could take for UTF-16 / UTF-32 text (a WAV of quiet 16-bit samples is all ASCII units): a
-/// file that starts with one is that binary, and the pattern is not asked about it (D18).
+/// file that starts with one is that binary, and the pattern is not asked about it (D18). The
+/// short ones that text can start with, `MZ` and `ID3`, are [`pe_executable`] and [`id3_tag`].
 const SIGNATURES: &[(usize, &[u8])] = &[
-    // RIFF (WAV, AVI, WebP), MP3 with a tag, FLAC, Ogg.
+    // RIFF (WAV, AVI, WebP), FLAC, Ogg.
     (0, b"RIFF"),
-    (0, b"ID3"),
     (0, b"fLaC"),
     (0, b"OggS"),
     // PNG, GIF, JPEG, PDF, ZIP (and what is a zip: docx, jar, …), SQLite.
@@ -180,8 +180,7 @@ const SIGNATURES: &[(usize, &[u8])] = &[
     (0, b"%PDF"),
     (0, b"PK\x03\x04"),
     (0, b"SQLite format 3\0"),
-    // Executables: PE, ELF, Mach-O (32 and 64 bits, either order) and a universal binary.
-    (0, b"MZ"),
+    // Executables: ELF, Mach-O (32 and 64 bits, either order) and a universal binary.
     (0, b"\x7FELF"),
     (0, b"\xFE\xED\xFA\xCE"),
     (0, b"\xFE\xED\xFA\xCF"),
@@ -201,11 +200,32 @@ const SIGNATURES: &[(usize, &[u8])] = &[
     (4, b"ftyp"),
 ];
 
-/// Whether `head` starts as a binary format of [`SIGNATURES`] does.
+/// A DOS / PE executable: `MZ`, which UTF-16LE text starts with too (U+5A4D), so only with the
+/// PE header where `e_lfanew` (the u32 at 0x3C) points, inside the head, or the DOS stub's
+/// message.
+fn pe_executable(head: &[u8]) -> bool {
+    const STUB: &[u8] = b"This program cannot be run in DOS mode";
+    if !head.starts_with(b"MZ") || head.len() < 64 {
+        return false;
+    }
+    let at = u32::from_le_bytes([head[0x3C], head[0x3D], head[0x3E], head[0x3F]]) as usize;
+    let pe = at.checked_add(4).and_then(|end| head.get(at..end)) == Some(b"PE\0\0");
+    pe || head.windows(STUB.len()).any(|w| w == STUB)
+}
+
+/// An MP3's ID3v2 tag: `ID3`, which UTF-16LE text starts with too (U+4449), so only with its
+/// version 2–4 and the flags' low four bits clear.
+fn id3_tag(head: &[u8]) -> bool {
+    head.len() >= 6 && head.starts_with(b"ID3") && (2..=4).contains(&head[3]) && head[5] & 0x0F == 0
+}
+
+/// Whether `head` starts as a binary format of [`SIGNATURES`] does, or is a PE or an ID3 tag.
 fn signed_binary(head: &[u8]) -> bool {
     SIGNATURES
         .iter()
         .any(|&(at, sig)| head.get(at..at + sig.len()) == Some(sig))
+        || pe_executable(head)
+        || id3_tag(head)
 }
 
 /// [`utf8_text`], or UTF-16 / UTF-32 by the text view's default (08 D18: §7.2's step 1, a BOM,
@@ -604,9 +624,8 @@ mod tests {
         assert_eq!(sniffed("notes.dat", &log), Kind::Text);
         // Each signature before samples the pattern would take for text.
         let samples: Vec<u8> = [0x40, 0x00].repeat(2000);
-        let signatures: [&[u8]; 26] = [
+        let signatures: [&[u8]; 24] = [
             b"RIFF",
-            b"ID3",
             b"fLaC",
             b"OggS",
             b"\x89PNG",
@@ -615,7 +634,6 @@ mod tests {
             b"%PDF",
             b"PK\x03\x04",
             b"SQLite format 3\0",
-            b"MZ",
             b"\x7FELF",
             b"\xFE\xED\xFA\xCE",
             b"\xFE\xED\xFA\xCF",
@@ -642,11 +660,61 @@ mod tests {
             );
             assert_eq!(sniffed("blob.dat", &file), Kind::Other, "{sig:02x?}");
         }
-        // A BOM decides before any signature: `FF FE`, then `RIFF`, is UTF-16LE text.
-        let mut bom = vec![0xFF, 0xFE];
-        bom.extend(b"RIFF");
+        // A BOM decides before any signature: `FF FE`, `A`, then `ftyp` where an ISO media file
+        // has it (offset 4), is UTF-16LE text.
+        let mut bom = vec![0xFF, 0xFE, 0x41, 0x00];
+        bom.extend(b"ftyp");
         bom.extend(&samples);
+        assert!(signed_binary(&bom));
         assert_eq!(sniffed("blob.dat", &bom), Kind::Text);
+    }
+
+    /// The two short signatures, `MZ` and `ID3`, are the start of UTF-16LE text too (U+5A4D,
+    /// U+4449): they refuse the pattern's guess only with what corroborates them — a PE header
+    /// where `e_lfanew` points, or the DOS stub's message; an ID3v2 version and clear flags.
+    #[test]
+    fn d18_mz_and_id3_refuse_the_guess_only_when_corroborated() {
+        let samples: Vec<u8> = [0x40, 0x00].repeat(2000);
+        let pattern = |file: &[u8]| WIDE.contains(&pick(file, false).encoding);
+        // Text: U+5A4D then `abc` (4 units, 3 ASCII), U+4449 then `3abc`, and `MZ` before
+        // ASCII units with neither a PE header nor the stub.
+        let texts: [&[u8]; 2] = [
+            b"\x4D\x5A\x61\x00\x62\x00\x63\x00",
+            b"\x49\x44\x33\x00\x61\x00\x62\x00\x63\x00",
+        ];
+        for file in texts {
+            assert!(pattern(file), "{file:02x?}");
+            assert_eq!(sniffed("notes.dat", file), Kind::Text, "{file:02x?}");
+        }
+        let mut mz = b"MZ".to_vec();
+        mz.extend(&samples);
+        assert_eq!(sniffed("notes.dat", &mz), Kind::Text);
+        // A PE: `e_lfanew` at 0x3C points to `PE\0\0` inside the head.
+        let mut pe = b"MZ".to_vec();
+        pe.extend([0x40, 0x00].repeat(29));
+        pe.extend(0x80u32.to_le_bytes());
+        pe.extend([0x40, 0x00].repeat(32));
+        assert_eq!(pe.len(), 0x80);
+        pe.extend(b"PE\0\0");
+        pe.extend(&samples);
+        // The DOS stub's message, its PE header past the head.
+        let mut stub = b"MZ".to_vec();
+        stub.extend([0x40, 0x00].repeat(29));
+        stub.extend(0x10_0000u32.to_le_bytes());
+        stub.extend(b"This program cannot be run in DOS mode");
+        stub.extend(&samples);
+        // An MP3's ID3v2.3 tag: version 3, revision 0, flags 0, a syncsafe size.
+        let mut id3 = b"ID3\x03\x00\x00\x00\x00\x10\x00".to_vec();
+        id3.extend(&samples);
+        for (name, file) in [("PE", pe), ("DOS stub", stub), ("ID3v2.3", id3)] {
+            assert!(pattern(&file), "{name}: the pattern alone takes it");
+            assert_eq!(sniffed("blob.dat", &file), Kind::Other, "{name}");
+        }
+        // Too short for `e_lfanew`: text.
+        let mut short = b"MZ".to_vec();
+        short.extend([0x41, 0x00].repeat(29));
+        assert!(short.len() < 64 && pattern(&short));
+        assert_eq!(sniffed("notes.dat", &short), Kind::Text);
     }
 
     /// The sniff before D18 (`looks_like_text` at 1c6fa00), the oracle of its UTF-8 half: no NUL
@@ -734,11 +802,12 @@ mod tests {
             let got = sniffed("blob.dat", &bytes);
             assert_eq!(got, want, "{name}");
             // The sniff and the text view's default agree: what the UTF-8 test does not take is
-            // text exactly when the default is UTF-16 or UTF-32.
+            // text exactly when the default is UTF-16 or UTF-32, unless a known signature refuses
+            // it (no sample here has a BOM).
             let head = &bytes[..bytes.len().min(SNIFF_BYTES)];
             let truncated = bytes.len() > SNIFF_BYTES;
             if !utf8_before_d18(head, truncated) {
-                let wide = WIDE.contains(&pick(head, truncated).encoding);
+                let wide = WIDE.contains(&pick(head, truncated).encoding) && !signed_binary(head);
                 assert_eq!(got == Kind::Text, wide, "{name}");
             }
         }

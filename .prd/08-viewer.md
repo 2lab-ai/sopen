@@ -219,9 +219,10 @@ and 4 with step 3's slot empty; VM-4 fills step 3.
 - **Routing** (D18): a file whose kind the sniff decides (no known extension, `kind::detect_sniffed`) is
   text when step 1 or 2 finds UTF-16 or UTF-32 — `kind::looks_like_text` asks `encoding::pick` itself
   (VM-3), so a UTF-16LE BOM is text where it was not. Step 2's guess is not taken for a file that
-  starts with a binary format's signature (`kind::SIGNATURES`: RIFF, ID3, FLAC, Ogg, PNG, GIF, JPEG,
-  PDF, ZIP, SQLite, PE, ELF, Mach-O, fonts, `.DS_Store`, OLE, a registry hive, `ftyp` at 4): a canonical
-  WAV of quiet 16-bit samples is all ASCII units. A BOM decides before any signature (D37). Step 3
+  starts with a binary format's signature (`kind::signed_binary`: RIFF, FLAC, Ogg, PNG, GIF, JPEG,
+  PDF, ZIP, SQLite, ELF, Mach-O, fonts, `.DS_Store`, OLE, a registry hive, `ftyp` at 4; `MZ` and
+  `ID3`, which text can start with, only with a PE header or the DOS stub, and an ID3v2 version): a
+  canonical WAV of quiet 16-bit samples is all ASCII units. A BOM decides before any signature (D37). Step 3
   does not route: an extension-less CP949 file fails the sniff's UTF-8 test (`kind::utf8_text`),
   stays Other and opens in Hex; its view 3 decodes it as CP949 by step 3.
 
