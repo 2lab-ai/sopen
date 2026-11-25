@@ -53,6 +53,7 @@ use super::buffer::{Buffer, Group, Original, Piece};
 use crate::encoding::encode::Refused;
 use crate::encoding::{Around, Cell, Encoding, AHEAD, W};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,6 +86,8 @@ const FFFD: char = char::REPLACEMENT_CHARACTER;
 thread_local! {
     /// The bytes this thread's editors decoded: the tests' measure of an operation's work.
     static DECODED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The most bytes one decode held at once: the tests' measure of an operation's memory.
+    static HELD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Turbo's block: two markers, shown while the begin is before the end and it is not hidden.
@@ -278,6 +281,9 @@ enum Put<'c> {
     /// A clip's pieces, its bytes where they are stale or none are given (its bytes with this
     /// file's line ends): the file's own bytes, which may end in a fragment.
     Clip(&'c [Piece], Cow<'c, [u8]>),
+    /// The file's own bytes written again, nothing typed between them (a Replace with nothing,
+    /// which is a delete): where they meet others they read as they read, as a delete's do.
+    Own(Vec<u8>),
 }
 
 /// One change, in the document's offsets before the edit: `remove` bytes at `at`, then `put`.
@@ -304,15 +310,16 @@ enum Wrong {
 /// The document as an edit would make it: ranges of today's document and new bytes, in order.
 enum Seg<'a> {
     Old(Range<u64>),
-    /// New bytes; `whole`: they end with a whole character (encoded text).
-    New(&'a [u8], bool),
+    /// New bytes; `whole`: they end with a whole character (encoded text); `typed`: typed or
+    /// pasted, so their seams are checked.
+    New(&'a [u8], bool, bool),
 }
 
 impl Seg<'_> {
     fn len(&self) -> u64 {
         match self {
             Seg::Old(r) => r.end - r.start,
-            Seg::New(b, _) => b.len() as u64,
+            Seg::New(b, ..) => b.len() as u64,
         }
     }
 }
@@ -360,7 +367,7 @@ impl<'a> Segs<'a> {
             if a < b {
                 match s {
                     Seg::Old(o) => d.b.read(o.start + a - at..o.start + b - at, &mut out),
-                    Seg::New(bytes, _) => {
+                    Seg::New(bytes, ..) => {
                         out.extend_from_slice(&bytes[(a - at) as usize..(b - at) as usize])
                     }
                 }
@@ -370,10 +377,11 @@ impl<'a> Segs<'a> {
     }
 }
 
-/// A long line's columns (item 1 of ED-ops's review): per line, by its start, the column at a
-/// character start every [`COL_STRIDE`] bytes walked, so a column is walked from the last one
-/// before it. An edit drops what it may change: the lines from its first place on, and the
-/// checkpoints past that place.
+/// A long line's checkpoints (ED-ops's review): per line, by its start, a character start and
+/// its column every [`COL_STRIDE`] bytes walked, so a column — or, in CP949 with no sync byte, a
+/// character start (D28) — is walked from the last one before it. An edit drops what it may
+/// change: the lines from its first place on, and the checkpoints at that place or past it (a
+/// delete there may join the fragment before it with the bytes after it).
 #[derive(Debug, Default)]
 struct Cols(HashMap<u64, Vec<(u64, u64)>>);
 
@@ -400,18 +408,20 @@ impl Cols {
         }
     }
 
+    /// A character start `at` and its column, once [`COL_STRIDE`] past the last one kept (or
+    /// the line's start): a short line keeps none.
     fn record(&mut self, ls: u64, at: u64, col: u64) {
-        let v = self.0.entry(ls).or_default();
-        if at >= v.last().map_or(ls, |l| l.0) + COL_STRIDE {
-            v.push((at, col));
+        let last = self.0.get(&ls).and_then(|v| v.last()).map_or(ls, |l| l.0);
+        if at >= last + COL_STRIDE {
+            self.0.entry(ls).or_default().push((at, col));
         }
     }
 
     /// An edit from byte `p` on.
     fn edited(&mut self, p: u64) {
         self.0.retain(|&ls, v| {
-            v.retain(|&(o, _)| o <= p);
-            ls < p
+            v.retain(|&(o, _)| o < p);
+            ls < p && !v.is_empty()
         });
     }
 }
@@ -421,7 +431,6 @@ impl Cols {
 /// and its column.
 fn walk(
     d: Doc<'_>,
-    cols: &mut Cols,
     (ls, le): (u64, u64),
     from: (u64, u64),
     mut stop: impl FnMut(u64, u64, u64) -> bool,
@@ -437,25 +446,25 @@ fn walk(
         }
         col += w;
         at = e;
-        cols.record(ls, at, col);
+        d.cols.borrow_mut().record(ls, at, col);
     }
     (le, col)
 }
 
 /// The column `x` is at, or `None` once it is past `cap`.
-fn column_at(d: Doc<'_>, cols: &mut Cols, x: u64, cap: u64) -> Option<u64> {
+fn column_at(d: Doc<'_>, x: u64, cap: u64) -> Option<u64> {
     let line = d.line_of(x);
     let ends = (d.line_start(line), d.line_end(line));
-    let from = cols.before(ends.0, x);
-    let (_, col) = walk(d, cols, ends, from, |s, col, _| s >= x || col > cap);
+    let from = d.cols.borrow().before(ends.0, x);
+    let (_, col) = walk(d, ends, from, |s, col, _| s >= x || col > cap);
     (col <= cap).then_some(col)
 }
 
 /// The place on `line` at column `goal`: the first character reaching past it, or the line's end.
-fn at_column(d: Doc<'_>, cols: &mut Cols, line: u64, goal: u64) -> u64 {
+fn at_column(d: Doc<'_>, line: u64, goal: u64) -> u64 {
     let ends = (d.line_start(line), d.line_end(line));
-    let from = cols.at_most(ends.0, goal);
-    walk(d, cols, ends, from, |_, col, w| col + w > goal).0
+    let from = d.cols.borrow().at_most(ends.0, goal);
+    walk(d, ends, from, |_, col, w| col + w > goal).0
 }
 
 /// What a Replace's pass found: the span from its first match to its last, the span's new
@@ -516,12 +525,13 @@ fn name(c: char) -> String {
     }
 }
 
-/// How a document is read: the buffer and where its BOM ends. Every place it gives is a
-/// character start or a line's end.
+/// How a document is read: the buffer, where its BOM ends, and its long lines' checkpoints.
+/// Every place it gives is a character start or a line's end.
 #[derive(Clone, Copy)]
 struct Doc<'a> {
     b: &'a Buffer<Sel>,
     bom: u64,
+    cols: &'a RefCell<Cols>,
 }
 
 impl<'a> Doc<'a> {
@@ -610,7 +620,10 @@ impl<'a> Doc<'a> {
     /// the cells end (short of `to` when not `whole`).
     fn cells(self, from: u64, to: u64, whole: bool) -> (Vec<(u64, Cell)>, u64) {
         #[cfg(test)]
-        DECODED.with(|n| n.set(n.get() + to.saturating_sub(from)));
+        {
+            DECODED.with(|n| n.set(n.get() + to.saturating_sub(from)));
+            HELD.with(|n| n.set(n.get().max(to.saturating_sub(from))));
+        }
         let bytes = self.read(from..to);
         let (cells, used) = self.enc().decode(&bytes, whole);
         let mut at = from;
@@ -643,8 +656,29 @@ impl<'a> Doc<'a> {
         };
         match e.left_start(near, g) {
             Some(s) if s >= ls && s < x => s,
-            _ => ls,
+            _ => self.stream_to(ls, x),
         }
+    }
+
+    /// A character start within [`CHUNK`] before `x` on the line starting at `ls`, where the
+    /// encoding's rules prove none (CP949 with no sync byte within W, D28): the line walked from
+    /// its last checkpoint before `x` a chunk at a time, carrying the phase — each chunk decoded
+    /// from a character start and left at its last whole character — so it holds a chunk at
+    /// once, and keeps checkpoints for the next walk.
+    fn stream_to(self, ls: u64, x: u64) -> u64 {
+        let (mut at, mut col) = self.cols.borrow().before(ls, x);
+        while at + CHUNK < x {
+            let (cells, used) = self.cells(at, at + CHUNK, false);
+            if used == at {
+                break;
+            }
+            for (_, c) in &cells {
+                col += width(c.ch, col);
+            }
+            at = used;
+            self.cols.borrow_mut().record(ls, at, col);
+        }
+        at
     }
 
     /// The place one character before `x`: across a line's ending as one; `None` at the start.
@@ -811,8 +845,9 @@ impl<'a> Doc<'a> {
             segs.push(Seg::Old(from..c.at));
             match &c.put {
                 Put::Nothing => {}
-                Put::Bytes(b) => segs.push(Seg::New(b, true)),
-                Put::Clip(_, b) => segs.push(Seg::New(b, false)),
+                Put::Bytes(b) => segs.push(Seg::New(b, true, true)),
+                Put::Clip(_, b) => segs.push(Seg::New(b, false, true)),
+                Put::Own(b) => segs.push(Seg::New(b, false, false)),
                 Put::Old(r) => segs.push(Seg::Old(r.clone())),
             }
             from = c.at + c.remove;
@@ -847,7 +882,7 @@ impl<'a> Doc<'a> {
                 let (cells, _) = self.cells(self.anchor(o), o, true);
                 lone(&cells, &|s| self.read(s..s + 1)[0])
             }
-            (Seg::New(b, _), at) => {
+            (Seg::New(b, ..), at) => {
                 let n = (p - at) as usize;
                 let (cells, _) = self.enc().decode(&b[..n], true);
                 let mut s = 0;
@@ -913,7 +948,8 @@ impl<'a> Doc<'a> {
             return Err(Wrong::Unit { end });
         }
         for (i, w) in list.windows(2).enumerate() {
-            let seam = matches!(w[1], Seg::New(..)) || matches!(w[0], Seg::New(_, false));
+            let seam =
+                matches!(w[1], Seg::New(_, _, true)) || matches!(w[0], Seg::New(_, false, true));
             if seam && self.joins_at(&segs, segs.starts[i + 1]) {
                 return Err(Wrong::Join);
             }
@@ -1237,7 +1273,7 @@ pub struct Editor {
     tabs: bool,
     /// The column ↑ ↓ keep, from the first of a run of them.
     goal: Option<Goal>,
-    cols: Cols,
+    cols: RefCell<Cols>,
     page: u64,
     /// Until the question is answered Type: E37's reason, once.
     doubt: Option<Doubt>,
@@ -1274,7 +1310,7 @@ impl Editor {
             indent: true,
             tabs: false,
             goal: None,
-            cols: Cols::default(),
+            cols: RefCell::default(),
             page: 20,
             doubt: doubt.any().then_some(doubt),
             question: None,
@@ -1299,7 +1335,7 @@ impl Editor {
             block: None,
         };
         self.goal = None;
-        self.cols = Cols::default();
+        self.cols = RefCell::default();
         self.doubt = doubt.any().then_some(doubt);
         self.question = None;
         self.tabs = self.doc().indents_with_tabs();
@@ -1309,6 +1345,7 @@ impl Editor {
         Doc {
             b: &self.buffer,
             bom: self.bom,
+            cols: &self.cols,
         }
     }
 
@@ -1404,6 +1441,7 @@ impl Editor {
         let d = Doc {
             b: &self.buffer,
             bom: self.bom,
+            cols: &self.cols,
         };
         let x = self.sel.caret;
         let line = d.line_of(x);
@@ -1438,16 +1476,18 @@ impl Editor {
                     // that the caret goes to its end, whatever the exact column.
                     let col = goal.col.or_else(|| {
                         let cap = WIDEST * (te - ts);
-                        column_at(d, &mut self.cols, goal.x, cap)
+                        column_at(d, goal.x, cap)
                     });
                     match col {
                         Some(c) => {
                             goal.col = Some(c);
-                            at_column(d, &mut self.cols, target, c)
+                            at_column(d, target, c)
                         }
                         None => te,
                     }
                 };
+                // A guard: whatever the walk started from, the caret lands on a character start.
+                let to = d.place(to);
                 self.go(to, extend);
                 return;
             }
@@ -1568,6 +1608,7 @@ impl Editor {
             Put::Nothing => 0,
             Put::Bytes(b) => b.len() as u64,
             Put::Clip(_, b) => b.len() as u64,
+            Put::Own(b) => b.len() as u64,
             Put::Old(r) => r.end - r.start,
         }
     }
@@ -1607,13 +1648,14 @@ impl Editor {
         );
         let before = self.sel;
         let bom = self.bom;
-        self.cols.edited(changes[0].at);
+        self.cols.get_mut().edited(changes[0].at);
+        let cols = &self.cols;
         let mut e = self.buffer.edit(group, before);
         for (c, (pieces, put_first)) in changes.iter().zip(&plans).rev() {
             let end = c.at + c.remove;
             let put = |e: &mut super::buffer::Edit<'_, Sel>, at: u64| match &c.put {
                 Put::Nothing => {}
-                Put::Bytes(b) => {
+                Put::Bytes(b) | Put::Own(b) => {
                     e.insert(at, b);
                 }
                 Put::Old(_) => {
@@ -1636,7 +1678,7 @@ impl Editor {
                 put(&mut e, c.at);
             }
         }
-        let sel = after(Doc { b: &e, bom }, &moved, before);
+        let sel = after(Doc { b: &e, bom, cols }, &moved, before);
         e.end(sel);
         self.sel = sel;
         self.goal = None;
@@ -1766,11 +1808,7 @@ impl Editor {
         if self.tabs {
             return self.insert_text("\t");
         }
-        let d = Doc {
-            b: &self.buffer,
-            bom: self.bom,
-        };
-        let col = column_at(d, &mut self.cols, self.sel.caret, u64::MAX).unwrap_or(0);
+        let col = column_at(self.doc(), self.sel.caret, u64::MAX).unwrap_or(0);
         let spaces = " ".repeat((TAB - col % TAB) as usize);
         self.insert_text(&spaces)
     }
@@ -2057,7 +2095,7 @@ impl Editor {
         Some(Clip {
             text: d.text(r.clone()),
             pieces: self.buffer.pieces_in(r),
-            breaks: e.find_lf(&bytes, 0).is_some(),
+            breaks: has_break(e, &bytes),
             bytes,
             encoding: e,
             editor: self.id,
@@ -2136,7 +2174,7 @@ impl Editor {
             return false;
         }
         self.goal = None;
-        self.cols = Cols::default();
+        self.cols = RefCell::default();
         match self.buffer.undo() {
             Some(sel) => {
                 self.sel = sel;
@@ -2152,7 +2190,7 @@ impl Editor {
             return false;
         }
         self.goal = None;
-        self.cols = Cols::default();
+        self.cols = RefCell::default();
         match self.buffer.redo() {
             Some(sel) => {
                 self.sel = sel;
@@ -2290,8 +2328,25 @@ impl Editor {
             Ok(Some(found)) => found,
         };
         let ask = Self::ask(text, Pending::ReplaceAll(search.clone(), text.to_string()));
-        let change = change(span.start, span.end - span.start, Put::Bytes(bytes));
-        let said = self.commit(Group::Single, vec![change], Verb::Replaced, ask, Self::kept);
+        let (at, new) = (span.start, bytes.len() as u64);
+        // A Replace with nothing is a delete: the span's bytes are all the file's own.
+        let (put, verb) = if text.is_empty() {
+            (Put::Own(bytes), Verb::Deleted)
+        } else {
+            (Put::Bytes(bytes), Verb::Replaced)
+        };
+        let change = change(at, span.end - span.start, put);
+        // The caret after the last replacement; block markers inside the span to its start.
+        let said = self.commit(
+            Group::Single,
+            vec![change],
+            verb,
+            ask,
+            move |d, moved, before| Sel {
+                caret: d.place(at + new),
+                ..Self::kept(d, moved, before)
+            },
+        );
         let n = if matches!(said, Some(Said::Refused(_) | Said::Asked(_))) {
             0
         } else {
@@ -2371,20 +2426,38 @@ fn lf_only(text: &str) -> Cow<'_, str> {
     }
 }
 
-/// `bytes` (of encoding `e`, from a character start) with each line end — an LF unit, and the CR
-/// unit right before it — as `ending`. A lone CR is a character, and stays.
+/// Whether `bytes` (of encoding `e`, from a character start) hold a line break as a paste
+/// gives it: an LF unit, or a CR unit (alone, or before an LF).
+fn has_break(e: Encoding, bytes: &[u8]) -> bool {
+    bytes
+        .chunks_exact(e.unit())
+        .any(|u| u == e.lf() || u == e.cr())
+}
+
+/// `bytes` (of encoding `e`, from a character start) with each line break — an LF unit, a CR
+/// unit and the LF unit after it, a lone CR unit, as both pastes take them — as `ending`. Units
+/// are read at their alignment, so no other unit is split; a CR or LF byte is never part of an
+/// undecodable sequence in the one-byte-unit encodings (UTF-8's continuation bytes and CP949's
+/// trails are 0x41 and up), so those bytes stay as they are.
 fn with_ending(e: Encoding, bytes: &[u8], ending: &[u8]) -> Vec<u8> {
-    let (lf, u) = (e.lf().len(), e.unit());
+    let (u, cr, lf) = (e.unit(), e.cr(), e.lf());
     let mut out = Vec::with_capacity(bytes.len());
-    let mut from = 0;
-    while let Some(i) = e.find_lf(&bytes[from..], from as u64) {
-        let at = from + i;
-        let cr = at >= from + u && e.ends_with_cr(&bytes[from..at], from as u64);
-        out.extend_from_slice(&bytes[from..if cr { at - u } else { at }]);
-        out.extend_from_slice(ending);
-        from = at + lf;
+    let mut i = 0;
+    while i + u <= bytes.len() {
+        let unit = &bytes[i..i + u];
+        i += u;
+        if unit == cr {
+            if bytes.get(i..i + u) == Some(lf) {
+                i += u;
+            }
+            out.extend_from_slice(ending);
+        } else if unit == lf {
+            out.extend_from_slice(ending);
+        } else {
+            out.extend_from_slice(unit);
+        }
     }
-    out.extend_from_slice(&bytes[from..]);
+    out.extend_from_slice(&bytes[i..]);
     out
 }
 

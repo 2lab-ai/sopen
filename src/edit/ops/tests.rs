@@ -1518,9 +1518,9 @@ fn decoding(ed: &mut Editor, f: impl FnOnce(&mut Editor)) -> u64 {
     DECODED.with(|n| n.get())
 }
 
-/// One operation's decode, bounded whatever the line's length: a decode chunk and the look-back
-/// window, a few times over.
-const OP_BOUND: u64 = 4 * CHUNK + 4 * WINDOW;
+/// One operation's decode, bounded whatever the line's length: a column checkpoint's stride, a
+/// decode chunk either side of it, and the look-back window, twice.
+const OP_BOUND: u64 = COL_STRIDE + 2 * CHUNK + 2 * WINDOW;
 
 /// Item 1: one 8 MiB line and an LF — a click mid-line, typing, Up and Down, Home and End,
 /// ← → and Backspace each decode a bounded number of bytes, and land where they should.
@@ -1840,4 +1840,149 @@ fn a_cp949_lead_run_longer_than_w_is_settled_by_a_decode() {
     ed.move_caret(Motion::End, false);
     assert_eq!(ed.type_text("c"), None);
     assert_eq!(&bytes_of(&ed)[run.len()..], b"c\n");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix-check of ED-ops's review (2026-11-25).
+
+/// Fix-check 1: a column checkpoint at the place a delete joins two fragments is gone with the
+/// delete; ↑ ↓ land on a character start, and typing there keeps the joined character whole.
+#[test]
+fn a_checkpoint_where_a_delete_joins_fragments_goes_with_it() {
+    // UTF-8 `ED` `x` `95 9C` (Del of `x`: 한), and `E2` space `82 AC` (Del of the space: €).
+    for (tail, joined) in [
+        ([0xED, b'x', 0x95, 0x9C], "한"),
+        ([0xE2, b' ', 0x82, 0xAC], "€"),
+    ] {
+        let a = 65_535u64;
+        let mut doc = vec![b'a'; a as usize];
+        doc.extend(tail);
+        doc.push(b'\n');
+        doc.extend(vec![b'b'; 70_000]);
+        let mut ed = open(&doc, Utf8);
+        // The column walked along line 0 once (Tab at its end): a checkpoint at 65536, right after
+        // the first fragment, kept past the Tab's edit.
+        at(&mut ed, a + 4);
+        assert_eq!(ed.tab(), None);
+        assert!(ed
+            .cols
+            .borrow()
+            .0
+            .get(&0)
+            .is_some_and(|v| v.contains(&(a + 1, a + 1))));
+        // Del of the byte between the fragments: they read as one character.
+        at(&mut ed, a + 1);
+        assert_eq!(ed.delete_right(), None);
+        let j = joined.as_bytes();
+        assert_eq!(&bytes_of(&ed)[a as usize..a as usize + 3], j);
+        // From line 1, at column 65536, ↑: line 0's place at that column is a character start,
+        // never inside the joined character — its start where it is two columns wide (한), the
+        // line's end after it where it is one (€, and the line is 65536 columns).
+        let line1 = ed.buffer().line_start(1).unwrap();
+        at(&mut ed, line1 + a + 1);
+        ed.move_caret(Motion::Up, false);
+        let caret = ed.caret();
+        assert_eq!(caret, ed.doc().place(caret), "{joined}: a character start");
+        let wide = joined == "한";
+        assert_eq!(caret, if wide { a } else { a + 3 }, "{joined}");
+        assert_eq!(ed.type_text("z"), None);
+        let k = (if wide { a + 1 } else { a }) as usize;
+        assert_eq!(&bytes_of(&ed)[k..k + 3], j, "{joined}: whole");
+        // Down and back up again: still a character start.
+        ed.move_caret(Motion::Down, false);
+        ed.move_caret(Motion::Up, false);
+        assert_eq!(ed.caret(), ed.doc().place(ed.caret()), "{joined}");
+    }
+}
+
+/// Fix-check 2: a Replace with nothing is a delete: where it brings fragments together they
+/// read as they read, whichever side of the replaced text the join is on.
+#[test]
+fn a_replace_with_nothing_joins_as_a_delete_does() {
+    let mut outcomes = Vec::new();
+    for doc in [[0x8C, 0x31, 0x63, 0x31], [0x31, 0x8C, 0x31, 0x63]] {
+        let mut ed = open(&doc, Cp949);
+        let said = ed.replace_all(&search("1", "gn"), "");
+        assert_eq!(said, (2, None), "{doc:02X?}");
+        outcomes.push(bytes_of(&ed));
+    }
+    assert_eq!(outcomes[0], [0x8C, 0x63], "똠");
+    assert_eq!(outcomes[0], outcomes[1]);
+}
+
+/// Fix-check 3: CP949 with no sync byte within W proves no character start near a place; the
+/// line is walked once in chunks, carrying the phase, keeping checkpoints — memory bounded on
+/// the first click, work bounded on the next.
+#[test]
+fn a_cp949_line_with_no_sync_byte_streams_once_then_uses_checkpoints() {
+    // 가 (`B0 A1`) for 4 MiB, one line.
+    let n = 2 << 20;
+    let mut doc = [0xB0, 0xA1].repeat(n);
+    doc.push(0x0A);
+    let mut ed = open(&doc, Cp949);
+    let held = |ed: &mut Editor, f: &dyn Fn(&mut Editor)| {
+        HELD.with(|h| h.set(0));
+        let work = decoding(ed, f);
+        (work, HELD.with(|h| h.get()))
+    };
+    let near_end = 2 * (n as u64 - 10) + 1;
+    let (_, most) = held(&mut ed, &|ed| ed.place(near_end, false));
+    assert_eq!(ed.caret(), near_end - 1, "inside 가: its start");
+    assert!(
+        most <= CHUNK + WINDOW,
+        "the first click held {most} bytes at once"
+    );
+    let (work, most) = held(&mut ed, &|ed| ed.place(near_end - 1000, false));
+    assert_eq!(ed.caret(), near_end - 1001, "inside 가: its start");
+    assert!(work <= OP_BOUND, "the second click decoded {work} bytes");
+    assert!(most <= CHUNK + WINDOW);
+    let (work, _) = held(&mut ed, &|ed| ed.move_caret(Motion::Left, false));
+    assert_eq!(ed.caret(), near_end - 1003);
+    assert!(work <= OP_BOUND, "← decoded {work} bytes");
+}
+
+/// Fix-check 4: a clip from another file takes this file's line ends for every line break it
+/// holds — LF, CR LF, and a lone CR, which both pastes give as LF.
+#[test]
+fn a_cross_file_clip_takes_this_files_ends_for_a_lone_cr_too() {
+    for e in [Utf8, Utf16Le] {
+        for (clip_text, want) in [("a\rb", "a\r\nb"), ("a\rb\nc", "a\r\nb\r\nc")] {
+            let mut from = open(&enc(e, clip_text), e);
+            from.select_all();
+            let clip = from.copy().unwrap();
+            let mut ed = open(&enc(e, "x\r\ny"), e);
+            let pasted = clip_text.replace('\r', "\n");
+            assert_eq!(ed.paste(&pasted, Some(&clip)), None, "{e:?} {clip_text:?}");
+            let mut doc = enc(e, want);
+            doc.extend(enc(e, "x\r\ny"));
+            assert_eq!(bytes_of(&ed), doc, "{e:?} {clip_text:?}");
+        }
+    }
+    // An undecodable byte stays, the line ends around it rewritten.
+    let mut from = open(b"\xFF\r\x0D\xFE", Utf8);
+    from.select_all();
+    let clip = from.copy().unwrap();
+    let mut ed = open(b"\r\n", Utf8);
+    assert_eq!(ed.paste("\u{FFFD}\n\n\u{FFFD}", Some(&clip)), None);
+    assert_eq!(bytes_of(&ed), b"\xFF\r\n\r\n\xFE\r\n");
+}
+
+/// Fix-check 5: after a Replace of every match the caret goes after the last replacement; a
+/// block marker inside the replaced text goes to its start.
+#[test]
+fn after_replace_all_the_caret_is_after_the_last_replacement() {
+    let mut ed = open(b"a1b1c1d", Utf8);
+    select(&mut ed, 2, 4);
+    ed.move_caret(Motion::FileStart, false);
+    assert_eq!(ed.replace_all(&search("1", "gn"), "XY"), (3, None));
+    assert_eq!(bytes_of(&ed), b"aXYbXYcXYd");
+    assert_eq!(ed.caret(), 9);
+    assert_eq!(ed.sel().block.map(|b| (b.begin, b.end)), Some((1, 1)));
+    // Short lines keep no column checkpoints, not even an empty list.
+    let mut ed = open(b"short\nlonger line\nx\n", Utf8);
+    ed.move_caret(Motion::End, false);
+    ed.move_caret(Motion::Down, false);
+    ed.move_caret(Motion::Down, false);
+    assert_eq!(ed.caret(), 19);
+    assert!(ed.cols.borrow().0.is_empty(), "{:?}", ed.cols.borrow().0);
 }

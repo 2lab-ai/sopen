@@ -164,6 +164,10 @@ encodings, and cites Turbo's and PC Tools' meaning of each. This table is the re
 | Ctrl/⌘+Q · Ctrl/⌘+W | sopen's close (§5.3) |
 | a click · a drag · the wheel | the caret · a block · scrolling. `[■]` = F3; `[↕]` = the column off or on; a click in the column moves the keyboard there; a tab's name switches to it; the F-key row's slots act |
 
+- **Replace all** (Find's N, with G or not) is one pass and one undo step (ED-ops). The caret goes
+  after the last replacement, and a block marker inside the replaced text goes to its start. A
+  replace with nothing is a delete: fragments it brings together read as they read (E35's rule for
+  a delete, decision of 2026-11-25).
 - **Not taken** (E4): the WordStar Ctrl+Q prefix and Ctrl+W (sopen's close), the cursor diamond and
   Ctrl+E / S / D / X / R / C / V / H / P, the Ctrl+O prefix, Alt+[ / Alt+], Alt+letter menus, Alt+X,
   Alt+F3. The cursor keys, Ins, Backspace and the menus cover them (*editor* §1.4).
@@ -462,6 +466,13 @@ and one rule. The rule sits right after rule 1 (a viewer covers both sides, `:11
   multiple of 4 (the viewer's `TAB`, `text.rs:152`).
 - **Moving by characters** steps one decoded `Cell` (`Encoding::decode`, `encoding.rs:381`), so the
   caret is always on a character start, in every encoding.
+- **A long line costs bounded work per key** (ED-ops). A character start is found within 4 KiB of
+  the place by the encoding's rules (08 §7.3 rule 4). Where they prove none — CP949 with no sync byte
+  within W (08 D28) — the line is walked once in 16 KiB chunks, carrying the phase, so memory stays
+  bounded. The first column walk on a long line, or between two long lines, likewise streams once
+  with bounded memory. Each walk keeps a checkpoint (a character start and its column) every
+  64 KiB, so later clicks, ← → and ↑ ↓ start from the last checkpoint before the place. An edit
+  drops the checkpoints at its place and past it.
 - **Bytes the encoding cannot decode** (a UTF-8 `FF`, a lone surrogate) show as U+FFFD and stay as
   they are unless edited. Ctrl+K C and V copy and move the block's pieces, so such bytes move
   unchanged.
