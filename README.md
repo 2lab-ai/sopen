@@ -7,6 +7,7 @@ Open a file or folder on another machine as if it were local:
 
 ```sh
 sopen myserver:~/project           # folder → the xtools file browser: two panels, Enter views any file
+sopen --tui myserver:~/project     # the same file browser in this terminal; F12 moves it into a window and back
 sopen myserver:/var/log/app.log    # text → VS Code remote (Remote - SSH), else Zed
 sopen myserver:/tmp/shot.png       # image → view, rectangle crop / pixelize, cut / copy / paste, save back
 sopen myserver:/tmp/talk.mp4       # video → play, cut / copy / paste, crop → save back or a new file
@@ -50,7 +51,8 @@ brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64
   on the machine whose screen shows the file (the one you sit at, or the `--target`), not on the
   remote. The file browser, the image and media windows, the binary-file dialog and the hex window
   need a desktop session (X11 or Wayland); without one a folder opens in the editor and a binary,
-  image or media file is fetched and its path printed.
+  image or media file is fetched and its path printed — or, with `--tui`, the file browser runs in
+  the terminal.
 
 ## What the remote needs
 
@@ -247,12 +249,16 @@ keys that work there are labelled), cyan dialogs with a shadow.
 | `⌘R` · `⌘U` · `⌘←` / `⌘→` | re-read · swap the panels · this folder in the left / right panel |
 | `⌘1`…`⌘0`, or a click on the bottom row | `F1`…`F10` (Ctrl on Linux) |
 | `Esc` / `F3` in a viewer | back to the list, the bar where it was |
+| `1` / `2` / `3` in a viewer | the file's own view / its bytes in the hex editor (any file) / the other view: Raw (text unhighlighted) for text, the text of a binary; the title row names them (`1 Text · 2 Hex · 3 Raw`). Where digits are typed (the hex editor being edited, a field), `F9` then the digit |
+| `F8` / `E` in a text or Raw view | the list of encodings (ASCII, UTF-8, UTF-16LE/BE, UCS-2LE/BE, UTF-32LE/BE, Latin-1, CP437, CP949): `↑` `↓` and `Enter` read the file again in the one chosen, `Esc` keeps it |
 | `F3` in a window of its own | close it, as `⌘W` (asks first when there are unsaved changes) |
 
 Text shows read-only with syntax highlighting and line numbers, a page at a time (a file of any
 size opens alike); images open in the image window, video and audio in the media window, anything
-else in the hex editor — each with its own edits and Save, as below. Leaving a viewer with unsaved
-changes asks first, as its own window does. A remote file is not downloaded: it shows as soon as
+else in the hex editor — each with its own edits and Save, as below. `2` shows any file's bytes in
+the hex editor, `1` its own view again, as it was; there the hex editor opens viewing: digits and
+letters are not typed until `Enter` (or `Insert`) starts editing, and `Esc` ends it. Leaving a
+viewer, or switching from a view, with unsaved changes asks first, as its own window does. A remote file is not downloaded: it shows as soon as
 its first part arrives and the rest is read as you move (an image is read whole into memory first,
 with its progress; `Esc` stops that).
 
@@ -285,10 +291,48 @@ there.
 | `Home` / `End` | wrapped, inside a long line: its first / last row first, then the start / end of the file; otherwise the start / end of the file |
 | `⌘Home` / `⌘End` (`Ctrl` elsewhere) | the start / end of the file |
 
+## In the terminal: `--tui`
+
+```sh
+sopen --tui myserver:/srv/app      # the file browser in this terminal
+sopen --tui ./notes.txt            # its folder with its viewer open: F12 shows it, Esc the list
+```
+
+`--tui` runs xtools in the terminal you typed it in, drawn in the same cells as its window — the
+same frames, colours and keys — Korean and other wide names two cells a character. Its input and
+output must be that terminal (in a pipe it is a usage error, exit 2). Without `--tui` nothing
+changes: a folder still opens in a window.
+
+- **F12**, **Alt+G** (for a terminal that keeps F12) or a click on the title row's **`[GUI]`**
+  moves it into a window on this machine, at the terminal's size, and back: F12 there, its
+  `[TUI]`, or closing the window (Cmd/Ctrl+Q and +W too) returns
+  to the terminal with everything as it was — the bar, a dialog with what you typed in it. Keys
+  typed into the terminal meanwhile are dropped. With `--target`, `SOPEN_TARGET` or a config
+  `target` naming another machine, it stays in the terminal and says so (the switch to another
+  machine comes later); on Linux without a display it says how to get one.
+- What the terminal does not draw yet — the preview, the viewers, the directory tree, the git
+  panel, their dialogs — is a box saying `F12 shows it in the window`; a click on it is F12.
+  F1's key help is the window's for now: in the terminal F1 says so on the status row.
+- **Keys**: where the terminal offers the kitty keyboard protocol sopen turns it on and every key
+  arrives as in the window. Elsewhere Ctrl+digits and some Ctrl+Shift chords cannot arrive, so
+  **Alt+1…0 are F1…F10** (on a Mac the terminal must send Option as Alt). Ctrl is the window's
+  Cmd/Ctrl on every machine: Ctrl+Q quits, Ctrl+C copies.
+- **Mouse**: clicks and the wheel act on the rows and the F-key row; to select text with the
+  terminal itself, hold Shift while dragging (in most terminals).
+- **Copy** goes to the clipboard through the terminal (OSC 52; some terminals ask first, or need it
+  turned on), up to 256 KiB — a larger copy says so on the status row instead; paste with the
+  terminal's own paste.
+- **Colours** are 24-bit where `COLORTERM` says `truecolor` or `24bit`, else the nearest of the
+  256-colour palette.
+- The terminal is left as it was found however xtools ends — quit, a crash, SIGTERM, SIGHUP; when
+  the terminal itself goes away, sopen ends too (exit 129). Messages written to the standard error
+  while xtools holds the terminal are printed once it has let go.
+
 ## Images
 
 The window shows the image fitted; the mouse wheel or a pinch zooms, a trackpad scroll or a
-right-drag pans (`F` fits again, `1` is 100 %). Drag a rectangle (handles adjust it, dragging
+right-drag pans (`F` fits again, `A` is 100 % — `1` too in a window of its own; in the browser's
+viewer `1` is view 1). Drag a rectangle (handles adjust it, dragging
 inside moves it), then:
 
 | Key | |
@@ -317,7 +361,8 @@ image's copy is 8-bit.
 A remote image shows its size (and its Exif thumbnail) at once, then fills in as it is read —
 JPEG and PNG as a partial picture. An image whose decoding needs more than 512 MiB of memory (or
 a file over 512 MiB) first says how much it needs and what this machine has, and waits:
-**Continue** or **Close** — and for a large decode **Hex view** too, its bytes in the hex editor.
+**Continue** or **Close** — and for a large decode **Hex view** too (`2` in the browser, `H`), its
+bytes in the hex editor.
 A file that does not decode opens in the hex editor, saying why.
 
 Animated GIF/PNG/WebP and multi-page TIFF open read-only (first frame / page; `⌘C` still copies).

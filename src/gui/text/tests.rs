@@ -2946,11 +2946,11 @@ fn w_and_f2_switch_wrapping_off_and_on() {
     let mut win = viewer(tmp.path(), "wide.txt", &format!("{line}\nnext\n"));
     let mut drv = Driver::new(600.0, 400.0);
     drv.until(&mut win, 5, |w| w.ready());
-    assert_eq!(labels(&win), [(2, "Unwrap")]);
+    assert_eq!(labels(&win), [(2, "Unwrap"), (8, "Encode")]);
     let x = text_x(&drv, "0000 0001");
     assert!(rows_at(&drv, x).len() >= 3);
     drv.key(&mut win, Key::W, Modifiers::NONE);
-    assert_eq!(labels(&win), [(2, "Wrap")]);
+    assert_eq!(labels(&win), [(2, "Wrap"), (8, "Encode")]);
     let rows = rows_at(&drv, x);
     assert_eq!(rows.len(), 2, "a row per line: {rows:?}");
     assert_eq!(rows[1], "next");
@@ -2960,7 +2960,7 @@ fn w_and_f2_switch_wrapping_off_and_on() {
         "→ scrolls the unwrapped line"
     );
     drv.key(&mut win, Key::F2, Modifiers::NONE);
-    assert_eq!(labels(&win), [(2, "Unwrap")]);
+    assert_eq!(labels(&win), [(2, "Unwrap"), (8, "Encode")]);
     assert!(rows_at(&drv, x).len() >= 3, "wrapped again");
     assert!(
         drv.text_starting_with("0000 0001").is_some(),

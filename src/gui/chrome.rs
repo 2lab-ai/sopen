@@ -114,7 +114,7 @@ pub const LIST_KEYS: &[FKey] = &[
 ];
 
 /// The keys the browser adds while a viewer is open in it (the viewer's own come with them):
-/// the key table's viewer row.
+/// the key table's viewer row. F9 then 1, 2 or 3 chooses a view in every view (08 §4, §8).
 pub const VIEWER_KEYS: &[FKey] = &[
     HELP_KEY,
     FKey {
@@ -124,6 +124,10 @@ pub const VIEWER_KEYS: &[FKey] = &[
     FKey {
         n: 4,
         label: "Edit",
+    },
+    FKey {
+        n: 9,
+        label: "View",
     },
 ];
 
@@ -187,18 +191,32 @@ pub const MEDIA_KEYS: &[FKey] = &[
     SAVE_AS_KEY,
 ];
 
-/// The text viewer's own key while lines wrap: F2 (or W) shows one row per line instead, as
-/// Norton Commander's and Far's viewers name it.
-pub const TEXT_WRAPPED_KEYS: &[FKey] = &[FKey {
-    n: 2,
-    label: "Unwrap",
-}];
+/// The text viewer's own keys while lines wrap: F2 (or W) shows one row per line instead, as
+/// Norton Commander's and Far's viewers name it; F8 (or E) opens the list of encodings (08
+/// §7.5).
+pub const TEXT_WRAPPED_KEYS: &[FKey] = &[
+    FKey {
+        n: 2,
+        label: "Unwrap",
+    },
+    ENCODE_KEY,
+];
 
-/// The text viewer's own key while lines do not wrap: F2 (or W) wraps them again.
-pub const TEXT_UNWRAPPED_KEYS: &[FKey] = &[FKey {
-    n: 2,
-    label: "Wrap",
-}];
+/// The text viewer's own keys while lines do not wrap: F2 (or W) wraps them again; F8 (or E)
+/// the encodings.
+pub const TEXT_UNWRAPPED_KEYS: &[FKey] = &[
+    FKey {
+        n: 2,
+        label: "Wrap",
+    },
+    ENCODE_KEY,
+];
+
+/// F8 in the text viewer, Text and Raw alike (08 §7.5, D19): the list of encodings.
+pub const ENCODE_KEY: FKey = FKey {
+    n: 8,
+    label: "Encode",
+};
 
 /// The key of slot `n` (1–10): F1…F10.
 pub fn fkey(n: u8) -> Option<egui::Key> {
@@ -732,9 +750,56 @@ fn cell_row(ui: &mut egui::Ui) -> (Rect, cells::Grid, cells::Buffer) {
 }
 
 /// The top row, in cells: the tool's name ([`PROGRAM`]) in its red block, then where the browser
-/// is, black on cyan — its end kept, after "…", when it is cut (the whole on hover) — and the
-/// clock at the right end after a `│`.
+/// is, black on cyan — its end kept, after "…", when it is cut (the whole on hover) — the mode
+/// button where a backend set one ([`set_mode_button`]), and the clock at the right end after a
+/// `│`.
 pub fn title_row(ui: &mut egui::Ui, place: &str) {
+    title_row_with(ui, place, None);
+}
+
+/// The viewer's views on the title row, before the clock (08 §8, D6): `1 Image · 2 Hex`, one
+/// entry per view — a binary's `1·2 Hex` together, no entry for a slot with none (D7) — the view
+/// on screen in the bar's colours, the rest warn-coloured while F9 is armed. A click on an entry
+/// chooses that view ([`take_strip_click`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Strip {
+    /// Each slot's view by its name (`views::View::name`); `None`: the slot has none.
+    pub slots: [Option<&'static str>; 3],
+    /// The view on screen; `None` while the next one is being made.
+    pub on: Option<&'static str>,
+    pub armed: bool,
+}
+
+impl Strip {
+    /// Its entries, in slot order: the slots that show one view and what the strip says of
+    /// them (`1·2 Hex`, `3 Text`).
+    pub fn entries(&self) -> Vec<(Vec<u8>, String)> {
+        let mut out: Vec<(Vec<u8>, &str)> = vec![];
+        for (n, name) in (1..=3u8).zip(self.slots) {
+            let Some(name) = name else { continue };
+            match out.iter_mut().find(|(_, shown)| *shown == name) {
+                Some((slots, _)) => slots.push(n),
+                None => out.push((vec![n], name)),
+            }
+        }
+        (out.into_iter())
+            .map(|(slots, name)| {
+                let digits: Vec<String> = slots.iter().map(u8::to_string).collect();
+                let text = format!("{} {name}", digits.join("·"));
+                (slots, text)
+            })
+            .collect()
+    }
+
+    /// The strip as one line: `1 Image · 2 Hex`.
+    pub fn text(&self) -> String {
+        let entries: Vec<String> = self.entries().into_iter().map(|(_, t)| t).collect();
+        entries.join(" · ")
+    }
+}
+
+/// [`title_row`], with the viewer's views before the clock ([`Strip`]).
+pub fn title_row_with(ui: &mut egui::Ui, place: &str, strip: Option<&Strip>) {
     let p = PALETTE;
     let (rect, grid, mut buf) = cell_row(ui);
     let pen = cells::Pen::new(p.title_text, p.title_back);
@@ -750,7 +815,35 @@ pub fn title_row(ui: &mut egui::Ui, place: &str) {
     let clock_x = cols.saturating_sub(cells::width(&clock) + 1);
     cells::put(&mut buf, clock_x as u16, 0, &clock, cols, pen);
     let x = block + 1;
-    let room = clock_x.saturating_sub(x + 1);
+    let (room, mode) = mode_button(ui.ctx(), &mut buf, x, clock_x, pen);
+    // The strip stands right before the mode button (or the clock), a blank either side; the
+    // place has what is left.
+    let mut end = room;
+    let mut clicks = vec![];
+    if let Some(strip) = strip {
+        let entries = strip.entries();
+        let width = cells::width(&strip.text()) + 2;
+        if !entries.is_empty() && end >= x + 1 + width {
+            let mut at = end - width + 1;
+            end -= width;
+            let rest = if strip.armed { p.warn } else { p.title_text };
+            for (i, (slots, text)) in entries.iter().enumerate() {
+                if i > 0 {
+                    at += cells::put(&mut buf, at as u16, 0, " · ", cols, pen);
+                }
+                let on = strip.on.is_some_and(|on| text.ends_with(&format!(" {on}")));
+                let entry_pen = if on {
+                    cells::Pen::new(p.bar_text, p.bar)
+                } else {
+                    cells::Pen::new(rest, p.title_back)
+                };
+                let w = cells::put(&mut buf, at as u16, 0, text, cols, entry_pen);
+                clicks.push((slots[0], cells::Cells::new(at as u16, 0, w as u16, 1)));
+                at += w;
+            }
+        }
+    }
+    let room = end.saturating_sub(x + 1);
     let shown = cells::fit_left(place, room);
     cells::put(&mut buf, x as u16, 0, &shown, room, pen);
     cells::paint(&ui.painter_at(rect), grid.origin, &buf, None);
@@ -758,19 +851,101 @@ pub fn title_row(ui: &mut egui::Ui, place: &str) {
         ui.interact(rect, ui.scope_id().with("title"), egui::Sense::hover())
             .on_hover_text(place);
     }
+    let at = mode.map(|at| grid.rect(at));
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(mode_rect_id(), ModeRect(at)));
+    for (slot, at) in clicks {
+        // Not focusable, as the F-key row's slots: a click leaves the keyboard where it was.
+        let id = ui.scope_id().with(("sopen-view-strip", slot));
+        if ui.interact(grid.rect(at), id, egui::Sense::CLICK).clicked() {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(strip_clicked_id(), StripClicked(slot)));
+        }
+    }
     // The clock turns over at the next minute.
     let rest = 60 - now.rem_euclid(60) as u64;
     ui.ctx().request_repaint_after(Duration::from_secs(rest));
 }
 
+/// The mode button (10 §7, T4): what a click on it switches to — `[GUI]` on the terminal's title
+/// row, `[TUI]` on a window a switch opened — set by that backend before each pass; a window
+/// started directly sets none and shows none.
+#[derive(Debug, Clone, Copy)]
+struct ModeButton(&'static str);
+
+/// Where the title row drew the mode button in its last pass (`None`: nowhere).
+#[derive(Debug, Clone, Copy, Default)]
+struct ModeRect(Option<Rect>);
+
+fn mode_button_id() -> egui::Id {
+    egui::Id::unique("sopen-mode-button")
+}
+
+fn mode_rect_id() -> egui::Id {
+    egui::Id::unique("sopen-mode-button-rect")
+}
+
+/// The title row shows the mode button `label` ([`title_row`]).
+pub fn set_mode_button(ctx: &egui::Context, label: &'static str) {
+    ctx.data_mut(|d| d.insert_temp(mode_button_id(), ModeButton(label)));
+}
+
+/// Where the mode button stands on screen, as the last pass drew it: the shell's input hook
+/// takes a press there before anything else sees it (`gui::FKeyInput`) — the switch, as F12,
+/// whatever is open; a modal's backdrop never gets it.
+pub fn mode_button_rect(ctx: &egui::Context) -> Option<Rect> {
+    ctx.data(|d| d.get_temp::<ModeRect>(mode_rect_id()))
+        .and_then(|r| r.0)
+}
+
+/// The mode button in `buf` right before the clock at `clock_x`, a blank either side, when the
+/// row has room for it after the place's start `x`: where the place's room ends, and its cells.
+fn mode_button(
+    ctx: &egui::Context,
+    buf: &mut cells::Buffer,
+    x: usize,
+    clock_x: usize,
+    pen: cells::Pen,
+) -> (usize, Option<cells::Cells>) {
+    let Some(ModeButton(label)) = ctx.data(|d| d.get_temp(mode_button_id())) else {
+        return (clock_x, None);
+    };
+    let w = cells::width(label);
+    let Some(at) = clock_x.checked_sub(w + 1).filter(|&at| at > x) else {
+        return (clock_x, None);
+    };
+    cells::put(buf, at as u16, 0, label, w, pen);
+    (at, Some(cells::Cells::new(at as u16, 0, w as u16, 1)))
+}
+
+/// An entry of the strip clicked: its first slot.
+#[derive(Debug, Clone, Copy, Default)]
+struct StripClicked(u8);
+
+fn strip_clicked_id() -> egui::Id {
+    egui::Id::unique("sopen-view-strip-clicked")
+}
+
+/// The slot of the strip's entry clicked since this was last asked, taken (the browser's viewer
+/// chooses it, as its digit would).
+pub fn take_strip_click(ctx: &egui::Context) -> Option<u8> {
+    ctx.data_mut(|d| d.remove_temp::<StripClicked>(strip_clicked_id()))
+        .map(|c| c.0)
+}
+
 /// The title row as a panel at the top of `ui`.
 pub fn title_panel(ui: &mut egui::Ui, id: &'static str, place: &str) {
+    title_panel_with(ui, id, place, None);
+}
+
+/// [`title_panel`] with the viewer's views ([`Strip`]).
+pub fn title_panel_with(ui: &mut egui::Ui, id: &'static str, place: &str, strip: Option<&Strip>) {
     egui::Panel::top(id)
         .frame(egui::Frame::NONE)
         .show_separator_line(false)
         .resizable(false)
         .exact_size(CELL.y)
-        .show(ui, |ui| title_row(ui, place));
+        .show(ui, |ui| title_row_with(ui, place, strip));
 }
 
 /// A one-line bar as a panel: a cell tall and a little, whatever it holds — so it has its height

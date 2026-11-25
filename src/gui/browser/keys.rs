@@ -181,6 +181,10 @@ pub enum Command {
     // The viewer (01 §3a).
     /// F3, Esc: back to the list (through the viewer's own `close_requested`).
     CloseViewer,
+    /// 1, 2, 3, and F9 then one of them: a view of the file (08 §4). Taken before the viewer's
+    /// pass, in the shell's input hook (`gui::route_view_keys`, 08 §8); the table lists them so
+    /// F1 and the F-key row name them (04 §3 rule 4: one table).
+    ViewKey,
     // The git panel (03 §9; S2–S4).
     /// F2: `reword` on a commit, `rename` on a local branch's label.
     Reword,
@@ -429,6 +433,7 @@ const TREE: &str = "The directory tree in place of this list";
 const SWITCH: &str = "Switch the mode, preview or two lists (the label names the next)";
 const OTHER_SIDE: &str = "The keyboard to the other side";
 const CLOSE_VIEWER: &str = "Back to the list";
+const VIEWS: &str = "View 1 (the file's own), 2 (Hex) or 3 (the other: Raw, Text)";
 const DETAILS: &str = "The row's details (with one marked row: compare the two)";
 const MENU: &str = "The menu of what is under the bar";
 /// Space and Ins: S2's marks, and from S3 a file of the uncommitted row staged or unstaged (03
@@ -494,6 +499,10 @@ pub const TABLE: &[Row] = &[
     key(Viewer, K::F3, Plain, C::CloseViewer, "Exit", CLOSE_VIEWER, 1),
     key(Viewer, K::Escape, Plain, C::CloseViewer, "", CLOSE_VIEWER, 1),
     key(Viewer, K::F4, Plain, C::Edit, "Edit", "The file in VS Code or Zed", 1),
+    key(Viewer, K::Num1, Plain, C::ViewKey, "", VIEWS, 1),
+    key(Viewer, K::Num2, Plain, C::ViewKey, "", VIEWS, 1),
+    key(Viewer, K::Num3, Plain, C::ViewKey, "", VIEWS, 1),
+    key(Viewer, K::F9, Plain, C::ViewKey, "View", "Then 1, 2 or 3: that view, also where digits are typed", 1),
     // The git panel (03 §9.1, §9.2).
     key(Git, K::F1, Plain, C::Help, "Help", HELP, 2),
     key(Git, K::F2, Plain, C::Reword, "Reword", "A commit: reword it; a branch's label: rename it", 3),
@@ -1197,7 +1206,7 @@ mod tests {
         assert_eq!(pairs(row(List, Mode::Dual))[8], (9, "Prevw"));
         assert_eq!(
             pairs(row(Viewer, Mode::Preview)),
-            [(1, "Help"), (3, "Exit"), (4, "Edit")]
+            [(1, "Help"), (3, "Exit"), (4, "Edit"), (9, "View")]
         );
         assert_eq!(
             pairs(row(Git, Mode::Preview)),

@@ -19,7 +19,7 @@
 //! The integration (S1-E) wired it in: `browser.rs` holds the [`Ops`], and its [`Run`] is
 //! [`crate::fileops::run`] on the worker [`start`] makes.
 
-mod dialog;
+pub(super) mod dialog;
 
 use super::panel::{self, Panel};
 use crate::fileops::{Answer, Clash, Item, ItemOutcome, Progress, Reply, Report};

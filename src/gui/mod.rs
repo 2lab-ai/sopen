@@ -23,6 +23,7 @@ pub mod playback;
 pub mod save_as;
 mod select;
 pub mod streamed;
+pub mod term;
 pub mod term_input;
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -291,7 +292,8 @@ pub enum Op {
 /// seconds. `op` may list several, comma-separated, applied in order. The hex window takes
 /// `at=OFFSET;patch=OFFSET:HEXBYTES[,OFFSET:HEXBYTES]` (offsets `0x…` or decimal); the file
 /// browser `open=NAME`, and `at=OFFSET` for the first text file it opens — by `open=NAME` or by
-/// hand, whichever comes first (the row that byte is in at the top), `mode=dual|preview` and
+/// hand, whichever comes first (the row that byte is in at the top), `view=1|2|3` for the first
+/// viewer it opens (08 §8), `mode=dual|preview` and
 /// `bar=NAME` (02 §9); the image, hex and media windows `close=ask`; the media window
 /// `clips=START-END[,START-END]` (its edit list, source seconds) and `stereo=1`; the image window
 /// `restore=1`; the hex window, and text, an image or a sound read through a stream, `loading=1`;
@@ -310,6 +312,9 @@ pub struct State {
     /// The file browser: the first text file it opens (as `at=`) reads its lines in this
     /// encoding (`enc=UTF-16LE`, any case; 08 D34).
     pub enc: Option<crate::encoding::Encoding>,
+    /// The file browser: the first viewer it opens switches to view 1, 2 or 3 once it is on
+    /// screen, as the plain digit would (`view=2`, 08 §8).
+    pub view: Option<u8>,
     /// Hex window: bytes overwritten at an offset, applied in order (each one an undo step).
     pub patches: Vec<(u64, Vec<u8>)>,
     /// File browser: the entry of the opened folder to open (as Enter would) once it is listed.
@@ -421,6 +426,10 @@ impl State {
                         .ok_or_else(|| anyhow!("SOPEN_STATE enc: '{value}' is not an encoding"))?;
                     state.enc = Some(enc);
                 }
+                "view" => match value {
+                    "1" | "2" | "3" => state.view = value.parse().ok(),
+                    other => bail!("SOPEN_STATE: view must be 1, 2 or 3 (got '{other}')"),
+                },
                 "open" => state.open = Some(value.to_string()),
                 "clips" => {
                     for one in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -690,6 +699,123 @@ pub trait Window {
     fn failure(&self) -> Option<String> {
         None
     }
+
+    // The view hooks (08 §8, VM-7): what the file browser's viewer asks of the view on screen
+    // and tells it. A window on its own has no views (D24) and is never asked.
+
+    /// The window is a view of the file browser's viewer (`true`): the hex window opens viewing
+    /// there (D35), its typing waiting for Enter or Insert. Told before its first pass. The
+    /// default does nothing.
+    fn set_in_viewer(&mut self, in_viewer: bool) {
+        let _ = in_viewer;
+    }
+
+    /// What the window declares to the view keys as of this pass (08 §4): a question it shows
+    /// (its close prompt, Save As, a confirmation) is [`crate::view_keys::State::Question`]; the
+    /// hex window in the viewer is `Hex`. A field with the typing is the host's to see
+    /// (`text_edit_focused`). Free by default.
+    fn view_state(&mut self) -> crate::view_keys::State {
+        crate::view_keys::State::Free
+    }
+
+    /// What the window holds (07 §10): unsaved edits, a Save running — what a switch of views
+    /// asks or waits for (08 §5, D2). Clean by default.
+    fn hold(&mut self) -> crate::views::Hold {
+        crate::views::Hold::Clean
+    }
+
+    /// How many Saves of this window wrote its file so far — every one, whether the window then
+    /// closes, keeps its notes on screen or asks again (08 D25: the hidden views of the file are
+    /// stale from then on). 0 for a window that never writes its file (the default).
+    fn saves_landed(&self) -> u64 {
+        0
+    }
+
+    /// A view key's command for the window itself (08 §4, D35): Enter or Insert starts editing
+    /// the hex view (`StartEditing`), Esc or F9 ends it (`EndEditing`, `Arm(Editing)`), a
+    /// read-only one says it never edits (`ReadOnly`). The default does nothing.
+    fn view_key(&mut self, command: crate::view_keys::Command) {
+        let _ = command;
+    }
+
+    /// A byte view's place (08 §2): the text view's first byte of its top row, the hex view's
+    /// cursor. `None`: no byte place (the default).
+    fn byte_place(&self) -> Option<u64> {
+        None
+    }
+
+    /// The place followed the owner from another byte view (D11): the hex view's cursor on that
+    /// byte, its row at the top; the text view at the row holding it, as `at=` opens it. The
+    /// default does nothing.
+    fn go_to_byte(&mut self, at: u64) {
+        let _ = at;
+    }
+
+    /// The text view as Raw (`true`, D8: highlighting off) or Text. The default does nothing.
+    fn set_raw(&mut self, raw: bool) {
+        let _ = raw;
+    }
+
+    /// The text view's encoding (08 §7.5): the one its lines are read in now, and the default
+    /// §7.2 picked (with whether it was guessed) once its first bytes were read. `None`: the
+    /// window decodes no text (the default).
+    fn encoding(&self) -> Option<(crate::encoding::Encoding, Option<crate::encoding::Pick>)> {
+        None
+    }
+
+    /// The text view's lines read in `enc` from now on, chosen by the owner (F8's list, 08
+    /// §7.5): the index is built again only when the LF unit changes (D22). The default does
+    /// nothing.
+    fn set_encoding(&mut self, enc: crate::encoding::Encoding) {
+        let _ = enc;
+    }
+}
+
+/// The view keys of the file browser's viewer while one is open (08 §8, VM-7): what the view on
+/// screen declared as of the last pass, the keys' own state ([`crate::view_keys::ViewKeys`]), and
+/// the commands taken since the browser last read them. The shell's input hook
+/// ([`FKeyInput`]) takes the view keys from each pass's input before any window sees it — after
+/// the Cmd/Ctrl+digit aliases, so Cmd/Ctrl+1…3 stay F1…F3 — and the browser's own scripted keys
+/// (`SOPEN_KEYS`) go through the same ([`route_view_keys`]).
+#[derive(Debug)]
+pub(crate) struct ViewKeySlot {
+    pub state: crate::view_keys::State,
+    pub keys: crate::view_keys::ViewKeys,
+    pub commands: Vec<crate::view_keys::Command>,
+}
+
+/// Where the context keeps the viewer's [`ViewKeySlot`].
+#[derive(Clone)]
+struct ViewKeysAt(Arc<Mutex<ViewKeySlot>>);
+
+fn view_keys_id() -> egui::Id {
+    egui::Id::unique("sopen-view-keys")
+}
+
+/// The viewer's view keys from the next pass on (`Some`: a viewer opened), or none (`None`: it
+/// closed — the list's letters and digits are its own again).
+pub(crate) fn set_view_keys(ctx: &egui::Context, slot: Option<Arc<Mutex<ViewKeySlot>>>) {
+    ctx.data_mut(|d| match slot {
+        Some(slot) => {
+            d.insert_temp(view_keys_id(), ViewKeysAt(slot));
+        }
+        None => {
+            d.remove::<ViewKeysAt>(view_keys_id());
+        }
+    });
+}
+
+/// Takes the view keys out of `events` while a viewer is open: each taken press (its key, its
+/// typed text, its release) is removed, and what the viewer does about it is kept for the
+/// browser's pass ([`ViewKeySlot::commands`]).
+pub(crate) fn route_view_keys(ctx: &egui::Context, events: &mut Vec<egui::Event>) {
+    let Some(ViewKeysAt(slot)) = ctx.data(|d| d.get_temp::<ViewKeysAt>(view_keys_id())) else {
+        return;
+    };
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    let state = slot.state;
+    let taken = slot.keys.take(state, events);
+    slot.commands.extend(taken);
 }
 
 /// While a window is hosted inside another (the file browser shows a viewer in its own
@@ -772,7 +898,8 @@ pub fn own_keys(ui: &mut egui::Ui, keys: &[chrome::FKey]) {
 /// a text field has the typing (04 §3 rule 4). F12 is the switch (10 §9, T4): taken in every
 /// context, a field's included, and said to the pass ([`switch_asked`]). In the terminal
 /// backend's context only ([`mark_terminal`]) Alt+1…0 are F1…F10 too and Alt+G is the switch
-/// (10 §9, T7, T33): in a window Option+digit and Option+G type characters on macOS. Then
+/// (10 §9, T7, T33): in a window Option+digit and Option+G type characters on macOS. Then, while
+/// the file browser's viewer is open, its view keys are taken (08 §8, [`route_view_keys`]). Then
 /// [`help::begin_pass`] before the window's pass and [`help::end_pass`] after it, and last the
 /// page views' after-frame step ([`web::after_pass`], 09 §2.2), so that a view under the help or
 /// anything else painted above it is hidden in the same frame.
@@ -782,6 +909,8 @@ pub(crate) struct FKeyInput {
     digits: [Digit; 10],
     /// G is down as Alt+G, the terminal's switch: its repeats and release are taken too.
     g: bool,
+    /// The primary button went down on the title row's mode button: its release is taken too.
+    mode: bool,
 }
 
 /// A digit key between its press and its release: the shell decides at the press what it is,
@@ -803,6 +932,14 @@ impl egui::Plugin for FKeyInput {
     }
 
     fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        // A switch between backends ended every gesture under way: their releases went to the
+        // other backend, or were dropped with the terminal's unread input (10 §7.2).
+        if ctx
+            .data_mut(|d| d.remove_temp::<GesturesEnded>(gestures_id()))
+            .is_some()
+        {
+            self.mode = false;
+        }
         // The focus as the last pass left it: what has the typing now.
         let typing = ctx.text_edit_focused();
         let clicked = chrome::take_clicked(ctx);
@@ -814,7 +951,13 @@ impl egui::Plugin for FKeyInput {
             typing,
             input.focused,
             clicked,
+        ) | mode_button(
+            &mut input.events,
+            &mut self.mode,
+            chrome::mode_button_rect(ctx),
         );
+        // The viewer's view keys (08 §8), once the digits that are F-keys are F-keys.
+        route_view_keys(ctx, &mut input.events);
         // This pass's word only: a switch nothing took is not left for a later pass.
         ctx.data_mut(|d| {
             if switch {
@@ -966,6 +1109,58 @@ fn key_aliases(
     }
     *events = out;
     switch
+}
+
+/// The title row's mode button (10 §7, T4; `chrome::mode_button_rect`, where the last pass drew
+/// it): a press of the primary button there is the switch and is taken, with its release, before
+/// anything sees them — a modal's backdrop would close its dialog on that click (§9: the button
+/// always works). The press's release is the next primary release only: a primary press elsewhere
+/// or the focus lost ends the gesture (as a switch does, [`gestures_ended`]), so a release it
+/// never got does not take another click's. Whether this pass asked.
+fn mode_button(events: &mut Vec<egui::Event>, down: &mut bool, at: Option<egui::Rect>) -> bool {
+    let mut asked = false;
+    events.retain(|e| match e {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            ..
+        } => {
+            let on = at.is_some_and(|r| r.contains(*pos));
+            *down = on;
+            asked |= on;
+            !on
+        }
+        egui::Event::PointerButton {
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            ..
+        } if *down => {
+            *down = false;
+            false
+        }
+        egui::Event::WindowFocused(false) => {
+            *down = false;
+            true
+        }
+        _ => true,
+    });
+    asked
+}
+
+/// The backend switched ([`gestures_ended`]): the next pass's hook forgets the gestures under way.
+#[derive(Debug, Clone, Copy, Default)]
+struct GesturesEnded;
+
+fn gestures_id() -> egui::Id {
+    egui::Id::unique("sopen-gestures-ended")
+}
+
+/// `ctx`'s backend gives the screen to the other, or takes it back (10 §7.2): a press under way
+/// there — the mode button's, whose release the other backend got or the terminal's dropped
+/// input took — is over; the shell's input hook forgets it at the next pass ([`FKeyInput`]).
+pub fn gestures_ended(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(gestures_id(), GesturesEnded));
 }
 
 /// A pass asked for the switch ([`switch_asked`]).
@@ -1663,6 +1858,10 @@ pub fn run_window_sized<W: Window + 'static>(
 ) -> Result<()> {
     let choice = renderer_choice()?;
     let shot_done = Arc::new(AtomicBool::new(false));
+    // The watchdog's word: set once the window is gone too, however it went (a window that
+    // closed or did not start stalls nothing), so it never ends a process that goes on — the
+    // terminal backend's, which still holds its terminal.
+    let disarm = shot_done.clone();
     let shot_result: Arc<Mutex<Option<Result<String, String>>>> = Arc::default();
     let closed = Arc::new(AtomicBool::new(false));
     if hooks.screenshot.is_some() {
@@ -1716,7 +1915,7 @@ pub fn run_window_sized<W: Window + 'static>(
                 .map_or(min, |[w, h]| [w.min(min[0]), h.min(min[1])]),
         )
         .with_active(true);
-    start(choice, &slot, |renderer| {
+    let started = start(choice, &slot, |renderer| {
         let options = eframe::NativeOptions {
             viewport: viewport.clone(),
             renderer,
@@ -1727,7 +1926,9 @@ pub fn run_window_sized<W: Window + 'static>(
             error,
             closed: closed.load(Ordering::SeqCst),
         })
-    })?;
+    });
+    disarm.store(true, Ordering::SeqCst);
+    started?;
     if hooks.screenshot.is_some() {
         match shot_result.lock().unwrap().take() {
             Some(Ok(line)) => println!("{line}"),
@@ -2578,10 +2779,10 @@ mod tests {
             self.drv.idle(&mut self.b, 1);
         }
 
-        /// Whether the viewer is open: its row has Exit, the list's View is gone.
+        /// Whether the viewer is open: its row has Exit, the list's Rename is gone.
         fn viewer(&self) -> bool {
             let exit = self.drv.find_text("Exit   ").is_some();
-            assert_ne!(exit, self.drv.find_text("View   ").is_some(), "one row");
+            assert_ne!(exit, self.drv.find_text("Rename ").is_some(), "one row");
             exit
         }
 

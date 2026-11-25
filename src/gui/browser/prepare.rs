@@ -160,31 +160,60 @@ impl Request<'_> {
 /// first, as the CLI resolves its argument: a link is opened (and saved) as the file it points
 /// at (spec §5). A remote file opens through a stream ([`streamed_prepared`]); a local one is
 /// read in place.
+#[cfg_attr(not(test), allow(dead_code))] // The browser asks [`prepare_opening`].
 pub fn prepare(
     req: &Request,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Prepared> {
-    prepare_with(req, false, cancel, progress)
+    prepare_opening(req, false, cancel, progress).map(|o| o.prepared)
 }
 
-/// [`prepare`] for a file at a revision or a diff (03 §6.2–§6.3, S2-F), opened read-only from
-/// the cache's `.revisions`: read where it is — an image is not copied into the cache's mirror
-/// (it is never saved, and nothing of it may outlive its window).
-pub fn prepare_in_place(
+/// A file made ready for the viewer with what its view set keeps of the opening (08 §6): the
+/// kind, refined (a `.ts` that is not media is Other; media with no picture is audio), the stat
+/// at open, and — a local image that does not decode, shown as bytes — why view 1 cannot show
+/// it (D10).
+pub struct Opened {
+    pub prepared: Prepared,
+    pub kind: Kind,
+    pub stat: Stat,
+    pub undecodable: Option<String>,
+}
+
+/// [`prepare`] with what the view set keeps ([`Opened`]). `in_place`: a file at a revision or a
+/// diff (03 §6.2–§6.3, S2-F), opened read-only from the cache's `.revisions` — read where it is:
+/// an image is not copied into the cache's mirror (it is never saved, and nothing of it may
+/// outlive its window).
+pub fn prepare_opening(
     req: &Request,
+    in_place: bool,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
-) -> Result<Prepared> {
-    prepare_with(req, true, cancel, progress)
+) -> Result<Opened> {
+    prepare_with(req, in_place, None, cancel, progress)
+}
+
+/// One view of a file already opened (08 §5: made the first time it is chosen), as `kind` would
+/// open it: `Other` its Hex view, `Text` its text (Text and Raw; view 3 of a binary), `Image`,
+/// `Video` or `Audio` its view 1 made again. A local file is read in place as the opening read it
+/// (a binary's text by the local whole-file pass, D23); a remote one through a stream of its own.
+pub fn prepare_view(
+    req: &Request,
+    in_place: bool,
+    kind: Kind,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Opened> {
+    prepare_with(req, in_place, Some(kind), cancel, progress)
 }
 
 fn prepare_with(
     req: &Request,
     in_place: bool,
+    want: Option<Kind>,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
-) -> Result<Prepared> {
+) -> Result<Opened> {
     let mut fs = (req.connect)()?;
     let abs = fs.realpath(req.abs)?;
     let req = &Request { abs: &abs, ..*req };
@@ -199,9 +228,55 @@ fn prepare_with(
         );
     }
     let (kind, sniff) = kind::detect_sniffed(fs.as_mut(), req.abs, &stat)?;
-    if let Some(label) = req.label {
-        return streamed_prepared(req, label, fs, kind, sniff, cancel);
-    }
+    let kind = want.unwrap_or(kind);
+    let mut undecodable = None;
+    let prepared = match req.label {
+        Some(label) => streamed_prepared(req, label, fs, kind, sniff, cancel)?,
+        None => local_prepared(
+            req,
+            in_place,
+            fs,
+            kind,
+            stat,
+            &mut undecodable,
+            progress,
+            cancel,
+        )?,
+    };
+    // The kind as the views see it (08 §3): what the preparation found the file to be.
+    let kind = match &prepared {
+        Prepared::Hex { .. } if undecodable.is_none() => Kind::Other,
+        Prepared::Media { media, .. } | Prepared::MediaStream { media, .. } => {
+            if media.video.is_some() {
+                Kind::Video
+            } else {
+                Kind::Audio
+            }
+        }
+        _ => kind,
+    };
+    Ok(Opened {
+        prepared,
+        kind,
+        stat,
+        undecodable,
+    })
+}
+
+/// A local file of `kind` made ready, read in place (an image copied into the cache unless
+/// `in_place`). A local image that does not decode is its hex window, the reason in
+/// `undecodable`.
+#[allow(clippy::too_many_arguments)]
+fn local_prepared(
+    req: &Request,
+    in_place: bool,
+    mut fs: Box<dyn RemoteFs + Send>,
+    kind: Kind,
+    stat: Stat,
+    undecodable: &mut Option<String>,
+    progress: &mut dyn FnMut(u64, u64),
+    cancel: &AtomicBool,
+) -> Result<Prepared> {
     let path = PathBuf::from(req.abs);
     match kind {
         Kind::Image => {
@@ -240,6 +315,7 @@ fn prepare_with(
                 // 06 §7.3: a file that does not decode is shown as bytes, why said first.
                 Err(e) => {
                     let base = hex::Base::open_as(Path::new(req.abs), &req.show())?;
+                    *undecodable = Some(format!("{e:#}"));
                     return Ok(Prepared::Hex {
                         file: HexFile::new(req.origin(fs, stat), base, None, req.cache),
                         notices: vec![format!("{e:#}; the file is shown as bytes")],
@@ -798,6 +874,14 @@ impl Previewed {
     /// ([`Window::set_preview`]), or the info card.
     pub fn show(self) -> Preview {
         let cache = &self.cache;
+        // What the viewer it is handed over to has for views (08 §3).
+        let kind = match &self.parts {
+            Parts::Text { .. } | Parts::TextStream { .. } => Kind::Text,
+            Parts::Image { .. } => Kind::Image,
+            Parts::Media { made, .. } if made.media.video.is_some() => Kind::Video,
+            Parts::Media { .. } => Kind::Audio,
+            Parts::Hex { .. } | Parts::Card(_) => Kind::Other,
+        };
         let (embedded, card) = match self.parts {
             Parts::Text {
                 doc,
@@ -827,6 +911,7 @@ impl Previewed {
             card,
             shown: true,
             lease: self.lease,
+            kind,
         }
     }
 }
@@ -841,6 +926,8 @@ pub struct Preview {
     /// A streamed preview's hold on the window's preview connection: dropped as a preview,
     /// its stream gives the connection back; handed over, the viewer keeps it.
     lease: Option<Lease>,
+    /// The file's kind as its viewer has views for it (08 §3).
+    kind: Kind,
 }
 
 /// A preview handed over (Enter or F3 on it): the viewer, a viewer again.
@@ -853,6 +940,8 @@ pub struct HandedOver {
     pub hold: Option<Claim>,
     /// What the hand-over has to say, for the status row.
     pub notices: Vec<String>,
+    /// The file's kind, as the preview found it: what views the viewer has (08 §3).
+    pub kind: Kind,
 }
 
 impl Preview {
@@ -865,6 +954,7 @@ impl Preview {
             card: None,
             shown: true,
             lease: None,
+            kind: Kind::Other,
         }
     }
 
@@ -908,6 +998,7 @@ impl Preview {
             embedded: self.embedded,
             hold: None,
             notices: Vec::new(),
+            kind: self.kind,
         })
     }
 }
