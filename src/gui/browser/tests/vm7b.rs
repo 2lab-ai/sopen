@@ -84,6 +84,41 @@ fn save_byte_at_the_start(fx: &mut Fx, file: &str, byte: u8) {
     fx.drv.idle(&mut fx.b, 2);
 }
 
+/// Crops the image on screen and saves it (Cmd/Ctrl+S), then passes until the file holds the
+/// Save. The baseline is the file before the key: the Save starts once its journal is in, a pass
+/// or two later, and on a loaded machine lands before the test looks — a baseline read after
+/// the key would be the saved file itself, and the wait would never end.
+fn crop_and_save(fx: &mut Fx, file: &str) {
+    let original = std::fs::read(file).unwrap();
+    edit_image(fx);
+    fx.drv.key(&mut fx.b, Key::S, command(false));
+    until_saved(fx, file, &original);
+}
+
+/// Passes until the window is ready and `file` is no longer `original`.
+fn until_saved(fx: &mut Fx, file: &str, original: &[u8]) {
+    pass_until(fx, "the image's Save", |b| {
+        b.ready() && std::fs::read(file).unwrap() != original
+    });
+}
+
+/// The interleaving of CI's 2-core runner, made certain: the image's Save lands before the wait
+/// looks at the file — the wait still ends (its baseline is the file before the key).
+#[test]
+fn the_saves_wait_ends_when_the_save_lands_before_it_looks() {
+    let (mut fx, _meter) = metered();
+    let file = format!("{}/photo.png", fx.root);
+    fx.open("photo.png");
+    pass_until(&mut fx, "the picture", |b| b.ready());
+    let original = std::fs::read(&file).unwrap();
+    edit_image(&mut fx);
+    fx.drv.key(&mut fx.b, Key::S, command(false));
+    pass_until(&mut fx, "the Save landing first", |_| {
+        std::fs::read(&file).unwrap() != original
+    });
+    until_saved(&mut fx, &file, &original);
+}
+
 /// D13, D14 and 06 §6: a remote text file, 2 (Hex), 3 (Raw), 2, a Save in Hex — one stream for
 /// all of them and one save session: at most 2 sessions at every point, never the 3–4 of a
 /// session per view. Hidden, the hex view gives its save session back (1 Text: 1 session); its
@@ -154,12 +189,7 @@ fn d14_an_image_and_its_hex_view_both_saved_hold_at_most_two_sessions() {
     from_here(&meter);
     fx.open("photo.png");
     pass_until(&mut fx, "the picture", |b| b.ready());
-    edit_image(&mut fx);
-    fx.drv.key(&mut fx.b, Key::S, command(false));
-    let before = std::fs::read(&file).unwrap().len();
-    pass_until(&mut fx, "the image's Save", |b| {
-        b.ready() && std::fs::read(&file).unwrap().len() != before
-    });
+    crop_and_save(&mut fx, &file);
     fx.settle();
     assert_eq!(
         live(&meter),
@@ -341,12 +371,7 @@ fn a_failed_reload_leaves_the_stream_behind_for_the_next_make() {
     let file = format!("{}/photo.png", fx.root);
     fx.open("photo.png");
     pass_until(&mut fx, "the picture", |b| b.ready());
-    edit_image(&mut fx);
-    fx.drv.key(&mut fx.b, Key::S, command(false));
-    let before = std::fs::read(&file).unwrap().len();
-    pass_until(&mut fx, "the image's Save", |b| {
-        b.ready() && std::fs::read(&file).unwrap().len() != before
-    });
+    crop_and_save(&mut fx, &file);
     fx.settle();
     fx.drv.idle(&mut fx.b, 2);
     let behind = |fx: &Fx| fx.b.viewer.as_ref().unwrap().views.behind();
@@ -577,17 +602,39 @@ fn a_switch_asked_during_an_export_goes_ahead_when_it_ends() {
     };
     let mut fx = fixture();
     fx.b.mode = view::Mode::Dual;
-    let clip = PathBuf::from(format!("{}/clip.mp4", fx.root));
-    crate::gui::media::fixtures::clip(&tools, &clip, (320, 240));
+    // Twelve seconds, ten of them exported: an Export that runs long enough to be asked over.
+    let clip = format!("{}/clip.mp4", fx.root);
+    crate::gui::media::fixtures::make(
+        &tools,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x480:rate=25:duration=12",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+        Path::new(&clip),
+    );
     let root = fx.root.clone();
     fx.b.list(Some(0), root, None, None);
     fx.settle();
     fx.open("clip.mp4");
     assert!(on_strip(&fx, "1 Video"));
-    for key in [Key::I, Key::ArrowRight, Key::ArrowRight, Key::O] {
-        fx.key(key);
+    fx.key(Key::I);
+    for _ in 0..10 {
+        fx.key(Key::ArrowRight);
     }
+    fx.key(Key::O);
     fx.key(Key::E);
+    // The Export runs (its progress on the status row) when 2 is pressed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !shows(&fx, "exporting") {
+        assert!(std::time::Instant::now() < deadline, "the Export never ran");
+        fx.drv.idle(&mut fx.b, 1);
+    }
     fx.drv.press_typed(&mut fx.b, Key::Num2, "2");
     fx.drv.idle(&mut fx.b, 1);
     assert!(shows(&fx, "saving…"), "the switch waits for the Export");
@@ -907,12 +954,7 @@ fn d14_on_the_default_route_a_handed_over_image_and_its_hex_view_saved_hold_at_m
     assert_eq!(window, 1, "the window's preview session, idle");
     fx.key(Key::Enter);
     fx.settle();
-    edit_image(&mut fx);
-    fx.drv.key(&mut fx.b, Key::S, command(false));
-    let before = std::fs::read(&file).unwrap().len();
-    pass_until(&mut fx, "the image's Save", |b| {
-        b.ready() && std::fs::read(&file).unwrap().len() != before
-    });
+    crop_and_save(&mut fx, &file);
     fx.settle();
     assert_eq!(live(&meter) - window, 1, "the views' save session");
     digit(&mut fx, 2);
