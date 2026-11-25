@@ -844,20 +844,28 @@ pub fn title_row_with(ui: &mut egui::Ui, place: &str, strip: Option<&Strip>) {
     cells::put(&mut buf, clock_x as u16, 0, &clock, cols, pen);
     let x = block + 1;
     let (room, mode) = mode_button(ui.ctx(), &mut buf, x, clock_x, pen);
-    // The strip stands right before the mode button (or the clock), a blank either side; the
-    // place has what is left.
+    // The strip stands right before the mode button's cells (or the clock), a blank either side;
+    // the place has what is left.
     let mut end = room;
     let mut clicks = vec![];
     if let Some(strip) = strip {
         let entries = strip.entries();
         let width = cells::width(&strip.text()) + 2;
+        // `·` is of width A: in a terminal that draws it in two cells, §10's stand-in `.` (one
+        // cell, as there), or the printer would lay it in two and cut an entry (`1·2 H~`).
+        let dot = if cells::ambiguous_wide(ui.ctx()) {
+            "."
+        } else {
+            "·"
+        };
         if !entries.is_empty() && end >= x + 1 + width {
             let mut at = end - width + 1;
             end -= width;
             let rest = if strip.armed { p.warn } else { p.title_text };
             for (i, (slots, text)) in entries.iter().enumerate() {
+                let text = &text.replace('·', dot);
                 if i > 0 {
-                    at += cells::put(&mut buf, at as u16, 0, " · ", cols, pen);
+                    at += cells::put(&mut buf, at as u16, 0, &format!(" {dot} "), cols, pen);
                 }
                 let on = strip.on.is_some_and(|on| text.ends_with(&format!(" {on}")));
                 let entry_pen = if on {
@@ -926,8 +934,14 @@ pub fn mode_button_rect(ctx: &egui::Context) -> Option<Rect> {
         .and_then(|r| r.0)
 }
 
+/// The mode button's cells: `[GUI]` and `[TUI]` alike.
+const MODE_CELLS: usize = 5;
+
 /// The mode button in `buf` right before the clock at `clock_x`, a blank either side, when the
 /// row has room for it after the place's start `x`: where the place's room ends, and its cells.
+/// A backend that shows no button (a window started directly) keeps its cells blank all the
+/// same, so what stands before it — the place, a viewer's views — is at the same cells in both
+/// backends (10 §5: the button is their one difference, TS-1).
 fn mode_button(
     ctx: &egui::Context,
     buf: &mut cells::Buffer,
@@ -935,12 +949,13 @@ fn mode_button(
     clock_x: usize,
     pen: cells::Pen,
 ) -> (usize, Option<cells::Cells>) {
-    let Some(ModeButton(label)) = ctx.data(|d| d.get_temp(mode_button_id())) else {
-        return (clock_x, None);
-    };
-    let w = cells::width(label);
+    let label = ctx.data(|d| d.get_temp::<ModeButton>(mode_button_id()));
+    let w = label.map_or(MODE_CELLS, |ModeButton(label)| cells::width(label));
     let Some(at) = clock_x.checked_sub(w + 1).filter(|&at| at > x) else {
         return (clock_x, None);
+    };
+    let Some(ModeButton(label)) = label else {
+        return (at, None);
     };
     cells::put(buf, at as u16, 0, label, w, pen);
     (at, Some(cells::Cells::new(at as u16, 0, w as u16, 1)))

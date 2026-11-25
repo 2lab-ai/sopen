@@ -14,6 +14,8 @@
 //! - The read-back ([`Layer::seen`], [`row_text`], [`find`], [`colors`], [`runs`]): character,
 //!   colours and caret per cell.
 //! - [`index256`]: a skin colour in a 256-colour terminal (10 §5).
+//! - [`set_ambiguous_wide`], [`ambiguous_wide`]: whether the passes are shown in a terminal that
+//!   draws a glyph of ambiguous width in two cells (10 §10).
 //!
 //! A buffer is one layer, and a wide glyph half written over is erased (see [`put`]) inside it
 //! only. A later layer whose cells cover half of a wide glyph in an earlier one leaves the glyph's
@@ -146,6 +148,39 @@ pub fn index256(c: Color32) -> u8 {
             .sum()
     };
     (16..=255).min_by_key(|&i| distance(i)).unwrap_or(16)
+}
+
+// ---------------------------------------------------------------------------------------------
+// An ambiguous-wide terminal (10 §10, TS-6).
+
+/// The context's passes are shown in a terminal that draws a glyph of ambiguous width in two
+/// cells ([`set_ambiguous_wide`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct AmbiguousWide;
+
+fn ambiguous_wide_id() -> egui::Id {
+    egui::Id::unique("sopen-ambiguous-wide")
+}
+
+/// Says that the passes of `ctx` are shown in a terminal that draws a glyph of ambiguous width
+/// in two cells (`wide`), or not: the terminal backend says it once its probe has answered
+/// (`term::Backend::enter`). A screen that knows a cell holds a glyph of sopen's own tables (the
+/// hex view's CP437 column) substitutes 10 §10's stand-in at the source, where the printer could
+/// not tell it from a name's letter.
+pub fn set_ambiguous_wide(ctx: &egui::Context, wide: bool) {
+    ctx.data_mut(|d| {
+        if wide {
+            d.insert_temp(ambiguous_wide_id(), AmbiguousWide);
+        } else {
+            d.remove_temp::<AmbiguousWide>(ambiguous_wide_id());
+        }
+    });
+}
+
+/// Whether `ctx`'s passes are shown in an ambiguous-wide terminal ([`set_ambiguous_wide`]); a
+/// window's never are.
+pub fn ambiguous_wide(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<AmbiguousWide>(ambiguous_wide_id()).is_some())
 }
 
 // ---------------------------------------------------------------------------------------------

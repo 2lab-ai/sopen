@@ -16,6 +16,16 @@
 //! [`HexFile`] the write side; both are window-free, so the tests and the `SOPEN_AUTOSAVE` hook
 //! run the exact code the window's buttons run.
 //!
+//! The screen is cells (10 §4–§6, X3-hex): the toolbar with its Go to field and `[ buttons ]`,
+//! the frame with the rows and its scroll bar, the status row and, on its own, the F-key row are
+//! written into buffers of whole cells ([`super::cells`]) and painted a glyph per cell, so the
+//! window and the terminal show the same cells (TS-4). In a terminal that draws a glyph of
+//! ambiguous width in two cells ([`cells::ambiguous_wide`], which the terminal backend sets) the
+//! ASCII column's CP437 glyphs of width A are 10 §10's stand-ins — `+ - = | # ^ v < >`, and `.`
+//! for the letters the table leaves ([`column_glyph`]). The rows below the
+//! grid (notices, the recovery and refusal rows, the read-only path) and the window's questions
+//! are still egui's.
+//!
 //! As the file browser's preview (02 §4.2, [`super::Window::set_preview`]) the window shows its
 //! first rows without toolbar, status row or cursor, takes no input and never takes the keyboard.
 //!
@@ -27,6 +37,8 @@ mod file;
 
 pub use file::{Base, Checking, HexFile, Rebind, Repaint, Saved};
 
+use super::browser::ops::dialog;
+use super::cells::{self, Buffer, Cells, Grid, Pen, Position};
 use super::chrome::{self, HEX_KEYS};
 use super::image::{AT_A_REVISION, CANNOT_REPLACE};
 use super::save_as::{self, SaveAs};
@@ -35,7 +47,7 @@ use crate::journal::{self, Journal, Keep, Schedule};
 use crate::remote::{patch, Fingerprint, HASH_CHECK_MAX};
 use crate::stream::{Bytes, Mark, ReadError, Reader, Source, Waiting};
 use anyhow::{anyhow, bail, Result};
-use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, Vec2};
+use eframe::egui::{self, Color32, Key, Rect, Sense, Vec2};
 use file::{LeftTemp as LeftTempRef, Request, Row, Saving, Streamed, Way};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -157,16 +169,32 @@ pub fn ascii_char(b: Option<u8>) -> char {
     }
 }
 
+/// The ASCII column's glyph for a byte (`None`: on its way, `·`): its code page 437 glyph
+/// ([`ascii_char`]) — or, in a terminal that draws a glyph of ambiguous width in two cells
+/// (`wide`), for one of width A 10 §10's stand-in: the table's (`+ - = |` for box lines, `#` for
+/// blocks, `^ v < >` for arrows, `.` for `·` and the other symbols, [`super::term::narrow`]),
+/// and `.` for what the table leaves — the Greek, maths and Latin-1 letters (its last row).
+/// Substituted here, where the cell is known to be a CP437 glyph: the terminal's printer lays a
+/// letter of width A in two cells, as it lays a name's, and would move the rest of the row.
+pub fn column_glyph(b: Option<u8>, wide: bool) -> char {
+    let glyph = b.map_or('·', chrome::cp437);
+    if !wide || !super::term::ambiguous(glyph) {
+        return glyph;
+    }
+    let mut utf8 = [0u8; 4];
+    let stand_in = super::term::narrow(glyph.encode_utf8(&mut utf8));
+    stand_in.and_then(|s| s.chars().next()).unwrap_or('.')
+}
+
 /// Where the hex column draws byte `i` of a row, in characters from the column's start.
 fn hex_col(i: u64) -> u64 {
     3 * i + u64::from(i >= 8)
 }
 
-/// Whether a row of `per` bytes — the offset, the hex column, the ASCII column — fits in
-/// `width` points at `cw` points a character.
-fn row_fits(width: f32, cw: f32, offset_chars: usize, per: u64) -> bool {
-    let chars = offset_chars as u64 + 1 + per * 3 + 2 + per;
-    cw * chars as f32 <= width
+/// Whether a row of `per` bytes — the offset, the hex column, the ASCII column — fits in `cols`
+/// cells.
+fn row_fits(cols: u16, offset_chars: u16, per: u64) -> bool {
+    u64::from(offset_chars) + 1 + per * 3 + 2 + per <= u64::from(cols)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1938,6 +1966,84 @@ pub(super) const EDITING: &str = "editing — Esc ends";
 
 fn goto_id() -> egui::Id {
     egui::Id::unique("sopen-hex-goto")
+}
+
+/// The Go to field on the toolbar, in cells: where it starts (after ` Go to `), its width (the
+/// egui field's 130 points), the fewest it gives up to on a narrow window, and its hint.
+const GOTO_AT: u16 = 7;
+const GOTO_CELLS: u16 = 16;
+const GOTO_FEWEST: u16 = 8;
+const GOTO_HINT: &str = "0x… or decimal";
+
+/// Between two parts of the status row.
+const RULE: &str = " │ ";
+
+/// The one-cell spinner while a save runs (10 §6), a quarter turn every tenth of a second.
+const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
+
+/// What a toolbar button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Does {
+    Undo,
+    Redo,
+    Save,
+    SaveCopy,
+    SaveAs,
+}
+
+impl Does {
+    fn label(self) -> &'static str {
+        match self {
+            Does::Undo => "Undo",
+            Does::Redo => "Redo",
+            Does::Save => "Save",
+            Does::SaveCopy => "Save copy",
+            Does::SaveAs => "Save As…",
+        }
+    }
+}
+
+/// A toolbar button: what it does, whether it does it now, and what it says on hover then
+/// (`tip`) and while it does not (`off`; empty: nothing).
+struct Tool {
+    does: Does,
+    on: bool,
+    tip: &'static str,
+    off: &'static str,
+}
+
+impl Tool {
+    /// Its cells: `[ label ]`.
+    fn cells(&self) -> u16 {
+        cells::width(self.does.label()) as u16 + 4
+    }
+}
+
+fn tool_id(does: Does) -> egui::Id {
+    egui::Id::unique("sopen-hex-tool").with(does)
+}
+
+/// A row one cell tall across `ui`, on the cell grid: its grid, and its cells in the body's
+/// colours.
+fn cell_row(ui: &mut egui::Ui) -> (Grid, Buffer) {
+    let width = ui.available_width();
+    let size = Vec2::new(width, chrome::CELL.y);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let grid = Grid::over(rect);
+    let mut buf = Buffer::empty(grid.all());
+    let p = chrome::PALETTE;
+    cells::fill(&mut buf, grid.all(), Pen::new(p.text, p.back));
+    (grid, buf)
+}
+
+/// F1's help over the window: the cells of `buf` (on `grid`) under its box blanked first — one
+/// buffer of cells laid over another (cells.rs) — so a wide glyph half under its edge (a Hangul
+/// name) goes as a terminal erases it.
+fn blank_under_help(ctx: &egui::Context, grid: &Grid, buf: &mut Buffer) {
+    let p = chrome::PALETTE;
+    for under in super::help::covered(ctx, grid) {
+        cells::fill(buf, under, Pen::new(p.text, p.back));
+    }
 }
 
 /// A stand-in run before each link of writing the list (tests).
@@ -3727,91 +3833,162 @@ impl HexWindow {
         }
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) -> egui::Response {
+    /// The toolbar, one row of cells (10 §6): `Go to` and its field — black cells, what is typed
+    /// in white, the hint dim while it is empty, the caret its cell while it has the keyboard —
+    /// then `[ Undo ]  [ Redo ]  [ Save ]  [ Save copy ]  [ Save As… ]`, two blank cells apart,
+    /// in the dialog's colours (blue, the weak colour, while one does nothing), each an egui
+    /// interaction at its cells with what it does on hover. Nothing in it comes, goes or changes
+    /// its label; on a narrow window the field gives up cells first (down to [`GOTO_FEWEST`]),
+    /// then the last buttons do, never half of one. Returns whether the field has this frame's
+    /// typing besides holding the keyboard: it let the keyboard go in this frame (Enter goes
+    /// there), or it was pressed.
+    fn toolbar(&mut self, ui: &mut egui::Ui) -> bool {
         let ctx = ui.ctx().clone();
+        let p = chrome::PALETTE;
         // A save or a reload under way: no other one, and no edit, starts (07 §10).
         let busy = self.job.is_some() || self.reloading.is_some();
         let free = !self.locked() && !busy && !self.dialog_up();
-        // One row, whatever the state: nothing in it comes, goes or changes its label.
-        ui.horizontal(|ui| {
-            ui.label("Go to");
-            let field = ui
-                .add(
-                    chrome::field(&mut self.goto)
-                        .id(goto_id())
-                        .hint_text("0x… or decimal")
-                        .desired_width(130.0),
-                )
-                .on_hover_text("⌘/Ctrl+G · Enter goes there");
-            if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                self.goto();
+        // A file at a revision has no place to be saved (03 §6.3): all three off, with that
+        // reason on hover before any other.
+        let saves = !self.at_revision;
+        let running = if self.at_revision {
+            AT_A_REVISION
+        } else {
+            "a save is running"
+        };
+        let save_off = if self.at_revision {
+            AT_A_REVISION
+        } else if !self.can_replace {
+            CANNOT_REPLACE
+        } else if self.reloading.is_some() {
+            RELOADING
+        } else if busy {
+            "a save is running"
+        } else {
+            "no changes to save"
+        };
+        let save_tip = if self.stream.is_some() {
+            "⌘/Ctrl+S — writes your changes into the original (copied on its host, then renamed \
+             over it); the bytes they replace are kept locally"
+        } else {
+            "⌘/Ctrl+S — overwrites the original after a local backup"
+        };
+        let tools = [
+            Tool {
+                does: Does::Undo,
+                on: free && self.doc.can_undo(),
+                tip: "⌘/Ctrl+Z",
+                off: "",
+            },
+            Tool {
+                does: Does::Redo,
+                on: free && self.doc.can_redo(),
+                tip: "⇧⌘/Shift+Ctrl+Z",
+                off: "",
+            },
+            Tool {
+                does: Does::Save,
+                on: saves && free && self.doc.dirty() && self.can_replace,
+                tip: save_tip,
+                off: save_off,
+            },
+            Tool {
+                does: Does::SaveCopy,
+                on: saves && free,
+                tip: "⇧⌘/Shift+Ctrl+S — a new <name>.edited file next to the original",
+                off: running,
+            },
+            Tool {
+                does: Does::SaveAs,
+                on: saves && free,
+                tip: "⌥⌘/Alt+Ctrl+S, F7 — a new local file with your changes",
+                off: running,
+            },
+        ];
+        let (grid, mut buf) = cell_row(ui);
+        let body = Pen::new(p.text, p.back);
+        cells::put(&mut buf, 1, 0, "Go to", 5, body);
+        // The field's cells: its nominal width where the whole row fits, else what is left,
+        // never fewer than `GOTO_FEWEST`.
+        let buttons: u16 = tools.iter().map(|t| 2 + t.cells()).sum();
+        let left = grid.cols.saturating_sub(GOTO_AT + buttons);
+        let field = Cells::new(GOTO_AT, 0, left.clamp(GOTO_FEWEST, GOTO_CELLS), 1);
+        let field_rect = grid.rect(field);
+        ui.interact(field_rect, goto_id().with("hover"), Sense::hover())
+            .on_hover_text("⌘/Ctrl+G · Enter goes there");
+        dialog::field(ui, &grid, field, goto_id(), &mut self.goto, |e| e);
+        let focused = ctx.memory(|m| m.has_focus(goto_id()));
+        let caret = dialog::field_cells(&ctx, &mut buf, field, goto_id(), &self.goto, focused);
+        if self.goto.is_empty() {
+            let hint = cells::fit_start(GOTO_HINT, field.width.into());
+            let pen = Pen::new(p.dim, chrome::cga::BLACK);
+            cells::put(&mut buf, field.x, 0, &hint, field.width.into(), pen);
+        }
+        let mut pressed = None;
+        let mut x = field.right() + 2;
+        for tool in tools {
+            let w = tool.cells();
+            if x + w > grid.cols {
+                break;
             }
-            ui.separator();
-            if ui
-                .add_enabled(free && self.doc.can_undo(), egui::Button::new("Undo"))
-                .on_hover_text("⌘/Ctrl+Z")
-                .clicked()
-            {
-                self.undo();
-            }
-            if ui
-                .add_enabled(free && self.doc.can_redo(), egui::Button::new("Redo"))
-                .on_hover_text("⇧⌘/Shift+Ctrl+Z")
-                .clicked()
-            {
-                self.redo();
-            }
-            ui.separator();
-            // A file at a revision has no place to be saved (03 §6.3): all three off, with that
-            // reason on hover before any other.
-            let saves = !self.at_revision;
-            let running = if self.at_revision {
-                AT_A_REVISION
+            let at = Cells::new(x, 0, w, 1);
+            let id = tool_id(tool.does);
+            let sense = if tool.on {
+                Sense::click()
             } else {
-                "a save is running"
+                Sense::hover()
             };
-            let save = ui
-                .add_enabled(
-                    saves && free && !busy && self.doc.dirty() && self.can_replace,
-                    egui::Button::new("Save"),
-                )
-                .on_hover_text(if self.stream.is_some() {
-                    "⌘/Ctrl+S — writes your changes into the original (copied on its host, then \
-                     renamed over it); the bytes they replace are kept locally"
-                } else {
-                    "⌘/Ctrl+S — overwrites the original after a local backup"
-                })
-                .on_disabled_hover_text(if self.at_revision {
-                    AT_A_REVISION
-                } else if !self.can_replace {
-                    CANNOT_REPLACE
-                } else if self.reloading.is_some() {
-                    RELOADING
-                } else if busy {
-                    "a save is running"
-                } else {
-                    "no changes to save"
-                });
-            if save.clicked() {
-                self.start(&ctx, JobKind::Save { close_after: false });
+            let resp = ui.interact(grid.rect(at), id, sense);
+            let tip = if tool.on { tool.tip } else { tool.off };
+            let resp = if tip.is_empty() {
+                resp
+            } else {
+                resp.on_hover_text(tip)
+            };
+            if tool.on && resp.clicked() {
+                pressed = Some(tool.does);
             }
-            let copy = ui
-                .add_enabled(saves && free && !busy, egui::Button::new("Save copy"))
-                .on_hover_text("⇧⌘/Shift+Ctrl+S — a new <name>.edited file next to the original")
-                .on_disabled_hover_text(running);
-            if copy.clicked() {
-                self.start(&ctx, JobKind::SaveCopy { close_after: false });
-            }
-            let as_new = ui
-                .add_enabled(saves && free, egui::Button::new("Save As…"))
-                .on_hover_text("⌥⌘/Alt+Ctrl+S, F7 — a new local file with your changes")
-                .on_disabled_hover_text(running);
-            if as_new.clicked() {
-                self.open_save_as(false);
-            }
-            field
-        })
-        .inner
+            let pen = if !tool.on {
+                Pen::new(p.dialog_weak, p.dialog_back)
+            } else if ctx.memory(|m| m.has_focus(id)) {
+                Pen::new(p.bar_text, p.bar)
+            } else {
+                Pen::new(p.dialog_text, p.dialog_back)
+            };
+            cells::put(
+                &mut buf,
+                x,
+                0,
+                &format!("[ {} ]", tool.does.label()),
+                w.into(),
+                pen,
+            );
+            x += w + 2;
+        }
+        blank_under_help(&ctx, &grid, &mut buf);
+        cells::paint(
+            &ui.painter_at(grid.rect(grid.all())),
+            grid.origin,
+            &buf,
+            caret,
+        );
+        match pressed {
+            Some(Does::Undo) => self.undo(),
+            Some(Does::Redo) => self.redo(),
+            Some(Does::Save) => self.start(&ctx, JobKind::Save { close_after: false }),
+            Some(Does::SaveCopy) => self.start(&ctx, JobKind::SaveCopy { close_after: false }),
+            Some(Does::SaveAs) => self.open_save_as(false),
+            None => {}
+        }
+        // The field let the keyboard go in this frame (Enter, Esc, a click elsewhere): Enter
+        // goes there.
+        let lost = ctx.memory(|m| m.had_focus_last_frame(goto_id()) && !m.has_focus(goto_id()));
+        if lost && ui.input(|i| i.key_pressed(Key::Enter)) {
+            self.goto();
+        }
+        let pressed_on =
+            ui.input(|i| i.pointer.primary_pressed()) && ui.rect_contains_pointer(field_rect);
+        lost || pressed_on
     }
 
     /// The cursor's offset and byte, as the status bar shows them.
@@ -3914,8 +4091,13 @@ impl HexWindow {
         self.stream.as_ref().and_then(|s| s.state().status())
     }
 
-    /// One line whatever it says (see [`super::one_line`]): the grid above must not move.
+    /// The status row, one row of cells whatever it says (10 §6): the cursor's offset and byte,
+    /// the size (in bytes on hover), the changed bytes, a one-cell spinner while a save runs, what
+    /// the window last said — cut with "…" to the room it has (whole on hover) — and where the
+    /// edits are kept (07 §3) at its right end, `│` between them. The grid above never moves.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let p = chrome::PALETTE;
         let cursor = self.cursor_line();
         let size = self.doc.size();
         let changed = self.doc.changed_count() as u64;
@@ -3925,102 +4107,132 @@ impl HexWindow {
                 self.status = Status::error(e.to_string());
             }
         }
-        let status = self.status_text(ui.ctx());
+        let status = self.status_text(&ctx);
         let shown = self.job.is_some() || !status.text.is_empty();
-        ui.horizontal(|ui| {
-            ui.add(egui::Label::new(egui::RichText::new(cursor).monospace()).extend());
-            ui.separator();
-            ui.add(egui::Label::new(crate::human(size)).extend())
-                .on_hover_text(format!("{} bytes", grouped(size)));
-            ui.separator();
-            ui.add(egui::Label::new(format!("{} changed", plural_bytes(changed))).extend());
-            if shown {
-                ui.separator();
-            }
-            if self.job.is_some() {
-                // No taller than the status text beside it, so the bar keeps its height.
-                let size = ui.text_style_height(&egui::TextStyle::Body);
-                ui.add(egui::Spinner::new().size(size));
-            }
-            // Where the edits are kept (07 §3) holds the bar's right end; what the window last
-            // said takes the room before it, cut with "…" when it is longer.
-            let kept = unsaved.then(|| self.kept_line());
-            let font = egui::TextStyle::Body.resolve(ui.style());
-            let width = |text: &str| {
-                ui.painter()
-                    .layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE)
-                    .size()
-                    .x
-            };
-            let room = ui.available_width();
-            let kept = kept.map(|(full, short, failed)| {
+        let (grid, mut buf) = cell_row(ui);
+        let body = Pen::new(p.text, p.back);
+        let end = grid.cols.saturating_sub(1);
+        let mut x = 1u16;
+        let put = |buf: &mut Buffer, x: &mut u16, text: &str, pen: Pen| -> Cells {
+            let w = cells::put(buf, *x, 0, text, usize::from(end.saturating_sub(*x)), pen) as u16;
+            let at = Cells::new(*x, 0, w, 1);
+            *x += w;
+            at
+        };
+        put(&mut buf, &mut x, &cursor, body);
+        put(&mut buf, &mut x, RULE, body);
+        let size_at = put(&mut buf, &mut x, &crate::human(size), body);
+        put(&mut buf, &mut x, RULE, body);
+        put(
+            &mut buf,
+            &mut x,
+            &format!("{} changed", plural_bytes(changed)),
+            body,
+        );
+        if shown {
+            put(&mut buf, &mut x, RULE, body);
+        }
+        if self.job.is_some() {
+            // A one-cell spinner (10 §6), a quarter turn every tenth of a second.
+            let turn = (ctx.input(|i| i.time) * 10.0) as usize % SPINNER.len();
+            put(&mut buf, &mut x, SPINNER[turn], body);
+            put(&mut buf, &mut x, " ", body);
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        // Where the edits are kept holds the row's right end; what the window last said takes
+        // the room before it, cut with "…" when it is longer.
+        let room = usize::from(end.saturating_sub(x));
+        let kept = unsaved
+            .then(|| self.kept_line())
+            .map(|(full, short, failed)| {
                 // The path when it fits in half the room; whole on hover either way.
-                let line = if width(&full) <= room / 2.0 {
+                let line = if cells::width(&full) <= room / 2 {
                     full
                 } else {
                     short
                 };
-                let w = width(&line) + ui.spacing().item_spacing.x * 3.0 + 1.0;
-                (line, failed, w)
+                (line, failed)
             });
-            let reserved = kept.as_ref().map_or(0.0, |k| k.2);
-            let height = ui.text_style_height(&egui::TextStyle::Body);
-            ui.allocate_ui_with_layout(
-                Vec2::new((room - reserved).max(0.0), height),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| status.show(ui),
-            );
-            if let Some((line, failed, _)) = kept {
-                ui.separator();
-                let text = egui::RichText::new(line);
-                let text = if failed {
-                    text.color(ui.visuals().error_fg_color)
-                } else {
-                    text
-                };
-                let label = ui.add(egui::Label::new(text).extend());
-                if let Some(dir) = &self.journal_dir {
-                    label.on_hover_text(format!("kept at {}", dir.display()));
-                }
-            }
-        });
+        let reserved = kept
+            .as_ref()
+            .map_or(0, |(line, _)| cells::width(line) + cells::width(RULE));
+        let text: String = (status.text.chars())
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let said = cells::fit_start(&text, room.saturating_sub(reserved));
+        let color = if status.error { p.error } else { p.text };
+        let said_at = put(&mut buf, &mut x, &said, Pen::new(color, p.back));
+        let mut kept_at = None;
+        if let Some((line, failed)) = &kept {
+            x = end.saturating_sub(reserved as u16).max(x);
+            put(&mut buf, &mut x, RULE, body);
+            let color = if *failed { p.error } else { p.text };
+            kept_at = Some(put(&mut buf, &mut x, line, Pen::new(color, p.back)));
+        }
+        blank_under_help(&ctx, &grid, &mut buf);
+        cells::paint(
+            &ui.painter_at(grid.rect(grid.all())),
+            grid.origin,
+            &buf,
+            None,
+        );
+        let hover = |at: Cells, salt: &str| {
+            ui.interact(
+                grid.rect(at),
+                egui::Id::unique(("sopen-hex-status", salt)),
+                Sense::hover(),
+            )
+        };
+        hover(size_at, "size").on_hover_text(format!("{} bytes", grouped(size)));
+        if said != text {
+            hover(said_at, "said").on_hover_text(&status.text);
+        }
+        if let (Some(at), Some(dir)) = (kept_at, &self.journal_dir) {
+            hover(at, "kept").on_hover_text(format!("kept at {}", dir.display()));
+        }
     }
 
-    /// The window, as PC Shell's File Edit: its frame, the file on its first line, then the
-    /// rows — offsets, hex, ASCII, the cursor in both columns, changed bytes marked — and the
-    /// scroll bar on its right border. Only the rows on screen are read and painted.
+    /// The window, as PC Shell's File Edit, in cells (10 §4–§6): its frame, the file on its
+    /// first line, then the rows — offsets, hex, ASCII, the cursor in both columns (the bar's
+    /// colours where it types, black in the other), changed bytes yellow on black, bytes on
+    /// their way `··` dim — and the scroll bar on its right border. Rows the file does not reach
+    /// are blank cells of the frame. Only whole rows of cells are shown, and only those are read
+    /// and painted. The caret is the cell the next digit goes into when that is a byte's low
+    /// nibble (as the underline was), unless `goto_focused` (a field has the keyboard).
     fn grid(&mut self, ui: &mut egui::Ui, goto_focused: bool) {
         let ctx = ui.ctx().clone();
         let outer = ui.max_rect();
-        let p = chrome::Palette::of(ui.visuals());
+        let p = chrome::PALETTE;
+        let grid = Grid::over(outer);
+        let mut buf = Buffer::empty(grid.all());
         // Single-lined in a preview: it does not have the keyboard.
-        let panel = chrome::frame(&ui.painter_at(outer), outer, TITLE, !self.preview);
-        let font = chrome::mono(ui);
-        let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-        // Rows touch, a cell apart, as on a text screen.
-        let row_h = text_h.ceil();
-        let bar = Rect::from_min_max(
-            Pos2::new(panel.right(), panel.top()),
-            Pos2::new(panel.right() + chrome::CELL.x, panel.bottom()),
-        );
+        let inner = cells::frame(&mut buf, grid.all(), TITLE, !self.preview);
         let size = self.doc.size();
-        let offset_chars = offset_text(0, size).chars().count();
+        let offset_chars = offset_text(0, size).chars().count() as u16;
         // Bytes a row: sixteen. A preview (02 §4.2) fits its rows to the side it is in: sixteen
         // where the ASCII column still fits, else eight.
-        let per = if self.preview && !row_fits(panel.width(), cw, offset_chars, ROW) {
+        let per = if self.preview && !row_fits(inner.width, offset_chars, ROW) {
             ROW / 2
         } else {
             ROW
         };
         // The file's name on the first line, a blank line, then the rows. A preview has no
         // bars: the side's frame names the file.
-        let head = if self.preview { 0.0 } else { 2.0 * row_h };
-        let rows_rect = Rect::from_min_max(
-            Pos2::new(panel.left(), (panel.top() + head).min(panel.bottom())),
-            panel.max,
+        let head = if self.preview { 0 } else { 2 };
+        let rows_cells = Cells::new(
+            inner.x,
+            inner.y + head.min(inner.height),
+            inner.width,
+            inner.height.saturating_sub(head),
         );
+        let rows_rect = grid.rect(rows_cells);
+        let bar_cells = Cells::new(inner.right(), inner.y, 1, inner.height);
+        let bar = grid.rect(bar_cells);
         let total = size.div_ceil(per);
-        let visible = ((rows_rect.height() / row_h).floor() as u64).max(1);
+        // The whole rows of cells the frame has room for — none when notices took its height —
+        // and a page of them for the keys and the cursor's place, a row at least.
+        let room = u64::from(rows_cells.height);
+        let visible = room.max(1);
         // The grid got shorter (a warning or a notice took rows off its bottom, the window
         // shrank) and the cursor's row, on screen until now, would fall off: the grid scrolls
         // down by just the rows that keep it whole. A cursor already in view moves nothing, and
@@ -4033,6 +4245,7 @@ impl HexWindow {
             }
         }
         let max_top = total.saturating_sub(visible);
+        let (cw, row_h) = (chrome::CELL.x, chrome::CELL.y);
 
         // A preview takes no click, drag or wheel, and never the keyboard (it belongs to the
         // list beside it, 02 §4.4).
@@ -4092,15 +4305,16 @@ impl HexWindow {
         // button is down on the bar.
         if bar_resp.is_pointer_button_down_on() && max_top > 0 {
             if let Some(at) = bar_resp.interact_pointer_pos() {
-                let cell = chrome::CELL.y;
-                let room = (bar.height() - 3.0 * cell).max(1.0);
-                let frac = ((at.y - bar.top() - 1.5 * cell) / room).clamp(0.0, 1.0);
+                let room = (bar.height() - 3.0 * row_h).max(1.0);
+                let frac = ((at.y - bar.top() - 1.5 * row_h) / room).clamp(0.0, 1.0);
                 self.top_row = (f64::from(frac) * max_top as f64).round() as u64;
             }
         }
 
-        let hex_x = rows_rect.left() + cw * (offset_chars + 1) as f32;
-        let ascii_x = hex_x + cw * (per * 3 + 2) as f32;
+        let hex_at = rows_cells.x + offset_chars + 1;
+        let ascii_at = hex_at + per as u16 * 3 + 2;
+        let hex_x = grid.rect(Cells::new(hex_at, 0, 1, 1)).left();
+        let ascii_x = grid.rect(Cells::new(ascii_at, 0, 1, 1)).left();
         // A click places the cursor on the byte under it, in that column.
         if resp.clicked() || resp.drag_started_by(egui::PointerButton::Primary) {
             if let Some(p) = resp.interact_pointer_pos() {
@@ -4125,7 +4339,7 @@ impl HexWindow {
             }
         }
         // On the window's first pass the rows below the grid have not taken their height yet:
-        // the cursor is followed again on the next one, or `at=` would leave its row half cut.
+        // the cursor is followed again on the next one, or `at=` would leave its row cut off.
         let follow = self.follow;
         self.follow &= !self.painted;
         if follow && size > 0 {
@@ -4138,122 +4352,84 @@ impl HexWindow {
         }
         self.top_row = self.top_row.min(max_top);
 
-        let rows = ((rows_rect.height() / row_h).ceil() as u64).min(total - self.top_row);
+        let rows = room.min(total - self.top_row);
         // The frame's one read, now that the rows on screen are known.
         let screen = self.top_row * per;
         let on_bar = bar_resp.is_pointer_button_down_on();
         self.read_screen(&ctx, screen, (rows * per).min(size - screen), on_bar);
 
-        let visuals = ui.visuals().clone();
-        // The rows never run under the scroll bar (on a narrow window the ASCII column is cut).
-        let painter = ui.painter_at(panel);
-        if !self.preview {
-            let title = chrome::fit_left(&ctx, &self.title, &font, panel.width());
-            painter.text(
-                panel.min,
-                egui::Align2::LEFT_TOP,
-                title,
-                font.clone(),
-                p.text,
-            );
+        let body = Pen::new(p.text, p.back);
+        if !self.preview && inner.height > 0 {
+            let title = cells::fit_left(&self.title, inner.width.into());
+            cells::put(&mut buf, inner.x, inner.y, &title, inner.width.into(), body);
         }
-        if size == 0 {
-            painter.text(
-                rows_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "empty file — nothing to show",
-                font.clone(),
-                p.dim,
-            );
+        if size == 0 && rows_cells.height > 0 {
+            let line = cells::fit_start("empty file — nothing to show", rows_cells.width.into());
+            let w = cells::width(&line) as u16;
+            let x = rows_cells.x + (rows_cells.width - w) / 2;
+            let y = rows_cells.y + (rows_cells.height - 1) / 2;
+            cells::put(&mut buf, x, y, &line, w.into(), Pen::new(p.dim, p.back));
         }
-        let text = p.text;
-        let (changed_fg, changed_bg) = (p.changed, p.changed_back);
-        let cursor_bg = visuals.selection.bg_fill;
+        let wide = cells::ambiguous_wide(&ctx);
         // No cursor in a preview: nothing there is being edited.
         let cursor_at = (!self.preview).then_some(self.cursor.at);
-        let cursor_line = egui::Stroke::new(1.0, visuals.selection.stroke.color);
+        let end = inner.right();
+        let mut caret = None;
         for k in 0..rows {
             let row = self.top_row + k;
-            let y = rows_rect.top() + k as f32 * row_h;
+            let y = rows_cells.y + k as u16;
             let off = row * per;
             let n = (size - off).min(per);
-            painter.text(
-                Pos2::new(rows_rect.left(), y),
-                egui::Align2::LEFT_TOP,
-                offset_text(off, size),
-                font.clone(),
-                p.dim,
+            let dim = Pen::new(p.dim, p.back);
+            cells::put(
+                &mut buf,
+                rows_cells.x,
+                y,
+                &offset_text(off, size),
+                usize::from(end - rows_cells.x),
+                dim,
             );
-            let cell = |x: f32, chars: f32| {
-                Rect::from_min_size(
-                    Pos2::new(x - 1.0, y - 1.0),
-                    Vec2::new(cw * chars + 2.0, row_h),
-                )
-            };
-            let mut hex_job = egui::text::LayoutJob::default();
-            let mut ascii_job = egui::text::LayoutJob::default();
-            let fmt = |color: Color32| egui::TextFormat::simple(font.clone(), color);
             for i in 0..n {
                 let at = off + i;
                 let shown = self.doc.cell(at);
                 let changed = self.doc.changed(at);
-                let color = if Some(at) == cursor_at {
-                    p.bar_text
-                } else if changed {
-                    changed_fg
-                } else if shown == Cell::Pending {
+                let cursor = (Some(at) == cursor_at).then_some(self.cursor.pane);
+                let pen_in = |pane: Pane| match cursor {
+                    Some(typing) if typing == pane => Pen::new(p.bar_text, p.bar),
+                    Some(_) => Pen::new(p.bar_text, p.bar_idle),
+                    None if changed => Pen::new(p.changed, p.changed_back),
                     // On its way (06 §7.1): `··` in the skin's dim colour, never a blank.
-                    p.dim
-                } else {
-                    text
+                    None if shown == Cell::Pending => dim,
+                    None => body,
                 };
-                let hx = hex_x + cw * hex_col(i) as f32;
-                let ax = ascii_x + cw * i as f32;
-                if changed {
-                    painter.rect_filled(cell(hx, 2.0), 0.0, changed_bg);
-                    painter.rect_filled(cell(ax, 1.0), 0.0, changed_bg);
-                }
-                if Some(at) == cursor_at {
-                    let (active, other) = match self.cursor.pane {
-                        Pane::Hex => (cell(hx, 2.0), cell(ax, 1.0)),
-                        Pane::Ascii => (cell(ax, 1.0), cell(hx, 2.0)),
-                    };
-                    painter.rect_filled(active, 0.0, cursor_bg);
-                    painter.rect_stroke(other, 0.0, cursor_line, egui::StrokeKind::Inside);
-                    if self.cursor.pane == Pane::Hex && self.cursor.low {
-                        // The next digit goes into the low nibble: underline it.
-                        let x = hx + cw;
-                        painter.line_segment(
-                            [
-                                Pos2::new(x, y + row_h - 3.0),
-                                Pos2::new(x + cw, y + row_h - 3.0),
-                            ],
-                            egui::Stroke::new(2.0, text),
-                        );
-                    }
-                }
-                if i > 0 {
-                    hex_job.append(if i == 8 { "  " } else { " " }, 0.0, fmt(text));
-                }
-                let (digits_text, glyph) = match shown {
-                    Cell::Byte(b) => (format!("{b:02X}"), ascii_char(Some(b))),
-                    Cell::Pending => ("··".to_string(), '·'),
-                    Cell::Unreadable => ("??".to_string(), ascii_char(None)),
+                let (digits, glyph) = match shown {
+                    Cell::Byte(b) => (format!("{b:02X}"), column_glyph(Some(b), wide)),
+                    // `·` is of width A: in an ambiguous-wide terminal its stand-in, as the
+                    // ASCII column's (a printer lays content of width A in two cells).
+                    Cell::Pending if wide => ("..".to_string(), column_glyph(None, wide)),
+                    Cell::Pending => ("··".to_string(), column_glyph(None, wide)),
+                    Cell::Unreadable => ("??".to_string(), '?'),
                 };
-                hex_job.append(&digits_text, 0.0, fmt(color));
-                ascii_job.append(&glyph.to_string(), 0.0, fmt(color));
+                let hx = hex_at + hex_col(i) as u16;
+                let ax = ascii_at + i as u16;
+                if hx < end {
+                    let room = usize::from(end - hx).min(2);
+                    cells::put(&mut buf, hx, y, &digits, room, pen_in(Pane::Hex));
+                }
+                if ax < end {
+                    cells::put(&mut buf, ax, y, &glyph.to_string(), 1, pen_in(Pane::Ascii));
+                }
+                if cursor == Some(Pane::Hex) && self.cursor.low && hx + 1 < end && !goto_focused {
+                    // The next digit goes into the low nibble: the caret is there.
+                    caret = Some(Position::new(hx + 1, y));
+                }
             }
-            let hex_galley = ctx.fonts_mut(|f| f.layout_job(hex_job));
-            let ascii_galley = ctx.fonts_mut(|f| f.layout_job(ascii_job));
-            painter.galley(Pos2::new(hex_x, y), hex_galley, text);
-            painter.galley(Pos2::new(ascii_x, y), ascii_galley, text);
         }
         self.rows_painted = rows;
-        chrome::scroll_bar(
-            &ui.painter_at(outer),
-            bar,
-            (max_top > 0).then(|| (self.top_row as f64 / max_top as f64) as f32),
-        );
+        let at = (max_top > 0).then(|| (self.top_row as f64 / max_top as f64) as f32);
+        cells::scroll_bar(&mut buf, bar_cells.x, bar_cells.y, bar_cells.height, at);
+        blank_under_help(&ctx, &grid, &mut buf);
+        cells::paint(&ui.painter_at(outer), grid.origin, &buf, caret);
         self.layout = Some(Layout {
             rows: rows_rect,
             row_h,
@@ -4557,21 +4733,21 @@ impl super::Window for HexWindow {
             self.goto.clear();
             ctx.memory_mut(|m| m.request_focus(goto_id()));
         }
-        let field = egui::Panel::top("hexbar")
-            .show(ui, |ui| {
-                ui.add_space(3.0);
-                let field = self.toolbar(ui);
-                ui.add_space(1.0);
-                field
-            })
+        // The toolbar, its row of cells.
+        let goto_took = egui::Panel::top("hexbar")
+            .frame(egui::Frame::NONE)
+            .show_separator_line(false)
+            .resizable(false)
+            .exact_size(chrome::CELL.y)
+            .show(ui, |ui| self.toolbar(ui))
             .inner;
-        // Whether the field has the keyboard is asked of egui's memory, not of the response:
-        // `Response::has_focus` is also false whenever the platform says the window itself is
-        // not focused (the owner in another application for a moment, a window that came up
-        // behind another one). The grid would take the keyboard back in such a pass, and the
-        // offset typed next would go over bytes.
+        // Whether the field has the keyboard is asked of egui's memory, not of a response's
+        // `has_focus`, which is also false whenever the platform says the window itself is not
+        // focused (the owner in another application for a moment, a window that came up behind
+        // another one). The grid would take the keyboard back in such a pass, and the offset
+        // typed next would go over bytes.
         let goto_has = ctx.memory(|m| m.has_focus(goto_id()));
-        let goto_owns = cmd_g || goto_has || field.lost_focus() || field.clicked();
+        let goto_owns = cmd_g || goto_has || goto_took;
         // The F-key row, the window's last (on its own: the browser around it has the row).
         super::own_keys(ui, HEX_KEYS);
         // The read-only window's path field (laid out below, with the rows) owns the typing of
@@ -4585,11 +4761,12 @@ impl super::Window for HexWindow {
                 self.notices = next;
             }
         }
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.add_space(2.0);
-            self.status_bar(ui);
-            ui.add_space(2.0);
-        });
+        egui::Panel::bottom("status")
+            .frame(egui::Frame::NONE)
+            .show_separator_line(false)
+            .resizable(false)
+            .exact_size(chrome::CELL.y)
+            .show(ui, |ui| self.status_bar(ui));
         let error = ui.visuals().error_fg_color;
         let warning = self.stream_warning();
         let lines: Vec<(String, Color32)> = warning
