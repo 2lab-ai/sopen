@@ -96,8 +96,9 @@ impl Pace {
 
 /// Runs that hooks drive (04 §6.2: never switched): any of these set to a non-empty value.
 /// `SOPEN_KEYS` too — its keys are not the owner's.
-const SCRIPTED: [&str; 5] = [
+const SCRIPTED: [&str; 6] = [
     "SOPEN_SCREENSHOT",
+    "SOPEN_CELLS",
     "SOPEN_AUTOSAVE",
     "SOPEN_AUTOEXPORT",
     "SOPEN_LIST",
@@ -503,8 +504,8 @@ fn remove_state(dir: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------------------------
 // One process's switch.
 
-/// A run hooks drive: `SOPEN_SCREENSHOT`, `SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`, `SOPEN_LIST` or
-/// `SOPEN_KEYS` set to anything but nothing (`var` reads the environment).
+/// A run hooks drive: `SOPEN_SCREENSHOT`, `SOPEN_CELLS`, `SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`,
+/// `SOPEN_LIST` or `SOPEN_KEYS` set to anything but nothing (`var` reads the environment).
 pub fn scripted_run(var: impl Fn(&str) -> Option<OsString>) -> bool {
     SCRIPTED
         .iter()

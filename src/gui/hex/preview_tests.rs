@@ -125,7 +125,7 @@ fn a_previewed_hex_viewer_has_no_bars_cursor_or_active_frame() {
         fx.drv.text_starting_with("00 01 02 03").is_some(),
         "the first row's bytes"
     );
-    for text in ["Go to", "Save", "Save copy", "Undo"] {
+    for text in ["Go to", "[ Save ]", "[ Save copy ]", "[ Undo ]", "Save"] {
         assert!(fx.drv.find_text(text).is_none(), "{text} in a preview");
     }
     assert_eq!(fx.drv.text_starting_with("0x0 (0)"), None, "no status row");
@@ -257,9 +257,8 @@ fn a_previewed_hex_viewer_fits_its_rows_and_draws_no_path_row() {
     assert!(!whole(&fx.drv, "00008(0008)"));
     fx.drv.resize(900.0, 500.0);
     fx.drv.idle(&mut fx.win, 2);
-    assert!(fx
-        .drv
-        .galleys()
-        .iter()
-        .any(|(_, g)| path.ends_with(g.text().trim_start_matches('…'))));
+    // The path row is cells (`texts`: its run; `galleys` holds one-character glyphs).
+    let path_row =
+        |t: &str| t == path || t.strip_prefix('…').is_some_and(|end| path.ends_with(end));
+    assert!(fx.drv.texts().iter().any(|(_, _, t)| path_row(t)), "{path}");
 }

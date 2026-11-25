@@ -21,7 +21,7 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
 | X2-state | 🔴 open | 10 §17's X2: the switch's state, `"v": 1`, taken from one browser and given to another | coder |
 | X2-host | 🔴 open | 10 §17's X2: HOST's half, `--state-stdin`, the `sopen-xtools-state` and `sopen-xtools-kept` cues | coder |
 | X2-switch | 🔴 open | 10 §17's X2: the TUI's half over ssh, §7.3's outcomes, the question before switching; ships X2 | coder |
-| XW-receipts | 🔴 open | 10 §17's X3: `SOPEN_CELLS=<path>` in both backends and TS-6, which XW-term left out by decision; the receipt of every X3 screen | coder |
+| XW-receipts | 🟡 review | 10 §17's X3: `SOPEN_CELLS=<path>` in both backends and TS-6, which XW-term left out by decision; the receipt of every X3 screen; branch `feat/xw-receipts` | coder |
 | X3-text | 🔴 open | 10 §17's X3: the text viewer and its preview in cells, wrapped by cells | coder |
 | X3-hex | 🔴 open | 10 §17's X3: the hex viewer in cells. Carried from #108's review: point the hex tests' `drawn()` at `texts()` once hex paints cells (`galleys()` then holds one-character glyphs), and note that `rects()` will list cell backgrounds and the caret | coder |
 | X3-questions | 🔴 open | 10 §17's X3: the hex window's questions and rows, and Save As, in cells | coder |

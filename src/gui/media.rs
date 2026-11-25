@@ -5076,9 +5076,10 @@ impl super::Window for MediaWindow {
         self.saves_landed
     }
 
-    /// What a switch of views asks or waits for (08 §5).
+    /// What a switch of views asks or waits for (08 §5): a Save, an Export or a Save As
+    /// running is waited for as a Save is (it writes through the views' save session).
     fn hold(&mut self) -> crate::views::Hold {
-        if self.save.is_some() {
+        if self.busy() {
             crate::views::Hold::Saving
         } else if self.unsaved() {
             crate::views::Hold::Unsaved

@@ -414,30 +414,44 @@ window on that host shares that one budget.
     waited 3.1 s (*edit* §2.4). The viewer's reads, on its `Ranged`, are not held up by it.
 - **The media window holds one Source.** All of ffmpeg's HTTP connections read through its single
   `Ranged`.
-- **A browser viewer's views each hold their own** (08 §8, VM-7, until VM-7b's D13/D14): a view
-  made on a remote file (2 Hex, 3 Text, a view 1 made again) opens one session for its own stream,
-  as the opening did, and keeps it while it is hidden; one that saves adds its `Origin` from its
-  first Save. A file has at most two documents among its views (§3 of 08: Raw is Text's), so a
-  viewer holds 2 sessions after its second view, and at worst 4 — an image and its Hex view both
-  saved; a page file has three (09 §6: Page, Hex, Text; WV-D), 3 sessions once all are made, 4
-  with its Hex view saved. A view the image gives way to by `H` reads the image's stream (no session more).
+- **A browser viewer's views share one stream and one save session** (08 §5–§6, D13, D14;
+  VM-7b): the opening's stream is kept beside the views, and every view made later (2 Hex, 3
+  Text, a view 1 made again) reads through it — no session of its own, nothing read again. Their
+  `Origin`s connect through one save session, opened at the first use by the view on screen (a
+  Save, Save copy, Save As or Export; hex: the recovery of an earlier session's journal), one
+  connect at a time, and given back when that view is hidden or closed — only once its window
+  holds nothing (a switch waits for its Save, Save copy, Save As or Export, 08 D2, and goes ahead
+  when it ends), so the operation, its publish and cleanup included, is over; never while a
+  request runs or a file is open on it (asked again on later passes until then); closed beside
+  the window's pass; its next use connects again. So a viewer holds 1, and 2 from its
+  first Save, however many of its views saved. A page file's Page view serves the page on a
+  connection of its own (09 §3.1), which it keeps while hidden (until WV-F): with Hex and Text,
+  which open and read one stream, 2 — and 3 while a Save of the Hex view runs; once it lands the
+  hidden Page is stale (08 D25) and closes with its connection. A view the image gives way to by
+  `H` reads the image's stream (no session more). A viewer handed over by the preview (02 §4.4)
+  is the same: its views share the stream the preview read through (the window's preview
+  session, the viewer's from the hand-over) and its `Origin`'s save session; a handed-over
+  image, read whole, has no stream, and the first view made after it opens one, kept from then
+  on (08 §6) — the image holding none, the count stays 1.
 
 | Holder | Channels while it lives |
 |---|---|
 | a standalone viewer (hex, image, media) | 1; 2 from its first Save, Save copy, Save As or Export (hex: or from an open that recovers a journal) |
 | the browser's listing | 1 |
-| a browser viewer | 1 per view made (at most 2; a page file's 3), each +1 from its first Save, Save copy, Save As or Export (hex: or from an open that recovers a journal): 1–4 (08 §8; VM-7b brings it back to 1–2) |
+| a browser viewer | 1: the stream its views share; 2 from the first Save, Save copy, Save As or Export of the view on screen (hex: or from an open that recovers a journal), 1 again once that view is hidden (08 §5–§6, VM-7b), opened from the list or handed over by the preview. A page file: 2 (Page's connection and the stream), 3 while a Save of Hex runs (above) |
 | the browser's preview session (02 §4.4, one per window) | 1 |
-| a remote page view (09 §3.1 "Channels", WV-D) | 1: its page server's one connection — in the preview the window's preview session (no more; it comes back to the window when the preview's server ends), in the viewer the connection that opened the file or the preview's carried over at the hand-over. Among a viewer's views it counts as one of them (a page file's Page, Hex and Text: 1–3, Hex +1 from its first Save); hidden, it keeps its session until WV-F gives it back |
+| a remote page view (09 §3.1 "Channels", WV-D) | 1: its page server's one connection — in the preview the window's preview session (no more; it comes back to the window when the preview's server ends), in the viewer the connection that opened the file or the preview's carried over at the hand-over. Among a viewer's views it counts as one of them (a page file's Page, Hex and Text: 2, 3 while a Save of Hex runs); hidden, it keeps its session until WV-F gives it back |
 | the directory tree (browser 05) | 1 |
 | a file operation (browser 04) | 1 each |
 | git commands (browser 03) | up to 3 exec sessions |
 
 These are 02 §4.4's counts: listing 1, viewer 1, preview 1, tree 1, file operation 1, git ≤ 3, which
-is 8, and 9 while a git stop runs. Streaming adds one only while a viewer has saved or exported.
-One more sopen window on the same host can therefore reach the limit. With VM-7's views a viewer
-that showed a second view is 2 (9, and 10 while a git stop runs), and one whose two views both
-saved is 4: with every other holder busy at once that is 11, past sshd's 10 — the next session
+is 8, and 9 while a git stop runs. Streaming adds one only while a viewer has saved or exported
+— the view on screen's save session, given back when it is hidden (VM-7b), whether the viewer
+was opened from the list or handed over by the preview — so 9, and 10 while a git stop runs:
+within sshd's 10. A page file adds one more while its Hex view saves (its Page keeps its
+session, above). One more sopen window on the same host can therefore reach the limit, and so
+can a page file at its worst: with every other holder busy at once that is 11 — the next session
 asked for is refused and said in words, as below. A view whose make is refused is not made: the
 view on screen stays, the status row says the refusal, and nothing is lost (a view 1 made again
 after its prompt was answered: its edits were saved or discarded first, and the viewer goes back
@@ -882,11 +896,12 @@ the page and drop the queued keys.
 - **Hex view, and the hex view for a file that does not decode.** The memory line offers Hex view
   (H), which shows the file's bytes in the hex window — in the browser, and in a window of its
   own, which becomes the hex window in place (as the binary dialog does). In the browser's viewer
-  Hex view is view 2 (08 §8, VM-7): the line reads `Hex view (2)`, `H` its alias. Only `H` (and a
-  file that does not decode) gives the hex window this stream; `2` makes the Hex view as every view
-  of the viewer is made today — on a connection and a stream of its own, reading again what it
-  shows (08 D13 is VM-7b's) — and the image window stays, hidden, on its own. A file that does not
-  decode opens in the hex window the same way, its reason the first of the window's rows.
+  Hex view is view 2 (08 §8, VM-7): the line reads `Hex view (2)`, `H` its alias. `H` (and a file
+  that does not decode) gives the hex window the image window's own file, that window spent (made
+  again when 1 is chosen); `2` makes the Hex view on the stream the viewer's views share (08 D13,
+  VM-7b) — no session more, nothing read again — and the image window stays, hidden, as it was. A
+  file that does not decode opens in the hex window the same way, its reason the first of the
+  window's rows.
   - A remote file's hex window reads the same stream: nothing is read again, and the stats line
     has one `first` for the open.
   - A local file's reads the file in place, opened on a thread of its own (the window says

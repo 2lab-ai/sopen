@@ -518,8 +518,8 @@ fn f8_in_raw_reads_again_in_place() {
     );
 }
 
-/// VA-1 through a stream (06): a remote text file's 2 and 3 are made over a stream of their own
-/// (08 §8's binding; D13 not built), 1 the text again.
+/// VA-1 through a stream (06): a remote text file's 2 and 3 are made over the opening's stream
+/// (D13, VM-7b; its sessions are counted in `vm7b`), 1 the text again.
 #[test]
 fn va1_a_remote_text_files_views_by_1_2_3() {
     let mut fx = fixture_with(Some("box"), local_connect(), None);
@@ -773,10 +773,12 @@ fn va4_the_images_zoom_survives_a_switch() {
     assert_eq!(fx.drv.pictures()[0], zoomed, "the zoom kept");
 }
 
-/// A hidden media view reads nothing (06 §5, 08 §5): a remote sound's stream sends no poll
-/// while Hex is on screen, and polls again once the sound is shown.
+/// A hidden media view reads nothing (06 §5, 08 §5): with a remote sound hidden behind Hex —
+/// which reads the sound's own stream (D13: no transport of its own) — the stream asks for no
+/// byte once Hex's rows are in; it polls on, as the stream of the view on screen, and so it
+/// does once the sound is shown again.
 #[test]
-fn a_hidden_remote_sounds_stream_does_not_poll() {
+fn a_hidden_remote_sound_reads_nothing_through_the_stream_hex_shares() {
     let tools = match crate::ffmpeg::resolve() {
         Ok(t) => t,
         Err(e) if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() => {
@@ -822,16 +824,28 @@ fn a_hidden_remote_sounds_stream_does_not_poll() {
             std::thread::sleep(Duration::from_millis(50));
         }
     };
+    let asked = |meter: &Meter| meter.asked.lock().unwrap().len();
     let before = polls(&meter);
     watch(&mut fx);
     assert!(polls(&meter) > before, "the control: on screen it polls");
     digit(&mut fx, 2);
-    let hidden = polls(&meter);
+    assert!(hex_row(&fx, "52 49 46 46"), "Hex: RIFF");
+    assert_eq!(
+        meter.opened.lock().unwrap().len(),
+        1,
+        "Hex reads the sound's stream"
+    );
+    let (hidden, reads) = (polls(&meter), asked(&meter));
     watch(&mut fx);
-    assert_eq!(polls(&meter), hidden, "hidden, it polls not");
+    assert_eq!(asked(&meter), reads, "hidden, the sound reads nothing");
+    assert!(
+        polls(&meter) > hidden,
+        "the stream of the view on screen polls"
+    );
     digit(&mut fx, 1);
+    let shown = polls(&meter);
     watch(&mut fx);
-    assert!(polls(&meter) > hidden, "shown again, it polls");
+    assert!(polls(&meter) > shown, "shown again, it polls");
 }
 
 /// D22 with D21: a rebuild in another LF unit that Esc stops keeps the encoding the text had —

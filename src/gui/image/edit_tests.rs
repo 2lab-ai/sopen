@@ -694,9 +694,16 @@ fn save_as_from_the_close_prompt_closes_once_it_lands() {
 /// Where the last pass drew `text` lowest: the prompt's button, below the toolbar's of the same
 /// name.
 fn lowest(drv: &Driver, text: &str) -> Option<Rect> {
+    // The F-key row (cells: `5Save` reads `Save`) is the window's lowest row; the prompt's
+    // buttons are the lowest above it.
+    let row = drv
+        .texts()
+        .into_iter()
+        .map(|(r, _, _)| r.bottom())
+        .fold(0.0, f32::max);
     drv.texts()
         .into_iter()
-        .filter(|(_, _, t)| t == text)
+        .filter(|(r, _, t)| t == text && r.bottom() < row)
         .map(|(r, _, _)| r)
         .max_by(|a, b| a.top().total_cmp(&b.top()))
 }
@@ -957,13 +964,14 @@ fn the_close_prompt_without_replace_offers_save_copy_and_save_as() {
         for button in ["Save copy", "Save As…", "Discard", "Cancel"] {
             assert!(drv.find_text(button).is_some(), "{button} at {width}");
         }
-        // Save is the toolbar's alone (disabled there): the prompt has none.
+        // Save is the toolbar's (disabled there) and the F-key row's 5Save alone: the prompt
+        // has none.
         let saves = drv
             .texts()
             .into_iter()
             .filter(|(_, _, t)| t == "Save")
             .count();
-        assert_eq!(saves, 1, "Save is off at {width}");
+        assert_eq!(saves, 2, "Save is off at {width}");
     }
 }
 
