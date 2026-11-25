@@ -148,7 +148,7 @@ impl Pick {
 /// 1. A BOM, the longest first, whatever the file's size (D37).
 /// 2. Else the NUL pattern: in the order UTF-32LE, UTF-32BE, UTF-16LE, UTF-16BE, the first whose
 ///    sample holds at least 4 whole units, at least 3/4 of them ASCII units (D17).
-/// 3. Else CP949 by D39's (a)–(f) ([`cp949::guess`]), shown `(guessed)`.
+/// 3. Else CP949 by D39's (a)–(e) ([`cp949::guess`]), shown `(guessed)`.
 /// 4. Else UTF-8, valid or not. ASCII, UCS-2, Latin-1 and CP437 are never defaults.
 pub fn pick(head: &[u8], truncated: bool) -> Pick {
     use Encoding::*;

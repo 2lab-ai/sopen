@@ -784,7 +784,7 @@ fn ea5_step_3_over_the_corpus() {
     // Each of the others by the criterion it fails. (This EUC-JP decodes with no error, its
     // kanji as Hangul and hanja: 36 % Hangul, under (d).)
     let stopped = |name: &str, by: &[usize]| {
-        let mut want = [true; 6];
+        let mut want = [true; 5];
         for &i in by {
             want[i] = false;
         }
@@ -793,13 +793,13 @@ fn ea5_step_3_over_the_corpus() {
     stopped("Korean with a hanja word each", &[3]);
     stopped("a file with one syllable", &[2]);
     stopped("UHC-only syllables mostly", &[4]);
-    stopped("EUC-JP", &[3, 5]);
+    stopped("EUC-JP", &[3]);
     assert!(!why["Korean UTF-8"][0]);
     assert!(!why["hiragana-only EUC-JP"][2], "no syllable");
     // The near misses: hiragana-only Shift-JIS decodes as UHC syllables with no error, stopped
     // by (e) alone (none of them in KS X 1001); a GB2312 text whose every character decodes in
     // CP949 is about 2/3 Hangul, stopped by (d) alone.
-    stopped("hiragana-only Shift-JIS", &[4, 5]);
+    stopped("hiragana-only Shift-JIS", &[4]);
     let sjis = encoded(SHIFT_JIS, &hiragana);
     let syllables = oracle(&sjis[..SNIFF_BYTES])
         .chars()
@@ -825,7 +825,7 @@ fn ea5_step_3_over_the_corpus() {
     assert_eq!(picked_each_cut("a GB2312 text", &gb2312), none);
     assert_eq!(
         cp949::criteria(&gb2312[..SNIFF_BYTES], true),
-        [true, true, true, false, true, false]
+        [true, true, true, false, true]
     );
     let share = hangul_share(&gb2312[..SNIFF_BYTES]);
     assert!((0.60..0.72).contains(&share), "{share}");
@@ -909,7 +909,7 @@ fn ea5_step_3_thresholds() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// D39 (f) (DEC 2026-11-25): Korean puts ASCII spaces between words; Chinese prose has next to none.
+// Step 3 over public-domain excerpts: Korean prose guessed, Chinese prose stopped by (b) and (d).
 
 const DOKRIP_ORIGINAL: &str = "吾等은 玆에 我 朝鮮의 獨立國임과 朝鮮人의 自主民임을 宣言하노라. \
 此로써 世界萬邦에 告하야 人類平等의 大義를 克明하며, 此로써 子孫萬代에 誥하야 民族自存의 正權을 \
@@ -986,27 +986,27 @@ fn repeated(text: &str, bytes: usize) -> String {
     out
 }
 
-/// A sample's two-byte characters and ASCII characters (printable, and whitespace) as CP949
-/// decodes its first 8 KiB.
-fn two_byte_and_ascii(sample: &[u8]) -> (usize, usize) {
+/// A sample's first 8 KiB as CP949 decodes it: its bad sequences ((b)) and the share of its
+/// non-ASCII characters that are Hangul syllables ((d)).
+fn bad_and_hangul(sample: &[u8]) -> (usize, f64) {
     let cells = Cp949
         .decode(&sample[..sample.len().min(SNIFF_BYTES)], true)
         .0;
-    let two = cells.iter().filter(|c| c.len == 2).count();
-    let ascii = cells
+    let bad = cells.iter().filter(|c| c.ch == FFFD).count();
+    let other = cells.iter().filter(|c| !c.ch.is_ascii()).count();
+    let hangul = cells
         .iter()
-        .filter(|c| c.len == 1 && matches!(c.ch, ' '..='~' | '\t' | '\n' | '\r' | '\x0B' | '\x0C'))
+        .filter(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c.ch))
         .count();
-    (two, ascii)
+    (bad, hangul as f64 / other.max(1) as f64)
 }
 
-/// D39 (f) over §7.2's excerpts (public domain, encoded here): each sample's ASCII characters
-/// per two-byte character, as CP949 decodes its first 8 KiB, and the criteria. Korean prose is
-/// 0.33–0.40 (spaces between words); Chinese prose next to none — 0.012 in simplified GBK, up to
-/// 0.12 where CP949 reads GBK and Big5 trail bytes as ASCII, all of it CP949 errors (b) anyway.
-/// An .srt of Chinese subtitles has ASCII timestamps (2.2): (d) stops it, not (f).
+/// Step 3 over §7.2's public-domain excerpts (encoded here; the first 8 KiB as CP949 decodes it):
+/// Korean prose is guessed; Chinese prose in GBK and Big5 is stopped by CP949 errors (b) and by
+/// its Hangul share (d), 36–54 % against 3/4; Chinese subtitles, ASCII timestamps and all, by
+/// (d), 42 %; Korean thick with hanja by (d), 39 %; 한문 by (c) and (d).
 #[test]
-fn ea5_f_korean_puts_spaces_between_words_and_chinese_none() {
+fn ea5_chinese_prose_is_stopped_by_b_and_d_and_korean_prose_is_guessed() {
     let srt: String = (1..200)
         .map(|i| {
             format!(
@@ -1022,98 +1022,82 @@ fn ea5_f_korean_puts_spaces_between_words_and_chinese_none() {
     let gbk = |text: &str| GBK.encode(&repeated(text, 3000)).0.into_owned();
     let big5 = |text: &str| BIG5.encode(&repeated(text, 3000)).0.into_owned();
     let ko = |text: &str| cp949_lossy(&repeated(text, 3000));
-    let ratio = |body: &[u8]| {
-        let (two, ascii) = two_byte_and_ascii(body);
-        ascii as f64 / two as f64
-    };
     let criteria = |body: &[u8]| {
         cp949::criteria(
             &body[..body.len().min(SNIFF_BYTES)],
             body.len() > SNIFF_BYTES,
         )
     };
-    // Korean: well above a tenth; the modern texts are guessed, by every criterion.
-    for (name, body, lo) in [
-        ("기미독립선언서 현대어", ko(DOKRIP_MODERN), 0.35),
-        ("훈민정음 서문 현대어", ko(HUNMIN_MODERN), 0.35),
-        ("헌법 전문", ko(HEONBEOP), 0.33),
+    for (name, body) in [
+        ("기미독립선언서 현대어", ko(DOKRIP_MODERN)),
+        ("훈민정음 서문 현대어", ko(HUNMIN_MODERN)),
+        ("헌법 전문", ko(HEONBEOP)),
     ] {
-        assert!(ratio(&body) >= lo, "{name}: {}", ratio(&body));
-        assert_eq!(criteria(&body), [true; 6], "{name}");
+        assert_eq!(criteria(&body), [true; 5], "{name}");
         assert_eq!(pick(&body, false).encoding, Cp949, "{name}");
     }
-    // Thick with hanja: (d) stops it, (f) would not; in hanja alone, (c) and (d).
     let original = ko(DOKRIP_ORIGINAL);
-    assert!(ratio(&original) >= 0.3, "{}", ratio(&original));
-    assert_eq!(criteria(&original), [true, true, true, false, true, true]);
+    assert_eq!(criteria(&original), [true, true, true, false, true]);
     let hanmun = ko(HUNMIN_HANMUN);
-    assert_eq!(criteria(&hanmun), [true, true, false, false, true, true]);
-    // Chinese: under a tenth where the bytes are what they say; every one not CP949.
-    let simplified = gbk(DAODEJING_SIMPLIFIED);
-    assert!(ratio(&simplified) < 0.02, "{}", ratio(&simplified));
+    assert_eq!(criteria(&hanmun), [true, true, false, false, true]);
     for (name, body) in [
         ("道德經 GBK", gbk(DAODEJING)),
         ("道德經 Big5", big5(DAODEJING)),
-        ("道德经 GBK", simplified),
+        ("道德经 GBK", gbk(DAODEJING_SIMPLIFIED)),
         ("論語 GBK", gbk(LUNYU)),
         ("論語 Big5", big5(LUNYU)),
         ("出師表 GBK", gbk(CHUSHIBIAO)),
         ("出師表 Big5", big5(CHUSHIBIAO)),
     ] {
-        assert!(ratio(&body) < 0.13, "{name}: {}", ratio(&body));
-        assert!(!criteria(&body)[1], "{name}: CP949 errors");
+        let (bad, share) = bad_and_hangul(&body);
+        let c = criteria(&body);
+        assert!(bad > 30 && !c[1], "{name}: {bad} CP949 errors");
+        assert!(share < 0.6 && !c[3], "{name}: {share:.3} Hangul");
         assert_eq!(pick(&body, false).encoding, Utf8, "{name}");
     }
     let srt = GBK.encode(&srt).0.into_owned();
-    assert!(ratio(&srt) > 2.0, "{}", ratio(&srt));
-    assert_eq!(criteria(&srt), [true, true, true, false, true, true]);
+    assert_eq!(criteria(&srt), [true, true, true, false, true]);
     assert_eq!(pick(&srt, false).encoding, Utf8);
 }
 
-/// D39 (f)'s floor, both ways: below 32 two-byte characters the guess is (a)–(e), Korean first —
-/// GBK's `你好你好` (`C4E3 BAC3 C4E3 BAC3`, KS X 1001 Hangul to CP949) is guessed CP949, F8 the
-/// way out (08's Tensions); at 32 and more, a sample with no ASCII is not guessed — GBK's
-/// `你好吗啊` over and over, and Korean with no space at all alike — while spaced Korean is.
+/// The guess is a Korean-first prior (D39): text made only of pairs that are KS X 1001 Hangul in
+/// another encoding too — GBK's `你好你好` (`C4E3 BAC3 C4E3 BAC3`), `你好` a line however many
+/// times, `你好吗啊` — is the same bytes as Korean and is guessed CP949, by design; the way out is
+/// choosing the encoding by hand.
 #[test]
-fn ea5_f_holds_from_32_two_byte_characters() {
+fn pairs_that_are_hangul_in_both_encodings_are_guessed_cp949_by_design() {
     let nihao = GBK.encode("你好你好").0.into_owned();
     assert_eq!(nihao, [0xC4, 0xE3, 0xBA, 0xC3, 0xC4, 0xE3, 0xBA, 0xC3]);
-    assert_eq!(
-        pick(&nihao, false).encoding,
-        Cp949,
-        "below the floor: Korean first"
-    );
-    let short = GBK.encode(&"你好吗啊".repeat(7)).0.into_owned();
-    assert_eq!(
-        pick(&short, false).encoding,
-        Cp949,
-        "28 two-byte characters"
-    );
-    let long = GBK.encode(&"你好吗啊".repeat(8)).0.into_owned();
-    assert_eq!(
-        cp949::criteria(&long, false),
-        [true, true, true, true, true, false]
-    );
-    assert_eq!(pick(&long, false).encoding, Utf8, "32: (f) alone stops it");
-    let unspaced = cp949(&"가나다라".repeat(8));
-    assert!(!cp949::criteria(&unspaced, false)[5]);
-    assert_eq!(
-        pick(&unspaced, false).encoding,
-        Utf8,
-        "Korean with no space at all"
-    );
-    let spaced = cp949(&"가나다라 ".repeat(8));
-    assert_eq!(pick(&spaced, false).encoding, Cp949);
-    let one_space = cp949(&format!(
-        "{} {}",
-        "가나다라".repeat(5),
-        "가나다라".repeat(4)
-    ));
-    assert_eq!(
-        pick(&one_space, false).encoding,
-        Utf8,
-        "one space to 36: under a tenth"
-    );
-    let enough = cp949(&"가나다 라마바 사아자 차카타 ".repeat(3));
-    assert_eq!(pick(&enough, false).encoding, Cp949);
+    assert_eq!(pick(&nihao, false).encoding, Cp949);
+    for n in [10, 1000] {
+        let lines = GBK.encode(&"你好\n".repeat(n)).0.into_owned();
+        assert_eq!(pick(&lines, false).encoding, Cp949, "{n} lines");
+    }
+    let more = GBK.encode(&"你好吗啊".repeat(100)).0.into_owned();
+    assert_eq!(pick(&more, false).encoding, Cp949);
+    let unspaced = cp949(&"가나다라".repeat(100));
+    assert_eq!(pick(&unspaced, false).encoding, Cp949);
+}
+
+/// A list of long Korean names, one a line — no space, the newline its only ASCII — is Korean
+/// and is guessed CP949, at any length.
+#[test]
+fn a_list_of_long_korean_names_is_guessed() {
+    let names = [
+        "국립중앙도서관전자자료실",
+        "한국과학기술정보연구원",
+        "서울특별시교육청정보센터",
+        "대한민국역사박물관연구소",
+        "국립현대미술관과천관",
+        "한국전자통신연구원",
+        "부산광역시해운대구청",
+        "국민건강보험공단본부",
+        "한국수자원공사연구원",
+        "경기도교육청북부청사",
+    ];
+    let list: String = names.iter().map(|n| format!("{n}\n")).collect();
+    for n in [1, 10, 100] {
+        let body = cp949(&list.repeat(n));
+        assert_eq!(pick(&body, false).encoding, Cp949, "{n} times");
+    }
 }

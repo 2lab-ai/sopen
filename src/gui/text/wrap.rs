@@ -508,10 +508,9 @@ const MEMO_MAX: usize = 4096;
 pub(super) struct Memo {
     width: f32,
     spans: HashMap<u64, Span>,
-    restarts: HashMap<(u64, u64), u64>,
-    /// Restart points nothing proved a character start at (CP949, D28), by line start and
-    /// byte: the row that ends at one leaves a lead pending there to the row after it.
-    unproven: HashMap<(u64, u64), ()>,
+    /// Restart points by line start and `k`, and whether a character start was proven there:
+    /// not (CP949, D28), the row that ends at one leaves a lead pending there to the row after.
+    restarts: HashMap<(u64, u64), (u64, bool)>,
     rows: HashMap<(u64, u64), Rc<Cut>>,
     segments: HashMap<(u64, u64), Rc<Vec<u64>>>,
     window: Window_,
@@ -624,8 +623,8 @@ impl Wrapper<'_> {
         if k == 0 || at >= span.len {
             return Ok(at.min(span.len));
         }
-        if let Some(r) = self.memo.restarts.get(&(span.start, k)) {
-            return Ok(*r);
+        if let Some(&(r, _)) = self.memo.restarts.get(&(span.start, k)) {
+            return Ok(r);
         }
         let enc = self.doc.enc;
         let from = at - RESTART_BEHIND;
@@ -644,8 +643,7 @@ impl Wrapper<'_> {
         };
         let Some(lead) = lead else {
             let r = at.min(span.len);
-            remember(&mut self.memo.restarts, (span.start, k), r);
-            remember(&mut self.memo.unproven, (span.start, r), ());
+            remember(&mut self.memo.restarts, (span.start, k), (r, false));
             return Ok(r);
         };
         let lead = ((lead - from) as usize).min(bytes.len());
@@ -679,7 +677,7 @@ impl Wrapper<'_> {
             None => enc.restart_start(near, at).unwrap_or(at),
         };
         let r = r.min(span.len);
-        remember(&mut self.memo.restarts, (span.start, k), r);
+        remember(&mut self.memo.restarts, (span.start, k), (r, true));
         Ok(r)
     }
 
@@ -728,8 +726,10 @@ impl Wrapper<'_> {
         }
         // A row that ends at a restart nothing proves (CP949, D28) is not decoded whole: a lead
         // pending there is left to the row after it, never a U+FFFD the whole decode lacks.
-        let open =
-            complete && limit < span.len && self.memo.unproven.contains_key(&(span.start, limit));
+        // (Nothing proven there: the restart is at the point itself, k × RESTART.)
+        let unproven =
+            self.memo.restarts.get(&(span.start, limit / RESTART)) == Some(&(limit, false));
+        let open = complete && limit < span.len && unproven;
         let whole = complete && !open;
         // A row starts where the row before it ended — a character start — but in an encoding
         // that needs its start proven (D28).

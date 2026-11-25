@@ -207,8 +207,8 @@ fn ea3_ii_a_long_line_with_no_sync_byte_waits_for_its_checkpoints() {
     let (body, end) = long_line();
     let whole = Whole::of(&body, 0, end);
     let path = write(tmp.path(), "long.txt", &body);
-    let doc = TextDoc::open_encoded(&path, Cp949).unwrap();
-    assert_eq!(doc.encoding_label().as_deref(), Some("CP949"));
+    let doc = TextDoc::open(&path).unwrap();
+    assert_eq!(doc.encoding_label().as_deref(), Some("CP949 (guessed)"));
     let mut win = TextWindow::new(doc, "box:long".into(), "long.txt", vec![]);
     let go = held_phases(&mut win);
     let mut drv = Driver::new(500.0, 200.0);
@@ -293,7 +293,7 @@ fn ea7_cp949_rows_and_places_not_wrapped_are_character_starts() {
     for (name, body, end) in [("spaced", spaced, spaced_end), ("bare", bare, bare_end)] {
         let whole = Whole::of(&body, 0, end);
         let path = write(tmp.path(), &format!("{name}.txt"), &body);
-        let doc = TextDoc::open_encoded(&path, Cp949).unwrap();
+        let doc = TextDoc::open(&path).unwrap();
         assert_eq!(doc.encoding(), Cp949, "{name}");
         let mut win = TextWindow::new(doc, "box:k".into(), "k.txt", vec![]);
         let mut drv = Driver::new(500.0, 200.0);
@@ -351,7 +351,7 @@ fn a_checkpoint_read_stops_when_the_document_is_made_again() {
     let (body, _) = long_line();
     let path = write(tmp.path(), "long.txt", &body);
     let mut win = TextWindow::new(
-        TextDoc::open_encoded(&path, Cp949).unwrap(),
+        TextDoc::open(&path).unwrap(),
         "box:l".into(),
         "l.txt",
         vec![],
@@ -384,7 +384,7 @@ fn reencoding_drops_the_checkpoints_and_a_read_needs_cp949() {
     let tmp = tempfile::tempdir().unwrap();
     let (body, _) = long_line();
     let path = write(tmp.path(), "long.txt", &body);
-    let mut doc = TextDoc::open_encoded(&path, Cp949).unwrap();
+    let mut doc = TextDoc::open(&path).unwrap();
     assert_eq!(doc.encoding(), Cp949);
     doc.phases.install(0, 0, vec![true; 4]);
     doc.phases.wanted = Some((0, 6));
@@ -407,7 +407,7 @@ fn a_latin1_round_trip_never_trusts_checkpoints_made_meanwhile() {
     let whole = Whole::of(&body, 0, end);
     let path = write(tmp.path(), "long.txt", &body);
     let mut win = TextWindow::new(
-        TextDoc::open_encoded(&path, Cp949).unwrap(),
+        TextDoc::open(&path).unwrap(),
         "box:l".into(),
         "l.txt",
         vec![],
@@ -445,7 +445,7 @@ fn the_row_before_a_restart_nothing_proves_shows_no_wrong_character() {
     let whole = Whole::of(&body, 0, end);
     let path = write(tmp.path(), "r.txt", &body);
     let mut win = TextWindow::new(
-        TextDoc::open_encoded(&path, Cp949).unwrap(),
+        TextDoc::open(&path).unwrap(),
         "box:r".into(),
         "r.txt",
         vec![],
@@ -479,7 +479,7 @@ fn more_long_lines_on_a_page_than_the_checkpoint_room_still_settle() {
     }
     let path = write(tmp.path(), "many.txt", &body);
     let mut win = TextWindow::new(
-        TextDoc::open_encoded(&path, Cp949).unwrap(),
+        TextDoc::open(&path).unwrap(),
         "box:m".into(),
         "m.txt",
         vec![],
