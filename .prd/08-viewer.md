@@ -93,7 +93,7 @@ inferred, not read in code or measured. What it amends in 01, 04, 06, 07, the RE
 | State | When | A plain digit | F9 |
 |---|---|---|---|
 | Free | any view in no other state — a hex view while viewing among them | chooses the view | arms |
-| DigitsAreData | a hex view while editing (D35), also while a reload or a Save holds typing back (`hex.rs:3664-3671`) | is typed as a nibble or an ASCII byte (`hex.rs:1002-1025`); held back, it says why — as today | ends editing and arms |
+| DigitsAreData | a hex view while editing (D35), also while a reload or a Save holds typing back (`hex.rs:3664-3671`); the Text view while editing, xtools's editor (12 §3) | is typed as a nibble or an ASCII byte (`hex.rs:1002-1025`), or in the editor as a character; held back, it says why — as today | ends editing and arms; in the editor arms, and the editor stays until a view is chosen (12 §6.4) |
 | Field | a status-row field has the typing: Go to (hex, text), the hex window's read-only path field | goes into the field (04 §3 rule 4) | closes the field, as Esc would, and arms (D29) |
 | Question | the close prompt, Save As, a confirmation, the encoding list | belongs to the question | does nothing |
 
@@ -105,6 +105,11 @@ inferred, not read in code or measured. What it amends in 01, 04, 06, 07, the RE
   editing, and a second Esc leaves; **F9** ends editing and arms. Edits stay unsaved until saved in
   either mode. A read-only hex view (a revision, `hex.rs:2270-2275`) never edits: Enter says so. A hex
   window on its own (`--hex`, the binary dialog) keeps today's typing.
+- **The editor** (12 §3, ED-ops: `State::Editing`) keeps Esc and F3: Esc first closes its innermost
+  arming, else each leaves the editor for where F4 was pressed (12 §6.4), and the rest of that input
+  meets a view not known yet. Enter and Insert are its own (a new line, Insert ↔ Overwrite). While its
+  own Ctrl+K or `^S` waits (12 §5.4), every key is the editor's, which drops or cancels it — F9 too —
+  and an armed F9 is disarmed, as a question's is.
 - **Armed** (D4): the next key decides — 1, 2 or 3 chooses that view; Esc or F9 disarms; any other key
   disarms and is dropped, never typed. No timeout (D33).
 - **Leave wins**: a view key and Esc or F3 in the same input leave the viewer; no view is made (the race

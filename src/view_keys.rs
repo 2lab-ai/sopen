@@ -1,5 +1,6 @@
 //! The viewer's view keys (`.prd/08-viewer.md` §4): which press chooses view 1, 2 or 3, arms F9,
-//! or starts or ends a hex view's editing (D35) — and which is the view's own, passed on as today.
+//! or starts or ends a hex view's editing (D35) — and which is the view's own, passed on as today,
+//! the editor's among them (the Text view editing, 12 §3: [`State::Editing`]).
 //! One press, one action: a press is taken by the viewer (its key event, its typed text and its
 //! release with it) or passed on to the view, never both.
 //!
@@ -25,6 +26,8 @@ pub enum State {
     Free,
     /// The hex view in the browser's viewer (D35): Free while viewing, DigitsAreData while editing.
     Hex(Hex),
+    /// The Text view in its editing state, xtools's editor (12 §3, ED-ops): DigitsAreData.
+    Editing(Editing),
     /// A status-row field has the typing: Go to (hex, text), the hex window's read-only path field.
     Field,
     /// A question is up: the close prompt, Save As, a confirmation, the encoding list.
@@ -43,6 +46,17 @@ pub struct Hex {
     pub saving: bool,
 }
 
+/// What the editor declares (12 §5.4, §6.4): a plain digit is typed as a character; F9 arms and
+/// the editor stays until a view is chosen; Esc and F3 are the editor's own — Esc closes its
+/// innermost arming, else each leaves the editor for where F4 was pressed, so the rest of that
+/// input meets a view not known yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Editing {
+    /// The editor's Ctrl+K or `^S` waits for its next key (`edit::arm::Armed`): every key is
+    /// the editor's, which drops or cancels it, F9 too — as a question keeps its keyboard.
+    pub arming: bool,
+}
+
 /// §4's four rows, which a [`State`] belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {
@@ -59,12 +73,22 @@ pub enum Row {
 }
 
 impl State {
+    /// Every key belongs to the view, F9 too, and an armed F9 is disarmed: a question (D5), or
+    /// the editor while its own Ctrl+K or `^S` waits (12 §5.4).
+    fn keeps_keyboard(self) -> bool {
+        matches!(
+            self,
+            State::Question | State::Editing(Editing { arming: true })
+        )
+    }
+
     /// The row of §4's table this state is.
     pub fn row(self) -> Row {
         match self {
             State::Free => Row::Free,
             State::Hex(hex) if hex.editing => Row::DigitsAreData,
             State::Hex(_) => Row::Free,
+            State::Editing(_) => Row::DigitsAreData,
             State::Field => Row::Field,
             State::Question => Row::Question,
         }
@@ -259,10 +283,23 @@ impl Command {
 
 /// §4's table: what `press` does in `state`, with F9 `armed` or not, and whether F9 is armed
 /// after it. Armed comes before the state — F9 then a digit chooses from a field or an editing hex
-/// view in one input — but for a question, which keeps its keyboard and disarms (D5, VA-3).
+/// view in one input — but for a question, which keeps its keyboard and disarms (D5, VA-3), and
+/// the editor while its own arming waits, likewise (12 §5.4).
 pub fn decide(state: State, armed: bool, press: Press) -> (Command, bool) {
-    if state.row() == Row::Question {
+    if state.keeps_keyboard() {
         return (Command::Pass, false);
+    }
+    if let State::Editing(_) = state {
+        // 12 §5.1, §6.4: digits typed, Esc and F3 the editor's; F9 arms, and the editor stays
+        // until a view is chosen.
+        let command = match press {
+            Press::Digit(n) if armed => Command::Choose(n),
+            Press::Esc | Press::F9 if armed => Command::Disarm,
+            _ if armed => Command::Drop,
+            Press::F9 => Command::Arm(Ending::Nothing),
+            _ => Command::Pass,
+        };
+        return (command, matches!(command, Command::Arm(_)));
     }
     if armed {
         let command = match press {
@@ -365,7 +402,7 @@ impl ViewKeys {
     /// text too, a guess: how the Korean input source sends digits is LR-2's to see). If the
     /// input leaves the viewer, no view key in it chooses (Leave wins, §4).
     pub fn route(&mut self, state: State, events: &[Event]) -> Vec<Command> {
-        if state.row() == Row::Question {
+        if state.keeps_keyboard() {
             self.armed = false;
         }
         let mut now = Now::Known(state);
@@ -526,6 +563,12 @@ impl ViewKeys {
             (Command::Choose(_) | Command::Arm(Ending::Field), ..) => Now::Unknown,
             // A field's own Esc closes it, as F9 does.
             (Command::Pass, _, State::Field) if press == Press::Esc => Now::Unknown,
+            // The editor's Esc and F3 may leave it (12 §6.4), or ask first.
+            (Command::Pass, _, State::Editing(Editing { arming: false }))
+                if matches!(press, Press::Esc | Press::F3) =>
+            {
+                Now::Unknown
+            }
             (_, Now::Unknown, _) => Now::Unknown,
             (Command::StartEditing, _, State::Hex(hex)) => Now::Known(State::Hex(Hex {
                 editing: true,

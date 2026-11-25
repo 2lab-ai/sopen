@@ -13,4 +13,6 @@
 //! Each unit adds its own `mod` line, so nothing here declares a file that does not exist yet
 //! (12 §16).
 
+pub mod arm;
 pub mod buffer;
+pub mod ops;

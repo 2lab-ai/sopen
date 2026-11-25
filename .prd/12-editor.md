@@ -435,8 +435,10 @@ and one rule. The rule sits right after rule 1 (a viewer covers both sides, `:11
   `read as UTF-16LE (guessed)`, or `editor.rs holds 12 bytes UTF-8 cannot decode — they stay as they
   are`. One decode pass on the read's worker counts them.
   - The first non-ASCII character typed or pasted then asks: `Type 한 as UTF-16LE? The encoding was
-    guessed` — **Type** · **Cancel**, the focus on Cancel. Cancel types nothing; Type is not asked
-    again for this file.
+    guessed` — or, for bytes it cannot decode, `Type 한 as UTF-8? The file holds bytes UTF-8 cannot
+    decode` — **Type** · **Cancel**, the focus on Cancel. Cancel types nothing; Type is not asked
+    again for this file (ED-ops). A single such byte reads `editor.rs holds 1 byte UTF-8 cannot
+    decode — it stays as it is`.
   - This holds for every encoding the default can guess, so it does not wait for VM-4's CP949.
 - **The BOM stays.** The caret's first place is after it (08 §7.2's skip rule), so no edit reaches it.
   Select all starts after it.
