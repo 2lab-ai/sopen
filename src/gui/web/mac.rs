@@ -146,6 +146,9 @@ thread_local! {
     static ESC_HELD: Cell<Option<isize>> = const { Cell::new(None) };
 }
 
+/// The key a view's navigation delegate is kept under, on the view itself.
+static DELEGATE_KEY: u8 = 0;
+
 /// The rule list's folder, once made: removed at exit.
 static RULES_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -579,6 +582,17 @@ impl Inner {
             let nav = Navigation::alloc(mtm).set_ivars(me.clone());
             let nav: Retained<Navigation> = unsafe { msg_send![super(nav), init] };
             unsafe { web.setNavigationDelegate(Some(ProtocolObject::from_ref(&*nav))) };
+            // WebKit holds its delegate weakly: the view keeps it for as long as it lives, so no
+            // moment of the view's life — its close included — is without its policy.
+            // SAFETY: both objects are alive; the key is this static's address.
+            unsafe {
+                objc2::ffi::objc_setAssociatedObject(
+                    Retained::as_ptr(&web).cast_mut().cast(),
+                    std::ptr::addr_of!(DELEGATE_KEY).cast(),
+                    Retained::as_ptr(&nav).cast_mut().cast(),
+                    objc2::ffi::OBJC_ASSOCIATION_RETAIN_NONATOMIC,
+                );
+            }
             if available!(macos = 13.3) {
                 unsafe { web.setInspectable(false) };
             }
@@ -843,8 +857,10 @@ impl Inner {
         }
     }
 
-    /// Gone: its requests stopped, out of its window, every WebKit object of it released — the
-    /// cells emptied first, then WebKit told (which may call back here).
+    /// Gone: its requests stopped, out of its window, every WebKit object of it let go — the cells
+    /// emptied first, then WebKit told (which may call back here). Containment is never lifted
+    /// before the view is freed: its rule list stays on its controller and its delegate on the
+    /// view (refusing every navigation from now on), whoever still holds the view.
     fn close(&self) {
         if self.closed.replace(true) {
             return;
@@ -868,19 +884,12 @@ impl Inner {
                         window.makeFirstResponder(Some(parent));
                     }
                 }
-                // SAFETY: the view's own delegate slot and load, on the main thread.
-                unsafe {
-                    web.setNavigationDelegate(None);
-                    web.stopLoading();
-                }
+                // SAFETY: the view's own load, on the main thread.
+                unsafe { web.stopLoading() };
                 web.removeFromSuperview();
             }
             if let Some(shield) = &shield {
                 shield.removeFromSuperview();
-            }
-            if let Some(controller) = &controller {
-                // SAFETY: the view's own controller, on the main thread.
-                unsafe { controller.removeAllContentRuleLists() };
             }
             drop(tasks);
             drop(web);
@@ -1109,16 +1118,36 @@ impl Inner {
 /// The most a snapshot's bitmap may take: 64 MiB of RGBA (4096 × 4096 pixels).
 const MAX_BITMAP: usize = 64 << 20;
 
-/// The pixel size of a `width` × `height`-point picture at `scale`: `None` unless every input
-/// is finite and positive and the RGBA bitmap fits [`MAX_BITMAP`] — checked before anything is
-/// allocated.
+/// The pixel size of a `width` × `height`-point picture at `scale`, decided before anything is
+/// allocated: `None` unless every input is finite and positive; a bitmap over [`MAX_BITMAP`] at
+/// `scale` is drawn smaller, to fit it — the compose scales a picture to its frame, so a receipt
+/// of a very large window keeps its page, only coarser (said under `SOPEN_LOG=debug`).
 fn bitmap_size(width: f64, height: f64, scale: f64) -> Option<(usize, usize)> {
+    let finite = [width, height, scale]
+        .iter()
+        .all(|v| v.is_finite() && *v > 0.0);
+    let area = width * scale * height * scale;
+    if !finite || !area.is_finite() {
+        return None;
+    }
+    let most = (MAX_BITMAP / 4) as f64;
+    let fit = if area > most {
+        (most / area).sqrt()
+    } else {
+        1.0
+    };
+    if fit < 1.0 {
+        crate::debug!(
+            "page view: a {width}x{height}-point snapshot at {scale}x is over {} MiB: drawn at {:.3}x",
+            MAX_BITMAP >> 20,
+            scale * fit
+        );
+    }
+    // Rounded down when made smaller, so the fit holds after rounding.
     let pixels = |points: f64| {
-        let n = (points * scale).round();
-        (points.is_finite() && scale.is_finite() && points > 0.0 && scale > 0.0 && n >= 1.0)
-            .then_some(n)
-            .filter(|n| *n <= MAX_BITMAP as f64)
-            .map(|n| n as usize)
+        let n = points * scale * fit;
+        let n = if fit < 1.0 { n.floor() } else { n.round() };
+        (n >= 1.0).then_some(n as usize)
     };
     let (w, h) = (pixels(width)?, pixels(height)?);
     let bytes = w.checked_mul(h)?.checked_mul(4)?;
@@ -1325,6 +1354,7 @@ define_class!(
     /// A file view's `sopen-page` handler: each task to the view's table.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
+    #[name = "SopenScheme"]
     #[ivars = Weak<Inner>]
     struct Scheme;
 
@@ -1351,6 +1381,7 @@ define_class!(
     /// A view's navigation delegate: the policy of §3.4 and §7, and its events.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
+    #[name = "SopenNavigation"]
     #[ivars = Weak<Inner>]
     struct Navigation;
 
@@ -1366,7 +1397,8 @@ define_class!(
             handler: &block2::DynBlock<dyn Fn(WKNavigationActionPolicy, NonNull<WKWebpagePreferences>)>,
         ) {
             let preferences_ptr = NonNull::from(preferences);
-            let Some(inner) = self.ivars().upgrade() else {
+            // A closed view loads nothing more, whoever still holds it.
+            let Some(inner) = self.ivars().upgrade().filter(|i| !i.closed.get()) else {
                 handler.call((WKNavigationActionPolicy::Cancel, preferences_ptr));
                 return;
             };
@@ -1423,6 +1455,10 @@ define_class!(
                 (shows, main, mime.filter(|m| !m.is_empty()), status)
             };
             let error = status.filter(|s| *s >= 400);
+            if self.ivars().upgrade().is_none_or(|i| i.closed.get()) {
+                handler.call((WKNavigationResponsePolicy::Cancel,));
+                return;
+            }
             // An error with nothing to show (a 403 or 404 head) is no download: shown empty.
             let allow = shows || error.is_some();
             handler.call((if allow {
@@ -1510,7 +1546,7 @@ define_class!(
 
 impl Navigation {
     fn say(&self, event: Event) {
-        if let Some(inner) = self.ivars().upgrade() {
+        if let Some(inner) = self.ivars().upgrade().filter(|i| !i.closed.get()) {
             inner.events.send(event);
         }
     }
@@ -1569,6 +1605,7 @@ define_class!(
     /// download or open a window ([`strip_menu`]).
     #[unsafe(super(WKWebView, NSView, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
+    #[name = "SopenPageView"]
     struct PageView;
 
     impl PageView {
@@ -1592,6 +1629,7 @@ define_class!(
     /// and does nothing with a click or a scroll.
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
+    #[name = "SopenShield"]
     struct Shield;
 
     impl Shield {

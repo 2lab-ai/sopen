@@ -121,11 +121,11 @@ fn child(name: &str, temp: &std::path::Path, env: &[(&str, &str)], deadline: Dur
         .unwrap();
     let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
         std::thread::spawn(move || {
-            let mut text = String::new();
+            let mut bytes = vec![];
             if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_string(&mut text);
+                let _ = pipe.read_to_end(&mut bytes);
             }
-            text
+            String::from_utf8_lossy(&bytes).into_owned()
         })
     };
     let stdout = read(process.stdout.take().map(|p| Box::new(p) as _));
@@ -239,6 +239,15 @@ fn wv_a_the_context_menu_offers_no_download_and_no_new_window() {
     webkit("menu");
 }
 
+/// §3.3 through the close: a file view whose page keeps asking for outside images (a CSS
+/// animation through 200 addresses) reaches nothing while it closes; and a closed view that
+/// something still holds stays contained — its policy refuses, its rule list stays — so a load
+/// into it reaches nothing.
+#[test]
+fn wv_a_a_closing_view_stays_contained() {
+    webkit("closing");
+}
+
 /// §2.2's ATS measurement: plain `http://` to an IP, to `localhost` and to dotted names, each
 /// load's outcome and time printed. The IP and `localhost` load. App Transport Security refuses
 /// before any lookup (`-1022`); `sopen-ats.invalid` — a dotted name nothing resolves, so no
@@ -254,7 +263,10 @@ fn wv_a_ats_and_plain_http() {
 
 fn scenario(name: &str) {
     if name == "hang" {
-        // The watchdogs' own test: a scenario that never ends.
+        // The watchdogs' own test: a scenario that never ends, after a line that is not UTF-8.
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\xff before the hang\n");
+        let _ = out.flush();
         loop {
             std::thread::sleep(Duration::from_secs(60));
         }
@@ -272,6 +284,7 @@ fn scenario(name: &str) {
         "follow" => follow(mtm),
         "keys" => keys(mtm),
         "menu" => menu(mtm),
+        "closing" => closing(mtm),
         "ats" => ats(mtm),
         other => panic!("no scenario {other}"),
     });
@@ -1002,6 +1015,27 @@ fn menu(mtm: MainThreadMarker) {
             assert!(!has(items, dropped), "{what} offers {dropped}: {items:?}");
         }
     }
+    // Every item offered is one this test knows: a new one from a new WebKit is looked at —
+    // whether it fetches or opens anything — before it is let through.
+    let known = [
+        "",
+        "WKMenuItemIdentifierOpenLink",
+        "WKMenuItemIdentifierCopyLink",
+        "WKMenuItemIdentifierCopyImage",
+        "WKMenuItemIdentifierCopySubject",
+        "WKMenuItemIdentifierRevealImage",
+        "WKMenuItemIdentifierShareMenu",
+    ];
+    for (what, items) in [("link", &link), ("image", &image), ("address", &in_address)] {
+        let new: Vec<_> = items
+            .iter()
+            .filter(|i| !known.contains(&i.as_str()))
+            .collect();
+        assert!(
+            new.is_empty(),
+            "{what}'s menu has items not looked at: {new:?}"
+        );
+    }
     let log = outside.log();
     let downloaded = log.iter().any(|l| l.starts_with("GET /linked "));
     assert!(!downloaded, "a download reached the server: {log:?}");
@@ -1052,6 +1086,62 @@ fn context_menu(rig: &Rig, web: &WKWebView, y: f64, then: &'static str) -> Vec<S
     MENU_HOOK.with(|hook| hook.borrow_mut().take());
     let ids = seen.borrow_mut().take().unwrap_or_default();
     ids
+}
+
+fn closing(mtm: MainThreadMarker) {
+    let rig = Rig::new(mtm);
+    let engine = WebKit::start(mtm);
+    let outside = Http::start();
+    let frames: String = (0..200)
+        .map(|i| {
+            format!(
+                "{}%{{background-image:url(http://127.0.0.1:{}/a{i}.png)}}",
+                f64::from(i) / 2.0,
+                outside.port
+            )
+        })
+        .collect();
+    let page = format!(
+        "<title>asking</title><style>@keyframes k{{{frames}}} \
+         div{{width:300px;height:200px;animation:k 1s steps(200) infinite}}</style><div></div>"
+    );
+    let site = Site::with(&[("/asking.html", "text/html", page.as_bytes())]);
+    let open = || {
+        let mut view = rig.page(&engine, &site, false);
+        view.show(&rig, rig.full());
+        view.page.load(&view.host.url("asking.html"));
+        view.until("the page keeps asking", |e| {
+            e.iter().any(|e| matches!(e, Event::Blocked(n) if *n >= 5))
+        });
+        view
+    };
+    for round in 0..5 {
+        let mut view = open();
+        assert_eq!(outside.accepted(), 0, "{:?}", outside.log());
+        view.page.close();
+        spin(0.4, || false);
+        assert_eq!(
+            outside.accepted(),
+            0,
+            "through the close, round {round}: {:?}",
+            outside.log()
+        );
+    }
+    // Held past its close, by anything.
+    let mut view = open();
+    let held = view.web();
+    view.page.close();
+    let late = format!("<img src='http://127.0.0.1:{}/late.png'>", outside.port);
+    // SAFETY: on the main thread.
+    unsafe { held.loadHTMLString_baseURL(&NSString::from_str(&late), None) };
+    spin(1.5, || false);
+    assert_eq!(
+        outside.accepted(),
+        0,
+        "a closed view, still held: {:?}",
+        outside.log()
+    );
+    drop(held);
 }
 
 fn ats(mtm: MainThreadMarker) {
@@ -1130,6 +1220,7 @@ define_class!(
     /// The stand-in for winit's view: flipped, as winit's is, and able to take the keyboard.
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
+    #[name = "SopenTestHostView"]
     struct HostView;
 
     impl HostView {
@@ -1756,6 +1847,22 @@ fn a_snapshots_bitmap_is_bounded_before_it_is_made() {
         Some((4096, 4096)),
         "64 MiB"
     );
+    // Over the cap, drawn smaller to fit it (the compose scales it to its frame): a 6K
+    // display's window at 2×, absurd sizes.
+    for (w, h, scale) in [
+        (3008.0, 1692.0, 2.0),
+        (2049.0, 2048.0, 2.0),
+        (1e9, 1e9, 2.0),
+    ] {
+        let (pw, ph) = bitmap_size(w, h, scale).expect("drawn smaller");
+        assert!(pw * ph * 4 <= MAX_BITMAP, "{w}x{h} at {scale}: {pw}x{ph}");
+        let (aspect, drawn) = (w / h, pw as f64 / ph as f64);
+        assert!((aspect - drawn).abs() / aspect < 0.01, "{w}x{h}: {pw}x{ph}");
+        assert!(
+            pw * ph * 4 > MAX_BITMAP / 2,
+            "not smaller than it needs: {pw}x{ph}"
+        );
+    }
     let bad = [
         (f64::NAN, 1.0, 2.0),
         (1.0, f64::INFINITY, 2.0),
@@ -1766,13 +1873,36 @@ fn a_snapshots_bitmap_is_bounded_before_it_is_made() {
         (0.0, 1.0, 2.0),
         (1.0, 1.0, 0.0),
         (1.0, 1.0, -2.0),
-        (2049.0, 2048.0, 2.0),
-        (1e9, 1e9, 2.0),
         (f64::MAX, f64::MAX, 2.0),
+        (1e9, 1e-9, 2.0),
     ];
     for (w, h, scale) in bad {
         assert_eq!(bitmap_size(w, h, scale), None, "{w}x{h} at {scale}");
     }
+}
+
+/// sopen's Objective-C classes carry its prefix, so no class of another loaded framework can
+/// take their names.
+#[test]
+fn the_objc_classes_are_sopens_own() {
+    let names = [
+        PageView::class().name(),
+        Scheme::class().name(),
+        Navigation::class().name(),
+        Shield::class().name(),
+        HostView::class().name(),
+    ];
+    let names: Vec<_> = names.iter().map(|n| n.to_string_lossy()).collect();
+    assert_eq!(
+        names,
+        [
+            "SopenPageView",
+            "SopenScheme",
+            "SopenNavigation",
+            "SopenShield",
+            "SopenTestHostView"
+        ]
+    );
 }
 
 /// The context-menu identifiers dropped are WebKit's own strings (its `_WKMenuItemIdentifier…`
@@ -1893,6 +2023,11 @@ fn a_stuck_child_ends() {
     assert!(!own.killed, "{}", own.stderr);
     assert_eq!(own.status.code(), Some(124), "{}", own.stderr);
     assert!(own.stderr.contains("did not end within"), "{}", own.stderr);
+    assert!(
+        own.stdout.contains("before the hang"),
+        "a byte not UTF-8 keeps the rest: {:?}",
+        own.stdout
+    );
     let deadline = Duration::from_millis(500);
     let parent = child("hang", temp.path(), &[], deadline);
     assert!(parent.killed, "{:?}", parent.status);
