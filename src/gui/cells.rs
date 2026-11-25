@@ -638,10 +638,18 @@ pub fn colors(l: &Layer, cells: Cells) -> Vec<Color32> {
     out
 }
 
-/// A frame's or a scroll bar's glyph (box drawing, blocks and shades, the arrows): never part of
-/// a text.
+/// A frame's or a scroll bar's glyph (box drawing, blocks and shades): never part of a text.
 pub fn frame_glyph(c: char) -> bool {
-    matches!(c, '\u{2500}'..='\u{259F}' | '↑' | '↓')
+    matches!(c, '\u{2500}'..='\u{259F}')
+}
+
+/// Whether a cell showing `symbol` in `fg` on `bg` is a frame's or a scroll bar's, never part of
+/// a text: a [`frame_glyph`], or an arrow in the scroll bar's colours ([`scroll_bar`]) — an arrow
+/// elsewhere (a status row's "↑ ↓ choose") is text.
+pub fn frame_cell(symbol: &str, fg: Option<Color32>, bg: Option<Color32>) -> bool {
+    let p = chrome::PALETTE;
+    let bar = (fg, bg) == (Some(p.track), Some(p.track_back));
+    (symbol.chars()).any(|c| frame_glyph(c) || (bar && matches!(c, '↑' | '↓')))
 }
 
 /// A run of text in a row: its cells and what it says.
@@ -651,11 +659,11 @@ pub struct Run {
     pub text: String,
 }
 
-/// Every run of text in `buf`: per row, the stretches of one pair of colours with no frame glyph
-/// and no two spaces in a row, blanks at either end cut, blank ones left out.
+/// Every run of text in `buf`: per row, the stretches of one pair of colours with no frame's cell
+/// ([`frame_cell`]) and no two spaces in a row, blanks at either end cut, blank ones left out.
 pub fn runs(buf: &Buffer) -> Vec<Run> {
     let blank = |s: &Slot| s.symbol.trim().is_empty();
-    let framed = |s: &Slot| s.symbol.chars().any(frame_glyph);
+    let framed = |s: &Slot| frame_cell(s.symbol, s.fg, s.bg);
     let mut out = vec![];
     let a = buf.area;
     for y in a.top()..a.bottom() {

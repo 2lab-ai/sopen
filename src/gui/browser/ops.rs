@@ -1,7 +1,7 @@
 //! The browser's side of the file operations (04 §4–§5): the select-group dialog (`+`, `-`),
 //! the Copy / Move dialog, the inline rename field, the make-folder and delete dialogs, the
 //! name-in-the-way dialog, the progress line and the report — and drawing helpers for the rename
-//! field and the selection colours, which the browser's `panel_ui` (S1-E) calls. The selection
+//! field and the selection colours, which the browser's `panel_cells` (S1-E) calls. The selection
 //! itself is the panel model's ([`Panel::toggle`] and its neighbours). The work is
 //! [`crate::fileops`]'s, behind [`Run`]. S1-D writes it (S6-B the make-folder and delete
 //! dialogs).
@@ -93,7 +93,7 @@ pub fn selected_color(p: &chrome::Palette) -> Color32 {
 
 /// The colour of a panel row's text: a selected entry's is [`selected_color`] (on the bar too);
 /// else the bar's text on the active panel's bar, the dim colour for a dot file, the folder
-/// colour, the plain text — `panel_ui`'s rule (browser.rs) with the selection first.
+/// colour, the plain text — `panel_cells`'s rule (list_cells.rs) with the selection first.
 pub fn entry_color(
     p: &chrome::Palette,
     entry: &Entry,
@@ -1919,7 +1919,7 @@ mod tests {
     //! the dispatch S1-E adds — both held back while [`Ops::holds_keyboard`]), then the list
     //! claiming the keyboard on every pass, ungated, so each piece must hold its own; then rows
     //! drawn with [`entry_color`] and the rename field in its row, and [`Ops::ui`] over them. The
-    //! browser's own `panel_ui`, its keys and its bar are S1-E's and not exercised here. The
+    //! browser's own `panel_cells`, its keys and its bar are S1-E's and not exercised here. The
     //! engine is a stand-in [`Run`].
 
     mod s6;
@@ -2162,7 +2162,7 @@ mod tests {
 
     /// [`entry_color`], as the host draws its rows with it: selected rows read yellow — on the
     /// bar too; the bar's own text, a folder, a dot file and a plain file keep the colours of
-    /// `panel_ui`'s rule.
+    /// `panel_cells`'s rule.
     #[test]
     fn selected_rows_draw_in_the_selection_colour() {
         let (mut h, _) = host(&[]);

@@ -21,7 +21,7 @@
 pub mod git;
 pub mod tree;
 
-use super::Status;
+use super::{cells, Status};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -678,6 +678,20 @@ pub fn clock_text(hour: i32, minute: i32) -> String {
     format!("{h:>2}:{minute:02}{half}")
 }
 
+/// The title row's clock of `secs`: local time — in tests whose time [`set_test_now`] pinned,
+/// UTC, so the clock reads the same in every time zone (` 9:24am` at the test kit's minute).
+fn clock_tm(secs: i64) -> Option<libc::tm> {
+    #[cfg(test)]
+    if TEST_NOW.with(std::cell::Cell::get).is_some() {
+        let secs = secs as libc::time_t;
+        // SAFETY: an all-zero tm is a valid value to be overwritten.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        // SAFETY: both pointers are valid for the call; gmtime_r is the thread-safe variant.
+        return (!unsafe { libc::gmtime_r(&secs, &mut tm) }.is_null()).then_some(tm);
+    }
+    local_tm(secs)
+}
+
 /// Seconds since the epoch, now (in tests, the time [`set_test_now`] gave this thread, if any).
 fn now_secs() -> i64 {
     #[cfg(test)]
@@ -694,9 +708,9 @@ thread_local! {
     static TEST_NOW: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
-/// Tests: the clock on the title row reads `now` (seconds since the epoch) on this thread —
-/// the test kit's driver sets the start of a minute, so the clock asks to be repainted only a
-/// minute later, never in the second a test watches (`None`: the real time).
+/// Tests: the clock on the title row reads `now` (seconds since the epoch) on this thread, in
+/// UTC ([`clock_tm`]) — the test kit's driver sets the start of a minute, so the clock asks to be
+/// repainted only a minute later, never in the second a test watches (`None`: the real time).
 #[cfg(test)]
 pub(crate) fn set_test_now(now: Option<i64>) {
     TEST_NOW.with(|t| t.set(now));
@@ -709,47 +723,37 @@ fn row(ui: &mut egui::Ui) -> Rect {
         .0
 }
 
-/// The top row: the tool's name ([`PROGRAM`]) in its red block, then where the browser is, black
-/// on cyan, and the clock at the right end after a `│`.
+/// A row one cell tall across `ui` on the cell grid (10 §4): its whole cells from the left, what
+/// is left at its right end, less than a cell, the window's background.
+fn cell_row(ui: &mut egui::Ui) -> (Rect, cells::Grid, cells::Buffer) {
+    let rect = row(ui);
+    let grid = cells::Grid::over(rect);
+    (rect, grid, cells::Buffer::empty(grid.all()))
+}
+
+/// The top row, in cells: the tool's name ([`PROGRAM`]) in its red block, then where the browser
+/// is, black on cyan — its end kept, after "…", when it is cut (the whole on hover) — and the
+/// clock at the right end after a `│`.
 pub fn title_row(ui: &mut egui::Ui, place: &str) {
     let p = PALETTE;
-    let rect = row(ui);
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, p.title_back);
+    let (rect, grid, mut buf) = cell_row(ui);
+    let pen = cells::Pen::new(p.title_text, p.title_back);
+    cells::fill(&mut buf, grid.all(), pen);
+    let cols = usize::from(grid.cols);
     let program = format!(" {PROGRAM} ");
-    let block = Rect::from_min_size(
-        rect.min,
-        Vec2::new(CELL.x * program.chars().count() as f32, CELL.y),
-    );
-    painter.rect_filled(block, 0.0, p.program_back);
-    painter.text(
-        block.min,
-        egui::Align2::LEFT_TOP,
-        program,
-        font(),
-        p.program_text,
-    );
+    let block_pen = cells::Pen::new(p.program_text, p.program_back);
+    let block = cells::put(&mut buf, 0, 0, &program, cols, block_pen);
     let now = now_secs();
-    let clock = local_tm(now).map_or(String::new(), |tm| {
+    let clock = clock_tm(now).map_or(String::new(), |tm| {
         format!("│{}", clock_text(tm.tm_hour, tm.tm_min))
     });
-    let clock_x = rect.right() - CELL.x * (clock.chars().count() + 1) as f32;
-    painter.text(
-        Pos2::new(clock_x, rect.top()),
-        egui::Align2::LEFT_TOP,
-        clock,
-        font(),
-        p.title_text,
-    );
-    let x = block.right() + CELL.x;
-    let shown = fit_left(ui.ctx(), place, &font(), (clock_x - CELL.x - x).max(0.0));
-    painter.text(
-        Pos2::new(x, rect.top()),
-        egui::Align2::LEFT_TOP,
-        &shown,
-        font(),
-        p.title_text,
-    );
+    let clock_x = cols.saturating_sub(cells::width(&clock) + 1);
+    cells::put(&mut buf, clock_x as u16, 0, &clock, cols, pen);
+    let x = block + 1;
+    let room = clock_x.saturating_sub(x + 1);
+    let shown = cells::fit_left(place, room);
+    cells::put(&mut buf, x as u16, 0, &shown, room, pen);
+    cells::paint(&ui.painter_at(rect), grid.origin, &buf, None);
     if shown != place {
         ui.interact(rect, ui.scope_id().with("title"), egui::Sense::hover())
             .on_hover_text(place);
@@ -783,6 +787,38 @@ pub fn bar_panel(panel: egui::Panel) -> egui::Panel {
 /// The status row: progress, results, what the keys do.
 pub fn status_row(ui: &mut egui::Ui, status: &Status) {
     ui.horizontal(|ui| status.show(ui));
+}
+
+/// The status row in cells, one row tall (10 §6): from the second cell, in the text's colour
+/// or the error colour on the body, cut with "…" to the row less a cell at either end (the whole
+/// on hover) — a status row keeps its height, or what is above it moves.
+pub fn status_cells(ui: &mut egui::Ui, status: &Status) {
+    let p = PALETTE;
+    let (rect, grid, mut buf) = cell_row(ui);
+    cells::fill(&mut buf, grid.all(), cells::Pen::new(p.text, p.back));
+    // A line break or a tab is a blank: the row is one line.
+    let text: String = (status.text.chars())
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let room = usize::from(grid.cols).saturating_sub(2);
+    let shown = cells::fit_start(&text, room);
+    let color = if status.error { p.error } else { p.text };
+    cells::put(&mut buf, 1, 0, &shown, room, cells::Pen::new(color, p.back));
+    cells::paint(&ui.painter_at(rect), grid.origin, &buf, None);
+    if shown != text {
+        ui.interact(rect, ui.scope_id().with("status"), egui::Sense::hover())
+            .on_hover_text(&status.text);
+    }
+}
+
+/// [`status_cells`] as a panel at the bottom of `ui`, one cell tall.
+pub fn status_panel_cells(ui: &mut egui::Ui, id: &'static str, status: &Status) {
+    egui::Panel::bottom(id)
+        .frame(egui::Frame::NONE)
+        .show_separator_line(false)
+        .resizable(false)
+        .exact_size(CELL.y)
+        .show(ui, |ui| status_cells(ui, status));
 }
 
 /// Where the F-key row puts key `n` (1–10) in a row `width` points wide from `left`: its digit
@@ -850,6 +886,78 @@ pub fn fkey_row(ui: &mut egui::Ui, keys: &[FKey]) {
             press_fkey(ui.ctx(), n);
         }
     }
+}
+
+/// Where the F-key row in cells puts key `n` (1–10) in a row `cols` cells wide: its digit's
+/// cells and its label's — [`key_slot`]'s slots on whole cells, the tenth to the row's end.
+pub fn key_cells(cols: u16, n: u8) -> (cells::Cells, cells::Cells) {
+    let slot = (cols / 10).max(3);
+    let x = slot.saturating_mul(u16::from(n.saturating_sub(1)));
+    let digits = if n >= 10 { 2 } else { 1 };
+    let end = if n >= 10 {
+        cols
+    } else {
+        x.saturating_add(slot)
+    };
+    let label = x.saturating_add(digits);
+    (
+        cells::Cells::new(x, 0, digits, 1),
+        cells::Cells::new(label, 0, end.saturating_sub(label), 1),
+    )
+}
+
+/// The bottom row in cells (10 §4, §6): [`fkey_row`]'s ten slots — each the key's digit on black
+/// and its label black on cyan, an empty label where the key does nothing here — and a click on
+/// a slot with a label is that F-key pressed, as there.
+pub fn fkey_cells(ui: &mut egui::Ui, keys: &[FKey]) {
+    let p = PALETTE;
+    let (rect, grid, mut buf) = cell_row(ui);
+    let digit_pen = cells::Pen::new(p.key_digit, p.key_digit_back);
+    let label_pen = cells::Pen::new(p.key_text, p.key_back);
+    cells::fill(&mut buf, grid.all(), digit_pen);
+    let mut slots = vec![];
+    for n in 1..=10u8 {
+        let (digit, label) = key_cells(grid.cols, n);
+        if digit.x >= grid.cols {
+            break;
+        }
+        let number = n.to_string();
+        cells::put(&mut buf, digit.x, 0, &number, digit.width.into(), digit_pen);
+        cells::fill(&mut buf, label, label_pen);
+        let Some(key) = keys.iter().find(|k| k.n == n && !k.label.is_empty()) else {
+            continue;
+        };
+        cells::put(
+            &mut buf,
+            label.x,
+            0,
+            key.label,
+            label.width.into(),
+            label_pen,
+        );
+        slots.push((n, digit.union(label).intersection(grid.all())));
+    }
+    cells::paint(&ui.painter_at(rect), grid.origin, &buf, None);
+    for (n, slot) in slots {
+        // Not focusable: a click on the row leaves the keyboard where it was.
+        let id = ui.scope_id().with(("sopen-fkey", n));
+        if ui
+            .interact(grid.rect(slot), id, egui::Sense::CLICK)
+            .clicked()
+        {
+            press_fkey(ui.ctx(), n);
+        }
+    }
+}
+
+/// [`fkey_cells`] as a panel at the bottom of `ui`.
+pub fn key_panel_cells(ui: &mut egui::Ui, id: &'static str, keys: &[FKey]) {
+    egui::Panel::bottom(id)
+        .frame(egui::Frame::NONE)
+        .show_separator_line(false)
+        .resizable(false)
+        .exact_size(CELL.y)
+        .show(ui, |ui| fkey_cells(ui, keys));
 }
 
 /// A slot clicked, for the window's next pass.
