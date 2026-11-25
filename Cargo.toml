@@ -100,6 +100,12 @@ syntect = { version = "5.3.0", default-features = false, features = ["default-sy
 # letter and its marks, an emoji sequence stay whole). Already in the tree (eframe → epaint), at
 # the same version.
 unicode-segmentation = "1.13.3"
+# The text views' CP949 / EUC-KR (`.prd/08-viewer.md` §7.4): its 17,048 two-byte pairs are data
+# sopen does not write by hand, decoded as the WHATWG Encoding Standard's EUC-KR (windows-949),
+# the decoder Gecko uses. For CP949 only: std decodes UTF-8 and UTF-16, and encoding_rs has no
+# UTF-32 and no Latin-1 (its `iso-8859-1` is windows-1252). Its one dependency, `cfg-if`, is in
+# the tree already.
+encoding_rs = "0.8.35"
 # The TUI (`.prd/10-tui.md` §4): every screen is drawn into ratatui-core's cell `Buffer` (the
 # buffer only, not ratatui; `gui::cells`), and crossterm drives the terminal and parses its input
 # (`gui::term_input`): pure Rust over mio, rustix and parking_lot, already in the tree, so nothing
