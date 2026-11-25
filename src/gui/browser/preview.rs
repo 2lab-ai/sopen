@@ -215,6 +215,29 @@ impl Host {
         self.prep.as_ref().is_some_and(Prep::cancelled)
     }
 
+    /// Tests: the window's preview session is back from what borrowed it (06 §13) — its
+    /// connection waits in `back` for the next preparation. Looked at without taking it: what is
+    /// there is put back as it was.
+    #[cfg(test)]
+    pub fn session_back(&self) -> bool {
+        let mut back = self.back.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(rx) = back.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(conn) => {
+                let (tx, again) = mpsc::channel();
+                let _ = tx.send(conn);
+                *back = Some(again);
+                true
+            }
+            Err(_) => {
+                *back = Some(rx);
+                false
+            }
+        }
+    }
+
     /// The file at `path` changed (a re-read found another size or time): a preview of it is
     /// prepared again — what is shown is dropped, a preparation of it cancelled.
     pub fn refresh(&mut self, path: &str) {

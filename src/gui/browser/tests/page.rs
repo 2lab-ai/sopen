@@ -770,6 +770,17 @@ fn wv_d_a_preview_handed_over_in_the_terminal_is_made_in_the_next_window() {
     fx.drv.idle(&mut fx.b, 12);
     loaded(&mut fx, &fake, 0, "index.html");
     crate::gui::web::teardown(&fx.drv.ctx);
+    // The old server gives its connection back on its own thread: the scenario is the one
+    // where the preview session has it back before Enter (Enter first keeps it with the viewer,
+    // the other right answer: one session).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !fx.b.preview.session_back() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the session never came back"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let mut t = terminal();
     t.idle(&mut fx.b, 3);
     t.key(&mut fx.b, Key::Enter, Modifiers::NONE);
@@ -917,12 +928,16 @@ fn wv_d_the_viewer_keeps_the_preview_session_it_was_handed() {
 }
 
 /// Enter while a page's preview is still being prepared (02 §4.4): that preparation becomes the
-/// viewer's opening — one view, opened as the viewer's (no shield), loaded once.
+/// viewer's opening — one connection (a fresh open would make a second), one view, opened as
+/// the viewer's (no shield), loaded once.
 #[test]
 fn wv_d_enter_while_a_page_preview_is_prepared_makes_one_view() {
     let gate = Gate::default();
     let held = gate.clone();
+    let made = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = made.clone();
     let connect: Connect = Arc::new(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         held.hold();
         Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)
     });
@@ -945,6 +960,12 @@ fn wv_d_enter_while_a_page_preview_is_prepared_makes_one_view() {
         }
     );
     assert_eq!(loads(&calls).len(), 1);
+    // The preview's preparation became the opening: its one connection, no fresh open's.
+    assert_eq!(
+        made.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one connection"
+    );
 }
 
 /// D25 with the page: Page, 2 Hex, an edit, 1 — the prompt's Save lands — the hidden page view
