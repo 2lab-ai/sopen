@@ -361,6 +361,23 @@ impl Driver {
         self.idle(win, 1);
     }
 
+    /// A press that types, as egui-winit 0.37 sends it (08 §12): the key with its physical key,
+    /// then its typed `text`, in one frame; the release in the next. ([`Driver::key`] sends the
+    /// key alone, which hides a press that both chooses a view and types.)
+    pub fn press_typed<W: Window>(&mut self, win: &mut W, key: Key, text: &str) {
+        let event = |pressed| Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        let down = vec![event(true), Event::Text(text.to_string())];
+        self.frame(win, down, Modifiers::NONE);
+        self.frame(win, vec![event(false)], Modifiers::NONE);
+        self.idle(win, 1);
+    }
+
     /// Cmd/Ctrl+`key` as egui-winit 0.37 delivers a clipboard shortcut (its `src/lib.rs`,
     /// `State::on_keyboard_input`): each press becomes `event` alone — no pressed `Key`; none
     /// at all for a paste of empty text — and only the release arrives as a `Key`. It drops

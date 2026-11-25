@@ -867,7 +867,8 @@ the page and drop the queued keys.
     - `Doc::decode` and `Doc::decode_checked` ask nothing and keep the crate's limit.
 - **Hex view, and the hex view for a file that does not decode.** The memory line offers Hex view
   (H), which shows the file's bytes in the hex window — in the browser, and in a window of its
-  own, which becomes the hex window in place (as the binary dialog does). A file that does not
+  own, which becomes the hex window in place (as the binary dialog does). In the browser's viewer
+  Hex view is view 2 (08 §8, VM-7): the line reads `Hex view (2)`, `H` its alias. A file that does not
   decode opens in the hex window the same way, its reason the first of the window's rows.
   - A remote file's hex window reads the same stream: nothing is read again, and the stats line
     has one `first` for the open.

@@ -1,0 +1,983 @@
+//! The viewer's views in today's windows (`.prd/08-viewer.md` §8, VM-7): the egui binding of the
+//! view set ([`crate::views`]) and the view keys ([`crate::view_keys`]).
+//!
+//! The viewer opens on its file's view 1 (or Hex, D10) as before; 1, 2 and 3 — taken before the
+//! viewer's pass by the shell's input hook (`gui::route_view_keys`), or F9 then one of them, or a
+//! click on the title row's strip — choose a view by §3's table. A view is made the first time it
+//! is chosen, on a worker, by the same preparation the opening ran ([`prepare::prepare_view`]);
+//! one switched away from is kept hidden ([`Window::set_shown`] `false`) and comes back as it was;
+//! one holding unsaved edits asks its own close prompt first, and a running Save makes the switch
+//! wait. The hex view opens viewing (D35). F8 (or E) in Text and Raw opens the list of encodings,
+//! a dialog of cells ([`super::ops::dialog`]).
+//!
+//! Not built here (each a line of 08): a remote view is made through a stream of its own, so a
+//! remote file's views read it again (D13); a hidden view keeps its save connection (D14); a
+//! reload does not make the hidden views stale (D25's reload half); F9 in a field takes the
+//! typing from it, which closes the hex window's Go to but leaves the text view's open (D29).
+
+use super::prepare::{self, Opened, Prepared};
+use super::{Browser, Closing, Connect, Viewer};
+use crate::encoding::Encoding;
+use crate::gui::{chrome, help, Embedded, Outcome, Status, ViewKeySlot, Window};
+use crate::kind::Kind;
+use crate::remote::Stat;
+use crate::view_keys::{self, Command, Ending, ViewKeys};
+use crate::views::{
+    Effect, Hold, Input, Now, Opening, PageClass, Reach, Screen, Slot, Ticket, View, ViewSet, Why,
+};
+use eframe::egui::{self, Key, Modifiers};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
+
+/// What the opening keeps to make a view later (08 §6): where the bytes are and how to reach
+/// them, and how the viewer titles them.
+pub(super) struct Means {
+    /// The bytes on screen: for a revision or a diff the `.revisions` copy (D13), never the
+    /// working file F4 opens.
+    pub path: String,
+    pub name: String,
+    pub title: String,
+    pub connect: Connect,
+    pub label: Option<String>,
+    /// A revision or a diff: read where it is, every view read-only.
+    pub in_place: bool,
+}
+
+/// One opened file's views in the viewer.
+pub(super) struct Views {
+    pub(super) set: ViewSet,
+    /// The view keys, shared with the shell's input hook ([`crate::gui::set_view_keys`]).
+    slot: Arc<Mutex<ViewKeySlot>>,
+    /// The view whose window is on screen ([`Viewer::embedded`]); `None`: a blank stands there
+    /// while the next one is made.
+    shown: Option<View>,
+    /// The views kept hidden (D1).
+    hidden: Vec<Kept>,
+    making: Option<Making>,
+    means: Means,
+    picker: Option<Picker>,
+    /// The view on screen's close prompt is up for a switch (`Effect::AskClose`), and a Save
+    /// from it was seen running.
+    asked: bool,
+    saw_saving: bool,
+    /// What the view on screen held at the last pass: a Save that ends is told to the set
+    /// whatever started it (D25: a landed one makes the hidden views stale).
+    last_hold: Hold,
+    /// `SOPEN_STATE` `view=N`: chosen once the first view is on screen and ready.
+    wanted: Option<Slot>,
+}
+
+/// A hidden view: its window, the cached copy it holds, its give-way.
+struct Kept {
+    view: View,
+    embedded: Embedded,
+    hold: Option<crate::cache::Claim>,
+    switch: Option<crate::gui::image::HexSwitch>,
+}
+
+/// A view being made on a worker (`Effect::Make`).
+struct Making {
+    ticket: Ticket,
+    view: View,
+    at: Option<u64>,
+    notice: Option<String>,
+    encoding: Option<Encoding>,
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<anyhow::Result<Opened>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+/// F8's list (08 §7.5): every encoding of §7.1, the current one marked, the default §7.2 picked
+/// named; ↑ ↓ and Enter choose, Esc leaves the encoding as it was.
+struct Picker {
+    current: Encoding,
+    pick: Option<crate::encoding::Pick>,
+    /// The row with the bar (and egui's focus, so Enter or Space chooses it): the current one
+    /// as the list opens.
+    at: usize,
+}
+
+/// The views of the file the viewer opened on and the means to make the others; the view keys
+/// handed to the shell's input hook from the next pass on. `wanted`: `view=N`.
+pub(super) fn open(
+    ctx: &egui::Context,
+    opened: &OpenedAs,
+    means: Means,
+    wanted: Option<u8>,
+) -> Views {
+    let reach = if means.label.is_some() {
+        Reach::Stream
+    } else {
+        Reach::Local
+    };
+    // A viewer shows a file: a folder is never opened (§3), so none is here.
+    let kind = match opened.kind {
+        Kind::Directory => Kind::Other,
+        kind => kind,
+    };
+    let mut opening = Opening::new(kind, means.path.clone(), opened.stat, reach);
+    opening.page = PageClass::of(&means.name, false);
+    opening.read_only = means.in_place;
+    opening.undecodable = opened.undecodable.clone();
+    let set = ViewSet::open(opening, Screen::GUI).expect("a file has views");
+    // A terminal's input sends its releases made (`term_input::RELEASES`), a window's its own.
+    let releases = !crate::gui::in_terminal(ctx) || crate::gui::term_input::RELEASES;
+    let down = ctx.input(|i| i.keys_down.iter().copied().collect::<Vec<_>>());
+    let slot = Arc::new(Mutex::new(ViewKeySlot {
+        state: view_keys::State::Free,
+        keys: ViewKeys::new(releases, down),
+        commands: Vec::new(),
+    }));
+    crate::gui::set_view_keys(ctx, Some(slot.clone()));
+    let shown = set.on_screen();
+    Views {
+        set,
+        slot,
+        shown,
+        hidden: Vec::new(),
+        making: None,
+        means,
+        picker: None,
+        asked: false,
+        saw_saving: false,
+        last_hold: Hold::Clean,
+        wanted: wanted.and_then(Slot::from_number),
+    }
+}
+
+/// What the view set needs of an opening besides its means: the kind, the stat, why view 1
+/// cannot show the file.
+pub(super) struct OpenedAs {
+    pub kind: Kind,
+    pub stat: Stat,
+    pub undecodable: Option<String>,
+}
+
+impl OpenedAs {
+    /// From a preparation's [`Opened`].
+    pub fn of(opened: &Opened) -> Self {
+        OpenedAs {
+            kind: opened.kind,
+            stat: opened.stat,
+            undecodable: opened.undecodable.clone(),
+        }
+    }
+}
+
+/// How a text window made from a preparation opens: the scripted run's `at=`, `loading=1` and
+/// `enc=` (the first viewer only), and the rows its first lines say.
+#[derive(Default)]
+pub(super) struct TextOpen {
+    pub at: Option<u64>,
+    pub loading: bool,
+    pub enc: Option<Encoding>,
+}
+
+/// A window made from a preparation, with the cached copy it holds and its give-way.
+pub(super) struct Made {
+    pub embedded: Embedded,
+    pub hold: Option<crate::cache::Claim>,
+    pub switch: Option<crate::gui::image::HexSwitch>,
+}
+
+/// The window that shows `prepared`, titled `title` (`name` picks a text file's syntax);
+/// `notice`: the first row of a hex window (D10's reason).
+pub(super) fn embed(
+    prepared: Prepared,
+    cache: &Path,
+    title: String,
+    name: &str,
+    text: TextOpen,
+    notice: Option<String>,
+) -> anyhow::Result<Made> {
+    use crate::gui::{hex, image, media, text as textview};
+    let mut switch = None;
+    let (embedded, hold) = match prepared {
+        Prepared::Image {
+            file,
+            doc,
+            notices,
+            claim,
+        } => (image::embed(file, doc, notices), claim),
+        Prepared::ImageAsking {
+            file,
+            path,
+            notices,
+            claim,
+        } => {
+            // 06 §7.3: the memory line, with Hex view on the file read in place.
+            let gives_way = image::HexSwitch::local(path);
+            let embedded = image::embed_asking(file, notices, Some(gives_way.clone()))?;
+            switch = Some(gives_way);
+            (embedded, claim)
+        }
+        Prepared::ImageStream {
+            origin,
+            source,
+            repaint,
+            notices,
+        } => {
+            // 06 §7.3: the window reads on a worker of its own, and gives way to the hex window
+            // on the same stream (Hex view, a file that does not decode).
+            let gives_way = image::HexSwitch::new(repaint);
+            let made =
+                image::embed_stream(origin, source, cache, notices, Some(gives_way.clone()))?;
+            switch = Some(gives_way);
+            (made, None)
+        }
+        Prepared::Media {
+            origin,
+            media,
+            notices,
+            claim,
+        } => (media::embed(origin, *media, cache, notices), claim),
+        // Probed on the worker: nothing slow is left for this frame (06 §7.4).
+        Prepared::MediaStream {
+            origin,
+            media,
+            notices,
+        } => (media::embed_streamed(origin, *media, cache, notices), None),
+        Prepared::Hex { file, notices } => {
+            let notices = notice.into_iter().chain(notices).collect();
+            (hex::embed(file, notices), None)
+        }
+        Prepared::Text {
+            doc,
+            notices,
+            claim,
+        } => {
+            // A file read in place (no fetched copy, no stream) is followed at its end.
+            let live = claim.is_none() && !doc.is_stream();
+            let TextOpen { at, loading, enc } = text;
+            (
+                textview::embed_scripted(doc, title, name, notices, live, at, loading, enc),
+                claim,
+            )
+        }
+    };
+    Ok(Made {
+        embedded,
+        hold,
+        switch,
+    })
+}
+
+/// A window with nothing in it: what stands on screen while the next view is made after the one
+/// that was there closed (its prompt answered, or it failed).
+struct Blank;
+
+impl Window for Blank {
+    fn ui(&mut self, _ui: &mut egui::Ui) {}
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+fn blank() -> Embedded {
+    Embedded {
+        window: Box::new(Blank),
+        settle: Box::new(|_| Some(Outcome::default())),
+    }
+}
+
+/// Text and Raw are one document (D8): one window.
+fn same_doc(a: View, b: View) -> bool {
+    let doc = |v: View| match v {
+        View::Raw => View::Text,
+        other => other,
+    };
+    doc(a) == doc(b)
+}
+
+/// The kind a view is prepared as ([`prepare::prepare_view`]).
+fn kind_of(view: View) -> Kind {
+    match view {
+        View::Image => Kind::Image,
+        View::Video => Kind::Video,
+        View::Audio => Kind::Audio,
+        View::Hex => Kind::Other,
+        View::Text | View::Raw | View::Page => Kind::Text,
+    }
+}
+
+/// D10's words for a reason the hex window's first row already says as bytes.
+fn reason(notice: &str) -> String {
+    notice
+        .strip_suffix("; the file is shown as bytes")
+        .unwrap_or(notice)
+        .to_string()
+}
+
+/// `key` pressed with no modifier in this pass's input, taken with the text it typed.
+fn take_plain(ctx: &egui::Context, key: Key) -> bool {
+    ctx.input_mut(|i| {
+        let at = i.events.iter().position(|e| {
+            matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. }
+                if *k == key && modifiers.is_none())
+        });
+        let Some(at) = at else {
+            return false;
+        };
+        i.events.remove(at);
+        if matches!(i.events.get(at), Some(egui::Event::Text(_))) {
+            i.events.remove(at);
+        }
+        true
+    })
+}
+
+fn picker_row_id(i: usize) -> egui::Id {
+    egui::Id::unique("sopen-encoding").with(i)
+}
+
+impl Views {
+    /// The strip on the title row (08 §8).
+    pub(super) fn strip(&self) -> chrome::Strip {
+        let slots = self.set.slots().map(|v| v.map(View::name));
+        let armed = self
+            .slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys
+            .armed();
+        chrome::Strip {
+            slots,
+            on: self.set.on_screen().map(View::name),
+            armed,
+        }
+    }
+
+    /// A diff or a file at a revision (03 §6.3): every view read-only.
+    pub(super) fn read_only(&self) -> bool {
+        self.means.in_place
+    }
+
+    /// Nothing is on its way: no view being made, `view=` chosen.
+    pub(super) fn settled(&self) -> bool {
+        self.making.is_none() && self.wanted.is_none()
+    }
+
+    /// The status row's line while the views have one: a view being made, the list of
+    /// encodings.
+    pub(super) fn status(&self) -> Option<Status> {
+        if let Some(making) = &self.making {
+            return Some(Status::info(format!(
+                "making the {} view… · Esc stops",
+                making.view.name()
+            )));
+        }
+        self.picker.as_ref().map(|p| {
+            Status::info(format!(
+                "↑ ↓ an encoding · Enter reads the file in it · Esc keeps {}",
+                p.current.label()
+            ))
+        })
+    }
+
+    /// Everything the views hold goes with the viewer: the hidden windows (what they may still
+    /// write settles after them), a view being made, the view keys.
+    pub(super) fn close(self, closing: &mut Vec<Closing>, workers: &mut Vec<JoinHandle<()>>) {
+        for kept in self.hidden {
+            closing.push(Closing {
+                settle: kept.embedded.settle,
+                hold: kept.hold,
+            });
+        }
+        if let Some(mut making) = self.making {
+            making.cancel.store(true, Ordering::Relaxed);
+            workers.extend(making.worker.take());
+        }
+    }
+}
+
+impl Browser {
+    /// Early in the window's pass, before the title row (its strip says what this pass did):
+    /// the strip's click and the view keys' commands, the view being made, the prompt or the
+    /// Save a switch waits for, `view=`.
+    pub(super) fn views_before(&mut self, ctx: &egui::Context) {
+        if let Some(n) = chrome::take_strip_click(ctx) {
+            if let Some(viewer) = self.viewer.as_mut() {
+                viewer
+                    .views
+                    .slot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .keys
+                    .disarm();
+            }
+            if let Some(slot) = Slot::from_number(n) {
+                self.view_input(ctx, Input::Choose(slot));
+            }
+        }
+        let commands = match self.viewer.as_ref() {
+            Some(viewer) => std::mem::take(
+                &mut viewer
+                    .views
+                    .slot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .commands,
+            ),
+            None => return,
+        };
+        for command in commands {
+            self.view_command(ctx, command);
+        }
+        self.poll_making(ctx);
+        self.poll_saves(ctx);
+        // `view=N`, once the view the viewer opened on is on screen and ready.
+        let wanted = self.viewer.as_mut().and_then(|v| {
+            let ready = v.views.making.is_none() && v.embedded.window.ready();
+            ready.then(|| v.views.wanted.take()).flatten()
+        });
+        if let Some(slot) = wanted {
+            self.view_input(ctx, Input::Choose(slot));
+        }
+    }
+
+    /// After the view's pass: what the view declares to the view keys for the next input.
+    pub(super) fn views_after(&mut self, ctx: &egui::Context) {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        let views = &mut viewer.views;
+        let state = if views.picker.is_some() || help::is_open(ctx) || views.set.asking() {
+            view_keys::State::Question
+        } else if ctx.text_edit_focused() {
+            view_keys::State::Field
+        } else if views.shown.is_none() {
+            view_keys::State::Free
+        } else {
+            viewer.embedded.window.view_state()
+        };
+        views
+            .slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .state = state;
+    }
+
+    /// The view on screen asked to close in its pass: when its prompt was up for a switch, its
+    /// answer is the switch's (`true`: taken here); else it is the viewer's leaving (`false`).
+    pub(super) fn views_asked(&mut self, ctx: &egui::Context) -> bool {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return false;
+        };
+        if !viewer.views.asked {
+            return false;
+        }
+        if viewer.embedded.window.close_requested() {
+            viewer.views.asked = false;
+            if std::mem::take(&mut viewer.views.saw_saving) {
+                self.view_input(ctx, Input::SaveEnded { landed: true });
+            }
+            self.view_input(ctx, Input::Closed);
+        }
+        true
+    }
+
+    /// The image on screen gave way to the hex window (06 §7.3): the memory line's Hex view is
+    /// view 2 chosen, a file that does not decode is D10's — either way the hex window it left is
+    /// the Hex view, made.
+    pub(super) fn views_given_way(
+        &mut self,
+        ctx: &egui::Context,
+        file: crate::gui::hex::HexFile,
+        notices: Vec<String>,
+    ) {
+        let input = match notices.first() {
+            Some(why) => Input::Failed(Why::Undecodable(reason(why))),
+            None => Input::Choose(Slot::Two),
+        };
+        let made = Made {
+            embedded: crate::gui::hex::embed(file, notices),
+            hold: None,
+            switch: None,
+        };
+        let chosen = matches!(input, Input::Choose(_));
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        let now = views_now(viewer);
+        let effects = viewer.views.set.apply(input, now);
+        self.view_effects(ctx, effects, Some(made));
+        if chosen {
+            // The image window that gave its file to the hex window is spent: hidden, it is
+            // closed as a stale view is, and made again when 1 is chosen (D25's rule).
+            self.view_input(ctx, Input::Reloaded);
+        }
+    }
+
+    /// One command of the view keys (08 §4).
+    fn view_command(&mut self, ctx: &egui::Context, command: Command) {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        match command {
+            Command::Choose(n) => {
+                if let Some(slot) = Slot::from_number(n) {
+                    self.view_input(ctx, Input::Choose(slot));
+                }
+            }
+            Command::Leave => {
+                // Esc while a view is made stops making it; the view on screen stays (§5).
+                let esc = ctx.input(|i| i.key_pressed(Key::Escape));
+                if viewer.views.making.is_some() && esc {
+                    ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+                    self.view_input(ctx, Input::CancelMake);
+                }
+            }
+            Command::Arm(Ending::Field) => {
+                // The field closes, as Esc would (D29): it loses the typing.
+                ctx.memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                });
+            }
+            Command::Arm(Ending::Editing)
+            | Command::StartEditing
+            | Command::EndEditing
+            | Command::ReadOnly => viewer.embedded.window.view_key(command),
+            Command::Arm(Ending::Nothing) | Command::Disarm => {}
+            Command::Pass | Command::Drop | Command::DropText => {}
+        }
+    }
+
+    /// `input` to the view set, given what the view on screen holds now; its effects carried
+    /// out.
+    fn view_input(&mut self, ctx: &egui::Context, input: Input) {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        let now = views_now(viewer);
+        let effects = viewer.views.set.apply(input, now);
+        self.view_effects(ctx, effects, None);
+    }
+
+    /// Carries out `effects` in order (`ready`: a window made already, for the Hex view the
+    /// set asks to make — the image's give-way). An effect that answers at once (a prompt not
+    /// needed, a window made already) is the set's next input.
+    fn view_effects(&mut self, ctx: &egui::Context, effects: Vec<Effect>, ready: Option<Made>) {
+        let mut ready = ready;
+        let mut next = None;
+        for effect in effects {
+            let Some(viewer) = self.viewer.as_mut() else {
+                return;
+            };
+            match effect {
+                Effect::Hide(view) => {
+                    let old = std::mem::replace(&mut viewer.embedded, blank());
+                    let mut kept = Kept {
+                        view,
+                        embedded: old,
+                        hold: viewer.hold.take(),
+                        switch: viewer.switch.take(),
+                    };
+                    kept.embedded.window.set_shown(false);
+                    viewer.views.hidden.push(kept);
+                    viewer.views.shown = None;
+                }
+                Effect::Show { view, at, viewing } => {
+                    let views = &mut viewer.views;
+                    if !views.shown.is_some_and(|s| same_doc(s, view)) {
+                        let Some(i) = views.hidden.iter().position(|k| same_doc(k.view, view))
+                        else {
+                            continue;
+                        };
+                        let kept = views.hidden.remove(i);
+                        // A blank, or a window that closed: nothing of it is left to settle.
+                        let gone = std::mem::replace(&mut viewer.embedded, kept.embedded);
+                        drop(gone);
+                        viewer.hold = kept.hold;
+                        viewer.switch = kept.switch;
+                        viewer.embedded.window.set_shown(true);
+                    }
+                    let window = &mut viewer.embedded.window;
+                    if matches!(view, View::Text | View::Raw) {
+                        window.set_raw(view == View::Raw);
+                    }
+                    if viewing {
+                        window.set_in_viewer(true);
+                    }
+                    if let Some(at) = at {
+                        window.go_to_byte(at);
+                    }
+                    viewer.views.shown = Some(view);
+                    viewer.views.last_hold = Hold::Clean;
+                    ctx.memory_mut(|m| m.surrender_focus(super::list_id()));
+                    // What the switch said (`saving…`) is over; a reason for it follows.
+                    self.status = Status::default();
+                }
+                Effect::ReleaseSaveConnection(_) | Effect::OpenStream => {}
+                Effect::Make {
+                    ticket,
+                    view,
+                    at,
+                    notice,
+                    encoding,
+                    viewing: _,
+                } => {
+                    if let Some(made) = ready.take().filter(|_| view == View::Hex) {
+                        // The image's give-way left the hex window: made already.
+                        let read_only = viewer.views.read_only();
+                        viewer.views.hidden.push(kept(view, made, read_only));
+                        next = Some(Input::Made(ticket));
+                        continue;
+                    }
+                    let encoding = encoding.as_deref().and_then(Encoding::from_label);
+                    let making = self.start_making(ctx, ticket, view, at, notice, encoding);
+                    if let Some(viewer) = self.viewer.as_mut() {
+                        viewer.views.making = Some(making);
+                    }
+                }
+                Effect::Abandon(ticket) => {
+                    let views = &mut viewer.views;
+                    if views.making.as_ref().is_some_and(|m| m.ticket == ticket) {
+                        let mut making = views.making.take().expect("being made");
+                        making.cancel.store(true, Ordering::Relaxed);
+                        let worker = making.worker.take();
+                        self.leftover.borrow_mut().workers.extend(worker);
+                    }
+                }
+                Effect::Close(view) => {
+                    let closed = if viewer.views.shown.is_some_and(|s| same_doc(s, view)) {
+                        viewer.views.shown = None;
+                        let old = std::mem::replace(&mut viewer.embedded, blank());
+                        viewer.switch = None;
+                        Some((old, viewer.hold.take()))
+                    } else {
+                        let views = &mut viewer.views;
+                        let at = views.hidden.iter().position(|k| same_doc(k.view, view));
+                        at.map(|i| {
+                            let kept = views.hidden.remove(i);
+                            (kept.embedded, kept.hold)
+                        })
+                    };
+                    if let Some((embedded, hold)) = closed {
+                        self.leftover.borrow_mut().closing.push(Closing {
+                            settle: embedded.settle,
+                            hold,
+                        });
+                    }
+                }
+                Effect::AskClose => {
+                    viewer.views.asked = true;
+                    viewer.views.saw_saving = false;
+                    if viewer.embedded.window.close_requested() {
+                        viewer.views.asked = false;
+                        next = Some(Input::Closed);
+                    }
+                }
+                Effect::WaitForSave => self.status = Status::info("saving…"),
+                Effect::Say(words) => self.status = Status::info(words),
+                Effect::Leave => {
+                    self.drop_viewer();
+                    self.after_viewer(ctx);
+                    return;
+                }
+            }
+        }
+        ctx.request_repaint();
+        if let Some(input) = next {
+            let Some(viewer) = self.viewer.as_mut() else {
+                return;
+            };
+            let now = views_now(viewer);
+            let effects = viewer.views.set.apply(input, now);
+            self.view_effects(ctx, effects, ready);
+        }
+    }
+
+    /// The view `view` made on a worker from what the opening kept, as the opening prepared it.
+    fn start_making(
+        &mut self,
+        ctx: &egui::Context,
+        ticket: Ticket,
+        view: View,
+        at: Option<u64>,
+        notice: Option<String>,
+        encoding: Option<Encoding>,
+    ) -> Making {
+        let means = &self.viewer.as_ref().expect("a viewer").views.means;
+        let (connect, label, path, in_place) = (
+            means.connect.clone(),
+            means.label.clone(),
+            means.path.clone(),
+            means.in_place,
+        );
+        let cache = self.cache.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let (stop, waker) = (cancel.clone(), ctx.clone());
+        let began = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            let repaint = waker.clone();
+            let wake: crate::stream::Waker = Arc::new(move || repaint.request_repaint());
+            let req = prepare::Request {
+                connect: &connect,
+                label: label.as_deref(),
+                abs: &path,
+                cache: &cache,
+                wake: &wake,
+                began,
+            };
+            let result =
+                prepare::prepare_view(&req, in_place, kind_of(view), &stop, &mut |_, _| {
+                    waker.request_repaint()
+                });
+            let _ = tx.send(result);
+            waker.request_repaint();
+        });
+        Making {
+            ticket,
+            view,
+            at,
+            notice,
+            encoding,
+            cancel,
+            rx,
+            worker: Some(worker),
+        }
+    }
+
+    /// The view being made, once its worker answers: made (kept hidden until the set shows it)
+    /// or not.
+    fn poll_making(&mut self, ctx: &egui::Context) {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        let Some(making) = viewer.views.making.as_mut() else {
+            return;
+        };
+        let result = match making.rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!("stopped without a result")),
+        };
+        let mut making = viewer.views.making.take().expect("being made");
+        if let Some(worker) = making.worker.take() {
+            let _ = worker.join();
+        }
+        let (ticket, view) = (making.ticket, making.view);
+        let made = result.and_then(|opened| {
+            // A picture view whose file does not decode is not made (D10).
+            if let (true, Some(why)) = (view.is_media(), &opened.undecodable) {
+                anyhow::bail!("{why}");
+            }
+            let means = &viewer.views.means;
+            let text = TextOpen {
+                at: None,
+                loading: false,
+                enc: making.encoding,
+            };
+            embed(
+                opened.prepared,
+                &self.cache,
+                means.title.clone(),
+                &means.name,
+                text,
+                making.notice.take(),
+            )
+        });
+        let input = match made {
+            Ok(made) => {
+                let read_only = viewer.views.read_only();
+                let mut kept = kept(view, made, read_only);
+                if let Some(at) = making.at.filter(|&at| at > 0) {
+                    kept.embedded.window.go_to_byte(at);
+                }
+                viewer.views.hidden.push(kept);
+                Input::Made(ticket)
+            }
+            Err(e) => Input::MakeFailed(ticket, crate::stream::explain(&e)),
+        };
+        self.view_input(ctx, input);
+    }
+
+    /// The view on screen's Saves and prompt: a switch waiting for its Save (D2), its prompt
+    /// cancelled, and any Save that ended (D25).
+    fn poll_saves(&mut self, ctx: &egui::Context) {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        if viewer.views.shown.is_none() {
+            return;
+        }
+        let (waiting, asking) = (viewer.views.set.waiting(), viewer.views.asked);
+        let hold = viewer.embedded.window.hold();
+        let was = std::mem::replace(&mut viewer.views.last_hold, hold);
+        if !(waiting || asking) {
+            // A Save of its own (F5, Cmd/Ctrl+S) ended — seen as its edits saved, since a local
+            // Save can start and land within one pass. (Undoing every edit reads so too: the
+            // hidden views are then made again, which costs a read and shows nothing wrong.)
+            let ended = match (was, hold) {
+                (Hold::Unsaved | Hold::Saving, Hold::Clean) => Some(true),
+                (Hold::Saving, Hold::Unsaved) => Some(false),
+                _ => None,
+            };
+            if let Some(landed) = ended {
+                self.view_input(ctx, Input::SaveEnded { landed });
+            }
+            return;
+        }
+        if waiting && hold != Hold::Saving {
+            // The switch's `saving…` is over: it goes on, or — a Save that did not land — stays
+            // (07 §10), the window saying why.
+            self.status = Status::default();
+            self.view_input(
+                ctx,
+                Input::SaveEnded {
+                    landed: hold == Hold::Clean,
+                },
+            );
+            return;
+        }
+        if asking {
+            if hold == Hold::Saving {
+                viewer.views.saw_saving = true;
+                return;
+            }
+            let question = viewer.embedded.window.view_state() == view_keys::State::Question;
+            if !question {
+                // The prompt was answered without closing: Cancel, or a Save from it that did
+                // not land (07 §10).
+                viewer.views.asked = false;
+                let landed = std::mem::take(&mut viewer.views.saw_saving);
+                if landed {
+                    self.view_input(ctx, Input::SaveEnded { landed: false });
+                }
+                self.view_input(ctx, Input::Cancelled);
+            }
+        }
+    }
+
+    /// Before the view's pass, over its `area`: F8 (or E) in Text and Raw opens the list of
+    /// encodings; the list, while it is up, as a dialog of cells over the viewer, which keeps
+    /// the keyboard from the view (08 §7.5).
+    pub(super) fn picker_ui(&mut self, ctx: &egui::Context, area: egui::Rect) {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        let views = &mut viewer.views;
+        let text = matches!(views.shown, Some(View::Text | View::Raw));
+        if views.picker.is_none() && text && !ctx.text_edit_focused() && !views.set.asking() {
+            let asked = take_plain(ctx, Key::F8) || take_plain(ctx, Key::E);
+            if let Some((current, pick)) = viewer.embedded.window.encoding().filter(|_| asked) {
+                let at = Encoding::ALL.iter().position(|e| *e == current);
+                views.picker = Some(Picker {
+                    current,
+                    pick,
+                    at: at.unwrap_or(0),
+                });
+            }
+        }
+        let Some(picker) = views.picker.as_mut() else {
+            return;
+        };
+        let all = Encoding::ALL;
+        // The bar's row has egui's focus, so Enter or Space chooses it. ↑ and ↓ move it a row,
+        // as this list's keys — those played into the pass too (`SOPEN_KEYS`), which egui's
+        // own arrow moves (read before the pass) never see; Tab or a click moves it as egui does.
+        if let Some(i) = (0..all.len()).find(|&i| ctx.memory(|m| m.has_focus(picker_row_id(i)))) {
+            picker.at = i;
+        }
+        if take_plain(ctx, Key::ArrowDown) {
+            picker.at = (picker.at + 1).min(all.len() - 1);
+        }
+        if take_plain(ctx, Key::ArrowUp) {
+            picker.at = picker.at.saturating_sub(1);
+        }
+        ctx.memory_mut(|m| {
+            m.move_focus(egui::FocusDirection::None);
+            m.request_focus(picker_row_id(picker.at));
+        });
+        let labels: Vec<String> = all
+            .iter()
+            .map(|e| {
+                let mark = if *e == picker.current { "•" } else { " " };
+                let default = match picker.pick {
+                    Some(p) if p.encoding == *e && p.guessed => " — the default, guessed",
+                    Some(p) if p.encoding == *e => " — the default",
+                    _ => "",
+                };
+                format!("{mark} {}{default}", e.label())
+            })
+            .collect();
+        let widest = labels
+            .iter()
+            .map(|l| crate::gui::cells::width(l))
+            .max()
+            .unwrap_or(0);
+        use super::ops::dialog::{self, Button, Part};
+        let mut parts = vec![Part::Text(
+            "The file's lines are read again in the one chosen.".to_string(),
+            dialog::Ink::Weak,
+        )];
+        parts.extend(labels.iter().enumerate().map(|(i, l)| {
+            Part::Buttons(vec![Button::new(
+                &format!("{l:<widest$}"),
+                picker_row_id(i),
+            )])
+        }));
+        let grid = crate::gui::cells::Grid::over(area);
+        let layout = dialog::layout(grid, "Encoding", 34, &parts);
+        let shown = dialog::show(
+            ctx,
+            egui::Id::unique("sopen-encoding-list"),
+            &layout,
+            dialog::Inputs::default(),
+        );
+        let chosen = (0..all.len()).find(|&i| shown.clicked(picker_row_id(i)));
+        let close = shown.modal.should_close();
+        // The list keeps the keyboard: nothing of this pass reaches the view or the viewer's
+        // keys behind it.
+        ctx.input_mut(|i| {
+            i.events
+                .retain(|e| !matches!(e, egui::Event::Key { .. } | egui::Event::Text(_)))
+        });
+        if let Some(i) = chosen {
+            views.picker = None;
+            let enc = all[i];
+            viewer.embedded.window.set_encoding(enc);
+            self.view_input(ctx, Input::Encoding(enc.label().to_string()));
+        } else if close {
+            views.picker = None;
+        }
+    }
+}
+
+/// A window made for `view`, kept hidden until the set shows it: told it is a view of the
+/// viewer (the hex view opens viewing, D35), read-only for a revision, Raw for Raw.
+fn kept(view: View, made: Made, read_only: bool) -> Kept {
+    let mut embedded = made.embedded;
+    if read_only {
+        embedded.window.set_read_only(true);
+    }
+    embedded.window.set_in_viewer(true);
+    if view == View::Raw {
+        embedded.window.set_raw(true);
+    }
+    embedded.window.set_shown(false);
+    Kept {
+        view,
+        embedded,
+        hold: made.hold,
+        switch: made.switch,
+    }
+}
+
+/// What the view on screen holds now (`views::Now`): its edits or Save, its byte place.
+fn views_now(viewer: &mut Viewer) -> Now {
+    if viewer.views.shown.is_none() {
+        return Now::CLEAN;
+    }
+    let window = &mut viewer.embedded.window;
+    Now {
+        hold: window.hold(),
+        place: window.byte_place(),
+    }
+}

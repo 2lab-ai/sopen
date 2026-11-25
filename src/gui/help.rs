@@ -203,8 +203,7 @@ pub(crate) fn open(ctx: &egui::Context, page: Page) {
     ctx.request_repaint();
 }
 
-/// Whether the help screen is on screen.
-#[cfg(test)]
+/// Whether the help screen is on screen (the viewer's view keys wait for it: 08 §4's Question).
 pub(crate) fn is_open(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<Open>(open_id()).is_some())
 }
@@ -675,6 +674,8 @@ mod tests {
                 "F1",
                 "F3, Esc",
                 "F4",
+                "1, 2, 3",
+                "F9",
                 "F5",
                 "F6",
                 "F7",

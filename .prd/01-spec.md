@@ -197,10 +197,12 @@ of the browser workstream: 1 Help, 2 Rename, 3 View, 4 Edit, 5 Copy, 6 Move, 9 D
 dual mode — and 10 Tree; the directory tree: 1 Help, 10 Tree; the git panel, since S2: 1 Help, 3 View,
 4 Edit, 9 Dual, and since S3 the slots that act on the object under the bar — 2 Reword (a branch's
 label: rename; since S4 a commit's reword), 5 Pick, 6 Rebase, 7 Branch (Commit on the uncommitted
-row), 8 Delete (since S4 a commit's drop), 10 Menu; with the planner open only 1 Help and 9 Dual; a viewer: 1 Help, 3 Exit, 4 Edit and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
-an alias of W; the hex window's 5 Save, 6 Goto, 7 SaveAs, 8 Asc/hx, aliases of ⌘S, ⌘G, ⌥⌘S and
+row), 8 Delete (since S4 a commit's drop), 10 Menu; with the planner open only 1 Help and 9 Dual; a viewer: 1 Help, 3 Exit, 4 Edit, 9 View (then 1, 2 or 3: 08 §4) and the viewer's own — the text viewer's 2 Unwrap (Wrap once unwrapped),
+an alias of W, and 8 Encode, an alias of E (08 §7.5); the hex window's 5 Save, 6 Goto, 7 SaveAs, 8 Asc/hx, aliases of ⌘S, ⌘G, ⌥⌘S and
 Tab; and the image and media windows' 5 Save and 7 SaveAs; a plain F-key never acts while a text
-field has the typing). The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
+field has the typing). In a viewer 1, 2 and 3 choose its views (08 §3, §8): 1 the file's own, 2 Hex
+for every file — opened viewing, Enter edits (08 D35) — 3 the other (Raw for text, the text of a
+binary); a view switched away from is kept hidden, and one with unsaved edits asks first. The foot shows `N Listed = N bytes` whole inside the frame whatever the width: the
 free space gives way first, then the end of the total. Every cell fits its column at a glyph
 boundary (a name or an extension too long ends in "…"; a size too long for its column is said in
 the smallest unit that fits, KB to EB, never cut). All drawing of those rows, the frames, the bar and every colour sits in

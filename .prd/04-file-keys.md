@@ -52,7 +52,8 @@ AGENTS.md "Rules" (file operations exist and never overwrite).
 - **The row changes with the context**, as PC Shell's does ("the functions on it will change
   depending upon what you are doing", PC Tools 6 manual p. 67, keys.md §3.3). In a viewer the slots
   keep the viewer's meanings — 3 Exit, 4 Edit, and the hex window's 5 Save, 6 Goto, 8 Asc/hx, the
-  image window's 5 Save — 1 is Help everywhere, and 2, 7, 9, 10 are empty. The git panel's row is 03 §9.1's; the tree's is
+  image window's 5 Save — 1 is Help everywhere, and 2, 7, 9, 10 are empty. With VM-7 (08 §8): 9 View
+  in every view, 8 Encode in Text and Raw. The git panel's row is 03 §9.1's; the tree's is
   05 §7's. A mis-press of 5 or 6 in the list costs a dialog, never a write (§5.1).
 
 ## 3. Matching keys
@@ -701,7 +702,8 @@ Run locally and on a remote folder under `/tmp/sopen-receipts/`; window receipts
 
 - K-R1. The list's F-key row reads `1Help 2Rename 3View 4Edit 5Copy 6Move 7MkDir 8Delete 9Dual 10Tree`
   in preview mode and `9Prevw` in dual mode (screenshot); in the hex window it reads `1Help 3Exit
-  4Edit 5Save 6Goto 8Asc/hx`.
+  4Edit 5Save 6Goto 7SaveAs 8Asc/hx 9View` (`9View` in every view of the browser's viewer, `8Encode`
+  in Text and Raw: 08 §8, VM-7).
 - K-R2. Each slot clicked, and each Cmd/Ctrl+digit, does what its key does (test: every slot of every
   context); with a rename field open, F5, Cmd/Ctrl+5 and `+` do nothing.
 - K-R3. Shift+F6 renames and F6 moves; Shift+F8 deletes permanently and F8 asks for the Trash; Alt+F10
