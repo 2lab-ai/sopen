@@ -75,7 +75,9 @@ contexts where it acts (list, viewer, git panel, tree, a dialog) and its `Comman
 4. **One table, and text fields own their typing**: a key acts in the contexts its row names and
    nowhere else; a key with no row in a context does nothing there. While a field has the keyboard
    (rename, a dialog's path, the hex window's Go to, find), no plain F-key, Cmd/Ctrl+digit or list key
-   acts (01 §3a's rule, extended to every key of this table). A preview never takes keys (02 §4.4).
+   acts (01 §3a's rule, extended to every key of this table) — but F9 in the browser's viewer, which
+   types nothing: it closes the field, as Esc would, and arms the view keys (08 D29, VM-7). A preview
+   never takes keys (02 §4.4).
 5. **Who writes the table**: S1-A (02 §8) writes every context's rows up front, from 02 §3.2, 03 §9, this
    section and 05 §1; a later work unit changes a row only through a declared hand-over (02 §8).
 

@@ -1634,10 +1634,18 @@ impl Browser {
         };
         means.title = title.clone();
         let opened_as = view_set::OpenedAs::of(&opened);
-        let text = view_set::TextOpen {
-            at: self.open_at.take(),
-            loading: self.open_loading,
-            enc: self.open_enc.take(),
+        // `at=` and `enc=` are the first text file's: taken by a text viewer, kept past any
+        // other.
+        let text = match opened.prepared {
+            prepare::Prepared::Text { .. } => view_set::TextOpen {
+                at: self.open_at.take(),
+                loading: self.open_loading,
+                enc: self.open_enc.take(),
+            },
+            _ => view_set::TextOpen {
+                loading: self.open_loading,
+                ..Default::default()
+            },
         };
         let made = view_set::embed(opened.prepared, &self.cache, title, &means.name, text, None);
         let made = match made {
@@ -2383,8 +2391,8 @@ impl Browser {
         // close): then the hex window is not made, and its file — the stream with it — goes;
         // the viewer closes below.
         let given_way = viewer.switch.as_ref().and_then(|s| s.take());
-        if let Some((file, notices)) = given_way.filter(|_| !asked) {
-            self.views_given_way(&ctx, file, notices);
+        if let Some((file, notices, failed)) = given_way.filter(|_| !asked) {
+            self.views_given_way(&ctx, file, notices, failed);
             self.views_after(&ctx);
             return;
         }

@@ -1882,6 +1882,10 @@ pub(super) struct HexWindow {
     /// at once, as ever.
     in_viewer: bool,
     editing: bool,
+    /// Saves that wrote the file so far (a Save, Write in place, a cut-off Save found landed):
+    /// the browser's view set tells its hidden views they are stale by it (08 D25), whatever
+    /// the window does after.
+    saves_landed: u64,
     /// Saves started so far (tests: a key starts exactly one).
     #[cfg(test)]
     pub(super) save_starts: usize,
@@ -2018,6 +2022,7 @@ impl HexWindow {
             cursor,
             in_viewer: false,
             editing: false,
+            saves_landed: 0,
             top_row: 0,
             visible: 1,
             follow: true,
@@ -2582,6 +2587,17 @@ impl HexWindow {
                 self.opened.push(CANNOT_REPLACE.to_string());
             }
             self.can_replace = can;
+        }
+        // What wrote the file itself (not a copy beside it): the view set's receipt (D25).
+        if matches!(
+            &result,
+            Ok(JobDone::Saved(Saved::Written { .. })
+                | JobDone::Streamed {
+                    done: Streamed::Saved { .. } | Streamed::FoundLanded { .. },
+                    ..
+                })
+        ) {
+            self.saves_landed += 1;
         }
         let landed = match &result {
             Ok(JobDone::Saved(Saved::Written { .. })) => {
@@ -4741,6 +4757,10 @@ impl super::Window for HexWindow {
 
     fn byte_place(&self) -> Option<u64> {
         Some(self.cursor.at)
+    }
+
+    fn saves_landed(&self) -> u64 {
+        self.saves_landed
     }
 
     /// The cursor on `at`, its row at the top (08 D11).

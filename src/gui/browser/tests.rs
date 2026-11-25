@@ -489,8 +489,6 @@ fn went_to_16_with_nothing_changed(fx: &mut Fx) {
     let said: Vec<String> = fx.drv.texts().into_iter().map(|t| t.2).collect();
     let changed: Vec<&String> = said.iter().filter(|t| t.contains("changed")).collect();
     assert_eq!(changed, ["0 bytes changed"], "bytes were typed over");
-    // The hex view is viewing (08 D35): Enter edits.
-    fx.key(Key::Enter);
     fx.typed("FF");
     assert!(
         fx.drv.text_starting_with("FF 11 12").is_some(),
@@ -507,7 +505,8 @@ fn a_hosted_hex_viewers_go_to_takes_played_keys_in_a_window_without_focus() {
     let mut fx = fixture();
     fx.open("data.bin");
     fx.drv.focused = false;
-    fx.b.script = parse_keys("F6,text:0x10,Enter").unwrap().into();
+    // Editing first (Enter, 08 D35): a digit that missed the field would be a byte.
+    fx.b.script = parse_keys("Enter,F6,text:0x10,Enter").unwrap().into();
     fx.settle();
     fx.drv.idle(&mut fx.b, 2);
     fx.drv.focused = true;
@@ -520,6 +519,8 @@ fn a_hosted_hex_viewers_go_to_takes_played_keys_in_a_window_without_focus() {
 fn a_hosted_hex_viewers_go_to_is_still_open_after_the_window_lost_focus() {
     let mut fx = fixture();
     fx.open("data.bin");
+    // Editing first (Enter, 08 D35): a digit that missed the field would be a byte.
+    fx.key(Key::Enter);
     fx.key(Key::F6);
     fx.drv.focused = false;
     fx.drv.idle(&mut fx.b, 1);

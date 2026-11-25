@@ -723,6 +723,13 @@ pub trait Window {
         crate::views::Hold::Clean
     }
 
+    /// How many Saves of this window wrote its file so far — every one, whether the window then
+    /// closes, keeps its notes on screen or asks again (08 D25: the hidden views of the file are
+    /// stale from then on). 0 for a window that never writes its file (the default).
+    fn saves_landed(&self) -> u64 {
+        0
+    }
+
     /// A view key's command for the window itself (08 §4, D35): Enter or Insert starts editing
     /// the hex view (`StartEditing`), Esc or F9 ends it (`EndEditing`, `Arm(Editing)`), a
     /// read-only one says it never edits (`ReadOnly`). The default does nothing.

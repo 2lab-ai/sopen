@@ -10,7 +10,11 @@
 //! wait. The hex view opens viewing (D35). F8 (or E) in Text and Raw opens the list of encodings,
 //! a dialog of cells ([`super::ops::dialog`]).
 //!
-//! Not built here (each a line of 08): a remote view is made through a stream of its own, so a
+//! A Save that landed is told by the window's own count of them ([`Window::saves_landed`]),
+//! checked before anything else in a pass: whatever the window did after it (closed, kept its
+//! notes on screen), the hidden views are stale (D25).
+//!
+//! Not built here (08 §13's VM-7b): a remote view is made through a stream of its own, so a
 //! remote file's views read it again (D13); a hidden view keeps its save connection (D14); a
 //! reload does not make the hidden views stale (D25's reload half); F9 in a field takes the
 //! typing from it, which closes the hex window's Go to but leaves the text view's open (D29).
@@ -59,13 +63,18 @@ pub(super) struct Views {
     making: Option<Making>,
     means: Means,
     picker: Option<Picker>,
-    /// The view on screen's close prompt is up for a switch (`Effect::AskClose`), and a Save
-    /// from it was seen running.
+    /// The view on screen's close prompt is up for a switch (`Effect::AskClose`).
     asked: bool,
-    saw_saving: bool,
-    /// What the view on screen held at the last pass: a Save that ends is told to the set
-    /// whatever started it (D25: a landed one makes the hidden views stale).
-    last_hold: Hold,
+    /// The view on screen's count of Saves that wrote the file, as last told to the set
+    /// ([`Window::saves_landed`]): one that moved is a landed Save (D25), whatever the window
+    /// did after it.
+    saves_seen: u64,
+    /// An encoding was chosen from F8's list: the set is told the one the text view reads in,
+    /// once it does (D21).
+    chose: bool,
+    /// Tests: views made on a worker so far.
+    #[cfg(test)]
+    pub(super) makes: usize,
     /// `SOPEN_STATE` `view=N`: chosen once the first view is on screen and ready.
     wanted: Option<Slot>,
 }
@@ -142,8 +151,10 @@ pub(super) fn open(
         means,
         picker: None,
         asked: false,
-        saw_saving: false,
-        last_hold: Hold::Clean,
+        saves_seen: 0,
+        chose: false,
+        #[cfg(test)]
+        makes: 0,
         wanted: wanted.and_then(Slot::from_number),
     }
 }
@@ -398,6 +409,8 @@ impl Browser {
     /// the strip's click and the view keys' commands, the view being made, the prompt or the
     /// Save a switch waits for, `view=`.
     pub(super) fn views_before(&mut self, ctx: &egui::Context) {
+        // First a Save that landed since: no switch below may show a view it made stale.
+        self.save_receipt(ctx);
         if let Some(n) = chrome::take_strip_click(ctx) {
             if let Some(viewer) = self.viewer.as_mut() {
                 viewer
@@ -458,6 +471,19 @@ impl Browser {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .state = state;
+        // The encoding the text view reads in now, after a choice from F8's list: the opening's
+        // one encoding from then on (D21), for Text, Raw and a text view made again.
+        let text = matches!(views.shown, Some(View::Text | View::Raw));
+        let reads = viewer
+            .embedded
+            .window
+            .encoding()
+            .map(|(enc, _)| enc.label());
+        if let Some(label) = reads.filter(|_| text && views.chose) {
+            if views.set.encoding() != Some(label) {
+                self.view_input(ctx, Input::Encoding(label.to_string()));
+            }
+        }
     }
 
     /// The view on screen asked to close in its pass: when its prompt was up for a switch, its
@@ -471,24 +497,40 @@ impl Browser {
         }
         if viewer.embedded.window.close_requested() {
             viewer.views.asked = false;
-            if std::mem::take(&mut viewer.views.saw_saving) {
-                self.view_input(ctx, Input::SaveEnded { landed: true });
-            }
+            // The prompt's Save that landed comes first (`views::Input::Closed`).
+            self.save_receipt(ctx);
             self.view_input(ctx, Input::Closed);
         }
         true
     }
 
+    /// The view on screen's Saves that wrote the file since the set was last told: each is
+    /// `SaveEnded { landed: true }` (D25: the hidden views are stale; a switch that waited goes
+    /// on).
+    fn save_receipt(&mut self, ctx: &egui::Context) {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        if viewer.views.shown.is_none() {
+            return;
+        }
+        let landed = viewer.embedded.window.saves_landed();
+        if std::mem::replace(&mut viewer.views.saves_seen, landed) != landed {
+            self.view_input(ctx, Input::SaveEnded { landed: true });
+        }
+    }
+
     /// The image on screen gave way to the hex window (06 §7.3): the memory line's Hex view is
-    /// view 2 chosen, a file that does not decode is D10's — either way the hex window it left is
-    /// the Hex view, made.
+    /// view 2 chosen, a file that does not decode (`failed`, its reason the first notice) is
+    /// D10's — either way the hex window it left is the Hex view, made.
     pub(super) fn views_given_way(
         &mut self,
         ctx: &egui::Context,
         file: crate::gui::hex::HexFile,
         notices: Vec<String>,
+        failed: bool,
     ) {
-        let input = match notices.first() {
+        let input = match notices.first().filter(|_| failed) {
             Some(why) => Input::Failed(Why::Undecodable(reason(why))),
             None => Input::Choose(Slot::Two),
         };
@@ -607,7 +649,7 @@ impl Browser {
                         window.go_to_byte(at);
                     }
                     viewer.views.shown = Some(view);
-                    viewer.views.last_hold = Hold::Clean;
+                    viewer.views.saves_seen = viewer.embedded.window.saves_landed();
                     ctx.memory_mut(|m| m.surrender_focus(super::list_id()));
                     // What the switch said (`saving…`) is over; a reason for it follows.
                     self.status = Status::default();
@@ -666,7 +708,6 @@ impl Browser {
                 }
                 Effect::AskClose => {
                     viewer.views.asked = true;
-                    viewer.views.saw_saving = false;
                     if viewer.embedded.window.close_requested() {
                         viewer.views.asked = false;
                         next = Some(Input::Closed);
@@ -702,6 +743,10 @@ impl Browser {
         notice: Option<String>,
         encoding: Option<Encoding>,
     ) -> Making {
+        #[cfg(test)]
+        if let Some(viewer) = self.viewer.as_mut() {
+            viewer.views.makes += 1;
+        }
         let means = &self.viewer.as_ref().expect("a viewer").views.means;
         let (connect, label, path, in_place) = (
             means.connect.clone(),
@@ -793,13 +838,23 @@ impl Browser {
                 viewer.views.hidden.push(kept);
                 Input::Made(ticket)
             }
-            Err(e) => Input::MakeFailed(ticket, crate::stream::explain(&e)),
+            Err(e) => {
+                let words = crate::stream::explain(&e);
+                if crate::stream::session_refused(&words) && view.is_media() {
+                    // A refused session is no reason the file cannot be shown (D10): the make
+                    // stops, the view on screen stays, and the refusal is said (06 §6).
+                    self.view_input(ctx, Input::CancelMake);
+                    self.status = Status::error(words);
+                    return;
+                }
+                Input::MakeFailed(ticket, words)
+            }
         };
         self.view_input(ctx, input);
     }
 
-    /// The view on screen's Saves and prompt: a switch waiting for its Save (D2), its prompt
-    /// cancelled, and any Save that ended (D25).
+    /// A switch waiting for the view on screen (D2): its Save that ended without landing (one
+    /// that landed is [`Browser::save_receipt`]'s), its prompt answered without closing.
     fn poll_saves(&mut self, ctx: &egui::Context) {
         let Some(viewer) = self.viewer.as_mut() else {
             return;
@@ -808,50 +863,23 @@ impl Browser {
             return;
         }
         let (waiting, asking) = (viewer.views.set.waiting(), viewer.views.asked);
-        let hold = viewer.embedded.window.hold();
-        let was = std::mem::replace(&mut viewer.views.last_hold, hold);
         if !(waiting || asking) {
-            // A Save of its own (F5, Cmd/Ctrl+S) ended — seen as its edits saved, since a local
-            // Save can start and land within one pass. (Undoing every edit reads so too: the
-            // hidden views are then made again, which costs a read and shows nothing wrong.)
-            let ended = match (was, hold) {
-                (Hold::Unsaved | Hold::Saving, Hold::Clean) => Some(true),
-                (Hold::Saving, Hold::Unsaved) => Some(false),
-                _ => None,
-            };
-            if let Some(landed) = ended {
-                self.view_input(ctx, Input::SaveEnded { landed });
-            }
             return;
         }
+        let hold = viewer.embedded.window.hold();
         if waiting && hold != Hold::Saving {
-            // The switch's `saving…` is over: it goes on, or — a Save that did not land — stays
-            // (07 §10), the window saying why.
+            // The switch's `saving…` is over: the Save did not land, so the view stays (07
+            // §10), the window saying why.
             self.status = Status::default();
-            self.view_input(
-                ctx,
-                Input::SaveEnded {
-                    landed: hold == Hold::Clean,
-                },
-            );
+            self.view_input(ctx, Input::SaveEnded { landed: false });
             return;
         }
-        if asking {
-            if hold == Hold::Saving {
-                viewer.views.saw_saving = true;
-                return;
-            }
-            let question = viewer.embedded.window.view_state() == view_keys::State::Question;
-            if !question {
-                // The prompt was answered without closing: Cancel, or a Save from it that did
-                // not land (07 §10).
-                viewer.views.asked = false;
-                let landed = std::mem::take(&mut viewer.views.saw_saving);
-                if landed {
-                    self.view_input(ctx, Input::SaveEnded { landed: false });
-                }
-                self.view_input(ctx, Input::Cancelled);
-            }
+        let question = viewer.embedded.window.view_state() == view_keys::State::Question;
+        if asking && hold != Hold::Saving && !question {
+            // The prompt was answered and the window stays: Cancel, a Save from it that did not
+            // land, or one that landed and kept the window open (its notes) — told already.
+            viewer.views.asked = false;
+            self.view_input(ctx, Input::Cancelled);
         }
     }
 
@@ -943,7 +971,9 @@ impl Browser {
             views.picker = None;
             let enc = all[i];
             viewer.embedded.window.set_encoding(enc);
-            self.view_input(ctx, Input::Encoding(enc.label().to_string()));
+            // The set hears of it once the text view reads in it (`views_after`): a rebuild Esc
+            // stops keeps the encoding it had (D22).
+            views.chose = true;
         } else if close {
             views.picker = None;
         }

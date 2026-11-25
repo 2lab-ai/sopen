@@ -161,15 +161,37 @@ fn va1_a_sounds_views_by_1_and_2() {
     fx.settle();
     fx.open("tone.wav");
     assert!(on_strip(&fx, "1 Audio"));
-    // Playing, then hidden: it stops where it was (D1), and the viewer settles.
+    // The transport's clock: the playhead.
+    let playhead = |fx: &Fx| {
+        let line = fx.drv.text_starting_with("0:0").expect("the clock line");
+        line.split(" / ").next().unwrap().trim().to_string()
+    };
+    // Playing, then hidden: it stops where it was (D1), and nothing plays while hidden.
     fx.key(Key::Space);
-    fx.drv.idle(&mut fx.b, 3);
+    for _ in 0..10 {
+        fx.drv.idle(&mut fx.b, 1);
+        std::thread::sleep(Duration::from_millis(20));
+    }
     digit(&mut fx, 2);
     assert!(hex_row(&fx, "52 49 46 46"), "the WAV's bytes: RIFF");
     assert!(on_strip(&fx, "2 Hex"));
+    for _ in 0..20 {
+        fx.drv.idle(&mut fx.b, 1);
+        std::thread::sleep(Duration::from_millis(20));
+    }
     digit(&mut fx, 1);
     assert!(on_strip(&fx, "1 Audio"), "the sound again");
     assert!(!hex_row(&fx, "52 49 46 46"));
+    let back = playhead(&fx);
+    for _ in 0..10 {
+        fx.drv.idle(&mut fx.b, 1);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        playhead(&fx),
+        back,
+        "paused where it was hidden: nothing plays"
+    );
     assert_eq!(std::fs::read(&wav).unwrap(), before, "nothing written");
 }
 
@@ -558,8 +580,18 @@ fn va2_an_edited_image_asks_before_a_switch() {
     assert!(!fx.drv.pictures().is_empty());
 }
 
-/// A window that says what it holds (a Save running, unsaved edits) as the test sets it.
-struct Holding(Arc<Mutex<Hold>>);
+/// What a [`Holding`] window says, as the test sets it: what it holds, the Saves of it that
+/// wrote the file, whether its close prompt is up.
+#[derive(Debug, Clone, Copy)]
+struct Told {
+    hold: Hold,
+    saves: u64,
+    question: bool,
+}
+
+/// A window that says what it holds, as the test sets it ([`Told`]); asked to close with
+/// something unsaved, it puts up its prompt.
+struct Holding(Arc<Mutex<Told>>);
 
 impl Window for Holding {
     fn ui(&mut self, _ui: &mut egui::Ui) {}
@@ -567,8 +599,62 @@ impl Window for Holding {
         true
     }
     fn hold(&mut self) -> Hold {
-        *self.0.lock().unwrap()
+        self.0.lock().unwrap().hold
     }
+    fn saves_landed(&self) -> u64 {
+        self.0.lock().unwrap().saves
+    }
+    fn view_state(&mut self) -> crate::view_keys::State {
+        match self.0.lock().unwrap().question {
+            true => crate::view_keys::State::Question,
+            false => crate::view_keys::State::Free,
+        }
+    }
+    fn close_requested(&mut self) -> bool {
+        let mut told = self.0.lock().unwrap();
+        told.question = told.hold != Hold::Clean;
+        !told.question
+    }
+}
+
+/// The viewer on `photo.png` with a [`Holding`] window as its view 1 (the image).
+fn holding(fx: &mut Fx) -> Arc<Mutex<Told>> {
+    let told = Arc::new(Mutex::new(Told {
+        hold: Hold::Clean,
+        saves: 0,
+        question: false,
+    }));
+    let abs = format!("{}/photo.png", fx.root);
+    let means = view_set::Means {
+        path: abs.clone(),
+        name: "photo.png".to_string(),
+        title: abs.clone(),
+        connect: local_connect(),
+        label: None,
+        in_place: false,
+    };
+    let opened = view_set::OpenedAs {
+        kind: crate::kind::Kind::Image,
+        stat: LocalFs::new().stat(&abs).unwrap(),
+        undecodable: None,
+    };
+    let ctx = fx.drv.ctx.clone();
+    let views = view_set::open(&ctx, &opened, means, None);
+    let made = view_set::Made {
+        embedded: Embedded {
+            window: Box::new(Holding(told.clone())),
+            settle: Box::new(|_| Some(Outcome::default())),
+        },
+        hold: None,
+        switch: None,
+    };
+    fx.b.view(&ctx, made, abs, false, views);
+    fx.drv.idle(&mut fx.b, 2);
+    told
+}
+
+fn set(fx: &Fx) -> &crate::views::ViewSet {
+    &fx.b.viewer.as_ref().expect("a viewer").views.set
 }
 
 /// D2: a Save running makes a switch wait (`saving…`); once it lands the switch goes on; one
@@ -577,38 +663,16 @@ impl Window for Holding {
 fn va2_a_running_save_makes_the_switch_wait() {
     for landed in [true, false] {
         let mut fx = fixture();
-        let hold = Arc::new(Mutex::new(Hold::Clean));
-        let abs = format!("{}/photo.png", fx.root);
-        let means = view_set::Means {
-            path: abs.clone(),
-            name: "photo.png".to_string(),
-            title: abs.clone(),
-            connect: local_connect(),
-            label: None,
-            in_place: false,
-        };
-        let opened = view_set::OpenedAs {
-            kind: crate::kind::Kind::Image,
-            stat: LocalFs::new().stat(&abs).unwrap(),
-            undecodable: None,
-        };
-        let ctx = fx.drv.ctx.clone();
-        let views = view_set::open(&ctx, &opened, means, None);
-        let made = view_set::Made {
-            embedded: Embedded {
-                window: Box::new(Holding(hold.clone())),
-                settle: Box::new(|_| Some(Outcome::default())),
-            },
-            hold: None,
-            switch: None,
-        };
-        fx.b.view(&ctx, made, abs, false, views);
-        fx.drv.idle(&mut fx.b, 2);
-        *hold.lock().unwrap() = Hold::Saving;
+        let told = holding(&mut fx);
+        told.lock().unwrap().hold = Hold::Saving;
         digit(&mut fx, 2);
         assert!(shows(&fx, "saving…"), "{landed}: the switch waits");
         assert!(on_strip(&fx, "1 Image"), "{landed}: still view 1");
-        *hold.lock().unwrap() = if landed { Hold::Clean } else { Hold::Unsaved };
+        {
+            let mut told = told.lock().unwrap();
+            told.hold = if landed { Hold::Clean } else { Hold::Unsaved };
+            told.saves += u64::from(landed);
+        }
         // The pass that sees it first (the browser was ready before it: the Save is the
         // window's), then the view made.
         fx.drv.idle(&mut fx.b, 1);
@@ -623,5 +687,197 @@ fn va2_a_running_save_makes_the_switch_wait() {
     }
 }
 
-use crate::views::Hold;
+/// D25 by the receipt, not by sampling what the window holds: a Save that lands in the pass
+/// before a view key (Unsaved → Clean, and the key in the very next input) makes the hidden Hex
+/// stale — it is made again, never shown as it was.
+#[test]
+fn d25_a_save_landing_right_before_a_view_key_makes_the_hidden_view_stale() {
+    let mut fx = fixture();
+    let told = holding(&mut fx);
+    digit(&mut fx, 2);
+    digit(&mut fx, 1);
+    let views = &fx.b.viewer.as_ref().unwrap().views;
+    assert!(
+        views.set.is_made(View::Hex) && views.makes == 1,
+        "Hex made, hidden"
+    );
+    told.lock().unwrap().hold = Hold::Unsaved;
+    fx.drv.idle(&mut fx.b, 1);
+    {
+        let mut told = told.lock().unwrap();
+        (told.hold, told.saves) = (Hold::Clean, 1);
+    }
+    digit(&mut fx, 2);
+    assert_eq!(
+        fx.b.viewer.as_ref().unwrap().views.makes,
+        2,
+        "the stale Hex was closed and made again"
+    );
+    assert!(hex_row(&fx, "89 50 4E 47"));
+}
+
+/// A Save from the prompt that lands while the window stays open (its notes on screen; an
+/// image's earlier Save found landed) is a landed Save: the hidden views are stale.
+#[test]
+fn d25_a_prompts_save_that_lands_and_keeps_the_window_open_makes_the_hidden_views_stale() {
+    let mut fx = fixture();
+    let told = holding(&mut fx);
+    digit(&mut fx, 2);
+    digit(&mut fx, 1);
+    assert!(set(&fx).is_made(View::Hex));
+    told.lock().unwrap().hold = Hold::Unsaved;
+    digit(&mut fx, 2);
+    assert!(set(&fx).asking(), "the prompt");
+    // Its Save runs, the prompt gone…
+    {
+        let mut told = told.lock().unwrap();
+        (told.hold, told.question) = (Hold::Saving, false);
+    }
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(set(&fx).asking(), "the switch waits for the prompt's Save");
+    // …and lands; the window stays open.
+    {
+        let mut told = told.lock().unwrap();
+        (told.hold, told.saves) = (Hold::Clean, 1);
+    }
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(!set(&fx).is_made(View::Hex), "the hidden Hex is stale");
+    assert!(!set(&fx).asking());
+    assert_eq!(set(&fx).on_screen(), Some(View::Image), "the view stays");
+}
+
+/// `enc=` (and `at=`) are the first text file's: an image opened first leaves them to it.
+#[test]
+fn enc_is_kept_past_an_image_for_the_first_text_file() {
+    let mut fx = fixture();
+    fx.b.scripted(&crate::gui::State::parse("enc=UTF-16LE").unwrap());
+    fx.open("photo.png");
+    fx.key(Key::Escape);
+    fx.open("notes.txt");
+    assert!(shows(&fx, "UTF-16LE"), "the text reads in enc=");
+}
+
+/// VA-4: the image's zoom survives 1 → 2 → 1 (D1: the view kept hidden, as it was) — the
+/// zoom `A` gives, 100 % (D12: `1` is view 1 here).
+#[test]
+fn va4_the_images_zoom_survives_a_switch() {
+    let mut fx = fixture();
+    fx.open("photo.png");
+    let fitted = fx.drv.pictures()[0];
+    fx.key(Key::A);
+    fx.settle();
+    let zoomed = fx.drv.pictures()[0];
+    assert_ne!(zoomed, fitted, "A: 100 %");
+    digit(&mut fx, 2);
+    digit(&mut fx, 1);
+    assert_eq!(fx.drv.pictures()[0], zoomed, "the zoom kept");
+}
+
+/// A hidden media view reads nothing (06 §5, 08 §5): a remote sound's stream sends no poll
+/// while Hex is on screen, and polls again once the sound is shown.
+#[test]
+fn a_hidden_remote_sounds_stream_does_not_poll() {
+    let tools = match crate::ffmpeg::resolve() {
+        Ok(t) => t,
+        Err(e) if std::env::var_os("SOPEN_REQUIRE_FFMPEG").is_some() => {
+            panic!("SOPEN_REQUIRE_FFMPEG is set but {e}")
+        }
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let meter = Meter::new(u64::MAX, u64::MAX);
+    let connect = meter.connect(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>));
+    let mut fx = fixture_with(Some("box"), connect, None);
+    let wav = format!("{}/tone.wav", fx.root);
+    let ok = std::process::Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=2"])
+        .arg(&wav)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "fixture");
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    fx.key(Key::F9);
+    fx.open("tone.wav");
+    let sound = meter.opened.lock().unwrap()[0].0;
+    let polls = |meter: &Meter| {
+        meter
+            .polls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&id| id == sound)
+            .count()
+    };
+    // Polls every 2 s (06 §5): over 5 s on screen, some.
+    let watch = |fx: &mut Fx| {
+        let deadline = std::time::Instant::now() + Duration::from_millis(5_000);
+        while std::time::Instant::now() < deadline {
+            fx.drv.idle(&mut fx.b, 1);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let before = polls(&meter);
+    watch(&mut fx);
+    assert!(polls(&meter) > before, "the control: on screen it polls");
+    digit(&mut fx, 2);
+    let hidden = polls(&meter);
+    watch(&mut fx);
+    assert_eq!(polls(&meter), hidden, "hidden, it polls not");
+    digit(&mut fx, 1);
+    watch(&mut fx);
+    assert!(polls(&meter) > hidden, "shown again, it polls");
+}
+
+/// D22 with D21: a rebuild in another LF unit that Esc stops keeps the encoding the text had —
+/// and the set hears of the one the text reads in, never of the one only asked for.
+#[test]
+fn f8_a_rebuild_esc_stops_leaves_the_sets_encoding_as_it_reads() {
+    let mut fx = fixture();
+    // Large enough that its index pass in UTF-16LE still runs a pass later.
+    let line = "abcdefghijklmnopqrstuvwxyz 0123456789\n";
+    std::fs::write(
+        format!("{}/big.txt", fx.root),
+        line.repeat((64 << 20) / line.len()),
+    )
+    .unwrap();
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    fx.open("big.txt");
+    fx.key(Key::F8);
+    fx.key(Key::ArrowDown);
+    let press = |key| Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+    fx.drv
+        .frame(&mut fx.b, vec![press(Key::Enter)], Modifiers::NONE);
+    fx.drv
+        .frame(&mut fx.b, vec![press(Key::Escape)], Modifiers::NONE);
+    fx.settle();
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(
+        fx.b.viewer.is_some(),
+        "Esc stopped the rebuild, it did not leave"
+    );
+    let viewer = fx.b.viewer.as_ref().unwrap();
+    let reads = viewer.embedded.window.encoding().map(|(e, _)| e.label());
+    assert_eq!(reads, Some("UTF-8"), "kept UTF-8");
+    assert_ne!(
+        viewer.views.set.encoding(),
+        Some("UTF-16LE"),
+        "never told UTF-16LE"
+    );
+}
+
+use crate::views::{Hold, View};
 use std::collections::HashSet;
