@@ -200,3 +200,32 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
 | WV-C | ✅ done 2026-11-25 | 09 §12: the page server (#124) | coder |
 | ED-buf | ✅ done 2026-11-25 | 12 §16: ED-0 (folded in) and ED-buf, the piece table (#122) | coder |
 | F-k_d1 | ✅ done 2026-11-25 | s6's k_d1: the Trash check runs on a worker; the test waits for it (#111) | coder |
+
+## R1 (part 5) — the macOS web engine, encode, the views and the TUI, closed 2026-11-25
+
+- **WV-A** (#126): the macOS engine — WKWebView in the window, a non-persistent data store per view, the rule list in a private store, link previews off, download menu items dropped; the close containment fix and Objective-C exceptions caught.
+- **ED-enc** (#127): `Encoding::encode`, refusing a character the encoding cannot hold with the character, its offset and the encoding (`Refused`).
+- **VM-7** (#128) answers owner message 20 in the window.
+  - Keys 1/2/3 and 9 View switch the views; a view with unsaved edits asks first, and a running Save is waited for.
+  - Hex for every file opens viewing (D35); F8 picks the text encoding in cells.
+  - Each window counts its landed Saves, read before any switch; a hidden media view stops polling and parks its waveform.
+  - What VM-7 did not build is VM-7b (08 §13).
+- **XW-term** (#129) ships **X1b**: `sopen --tui`.
+  - egui's cell layers painted to the terminal, diffed; 24-bit colour or the 256-colour table; kitty keyboard flag 1, mouse, OSC 52 (capped at 256 KiB).
+  - The terminal is restored on close, panic and signals (exit 128+n); a real hang-up ends the run (it spun at about 92 % CPU before the review); an idle TUI makes no passes.
+  - F12 or the `[GUI]`/`[TUI]` button switches in process, keeping dialogs, focus and textures; the button works over a modal.
+- **Reviews.** Two engines per unit, then one fix-check; the orchestrator verified the last fixes at their lines. VM-7's fix-check found a refusal lost when the viewer leaves; XW-term's found the mode button's press surviving the switch.
+- **Prereleases, installed on both hosts:**
+  - preview-2026-11-25-0551-b01e688ce90b (WV-A);
+  - preview-2026-11-25-0623-cb69ae806e10 (ED-enc);
+  - preview-2026-11-25-0708-d472fa49f50e (VM-7);
+  - preview-2026-11-25-0746-6a86f31b0541 (XW-term).
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| WV-A | ✅ done 2026-11-25 | 09 §12: the macOS engine (#126) | coder |
+| ED-enc | ✅ done 2026-11-25 | 12 §16: `Encoding::encode` and its refusal (#127) | coder |
+| VM-7 | ✅ done 2026-11-25 | 08 §13: the egui binding of the view keys and the views (1/2/3, 9 View, F8 encodings) (#128) | coder |
+| XW-term | ✅ done 2026-11-25 | 10 §17: the terminal backend and `sopen --tui`; ships X1b (#129) | coder |
