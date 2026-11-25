@@ -141,6 +141,7 @@ jobs:
           SOPEN_REQUIRE_SHELLS: "1"
           SOPEN_REQUIRE_NODE: "1"
           SOPEN_REQUIRE_SFTP_SERVER: "1"
+          SOPEN_REQUIRE_WEBKIT: ${{ runner.os == 'macOS' && '1' || '' }}
         run: cargo test --locked
 
       # The Linux binary loads libasound and glibc's and GCC's own runtime at start: libc, libm,

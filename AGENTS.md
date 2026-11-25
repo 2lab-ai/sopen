@@ -61,8 +61,9 @@ exists: a command output or a window screenshot that someone actually looked at.
 zsh, fish, node or OpenSSH's `sftp-server` skip with a note when it is missing; CI installs them (node is on the
 runners, `sftp-server` on macOS) and sets `SOPEN_REQUIRE_FFMPEG=1`, `SOPEN_REQUIRE_SHELLS=1`,
 `SOPEN_REQUIRE_NODE=1`, `SOPEN_REQUIRE_SFTP_SERVER=1` and, from S2, `SOPEN_REQUIRE_GIT=1` (git is on the
-runners; the git tests skip without it locally), so there they fail instead. The separation tests
-(`sopen stems`) need the model: they skip unless `SOPEN_STEMS_MODEL` names it; CI downloads it (cached, its
+runners; the git tests skip without it locally), so there they fail instead. On macOS CI also sets
+`SOPEN_REQUIRE_WEBKIT=1`: the page view's window tests run there, and skip locally without it. The
+separation tests (`sopen stems`) need the model: they skip unless `SOPEN_STEMS_MODEL` names it; CI downloads it (cached, its
 SHA-256 checked) and sets `SOPEN_REQUIRE_STEMS=1`. The default build links sherpa-onnx (feature `stems`,
 downloaded and checked by build.rs; `SHERPA_ONNX_LIB_DIR` for offline builds); `cargo build
 --no-default-features` builds without it.
@@ -203,6 +204,7 @@ prompts on close.
 | `SOPEN_GIT=<path>` | This machine's git for the git panel instead of `git` on PATH (03 §2.4); a path that names nothing is "no git". A local setting, not forwarded by `--target`. |
 | `SOPEN_REQUIRE_GIT=1` | Tests that need git fail instead of skipping when it is missing (CI sets it). |
 | `SOPEN_REQUIRE_TMUX=1` | The terminal backend's tmux test (`gui::term`, `.prd/10-tui.md` §15's second emulator: the backend's bytes in a private tmux server, `capture-pane -e` against the window's cells) fails instead of skipping when tmux is missing (CI does not set it yet). |
+| `SOPEN_REQUIRE_WEBKIT=1` | The page view's engine tests run (`.prd/09-web-view.md` §11; macOS: `src/gui/web/mac/tests.rs`): each opens a WebKit window — borderless, off every screen, in a child process that never becomes the active app — and a failure fails; without it they skip with a note, since WebKit is always on a Mac and the window is what the variable asks for. macOS CI sets it. |
 | `SOPEN_SAVE_TO=<path>` | Where the dialog's "Save to…" saves (the path field's first value; a folder gets the file's name), instead of the download folder — no native dialog. |
 | `SOPEN_SAVE_AS=<folder>` | The hex and media windows: their edits are saved as `<folder>/<stem>.edited<ext>` (the next free `-N` when taken; media: the extension its render has) — without a window under `SOPEN_AUTOSAVE` (progress lines on stderr, `saved <path>` on stdout; exit 0 saved, 3 not), else through the Save As modal once the state is on screen (`.prd/07-streaming-edit.md` §7). |
 | `SOPEN_SAVE_AS_HOLD_MS=<ms>` | With `SOPEN_SAVE_AS`: the save holds at its first progress at or past 30 % for that long (media: of the render), so `SOPEN_SCREENSHOT` shoots the modal mid-transfer. |
