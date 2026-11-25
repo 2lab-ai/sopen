@@ -132,7 +132,8 @@ pub fn wrap(text: &str, room: usize) -> Vec<String> {
     let room = room.max(1);
     let mut rows = vec![];
     let mut rest = text;
-    while cells::width(rest) > room {
+    // After a break, blanks alone — the text's own trailing ones — make no row, however wide.
+    while cells::width(rest) > room && (rows.is_empty() || !rest.trim().is_empty()) {
         let (mut used, mut cut, mut blank) = (0, 0, None);
         for (i, g) in rest.grapheme_indices(true) {
             let w = cells::width(g);
@@ -157,7 +158,6 @@ pub fn wrap(text: &str, room: usize) -> Vec<String> {
         rows.push(row.to_string());
         rest = next;
     }
-    // A break may leave only blanks — the text's own trailing ones: no row of nothing after it.
     if !rest.trim().is_empty() || rows.is_empty() {
         rows.push(rest.to_string());
     }
@@ -523,6 +523,9 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
             cells::fill(&mut buf, under, shadow);
             frame(&mut buf, frame_cells, &layout.title);
             let mut field_at = None;
+            // A control's cells on the grid: one with none there (a grid smaller than the dialog)
+            // is not there to click, nor its field to hold the keyboard.
+            let visible = |c: &Cells| Some(c.intersection(grid.all())).filter(|v| !v.is_empty());
             for placed in &layout.placed {
                 match placed {
                     Placed::Text(at, text, pen) => {
@@ -530,20 +533,23 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                         cells::put(&mut buf, at.x, at.y, text, room, *pen);
                     }
                     Placed::Held(cells, id) => {
-                        ui.interact(grid.rect(*cells), *id, Sense::focusable_noninteractive());
+                        if let Some(cells) = visible(cells) {
+                            let sense = Sense::focusable_noninteractive();
+                            ui.interact(grid.rect(cells), *id, sense);
+                        }
                     }
                     Placed::Field(cells, id) => {
-                        if let Some(text) = field.as_deref_mut() {
-                            self::field(ui, &grid, *cells, *id, text, |e| e);
+                        if let (Some(text), Some(cells)) = (field.as_deref_mut(), visible(cells)) {
+                            self::field(ui, &grid, cells, *id, text, |e| e);
                             controls.push(*id);
-                            field_at = Some((*cells, *id));
+                            field_at = Some((cells, *id));
                         }
                     }
                     Placed::Check(cells, _, id) => {
-                        if ui
-                            .interact(grid.rect(*cells), *id, Sense::click())
-                            .clicked()
-                        {
+                        let Some(cells) = visible(cells) else {
+                            continue;
+                        };
+                        if ui.interact(grid.rect(cells), *id, Sense::click()).clicked() {
                             clicked.push(*id);
                             if let Some(on) = check.as_deref_mut() {
                                 *on = !*on;
@@ -552,8 +558,11 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                         controls.push(*id);
                     }
                     Placed::Button(cells, b) => {
+                        let Some(cells) = visible(cells) else {
+                            continue;
+                        };
                         let sense = if b.on { Sense::click() } else { Sense::hover() };
-                        if ui.interact(grid.rect(*cells), b.id, sense).clicked() {
+                        if ui.interact(grid.rect(cells), b.id, sense).clicked() {
                             clicked.push(b.id);
                         }
                         controls.push(b.id);

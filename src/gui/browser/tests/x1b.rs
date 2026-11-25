@@ -69,9 +69,17 @@ fn a_dialog_stays_between_the_title_row_and_the_status_row() {
     fx.key(Key::Enter);
     fx.drv.idle(&mut fx.b, 2);
     assert!(fx.b.ops.holds_keyboard(), "refused: still open");
-    assert!(
-        fx.drv.text_starting_with("aaaaaaaa").is_some(),
-        "the refusal shows"
+    // The refusal — `aaa…: 1000 bytes; a name has at most 255` — is cut to the room, its reason
+    // with it: its rows are told from the field's (white on black, never cut) by the error
+    // colour and the "…" its last kept row ends in.
+    let refused = (fx.drv.texts_starting_with("aaaa").into_iter())
+        .map(|(_, t)| t)
+        .find(|t| t.ends_with('…'))
+        .expect("the refusal's last row, cut");
+    assert_eq!(
+        fx.drv.colors_of(&refused),
+        Some(vec![chrome::PALETTE.dialog_error]),
+        "{refused}"
     );
     assert_eq!(edges(&fx, w, h), before, "nothing of the dialog over them");
 }

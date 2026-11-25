@@ -197,6 +197,8 @@ As the list's dialogs were built (XW-dialogs, 2026-11-25):
   room, its texts lose their last rows, and what still does not fit is cut there, never drawn
   over them.
 - **Dialog and list text cannot be selected** (egui's labels could) until cell selection lands.
+- **A dialog's scroll bar** (the report's): ↑ and ↓ a row, a click on the track a page, the DOS
+  way (egui's scroll area jumped there), the thumb dragged.
 
 ## 7. The switch (T4)
 

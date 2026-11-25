@@ -658,21 +658,24 @@ fn x1b_a_click_on_wide_glyphs_lands_on_the_character_its_cell_shows() {
     assert_eq!(h.ops.field_text(), Some("새 폴W더 X2026"), "after 폴");
 }
 
+/// The stand-in host, and the IME rectangle the last pass put out.
+struct Ime(Host, Option<egui::output::IMEOutput>);
+
+impl Window for Ime {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        Window::ui(&mut self.0, ui);
+        self.1 = ui.ctx().output(|o| o.ime);
+    }
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
 /// The field's IME rectangle — where the system puts its candidate window — is the caret's
 /// cell after each syllable typed, as the cells show the caret (10 §4: a terminal's cursor goes
 /// there too).
 #[test]
 fn x1b_the_ime_cursor_is_the_carets_cell() {
-    struct Ime(Host, Option<egui::output::IMEOutput>);
-    impl Window for Ime {
-        fn ui(&mut self, ui: &mut egui::Ui) {
-            Window::ui(&mut self.0, ui);
-            self.1 = ui.ctx().output(|o| o.ime);
-        }
-        fn ready(&self) -> bool {
-            true
-        }
-    }
     let (host, _) = host(&[]);
     let mut w = Ime(host, None);
     let mut drv = Driver::new(900.0, 500.0);
@@ -718,6 +721,16 @@ fn x1b_texts_wrap_by_cells() {
     use super::super::dialog::wrap;
     assert_eq!(wrap("abc ", 3), ["abc"]);
     assert_eq!(wrap("abc  ", 3), ["abc"]);
+    assert_eq!(
+        wrap("abc     ", 3),
+        ["abc"],
+        "blanks wider than the row: no row of them"
+    );
+    assert_eq!(
+        wrap("abc  de", 3),
+        ["abc", " de"],
+        "blanks inside a row that fits stay"
+    );
     assert_eq!(wrap("", 3), [""]);
     assert_eq!(wrap("ab cd", 3), ["ab", "cd"]);
     assert_eq!(wrap("abcdef", 3), ["abc", "def"]);
@@ -785,4 +798,82 @@ fn x1b_the_reports_scroll_bar_takes_clicks_and_a_drag() {
         down - Vec2::new(0.0, CELL.y),
     );
     assert!(in_cells(&drv, last), "the thumb dragged to the end");
+}
+
+/// On a middle of four cells by four — below the smallest window — F7's dialog registers no
+/// control outside those cells: its field's editor and its buttons, which the layout puts below
+/// and right of them, are not there to click or to hold the keyboard. Esc still closes it.
+#[test]
+fn x1b_controls_outside_a_tiny_grid_are_not_there() {
+    struct Tiny(Host, Rect);
+    impl Window for Tiny {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            let ctx = ui.ctx().clone();
+            if let Some(changed) = self.0.ops.poll(&mut self.0.panel) {
+                self.0.changed.push(changed);
+            }
+            self.0.ops.dialogs(&ctx, self.1, &mut self.0.panel);
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+    let area = Rect::from_min_size(Pos2::new(0.0, CELL.y), Vec2::new(4.0, 4.0) * CELL);
+    let (host, _) = host(&[]);
+    let mut w = Tiny(host, area);
+    let mut drv = Driver::new(480.0, 320.0);
+    w.0.ops.open_make_folder(&w.0.panel, None);
+    drv.idle(&mut w, 3);
+    assert!(w.0.ops.holds_keyboard(), "the dialog is up");
+    let id = make_folder_id();
+    for (what, id) in [
+        ("field", id.with("name")),
+        ("Make", id.with("go")),
+        ("Cancel", id.with("cancel")),
+    ] {
+        if let Some(r) = drv.ctx.read_response(id) {
+            assert!(
+                area.expand(0.25).contains_rect(r.rect),
+                "{what} at {:?}, outside {area:?}",
+                r.rect
+            );
+        }
+    }
+    drv.key(&mut w, Key::Escape, Modifiers::NONE);
+    assert!(!w.0.ops.holds_keyboard(), "Esc closed it");
+}
+
+/// A Hangul name longer than its field, the caret at its end: the field scrolled so the caret is
+/// on its last cell, and the IME rectangle there too — the engine's view and the cells' are one.
+#[test]
+fn x1b_the_ime_cursor_follows_a_scrolled_field() {
+    let (host, _) = host(&[]);
+    let mut w = Ime(host, None);
+    let mut drv = Driver::new(900.0, 500.0);
+    w.0.ops.open_make_folder(&w.0.panel, None);
+    drv.idle(&mut w, 2);
+    let name = "가나다라마바사아자차카타파하".repeat(3);
+    drv.frame(&mut w, vec![Event::Text(name.clone())], Modifiers::NONE);
+    drv.idle(&mut w, 1);
+    let label = drv.find_text("name").expect("the field's label");
+    // The field: the black cells after its label, inside the frame (the shadow is black too).
+    let inner = framed(&drv, "Make folder").shrink(CELL.x);
+    let field = (drv.rects().into_iter())
+        .filter(|&(r, c, _)| c == BLACK && r.top() == label.top() && r.left() > label.right())
+        .filter(|&(r, _, _)| r.right() <= inner.right())
+        .map(|(r, _, _)| r)
+        .reduce(|a, b| a.union(b))
+        .expect("the field's cells");
+    let cells = (field.width() / CELL.x) as usize;
+    assert!(cells::width(&name) > cells, "longer than the field");
+    let last = Pos2::new(field.right() - CELL.x, field.top());
+    assert!(caret_at(&drv, last), "the caret on the field's last cell");
+    let ime = w.1.expect("the IME rectangle").cursor_rect;
+    assert_eq!(
+        ime.center().x,
+        last.x,
+        "{ime:?} at the caret's cell {last:?}"
+    );
+    let end: String = name.chars().skip(name.chars().count() - 5).collect();
+    assert!(shown_wrapped(&drv, &end), "the name's end shows");
 }
