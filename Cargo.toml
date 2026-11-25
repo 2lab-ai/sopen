@@ -141,8 +141,10 @@ tokio = { version = "1.54.1", features = ["process", "io-util", "test-util"] }
 # The page view's engine (`.prd/09-web-view.md` §2.2, WV-A) is WKWebView over the window: its scheme
 # handler, content rule list, key monitor and snapshot take the features after the first line of
 # each list, and `NSRunLoop` / `NSDate` / `NSApplication` run its window tests' child process.
-# objc2-web-kit is the one new lock entry, of the same objc2 0.6 family (09 §2.2).
-objc2 = "=0.6.5"
+# objc2-web-kit is the one new lock entry of the same objc2 0.6 family (09 §2.2); objc2's
+# `exception` (objc2-exception-helper, a few lines of C) lets the scheme glue catch an
+# Objective-C exception from WebKit instead of aborting.
+objc2 = { version = "=0.6.5", features = ["exception"] }
 block2 = "=0.6.2"
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "std",
@@ -155,6 +157,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "NSData",
     "NSDate",
     "NSDictionary",
+    "NSEnumerator",
     "NSError",
     "NSGeometry",
     "NSObject",
@@ -176,8 +179,11 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSGraphicsContext",
     "NSImage",
     "NSImageRep",
+    "NSMenu",
+    "NSMenuItem",
     "NSResponder",
     "NSRunningApplication",
+    "NSUserInterfaceItemIdentification",
     "NSView",
     "NSWindow",
 ] }

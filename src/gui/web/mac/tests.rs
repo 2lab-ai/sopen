@@ -7,9 +7,9 @@
 //!
 //! The window tests run only with `SOPEN_REQUIRE_WEBKIT=1` (09 §11; macOS CI sets it) and skip with
 //! a note without it: WebKit is always on a Mac, a window opening under the developer's hands is
-//! what the variable asks for. A scenario that panics, crashes — a call on a stopped task throws
-//! in WebKit and aborts the child — or outlives its watchdog fails its test. The tests below the
-//! window tests need no window and always run.
+//! what the variable asks for. A scenario that panics, crashes or outlives its watchdog fails its
+//! test, and a child still running at the parent's deadline is killed. The tests below the window
+//! tests need no window and always run.
 
 use super::*;
 use crate::gui::web::{
@@ -32,8 +32,12 @@ use std::time::{Duration, Instant};
 const CHILD: &str = "SOPEN_WEBKIT_CHILD";
 /// The child's last line when its scenario passed.
 const PASSED: &str = "sopen-webkit-scenario-passed";
-/// A child still running after this long ends, failing its test.
+/// A child still running after this long ends itself, failing its test ([`CHILD_WATCHDOG`] sets
+/// another, in milliseconds).
 const WATCHDOG: Duration = Duration::from_secs(90);
+const CHILD_WATCHDOG: &str = "SOPEN_WEBKIT_CHILD_WATCHDOG_MS";
+/// The parent kills a child still running this long after it started, whatever the child does.
+const DEADLINE: Duration = Duration::from_secs(120);
 
 #[used]
 #[link_section = "__DATA,__mod_init_func"]
@@ -44,10 +48,18 @@ extern "C" fn child_main() {
     let Ok(name) = std::env::var(CHILD) else {
         return;
     };
-    std::thread::spawn(|| {
-        std::thread::sleep(WATCHDOG);
-        eprintln!("the scenario did not end within {WATCHDOG:?}");
-        std::process::exit(124);
+    let watchdog = std::env::var(CHILD_WATCHDOG)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(WATCHDOG, Duration::from_millis);
+    std::thread::spawn(move || {
+        std::thread::sleep(watchdog);
+        eprintln!("the scenario did not end within {watchdog:?}");
+        let _ = std::io::stderr().flush();
+        let _ = std::io::stdout().flush();
+        // At once, from this thread: no exit handler runs beside the stuck main thread.
+        // SAFETY: ends the process.
+        unsafe { libc::_exit(124) };
     });
     let passed = std::panic::catch_unwind(|| scenario(&name)).is_ok();
     if passed {
@@ -70,22 +82,73 @@ fn webkit_in(name: &str, temp: &std::path::Path) -> Option<String> {
         eprintln!("skipped: {name} opens a WebKit window; SOPEN_REQUIRE_WEBKIT=1 runs it");
         return None;
     }
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
+    let ran = child(name, temp, &[], DEADLINE);
+    let text = format!("{}{}", ran.stdout, ran.stderr);
+    println!("{text}");
+    assert!(!ran.killed, "{name} outlived {DEADLINE:?}: killed\n{text}");
+    assert!(ran.status.success(), "{name}: {:?}\n{text}", ran.status);
+    assert!(
+        ran.stdout.lines().last() == Some(PASSED),
+        "{name} did not run in the child:\n{text}"
+    );
+    Some(ran.stdout)
+}
+
+/// What a child did.
+struct Ran {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+    /// The parent killed it at the deadline.
+    killed: bool,
+    took: Duration,
+}
+
+/// This test binary again, as the child running `name` with `env` added, killed if it is still
+/// running at `deadline`.
+fn child(name: &str, temp: &std::path::Path, env: &[(&str, &str)], deadline: Duration) -> Ran {
+    use std::process::Stdio;
+    let start = Instant::now();
+    let mut process = std::process::Command::new(std::env::current_exe().unwrap())
         // Should the initializer not run, libtest finds no test by this name and runs nothing.
         .args(["--exact", "sopen-webkit-child"])
         .env(CHILD, name)
         .env("TMPDIR", temp)
-        .output()
+        .envs(env.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let text = format!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
-    println!("{text}");
-    assert!(out.status.success(), "{name}: {:?}\n{text}", out.status);
-    assert!(
-        stdout.lines().last() == Some(PASSED),
-        "{name} did not run in the child:\n{text}"
-    );
-    Some(stdout)
+    let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        })
+    };
+    let stdout = read(process.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = read(process.stderr.take().map(|p| Box::new(p) as _));
+    let mut killed = false;
+    let status = loop {
+        if let Some(status) = process.try_wait().unwrap() {
+            break status;
+        }
+        if start.elapsed() >= deadline {
+            let _ = process.kill();
+            killed = true;
+            break process.wait().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Ran {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+        killed,
+        took: start.elapsed(),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -167,6 +230,15 @@ fn wv_a_the_monitor_and_the_shield() {
     webkit("keys");
 }
 
+/// §3.2's no downloads, no windows: the context menu WebKit opens on a link or an image offers
+/// no Download … and no Open … in New Window — in a file view and in an address window — and
+/// invoking a download item, were one offered, reaches no server; Copy Link and Copy Image stay
+/// (the menu was WebKit's real one).
+#[test]
+fn wv_a_the_context_menu_offers_no_download_and_no_new_window() {
+    webkit("menu");
+}
+
 /// §2.2's ATS measurement: plain `http://` to an IP, to `localhost` and to dotted names, each
 /// load's outcome and time printed. The IP and `localhost` load. App Transport Security refuses
 /// before any lookup (`-1022`); `sopen-ats.invalid` — a dotted name nothing resolves, so no
@@ -181,6 +253,12 @@ fn wv_a_ats_and_plain_http() {
 // The scenarios (the child, on its main thread).
 
 fn scenario(name: &str) {
+    if name == "hang" {
+        // The watchdogs' own test: a scenario that never ends.
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
     let mtm = MainThreadMarker::new().expect("the initializer runs on the main thread");
     let app = NSApplication::sharedApplication(mtm);
     // No Dock icon, never active: the child takes no focus.
@@ -193,6 +271,7 @@ fn scenario(name: &str) {
         "cookies" => cookies(mtm),
         "follow" => follow(mtm),
         "keys" => keys(mtm),
+        "menu" => menu(mtm),
         "ats" => ats(mtm),
         other => panic!("no scenario {other}"),
     });
@@ -223,6 +302,11 @@ fn render(mtm: MainThreadMarker) {
     );
     wait("its title", 5.0, || view.title() == "sopen page");
     assert!(site.started("/style.css").is_some(), "{:?}", site.said());
+    // A link preview would load the link in a WebKit view of its own (§3.4).
+    assert!(
+        !unsafe { view.web().allowsLinkPreview() },
+        "no link preview"
+    );
     let frame = view.web().frame();
     assert_eq!(
         (
@@ -273,6 +357,22 @@ fn render(mtm: MainThreadMarker) {
         took.as_secs_f64() * 1e3
     );
     view.page.close();
+
+    // Closed and still held, a view keeps none of its WebKit objects: its content controller
+    // (and the rule list on it) and its scheme handler go with the close, not the drop.
+    let (closed, controller, handler) = autoreleasepool(|_| {
+        let mut view = rig.page(&engine, &site, false);
+        view.show(&rig, rect);
+        view.page.load(&view.host.url("index.html"));
+        view.until("the page finished", |e| e.contains(&Event::Finished));
+        let (controller, handler) = view.page.inner().objects();
+        view.page.close();
+        (view, controller, handler.expect("a file view's handler"))
+    });
+    wait("the controller and the handler released", 2.0, || {
+        controller.load().is_none() && handler.load().is_none()
+    });
+    drop(closed);
 }
 
 fn stops(mtm: MainThreadMarker) {
@@ -318,11 +418,20 @@ fn stops(mtm: MainThreadMarker) {
     view.page.load(&view.host.url("a.html"));
     let (a, reply) = site.take_held("/a.html");
     let raw = reply.raw();
+    let task = view.page.inner().task(a).expect("the glue holds a's task");
     view.page.load(&view.host.url("next.html"));
     wait("WebKit stops a before its head", 5.0, || {
         view.log().contains(&Glue::Stop(a))
     });
     assert!(site.stopped(a), "the server was told");
+    // Were a call ever made on a stopped task, WebKit's exception is caught: the task is dropped
+    // and nothing ends the process.
+    assert!(
+        !view.page.inner().call(a, &task, Call::Data(b"x".to_vec())),
+        "WebKit threw on the stopped task, and the glue caught it"
+    );
+    assert!(view.page.inner().task(a).is_none());
+    drop(task);
     raw.head(Head::whole("text/html", 4));
     raw.data(b"late".to_vec());
     raw.done();
@@ -382,7 +491,7 @@ fn stops(mtm: MainThreadMarker) {
 fn rules(mtm: MainThreadMarker) {
     // A sopen that died left its folder; this one's is made at the start.
     let temp = std::env::temp_dir();
-    let stale = temp.join(format!("{RULES_PREFIX}{}", dead_pid()));
+    let stale = temp.join(format!("{RULES_PREFIX}{}-0123", dead_pid()));
     std::fs::create_dir_all(&stale).unwrap();
     let rig = Rig::new(mtm);
     let start = Instant::now();
@@ -434,7 +543,7 @@ fn rules(mtm: MainThreadMarker) {
         _ => None,
     });
     assert_eq!(blocked, Some(3), "the row's count: {:?}", view.seen);
-    let ours = rules_dir(&temp);
+    let ours = RULES_DIR.get().expect("the list's folder").clone();
     let files = std::fs::read_dir(&ours).unwrap().count();
     assert!(files > 0, "the compiled list is in {}", ours.display());
     println!(
@@ -512,14 +621,7 @@ fn rules(mtm: MainThreadMarker) {
 fn scripts(mtm: MainThreadMarker) {
     let rig = Rig::new(mtm);
     let engine = WebKit::start(mtm);
-    let site = Site::with(&[(
-        "/js.html",
-        "text/html",
-        b"<title>before</title><script>document.title = 'ran'</script>",
-    )]);
-    let mut view = rig.page(&engine, &site, false);
-    view.show(&rig, rig.full());
-    view.page.load(&view.host.url("js.html"));
+    let site = Site::with(&[("/js.html", "text/html", JS_PAGE.as_bytes())]);
     let title = |view: &mut Shown, loads: usize| {
         view.until("the page finished", |e| {
             e.iter().filter(|e| **e == Event::Finished).count() >= loads
@@ -527,13 +629,47 @@ fn scripts(mtm: MainThreadMarker) {
         spin(0.5, || false);
         view.title()
     };
+    let mut view = rig.page(&engine, &site, false);
+    view.show(&rig, rig.full());
+    view.page.load(&view.host.url("js.html"));
     assert_eq!(title(&mut view, 1), "before", "scripts off");
+    // The engine holds a file view's scripts off, whatever its caller asks (§3.3, R1).
     view.page.set_scripts(true);
     view.page.reload();
-    assert_eq!(title(&mut view, 2), "ran", "scripts on (the control)");
+    assert_eq!(title(&mut view, 2), "before", "asked on later");
+    view.page.close();
+    let (events, rx) = Events::new();
+    let host = Host::new();
+    let page = engine
+        .open_page(Opening {
+            content: Opened::Page {
+                host: host.clone(),
+                server: site.server(),
+            },
+            preview: false,
+            scripts: true,
+            events,
+        })
+        .unwrap();
+    let mut view = Shown::new(page, host, rx);
+    view.show(&rig, rig.full());
+    view.page.load(&view.host.url("js.html"));
+    assert_eq!(
+        title(&mut view, 1),
+        "before",
+        "opened with scripts asked on"
+    );
+    view.page.close();
+    // The control: an address window's scripts run.
+    let server = Http::start();
+    let origin = format!("http://127.0.0.1:{}", server.port);
+    let mut view = rig.address(&engine, &origin);
+    view.show(&rig, rig.full());
+    view.page.load(&format!("{origin}/js"));
+    assert_eq!(title(&mut view, 1), "ran", "scripts on (the control)");
     view.page.set_scripts(false);
     view.page.reload();
-    assert_eq!(title(&mut view, 3), "before", "off again");
+    assert_eq!(title(&mut view, 2), "before", "off");
     view.page.close();
 }
 
@@ -546,6 +682,7 @@ fn cookies(mtm: MainThreadMarker) {
     let mut two = rig.address(&engine, &origin);
     one.show(&rig, rig.full());
     two.show(&rig, rig.full());
+    assert!(!unsafe { one.web().allowsLinkPreview() }, "no link preview");
     let visit = |view: &mut Shown, path: &str, title: &str| {
         let loads = view.count(&Event::Finished);
         view.page.load(&format!("{origin}{path}"));
@@ -708,6 +845,17 @@ fn keys(mtm: MainThreadMarker) {
         "Esc is consumed"
     );
     assert!(rig.host_has_keyboard(), "Esc took the keyboard back");
+    // Another window's Esc events are its own: never taken for the held one's.
+    let other = Rig::new(mtm);
+    let other_esc = |repeat: bool, down: bool| other.key(KEY_ESCAPE, "\u{1b}", none, repeat, down);
+    assert!(
+        on_key(&other_esc(true, true)),
+        "another window's repeat goes on"
+    );
+    assert!(
+        on_key(&other_esc(false, false)),
+        "another window's release goes on"
+    );
     assert!(
         !on_key(&key(KEY_ESCAPE, "\u{1b}", none, true, true)),
         "its repeat too"
@@ -715,6 +863,10 @@ fn keys(mtm: MainThreadMarker) {
     assert!(
         !on_key(&key(KEY_ESCAPE, "\u{1b}", none, false, false)),
         "and its release"
+    );
+    assert!(
+        on_key(&key(KEY_ESCAPE, "\u{1b}", none, false, false)),
+        "and only it"
     );
     for (code, chars, flags, what) in [
         (99, "\u{F706}", none, "F3"),
@@ -788,6 +940,120 @@ fn keys(mtm: MainThreadMarker) {
     preview.page.close();
 }
 
+fn menu(mtm: MainThreadMarker) {
+    let rig = Rig::new(mtm);
+    let engine = WebKit::start(mtm);
+    let outside = Http::start();
+    let outside_link = format!("href='http://127.0.0.1:{}/linked'", outside.port);
+    let page = MENU_PAGE.replace("href='/linked'", &outside_link);
+    let site = Site::with(&[("/menu.html", "text/html", page.as_bytes())]);
+    let mut view = rig.page(&engine, &site, false);
+    view.show(&rig, rig.full());
+    view.page.load(&view.host.url("menu.html"));
+    view.until("the page finished", |e| e.contains(&Event::Finished));
+    spin(0.3, || false);
+    let web = view.web();
+    let link = context_menu(&rig, &web, 70.0, "WKMenuItemIdentifierDownloadLinkedFile");
+    let image = context_menu(&rig, &web, 210.0, "WKMenuItemIdentifierDownloadImage");
+    // Open Link stays: it is a navigation, through the view's policy — refused, said, and
+    // nothing reaches the server, not even a connection.
+    let accepted = outside.accepted();
+    context_menu(&rig, &web, 70.0, "WKMenuItemIdentifierOpenLink");
+    let linked = format!("http://127.0.0.1:{}/linked", outside.port);
+    view.until("Open Link refused", |e| {
+        e.iter()
+            .any(|e| matches!(e, Event::Refused { target, .. } if *target == linked))
+    });
+    view.page.close();
+    spin(1.0, || false);
+    let from_file_view = outside.log();
+    println!(
+        "menus: Open Link in a file view: {:?}; {} connections",
+        view.seen
+            .iter()
+            .rev()
+            .find(|e| matches!(e, Event::Refused { .. })),
+        outside.accepted() - accepted
+    );
+    assert_eq!(outside.accepted(), accepted, "Open Link connected out");
+    let origin = format!("http://127.0.0.1:{}", outside.port);
+    let mut address = rig.address(&engine, &origin);
+    address.show(&rig, rig.full());
+    address.page.load(&format!("{origin}/links"));
+    address.until("the address finished", |e| e.contains(&Event::Finished));
+    spin(0.3, || false);
+    let web = address.web();
+    let in_address = context_menu(&rig, &web, 70.0, "WKMenuItemIdentifierDownloadLinkedFile");
+    spin(2.0, || false);
+    println!(
+        "menus: the server saw {from_file_view:?} from the file view, {:?} in all",
+        outside.log()
+    );
+    println!("menus: a file view's link {link:?}, its image {image:?}; an address window's link {in_address:?}");
+    let has = |items: &[String], id: &str| items.iter().any(|i| i == id);
+    assert!(has(&link, "WKMenuItemIdentifierCopyLink"), "{link:?}");
+    assert!(has(&image, "WKMenuItemIdentifierCopyImage"), "{image:?}");
+    assert!(
+        has(&in_address, "WKMenuItemIdentifierCopyLink"),
+        "{in_address:?}"
+    );
+    for dropped in DROPPED_MENU_ITEMS {
+        for (what, items) in [("link", &link), ("image", &image), ("address", &in_address)] {
+            assert!(!has(items, dropped), "{what} offers {dropped}: {items:?}");
+        }
+    }
+    let log = outside.log();
+    let downloaded = log.iter().any(|l| l.starts_with("GET /linked "));
+    assert!(!downloaded, "a download reached the server: {log:?}");
+    address.page.close();
+}
+
+/// The identifiers of the context menu `web` opens for a right click at `y` (its points, x 200),
+/// its `then` item invoked first if it has one; WebKit's tracking ends at once.
+fn context_menu(rig: &Rig, web: &WKWebView, y: f64, then: &'static str) -> Vec<String> {
+    use objc2_app_kit::NSUserInterfaceItemIdentification;
+    let seen: Rc<RefCell<Option<Vec<String>>>> = Rc::default();
+    let into = seen.clone();
+    MENU_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |menu: &NSMenu| {
+            let ids: Vec<String> = menu
+                .itemArray()
+                .iter()
+                .map(|item| {
+                    item.identifier()
+                        .map_or_else(String::new, |i| i.to_string())
+                })
+                .collect();
+            if let Some(at) = ids.iter().position(|id| id == then) {
+                menu.performActionForItemAtIndex(at as isize);
+            }
+            menu.cancelTrackingWithoutAnimation();
+            *into.borrow_mut() = Some(ids);
+        }));
+    });
+    let at = web.convertPoint_toView(NSPoint::new(200.0, y), None);
+    let event = |kind| {
+        NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+            kind,
+            at,
+            NSEventModifierFlags::empty(),
+            0.0,
+            rig.window.windowNumber(),
+            None,
+            0,
+            1,
+            1.0,
+        )
+        .expect("a mouse event")
+    };
+    web.rightMouseDown(&event(NSEventType::RightMouseDown));
+    wait("the context menu", 5.0, || seen.borrow().is_some());
+    web.rightMouseUp(&event(NSEventType::RightMouseUp));
+    MENU_HOOK.with(|hook| hook.borrow_mut().take());
+    let ids = seen.borrow_mut().take().unwrap_or_default();
+    ids
+}
+
 fn ats(mtm: MainThreadMarker) {
     let rig = Rig::new(mtm);
     let engine = WebKit::start(mtm);
@@ -847,6 +1113,15 @@ const QUADRANTS: &str = "<!doctype html><title>sopen page</title>\
     <div style='position:fixed;right:0;top:0;width:50%;height:50%;background:#0f0'></div>\
     <div style='position:fixed;left:0;bottom:0;width:50%;height:50%;background:#00f'></div>\
     <div style='position:fixed;right:0;bottom:0;width:50%;height:50%;background:#ff0'></div>";
+
+/// A page with a link on its first 140 points and an image on the next 140.
+const MENU_PAGE: &str = "<title>menu</title>\
+    <a href='/linked' style='display:block;font-size:60px;height:140px'>LINK</a>\
+    <img style='display:block;width:400px;height:140px' \
+    src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAICRAEAOw=='>";
+
+/// A page whose script, when it runs, retitles it.
+const JS_PAGE: &str = "<title>before</title><script>document.title = 'ran'</script>";
 
 /// The first of two pieces of [`stops`]'s last page.
 const WINDOW_PIECE: usize = 128 * 1024;
@@ -1334,9 +1609,14 @@ impl Http {
                     } else {
                         ""
                     };
-                    let body = match set {
-                        "" => format!("<title>cookie[{cookie}]</title>"),
-                        _ => "<title>cookie[set]</title>".to_string(),
+                    let body = if first.starts_with("GET /js ") {
+                        JS_PAGE.to_string()
+                    } else if first.starts_with("GET /links ") {
+                        MENU_PAGE.to_string()
+                    } else if set.is_empty() {
+                        format!("<title>cookie[{cookie}]</title>")
+                    } else {
+                        "<title>cookie[set]</title>".to_string()
                     };
                     let _ = write!(
                         stream,
@@ -1405,22 +1685,109 @@ fn the_rule_list_lets_through_only_the_scheme_data_and_blob() {
     assert_eq!(crate::scheme::SCHEME, "sopen-page");
 }
 
-/// A rule-list folder of a process that is gone is swept; a live process's, and anything not
-/// named as one, stay.
+/// The rule-list folder is made new, never taken over: its own name (the pid and a random
+/// suffix), mode 0700, a real folder of this user's; something already at a name — a folder,
+/// a link to one — is refused, and what the link points at is untouched.
 #[test]
-fn a_dead_processs_rule_folder_is_swept() {
+fn the_rule_folder_is_new_private_and_a_real_folder() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let temp = tempfile::tempdir().unwrap();
-    let dead = temp.path().join(format!("{RULES_PREFIX}{}", dead_pid()));
-    let mine = rules_dir(temp.path());
+    let a = make_rules_dir(temp.path()).unwrap();
+    let b = make_rules_dir(temp.path()).unwrap();
+    assert_ne!(a, b, "each its own");
+    let name = a.file_name().unwrap().to_str().unwrap();
+    let mine = format!("{RULES_PREFIX}{}-", std::process::id());
+    assert!(name.starts_with(&mine), "{name}");
+    let meta = std::fs::symlink_metadata(&a).unwrap();
+    assert!(meta.file_type().is_dir());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+    // SAFETY: reads this process's uid.
+    assert_eq!(meta.uid(), unsafe { libc::getuid() });
+    let elsewhere = temp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("kept"), b"x").unwrap();
+    let link = temp.path().join("link");
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+    assert!(make_dir_at(&link).is_err(), "a link at the name");
+    assert!(make_dir_at(&elsewhere).is_err(), "a folder at the name");
+    assert!(elsewhere.join("kept").exists());
+}
+
+/// The sweep removes a dead process's rule-list folder, and nothing else: not a live process's
+/// (this one's), not a name without a pid, not another name, and never a link or a file under a
+/// dead process's name — a link is not followed, what it points at is untouched.
+#[test]
+fn a_dead_processs_rule_folder_is_swept_and_nothing_else() {
+    let temp = tempfile::tempdir().unwrap();
+    let dead = dead_pid();
+    let gone = temp.path().join(format!("{RULES_PREFIX}{dead}-00ff"));
+    let mine = make_rules_dir(temp.path()).unwrap();
     let other = temp.path().join(format!("{RULES_PREFIX}notapid"));
     let unrelated = temp.path().join("sopen-something-else");
-    for dir in [&dead, &mine, &other, &unrelated] {
+    for dir in [&gone, &other, &unrelated] {
         std::fs::create_dir_all(dir).unwrap();
+    }
+    for dir in [&gone, &mine, &other, &unrelated] {
         std::fs::write(dir.join("ContentRuleList-x"), b"x").unwrap();
     }
+    let target = temp.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("kept"), b"x").unwrap();
+    let link = temp.path().join(format!("{RULES_PREFIX}{dead}-link"));
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let file = temp.path().join(format!("{RULES_PREFIX}{dead}-file"));
+    std::fs::write(&file, b"x").unwrap();
     sweep(temp.path());
-    assert!(!dead.exists());
+    assert!(!gone.exists(), "a dead process's folder is swept");
     assert!(mine.exists() && other.exists() && unrelated.exists());
+    assert!(std::fs::symlink_metadata(&link).is_ok(), "a link stays");
+    assert!(target.join("kept").exists(), "its target is untouched");
+    assert!(file.exists(), "a file stays");
+}
+
+/// A snapshot's bitmap is bounded before it is made: finite positive sizes and scale, at most
+/// 64 MiB of RGBA; a normal page at 2× and 3× is its size times the scale.
+#[test]
+fn a_snapshots_bitmap_is_bounded_before_it_is_made() {
+    assert_eq!(bitmap_size(200.0, 120.0, 2.0), Some((400, 240)));
+    assert_eq!(bitmap_size(200.0, 120.0, 3.0), Some((600, 360)));
+    assert_eq!(
+        bitmap_size(2048.0, 2048.0, 2.0),
+        Some((4096, 4096)),
+        "64 MiB"
+    );
+    let bad = [
+        (f64::NAN, 1.0, 2.0),
+        (1.0, f64::INFINITY, 2.0),
+        (f64::NEG_INFINITY, 1.0, 2.0),
+        (1.0, 1.0, f64::NAN),
+        (1.0, 1.0, f64::INFINITY),
+        (-1.0, 1.0, 2.0),
+        (0.0, 1.0, 2.0),
+        (1.0, 1.0, 0.0),
+        (1.0, 1.0, -2.0),
+        (2049.0, 2048.0, 2.0),
+        (1e9, 1e9, 2.0),
+        (f64::MAX, f64::MAX, 2.0),
+    ];
+    for (w, h, scale) in bad {
+        assert_eq!(bitmap_size(w, h, scale), None, "{w}x{h} at {scale}");
+    }
+}
+
+/// The context-menu identifiers dropped are WebKit's own strings (its `_WKMenuItemIdentifier…`
+/// constants, read from the WebKit this process links).
+#[test]
+fn the_dropped_menu_items_are_webkits_own_identifiers() {
+    for name in DROPPED_MENU_ITEMS {
+        let symbol = std::ffi::CString::new(format!("_{name}")).unwrap();
+        // SAFETY: a lookup in the loaded images; a hit is an `NSString *const`.
+        let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
+        assert!(!found.is_null(), "WebKit has no {symbol:?}");
+        // SAFETY: as above.
+        let value = unsafe { &**found.cast::<*const NSString>() }.to_string();
+        assert_eq!(value, name);
+    }
 }
 
 /// The monitor reads the keys [`route`] tells apart: Esc and the F-keys by their key codes, W
@@ -1456,6 +1823,16 @@ fn the_monitor_reads_keys_as_the_route_does() {
     );
     assert_eq!(key_of(12, "q"), Some(Q));
     assert_eq!(key_of(0, "a"), None);
+    assert_eq!(
+        key_of(13, "ц"),
+        Some(W),
+        "a Russian layout's W key, by its code"
+    );
+    assert_eq!(key_of(12, "й"), Some(Q));
+    assert_eq!(key_of(13, "ς"), Some(W), "a Greek layout's");
+    assert_eq!(key_of(13, ""), Some(W), "no characters");
+    assert_eq!(key_of(0, "q"), Some(Q), "AZERTY's Q, by its character");
+    assert_eq!(key_of(12, "a"), None, "AZERTY's A is not Q");
     let cmd = modifiers_of(NSEventModifierFlags::Command);
     assert!(cmd.mac_cmd && cmd.command && !cmd.ctrl);
     assert_eq!(route(Keyboard::Page, W, cmd), Route::TakeBackAndAct);
@@ -1505,4 +1882,23 @@ fn a_view_keeps_to_its_scope() {
     assert_eq!(page.document(&host.url("sub/a b.html")), "sub/a b.html");
     assert_eq!(page.document(&host.url("%E2%82%AC.html")), "%E2%82%AC.html");
     assert_eq!(decoded("%E2%82%AC.html"), "€.html");
+}
+
+/// A stuck child ends: by its own watchdog (exit 124, said on stderr), and — should that not
+/// come — killed by the parent at its deadline.
+#[test]
+fn a_stuck_child_ends() {
+    let temp = tempfile::tempdir().unwrap();
+    let own = child("hang", temp.path(), &[(CHILD_WATCHDOG, "300")], DEADLINE);
+    assert!(!own.killed, "{}", own.stderr);
+    assert_eq!(own.status.code(), Some(124), "{}", own.stderr);
+    assert!(own.stderr.contains("did not end within"), "{}", own.stderr);
+    let deadline = Duration::from_millis(500);
+    let parent = child("hang", temp.path(), &[], deadline);
+    assert!(parent.killed, "{:?}", parent.status);
+    assert!(
+        parent.took < deadline + Duration::from_secs(5),
+        "{:?}",
+        parent.took
+    );
 }

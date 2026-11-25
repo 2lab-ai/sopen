@@ -408,9 +408,24 @@ No JS↔native bridge (no `WKScriptMessageHandler`, no script message handler); 
 (`window.open` makes nothing, JS dialogs show nothing); devtools off (`inspectable = false`,
 `enable-developer-extras = FALSE`); no file URL ever loaded (Linux: `allow-file-access-from-file-urls`
 and `allow-universal-access-from-file-urls` off); no downloads (a top-level response the engine cannot
-show is cancelled, with a row line); WebKitGTK's web-process sandbox on; WebRTC off by setting where
-the engine has one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it has one (Linux
+show is cancelled, with a row line; on macOS a 403/404 head with nothing to show is shown empty,
+never downloaded); WebKitGTK's web-process sandbox on; WebRTC off by setting where the engine has
+one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it has one (Linux
 `enable-dns-prefetching = FALSE` **[추정: it may be a no-op in 2.52]**).
+
+- **The context menu** (macOS, every view): WebKit's own, without its Download Linked File,
+  Download Image, Download Media and Open Link / Image / Media / Frame in New Window items — the
+  view's `WKWebView` subclass drops them by WebKit's identifiers (`strip_menu`, `DROPPED_MENU_ITEMS`
+  in `src/gui/web/mac.rs`; the strings checked against WebKit's `_WKMenuItemIdentifier…`
+  constants). Measured by WV-A (`wv_a_the_context_menu_offers_no_download_and_no_new_window`):
+  Download Linked File on an outside link of a file view fetched it from the outside server,
+  past the rule list and the navigation policy; with the items gone, nothing reaches it. Open Link,
+  Copy Link, Copy Image, Look Up and Share stay: Open Link is a navigation, refused as a clicked
+  link out (§3.4, 0 connections measured). Linux's menu: WV-B **[미측정]**.
+- **No link preview** (macOS, every view): `allowsLinkPreview = false`. A force click on a link would
+  otherwise load it in a WebKit preview of its own, with the default configuration — no rule list,
+  the persistent store, past the navigation policy **[추정: the preview's configuration, from
+  WebKit's documented default; not measured — a force click cannot be synthesized]**.
 
 ### 3.3 Scripts and outside requests
 
@@ -438,7 +453,11 @@ the engine has one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it
   pages on that backend show their source**, with §4's line (`the page view is not contained here
   (<channel>): showing the source`), until a measurement shows containment.
 - **Scripts are off by default**: `WKWebpagePreferences.allowsContentJavaScript = false`;
-  `enable-javascript-markup = FALSE` (*web* §4.1-5).
+  `enable-javascript-markup = FALSE` (*web* §4.1-5). On macOS the engine itself holds a file view's
+  scripts off — opened with them asked on, or asked on later — whatever its caller says, and logs
+  it under `SOPEN_LOG=debug`: WebRTC is not contained there (R1, Tensions), so no caller's
+  mistake can turn them on (measured, `wv_a_scripts_off_means_a_script_does_not_run`; an address
+  window's scripts run, the control) **[decision]**.
 - **F2** turns scripts on for this view and off again, reloading the document on screen. Its label
   names what it does (`JS on` / `JS off`); the top bar says `scripts off`, or `scripts ON` in the warn
   colour. A new view starts off; the preview is always off (F2 does nothing there).
@@ -471,6 +490,10 @@ the engine has one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it
   whose link would be clicked).
 - Every other navigation out (a redirect, a meta refresh, `location=`, a form, a script's `a.click()`)
   is cancelled; the row says where it went, redacted the same way.
+- **Only through the view's policy.** WebKit's ways of following a link outside the view's own
+  navigation policy are closed on macOS: the link preview (off, §3.2) and the context menu's Open
+  … in New Window (gone, §3.2); its Open Link is a click like any other (refused out of the
+  scheme, `clicked`, F5 copies it).
 - No back or forward (non-scope): a link followed inside the root is left with Esc; Enter opens the
   file again.
 

@@ -6,17 +6,21 @@
 //! - **A view** ([`Page`]): its own `WKWebsiteDataStore.nonPersistentDataStore` — nothing kept,
 //!   no cookie, cache or storage shared with another view (09 §2.5; separate `WKProcessPool`s have
 //!   had no effect since macOS 12, R12, so none is made); no script message handler, no UI
-//!   delegate, not inspectable, no file URL; scripts as each navigation's preferences say.
+//!   delegate, not inspectable, no link preview, no file URL; a context menu without WebKit's
+//!   download and new-window items ([`strip_menu`]); scripts as each navigation's preferences
+//!   say — never on in a file view, whatever the caller asks (§3.3, R1).
 //! - **A file view** registers `sopen-page` for itself (§3.1) and is served through the scheme
 //!   [`Table`] in push mode: WebKit's start and stop go to the table; what the page server sends
 //!   comes back on the main queue (the wake), and only there is a task called — the head, the
 //!   pieces, the end — in the table's order and never after its stop: a stopped id is gone from
 //!   the table (the tombstone), and a stop may come before the head, mid-body or after the last
 //!   byte (X-W1: macOS throws on any call after a stop). The task is retained from its start to
-//!   its end or stop, never longer.
+//!   its end or stop, never longer. Should WebKit throw anyway, the exception is caught, the task
+//!   let go and its request stopped: never the process's end.
 //! - **Its content rule list** (§3.3): everything blocked but `sopen-page:`, `data:` and `blob:`,
-//!   compiled once per process into a temp folder of its own ([`rules_dir`]), removed at exit; one
-//!   left by a sopen that was killed is swept at the next start. Nothing loads in a file view
+//!   compiled once per process into a new folder of its own in the temp folder — mode 0700, a
+//!   name never taken before ([`make_rules_dir`]) — removed at exit; one left by a sopen that
+//!   was killed is swept at the next start ([`sweep`]). Nothing loads in a file view
 //!   before the list is on its controller (a load waits), and a list that does not compile fails
 //!   the view: nothing is ever loaded uncontained.
 //! - **Navigation** (§3.4, §7): a file view's main frame stays in its scheme; a link out — or any
@@ -25,10 +29,11 @@
 //!   cancelled, never downloaded.
 //! - **Keys** (§2.4): a local key monitor, on while a view is in a window, hands the keys that are
 //!   always sopen's ([`super::route`]) back to winit's view; Esc only takes the keyboard back,
-//!   and its repeats and release are swallowed with it. A preview's view never keeps the keyboard,
+//!   and its repeats and release in its window are swallowed with it. A preview's view never keeps the keyboard,
 //!   and its shield — a transparent view of sopen's own over the page — takes every click and
 //!   scroll and does nothing with them.
-//! - **Receipts**: `takeSnapshot`, drawn into pixels at the window's scale.
+//! - **Receipts**: `takeSnapshot`, drawn into pixels at the window's scale, bounded before the
+//!   bitmap is made ([`bitmap_size`]).
 
 #[cfg(test)]
 mod tests;
@@ -47,7 +52,7 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSBitmapImageRep, NSDeviceRGBColorSpace, NSEvent, NSEventMask, NSEventModifierFlags,
-    NSEventType, NSGraphicsContext, NSImage, NSView, NSWindow,
+    NSEventType, NSGraphicsContext, NSImage, NSMenu, NSResponder, NSView, NSWindow,
 };
 use objc2_foundation::{
     NSBundle, NSData, NSDictionary, NSError, NSHTTPURLResponse, NSLocalizedDescriptionKey,
@@ -81,7 +86,8 @@ const RULES: &str = r#"[
 /// The rule list's name in its store.
 const RULES_ID: &str = "sopen-file-view";
 
-/// The temp folder of a process's rule list is this and its pid ([`rules_dir`]).
+/// The temp folder of a process's rule list is this, its pid and a random suffix
+/// ([`make_rules_dir`]).
 const RULES_PREFIX: &str = "sopen-web-rules-";
 
 /// The channel a file view's scripts would not have contained (§3.3, R1): macOS has no setting
@@ -135,8 +141,9 @@ thread_local! {
     static NEXT_KEY: Cell<u64> = const { Cell::new(0) };
     /// The local key monitor, while on.
     static MONITOR: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
-    /// The Esc that took the keyboard back is down: its repeats and release are its own.
-    static ESC_HELD: Cell<bool> = const { Cell::new(false) };
+    /// The Esc that took the keyboard back is down, in this window (its number): its repeats and
+    /// release there are its own; another window's keys are never taken for them.
+    static ESC_HELD: Cell<Option<isize>> = const { Cell::new(None) };
 }
 
 /// The rule list's folder, once made: removed at exit.
@@ -170,8 +177,13 @@ impl WebKit {
         self.open_view(opening, false)
     }
 
-    fn open_view(&self, opening: Opening, ruled: bool) -> Result<Page, String> {
+    fn open_view(&self, mut opening: Opening, ruled: bool) -> Result<Page, String> {
         let mtm = self.mtm;
+        if matches!(opening.content, Opened::Page { .. }) && opening.scripts {
+            // File views' scripts are not contained here (§3.3, R1): off, whatever is asked.
+            crate::debug!("page view: a file view's scripts stay off ({SCRIPTS_UNCONTAINED})");
+            opening.scripts = false;
+        }
         let rules = match &opening.content {
             Opened::Page { .. } if ruled => RULE_LIST.with(|r| match &*r.borrow() {
                 Rules::Failed(why) => Err(format!("the content rule list did not compile: {why}")),
@@ -231,12 +243,45 @@ fn webkit_version() -> String {
         .map_or_else(|| "unknown".to_string(), |v| v.to_string())
 }
 
-/// This process's rule-list folder in `temp`.
-fn rules_dir(temp: &Path) -> PathBuf {
-    temp.join(format!("{RULES_PREFIX}{}", std::process::id()))
+/// A new rule-list folder of this process in `temp`: `sopen-web-rules-<pid>-<64 random bits>`.
+fn make_rules_dir(temp: &Path) -> std::io::Result<PathBuf> {
+    let name = format!(
+        "{RULES_PREFIX}{}-{}",
+        std::process::id(),
+        crate::remote::random_hex()
+    );
+    let dir = temp.join(name);
+    make_dir_at(&dir)?;
+    Ok(dir)
 }
 
-/// The rule-list folders in `temp` of processes that are gone are removed; a live one's stays.
+/// A new folder at `path`, mode 0700, this user's — never one that was there already, nor a
+/// link: `mkdir` fails on anything at the name, and what it made is checked without following
+/// links.
+fn make_dir_at(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)?;
+    if !own_folder(path) {
+        return Err(std::io::Error::other(format!(
+            "{} is not a folder of this user's",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `path` itself (a link not followed) is a folder owned by this user.
+fn own_folder(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        // SAFETY: reads this process's uid.
+        meta.file_type().is_dir() && meta.uid() == unsafe { libc::getuid() }
+    })
+}
+
+/// The rule-list folders in `temp` of processes that are gone are removed: only a real folder
+/// of this user's (a link is never followed nor removed) named for a pid that no process has; a
+/// live one's — another user's process counts as live — stays.
 fn sweep(temp: &Path) {
     let Ok(entries) = std::fs::read_dir(temp) else {
         return;
@@ -246,12 +291,14 @@ fn sweep(temp: &Path) {
         let Some(pid) = name
             .to_str()
             .and_then(|n| n.strip_prefix(RULES_PREFIX))
+            .and_then(|rest| rest.split('-').next())
             .and_then(|p| p.parse::<i32>().ok())
         else {
             continue;
         };
-        if pid > 0 && !alive(pid) {
-            let _ = std::fs::remove_dir_all(entry.path());
+        let path = entry.path();
+        if pid > 0 && !alive(pid) && own_folder(&path) {
+            let _ = std::fs::remove_dir_all(&path);
         }
     }
 }
@@ -283,11 +330,13 @@ fn compile(mtm: MainThreadMarker) {
     if !started {
         return;
     }
-    let dir = rules_dir(&std::env::temp_dir());
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        finish_compile(Err(format!("{}: {e}", dir.display())));
-        return;
-    }
+    let dir = match make_rules_dir(&std::env::temp_dir()) {
+        Ok(dir) => dir,
+        Err(e) => {
+            finish_compile(Err(format!("the rule-list folder: {e}")));
+            return;
+        }
+    };
     if RULES_DIR.set(dir.clone()).is_ok() {
         // SAFETY: a plain function, run once at exit.
         unsafe { libc::atexit(remove_rules_dir) };
@@ -442,10 +491,13 @@ pub(super) struct Inner {
     key: u64,
     scope: Scope,
     events: Events,
+    mtm: MainThreadMarker,
     web: RefCell<Option<Retained<WKWebView>>>,
-    controller: Retained<WKUserContentController>,
+    /// The view's content controller, with its rule list: released at the close.
+    controller: RefCell<Option<Retained<WKUserContentController>>>,
     nav: RefCell<Option<Retained<Navigation>>>,
-    _handler: Option<Retained<Scheme>>,
+    /// A file view's scheme handler: released at the close.
+    handler: RefCell<Option<Retained<Scheme>>>,
     parent: RefCell<Option<Retained<NSView>>>,
     shield: RefCell<Option<Retained<Shield>>>,
     scripts: Cell<bool>,
@@ -520,24 +572,29 @@ impl Inner {
                 }
             }
             let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
-            let web = unsafe {
-                WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), frame, &config)
+            let web: Retained<PageView> = unsafe {
+                msg_send![PageView::alloc(mtm), initWithFrame: frame, configuration: &*config]
             };
+            let web = Retained::into_super(web);
             let nav = Navigation::alloc(mtm).set_ivars(me.clone());
             let nav: Retained<Navigation> = unsafe { msg_send![super(nav), init] };
             unsafe { web.setNavigationDelegate(Some(ProtocolObject::from_ref(&*nav))) };
             if available!(macos = 13.3) {
                 unsafe { web.setInspectable(false) };
             }
+            // A link preview (force click) would load the link in a WebKit view of its own,
+            // outside this one's configuration and policy (§3.4).
+            unsafe { web.setAllowsLinkPreview(false) };
             web.setHidden(true);
             let inner = Inner {
                 key,
                 scope,
                 events: opening.events,
+                mtm,
                 web: RefCell::new(Some(web)),
-                controller: controller.clone(),
+                controller: RefCell::new(Some(controller.clone())),
                 nav: RefCell::new(Some(nav)),
-                _handler: handler,
+                handler: RefCell::new(handler),
                 parent: RefCell::default(),
                 shield: RefCell::default(),
                 scripts: Cell::new(opening.scripts),
@@ -583,8 +640,11 @@ impl Inner {
         if self.closed.get() || self.ruled.get() {
             return;
         }
+        let Some(controller) = self.controller.borrow().clone() else {
+            return;
+        };
         // SAFETY: the view's own controller, on the main thread.
-        unsafe { self.controller.addContentRuleList(list) };
+        unsafe { controller.addContentRuleList(list) };
         self.ruled.set(true);
         #[cfg(test)]
         self.note(Glue::Ruled);
@@ -667,7 +727,7 @@ impl Inner {
 
     fn set_preview(&self, on: bool) {
         self.preview.set(on);
-        let mtm = MainThreadMarker::from(&*self.controller);
+        let mtm = self.mtm;
         if on {
             self.take_keyboard();
             if self.shield.borrow().is_some() {
@@ -713,11 +773,30 @@ impl Inner {
                     Call::Readable => "readable",
                 },
             ));
-            autoreleasepool(|_| make(&task, call));
-            if ended {
+            if self.call_task(id, &task, call) && ended {
                 self.tasks.borrow_mut().remove(&id);
             }
         }
+    }
+
+    /// One call on task `id`; whether it went through. Should WebKit throw — it does on a call
+    /// after a stop, which the table never makes — the exception is caught here, never left to
+    /// end the process: the task is let go and its request stopped.
+    fn call_task(&self, id: RequestId, task: &Task, call: Call) -> bool {
+        // The closure only calls the task: an exception unwinds no Rust state to repair.
+        let made = autoreleasepool(|_| {
+            objc2::exception::catch(std::panic::AssertUnwindSafe(|| make(task, call)))
+        });
+        let Err(exception) = made else {
+            return true;
+        };
+        let what = exception.map_or_else(|| "an exception".to_string(), |e| format!("{e:?}"));
+        crate::debug!("page view: WebKit threw on request {}: {what}", id.get());
+        self.tasks.borrow_mut().remove(&id);
+        if let Some(table) = self.table.borrow_mut().as_mut() {
+            table.stop(id);
+        }
+        false
     }
 
     /// WebKit starts a task.
@@ -777,6 +856,8 @@ impl Inner {
         let nav = self.nav.borrow_mut().take();
         let shield = self.shield.borrow_mut().take();
         let parent = self.parent.borrow_mut().take();
+        let controller = self.controller.borrow_mut().take();
+        let handler = self.handler.borrow_mut().take();
         self.pending.borrow_mut().take();
         // The server is told every request stopped; the tasks are let go without a call.
         drop(table);
@@ -797,10 +878,16 @@ impl Inner {
             if let Some(shield) = &shield {
                 shield.removeFromSuperview();
             }
+            if let Some(controller) = &controller {
+                // SAFETY: the view's own controller, on the main thread.
+                unsafe { controller.removeAllContentRuleLists() };
+            }
             drop(tasks);
             drop(web);
             drop(nav);
             drop(shield);
+            drop(controller);
+            drop(handler);
         });
     }
 }
@@ -925,6 +1012,11 @@ impl View for Page {
     }
 
     fn set_scripts(&mut self, on: bool) {
+        if on && matches!(self.0.scope, Scope::Page(_)) {
+            // As at the open: never on in a file view here.
+            crate::debug!("page view: a file view's scripts stay off ({SCRIPTS_UNCONTAINED})");
+            return;
+        }
         self.0.scripts.set(on);
     }
 
@@ -987,16 +1079,57 @@ impl Page {
     }
 }
 
+#[cfg(test)]
+impl Inner {
+    /// The task WebKit gave for `id`, while the glue holds it.
+    pub(super) fn task(&self, id: RequestId) -> Option<Retained<Task>> {
+        self.tasks.borrow().get(&id).cloned()
+    }
+
+    /// Weak handles on the view's content controller and scheme handler.
+    pub(super) fn objects(
+        &self,
+    ) -> (
+        objc2::rc::Weak<WKUserContentController>,
+        Option<objc2::rc::Weak<NSObject>>,
+    ) {
+        let controller = self.controller.borrow().clone().expect("open");
+        let handler = self.handler.borrow().clone();
+        (
+            objc2::rc::Weak::new(&controller),
+            handler.map(|h| objc2::rc::Weak::new(objc2::ClassType::as_super(&*h))),
+        )
+    }
+
+    pub(super) fn call(&self, id: RequestId, task: &Task, call: Call) -> bool {
+        self.call_task(id, task, call)
+    }
+}
+
+/// The most a snapshot's bitmap may take: 64 MiB of RGBA (4096 × 4096 pixels).
+const MAX_BITMAP: usize = 64 << 20;
+
+/// The pixel size of a `width` × `height`-point picture at `scale`: `None` unless every input
+/// is finite and positive and the RGBA bitmap fits [`MAX_BITMAP`] — checked before anything is
+/// allocated.
+fn bitmap_size(width: f64, height: f64, scale: f64) -> Option<(usize, usize)> {
+    let pixels = |points: f64| {
+        let n = (points * scale).round();
+        (points.is_finite() && scale.is_finite() && points > 0.0 && scale > 0.0 && n >= 1.0)
+            .then_some(n)
+            .filter(|n| *n <= MAX_BITMAP as f64)
+            .map(|n| n as usize)
+    };
+    let (w, h) = (pixels(width)?, pixels(height)?);
+    let bytes = w.checked_mul(h)?.checked_mul(4)?;
+    (bytes <= MAX_BITMAP).then_some((w, h))
+}
+
 /// `image` drawn into RGBA pixels at `scale` pixels a point.
 fn pixels(image: &NSImage, scale: f64) -> Option<egui::ColorImage> {
     let size = image.size();
-    let (w, h) = (
-        (size.width * scale).round() as isize,
-        (size.height * scale).round() as isize,
-    );
-    if w <= 0 || h <= 0 {
-        return None;
-    }
+    let (w, h) = bitmap_size(size.width, size.height, scale)?;
+    let (w, h) = (w as isize, h as isize);
     // SAFETY: a bitmap of sopen's own, 8-bit RGBA, drawn into on the main thread and read back
     // within its size.
     unsafe {
@@ -1039,7 +1172,7 @@ fn monitor(on: bool) {
             // SAFETY: the monitor this function installed.
             unsafe { NSEvent::removeMonitor(&monitor) };
         }
-        ESC_HELD.with(|held| held.set(false));
+        ESC_HELD.with(|held| held.set(None));
         return;
     }
     if MONITOR.with(|m| m.borrow().is_some()) {
@@ -1067,13 +1200,14 @@ fn monitor(on: bool) {
 fn on_key(event: &NSEvent) -> bool {
     let down = event.r#type() == NSEventType::KeyDown;
     let code = event.keyCode();
-    if code == KEY_ESCAPE && ESC_HELD.with(Cell::get) {
+    let window_number = event.windowNumber();
+    if code == KEY_ESCAPE && ESC_HELD.with(Cell::get) == Some(window_number) {
         if !down || event.isARepeat() {
-            ESC_HELD.with(|held| held.set(down));
+            ESC_HELD.with(|held| held.set(down.then_some(window_number)));
             return false;
         }
         // A new press: the release was missed.
-        ESC_HELD.with(|held| held.set(false));
+        ESC_HELD.with(|held| held.set(None));
     }
     if !down {
         return true;
@@ -1103,7 +1237,7 @@ fn on_key(event: &NSEvent) -> bool {
         Route::Page | Route::Sopen => true,
         Route::TakeBack => {
             page.take_keyboard();
-            ESC_HELD.with(|held| held.set(true));
+            ESC_HELD.with(|held| held.set(Some(window_number)));
             false
         }
         Route::TakeBackAndAct => {
@@ -1157,11 +1291,22 @@ fn key_of(code: u16, chars: &str) -> Option<egui::Key> {
         29 => Some(Num0),
         _ => None,
     };
-    by_code.or(match chars.to_ascii_lowercase().as_str() {
-        "w" => Some(W),
-        "q" => Some(Q),
-        _ => None,
-    })
+    // W and Q by the character on a Latin layout (AZERTY's Q is where QWERTY's A is), by the
+    // key — kVK_ANSI_W, kVK_ANSI_Q — where it types no ASCII letter (Cyrillic, Greek, …).
+    let by_char = if chars.is_ascii() && !chars.is_empty() {
+        match chars.to_ascii_lowercase().as_str() {
+            "w" => Some(W),
+            "q" => Some(Q),
+            _ => None,
+        }
+    } else {
+        match code {
+            13 => Some(W),
+            12 => Some(Q),
+            _ => None,
+        }
+    };
+    by_code.or(by_char)
 }
 
 /// The modifiers as egui-winit reports them on a Mac: ⌘ is `mac_cmd` and `command`.
@@ -1381,6 +1526,66 @@ impl Navigation {
         }
     }
 }
+
+/// WebKit's context-menu items that would download or open a window (§3.2), by their
+/// identifiers (WebKit's `_WKMenuItemIdentifier…` constants; their strings are checked against
+/// WebKit's own in the tests).
+const DROPPED_MENU_ITEMS: [&str; 7] = [
+    "WKMenuItemIdentifierDownloadLinkedFile",
+    "WKMenuItemIdentifierDownloadImage",
+    "WKMenuItemIdentifierDownloadMedia",
+    "WKMenuItemIdentifierOpenLinkInNewWindow",
+    "WKMenuItemIdentifierOpenImageInNewWindow",
+    "WKMenuItemIdentifierOpenMediaInNewWindow",
+    "WKMenuItemIdentifierOpenFrameInNewWindow",
+];
+
+/// `menu` without [`DROPPED_MENU_ITEMS`] (measured: WebKit's Download Linked File fetches the
+/// link through the network, past the view's rule list and navigation policy).
+fn strip_menu(menu: &NSMenu) {
+    use objc2_app_kit::NSUserInterfaceItemIdentification;
+    for item in menu.itemArray().iter() {
+        let dropped = item
+            .identifier()
+            .is_some_and(|id| DROPPED_MENU_ITEMS.contains(&id.to_string().as_str()));
+        if dropped {
+            menu.removeItem(&item);
+        }
+    }
+}
+
+/// A look at a context menu as it opens (the tests').
+#[cfg(test)]
+pub(super) type MenuHook = Box<dyn Fn(&NSMenu)>;
+
+#[cfg(test)]
+thread_local! {
+    /// The tests' look at every context menu, as it opens (after [`strip_menu`]).
+    pub(super) static MENU_HOOK: RefCell<Option<MenuHook>> = const { RefCell::new(None) };
+}
+
+define_class!(
+    /// Every view's WKWebView: WebKit's own, its context menu without the items that would
+    /// download or open a window ([`strip_menu`]).
+    #[unsafe(super(WKWebView, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    struct PageView;
+
+    impl PageView {
+        #[unsafe(method(willOpenMenu:withEvent:))]
+        fn will_open_menu(&self, menu: &NSMenu, event: &NSEvent) {
+            // SAFETY: WebKit's own handling first, on the main thread.
+            let () = unsafe { msg_send![super(self), willOpenMenu: menu, withEvent: event] };
+            strip_menu(menu);
+            #[cfg(test)]
+            MENU_HOOK.with(|hook| {
+                if let Some(hook) = &*hook.borrow() {
+                    hook(menu);
+                }
+            });
+        }
+    }
+);
 
 define_class!(
     /// A preview's shield (§2.2): a transparent view over the page that is hit instead of it
