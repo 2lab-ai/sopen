@@ -22,6 +22,7 @@
 use super::prepare::{self, Opened, Prepared};
 use super::{Browser, Closing, Connect, Viewer};
 use crate::encoding::Encoding;
+use crate::gui::web::Unavailable;
 use crate::gui::{chrome, help, Embedded, Outcome, Status, ViewKeySlot, Window};
 use crate::kind::Kind;
 use crate::remote::Stat;
@@ -77,6 +78,10 @@ pub(super) struct Views {
     pub(super) makes: usize,
     /// `SOPEN_STATE` `view=N`: chosen once the first view is on screen and ready.
     wanted: Option<Slot>,
+    /// The folder the browser was opened on, for a page view made later (09 §3.1's root).
+    opened_on: Option<String>,
+    /// The page view could not be made (09 §4): the first row of the text view made next.
+    pub(super) source_line: Option<String>,
 }
 
 /// A hidden view: its window, the cached copy it holds, its give-way.
@@ -109,13 +114,38 @@ struct Picker {
     at: usize,
 }
 
+/// How a viewer's views treat a page file (09 §5–§6).
+#[derive(Default)]
+pub(super) struct PageOpen {
+    /// The page is its default view (`kind::page_default`).
+    pub styled: bool,
+    /// The window shows pages: the page is one of its views (else D30's source, 09 §4).
+    pub shown: bool,
+    /// The folder the browser was opened on (§3.1's root).
+    pub opened_on: Option<String>,
+}
+
 /// The views of the file the viewer opened on and the means to make the others; the view keys
-/// handed to the shell's input hook from the next pass on. `wanted`: `view=N`.
+/// handed to the shell's input hook from the next pass on. `wanted`: `view=N`. A page file's
+/// views as a window without the page view has them (09 §4).
+#[cfg_attr(not(test), allow(dead_code))] // The browser asks [`open_paged`].
 pub(super) fn open(
     ctx: &egui::Context,
     opened: &OpenedAs,
     means: Means,
     wanted: Option<u8>,
+) -> Views {
+    open_paged(ctx, opened, means, wanted, PageOpen::default())
+}
+
+/// [`open`], a page file's views as `page` says: 1 Page · 2 Hex · 3 Text for HTML, HTM and
+/// styled XML, 1 Text · 2 Hex · 3 Page for other XML, where the window shows pages (09 §6).
+pub(super) fn open_paged(
+    ctx: &egui::Context,
+    opened: &OpenedAs,
+    means: Means,
+    wanted: Option<u8>,
+    page: PageOpen,
 ) -> Views {
     let reach = if means.label.is_some() {
         Reach::Stream
@@ -128,10 +158,15 @@ pub(super) fn open(
         kind => kind,
     };
     let mut opening = Opening::new(kind, means.path.clone(), opened.stat, reach);
-    opening.page = PageClass::of(&means.name, false);
+    opening.page = PageClass::of(&means.name, page.styled);
     opening.read_only = means.in_place;
     opening.undecodable = opened.undecodable.clone();
-    let set = ViewSet::open(opening, Screen::GUI).expect("a file has views");
+    let screen = if page.shown {
+        Screen::GUI
+    } else {
+        Screen::NO_ENGINE
+    };
+    let set = ViewSet::open(opening, screen).expect("a file has views");
     // A terminal's input sends its releases made (`term_input::RELEASES`), a window's its own.
     let releases = !crate::gui::in_terminal(ctx) || crate::gui::term_input::RELEASES;
     let down = ctx.input(|i| i.keys_down.iter().copied().collect::<Vec<_>>());
@@ -156,6 +191,8 @@ pub(super) fn open(
         #[cfg(test)]
         makes: 0,
         wanted: wanted.and_then(Slot::from_number),
+        opened_on: page.opened_on,
+        source_line: None,
     }
 }
 
@@ -263,11 +300,15 @@ pub(super) fn embed(
             // A file read in place (no fetched copy, no stream) is followed at its end.
             let live = claim.is_none() && !doc.is_stream();
             let TextOpen { at, loading, enc } = text;
+            // The page view that could not be made says why first (09 §4).
+            let notices = notice.into_iter().chain(notices).collect();
             (
                 textview::embed_scripted(doc, title, name, notices, live, at, loading, enc),
                 claim,
             )
         }
+        // 09 §6: its view is made on the window's next pass.
+        Prepared::Page { page } => (crate::gui::web::page::embed(page), None),
     };
     Ok(Made {
         embedded,
@@ -313,7 +354,8 @@ fn same_doc(a: View, b: View) -> bool {
     doc(a) == doc(b)
 }
 
-/// The kind a view is prepared as ([`prepare::prepare_view`]).
+/// The kind a view is prepared as ([`prepare::prepare_view`]; the page view is
+/// [`prepare::prepare_page_view`]'s).
 fn kind_of(view: View) -> Kind {
     match view {
         View::Image => Kind::Image,
@@ -355,6 +397,13 @@ fn picker_row_id(i: usize) -> egui::Id {
 }
 
 impl Views {
+    /// The slot the file's source is in (09 §4: where the page view gives way to, 1 or 3).
+    pub(super) fn source_slot(&self) -> Option<Slot> {
+        Slot::ALL
+            .into_iter()
+            .find(|&s| self.set.slot(s) == Some(View::Text))
+    }
+
     /// The strip on the title row (08 §8).
     pub(super) fn strip(&self) -> chrome::Strip {
         let slots = self.set.slots().map(|v| v.map(View::name));
@@ -563,6 +612,19 @@ impl Browser {
         }
     }
 
+    /// The page view on screen could not be made (09 §4): the file's source is chosen in its
+    /// place — view 3 of a page, view 1 of plain XML — its first row saying why.
+    pub(super) fn views_page_failed(&mut self, ctx: &egui::Context, why: &Unavailable) {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        let Some(slot) = viewer.views.source_slot() else {
+            return;
+        };
+        viewer.views.source_line = Some(crate::gui::web::page::source_line(why));
+        self.view_input(ctx, Input::Choose(slot));
+    }
+
     /// One command of the view keys (08 §4).
     fn view_command(&mut self, ctx: &egui::Context, command: Command) {
         let Some(viewer) = self.viewer.as_mut() else {
@@ -767,7 +829,14 @@ impl Browser {
         if let Some(viewer) = self.viewer.as_mut() {
             viewer.views.makes += 1;
         }
-        let means = &self.viewer.as_ref().expect("a viewer").views.means;
+        let views = &mut self.viewer.as_mut().expect("a viewer").views;
+        // The text view made after a page view that could not be (09 §4) says why first.
+        let notice = match view {
+            View::Text | View::Raw => notice.or_else(|| views.source_line.take()),
+            _ => notice,
+        };
+        let opened_on = views.opened_on.clone();
+        let means = &views.means;
         let (connect, label, path, in_place) = (
             means.connect.clone(),
             means.label.clone(),
@@ -790,10 +859,15 @@ impl Browser {
                 wake: &wake,
                 began,
             };
-            let result =
-                prepare::prepare_view(&req, in_place, kind_of(view), &stop, &mut |_, _| {
+            let result = match view {
+                // 09 §6: the page, from its root.
+                View::Page => {
+                    prepare::prepare_page_view(&req, in_place, opened_on.as_deref(), &stop)
+                }
+                _ => prepare::prepare_view(&req, in_place, kind_of(view), &stop, &mut |_, _| {
                     waker.request_repaint()
-                });
+                }),
+            };
             let _ = tx.send(result);
             waker.request_repaint();
         });

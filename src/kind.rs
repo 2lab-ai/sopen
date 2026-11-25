@@ -273,6 +273,79 @@ pub fn classify(name: &str, head: impl FnOnce() -> Vec<u8>, size: u64) -> Kind {
     }
 }
 
+/// The names 09 can show as a page (09 §5): `.html`, `.htm` and `.xml`, in any case. They stay
+/// [`Kind::Text`] for routing, the usage log and the editor; which view a page file opens on is
+/// [`page_default`]'s.
+pub fn page_file(name: &str) -> bool {
+    matches!(extension(name).as_deref(), Some("html" | "htm" | "xml"))
+}
+
+/// Whether the page is a file's default view (09 §5): `.html` and `.htm` always; an `.xml` when
+/// `head` — its first [`SNIFF_BYTES`], read on the opening's connection — holds
+/// `<?xml-stylesheet` before the first element (plain XML and RSS default to their source);
+/// any other name never. `head` is not looked at for `.html`/`.htm`, and nothing past
+/// [`SNIFF_BYTES`] is.
+pub fn page_default(name: &str, head: &[u8]) -> bool {
+    match extension(name).as_deref() {
+        Some("html" | "htm") => true,
+        Some("xml") => styled(&head[..head.len().min(SNIFF_BYTES)]),
+        _ => false,
+    }
+}
+
+/// `<?xml-stylesheet` before the first element of `head`, read as bytes (a UTF-8 BOM skipped;
+/// a UTF-16 file names nothing here — 09 §3.4: no link test rests on this): comments, the
+/// doctype with its internal subset and other processing instructions are stepped over; the
+/// first `<` that opens anything else is the first element.
+fn styled(head: &[u8]) -> bool {
+    const TARGET: &[u8] = b"<?xml-stylesheet";
+    let mut at = usize::from(head.starts_with(b"\xEF\xBB\xBF")) * 3;
+    let after = |at: usize, end: &[u8]| -> Option<usize> {
+        head[at..]
+            .windows(end.len())
+            .position(|w| w == end)
+            .map(|i| at + i + end.len())
+    };
+    while let Some(i) = head[at..].iter().position(|&b| b == b'<') {
+        at += i;
+        let rest = &head[at..];
+        if rest.starts_with(TARGET) {
+            // The target name ends there: a space or the instruction's end, not `-sheets`.
+            match rest.get(TARGET.len()) {
+                Some(b) if b.is_ascii_whitespace() || *b == b'?' => return true,
+                None => return false,
+                Some(_) => {}
+            }
+        }
+        let next = if rest.starts_with(b"<?") {
+            after(at, b"?>")
+        } else if rest.starts_with(b"<!--") {
+            after(at + 4, b"-->")
+        } else if rest.starts_with(b"<!") {
+            // A doctype: its internal subset, `[…]`, may hold `>` and `<` of its own.
+            let close = rest.iter().position(|&b| b == b'>');
+            match rest.iter().position(|&b| b == b'[') {
+                Some(open) if close.is_none_or(|c| open < c) => {
+                    after(at + open, b"]").and_then(|end| {
+                        head[end..]
+                            .iter()
+                            .position(|&b| b == b'>')
+                            .map(|i| end + i + 1)
+                    })
+                }
+                _ => close.map(|c| at + c + 1),
+            }
+        } else {
+            return false;
+        };
+        match next {
+            Some(n) => at = n,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// A "video" file whose probe shows no video stream is audio (spec §3).
 pub fn refine_with_probe(kind: Kind, has_video_stream: bool) -> Kind {
     match kind {
@@ -829,6 +902,74 @@ mod tests {
         }
         assert_eq!(classify("clip.ts", || mpegts.clone(), 1 << 20), Kind::Video);
         assert_eq!(classify("clip.dat", || mpegts, 1 << 20), Kind::Other);
+    }
+
+    /// 09 §5: `.html` and `.htm` are pages by name; an `.xml` only when `<?xml-stylesheet`
+    /// comes before its first element within the first 8 KiB — past a BOM, the declaration,
+    /// comments, a doctype (its internal subset too) and other instructions; anything else is
+    /// never a page, whatever it holds.
+    #[test]
+    fn wv_d_page_default_by_extension_and_sniff() {
+        let styled =
+            b"<?xml version=\"1.0\"?>\n<?xml-stylesheet type=\"text/xsl\" href=\"s.xsl\"?>\n<doc/>";
+        let rss = b"<?xml version=\"1.0\"?>\n<rss version=\"2.0\"><channel/></rss>";
+        for name in ["index.html", "A.HTM", "/x/y/page.htm"] {
+            assert!(page_file(name), "{name}");
+            assert!(page_default(name, b""), "{name}: by its name");
+            assert!(page_default(name, rss), "{name}: whatever it holds");
+        }
+        assert!(page_file("feed.XML"));
+        assert!(page_default("styled.xml", styled));
+        assert!(page_default("STYLED.XML", styled));
+        assert!(
+            !page_default("feed.xml", rss),
+            "plain XML and RSS: the source"
+        );
+        assert!(!page_default("feed.xml", b""));
+        for name in [
+            "a.svg",
+            "a.xhtml",
+            "a.rss",
+            "a.mhtml",
+            "notes.txt",
+            "x.xsl",
+            "Makefile",
+        ] {
+            assert!(!page_file(name), "{name}");
+            assert!(!page_default(name, styled), "{name}: never a page");
+        }
+        let cases: [(&str, &[u8], bool); 11] = [
+            ("a BOM first", b"\xEF\xBB\xBF<?xml-stylesheet href=\"s.css\"?><a/>", true),
+            ("no declaration", b"<?xml-stylesheet href=\"s.xsl\"?><a/>", true),
+            (
+                "after a comment and a doctype",
+                b"<?xml version=\"1.0\"?><!-- <a> --><!DOCTYPE a [<!ENTITY e \"<b>\">]><?xml-stylesheet href=\"s.xsl\"?><a/>",
+                true,
+            ),
+            ("after another instruction", b"<?pi x?>\n<?xml-stylesheet href=\"s\"?>", true),
+            (
+                "after the first element",
+                b"<?xml version=\"1.0\"?><a/><?xml-stylesheet href=\"s.xsl\"?>",
+                false,
+            ),
+            ("a comment that names it", b"<!-- <?xml-stylesheet href=\"s\"?> --><a/>", false),
+            ("a longer target", b"<?xml-stylesheets href=\"s\"?><a/>", false),
+            ("only its start", b"<?xml-styleshee", false),
+            ("an unclosed comment", b"<!-- <?xml-stylesheet", false),
+            ("text before", b"hello <?xml-stylesheet href=\"s\"?>", true),
+            ("UTF-16 is not read", b"\xFF\xFE<\0?\0x\0m\0l\0-\0", false),
+        ];
+        for (what, head, want) in cases {
+            assert_eq!(page_default("a.xml", head), want, "{what}");
+        }
+        // Past the 8 KiB, nothing counts.
+        let mut late = b"<?xml version=\"1.0\"?>".to_vec();
+        late.extend(std::iter::repeat_n(b' ', SNIFF_BYTES));
+        late.extend(b"<?xml-stylesheet href=\"s.xsl\"?><a/>");
+        assert!(!page_default("a.xml", &late), "an instruction past 8 KiB");
+        let mut early = b"<?xml-stylesheet href=\"s.xsl\"?>".to_vec();
+        early.extend(std::iter::repeat_n(b' ', SNIFF_BYTES));
+        assert!(page_default("a.xml", &early));
     }
 
     /// The route `main.rs` and the browser take (`detect_sniffed`), on a file on disk.

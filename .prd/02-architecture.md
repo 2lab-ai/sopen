@@ -182,8 +182,17 @@ frame single-lined), and the text viewer does not follow a growing file.
 | image | the image fitted into the side |
 | video | one frame: the frame at 0 s (the media window's first frame), fitted in the picture's own shape (pixels that are not square are shown as wide as they are), with a line under it saying its size, frame rate and duration |
 | audio | the waveform, with a line under it saying its channels, sample rate and whole duration; of a sound longer than 10 minutes, the waveform of the first 10 minutes **drawn over the side's whole width**, the line ending `preview of the first 10 minutes`. A sound in more than two channels shows its first two, the lanes named as the channels are (`FL`, `FR`), the line saying `6 channels · first 2 shown` |
+| a page (09 §5: `.html`, `.htm`, an `.xml` whose first 8 KiB has `<?xml-stylesheet` before its first element) | the page as the system's web engine shows it (09 §6, WV-D): scripts off, nothing outside its own scheme loaded, nothing reaching it (macOS: the shield over it), served from its root by its page server; with no engine here, or a terminal, see below |
 | anything else | the hex view of the first rows |
 
+- **A page** (09 §6, WV-D) is prepared as Enter prepares it: the worker resolves its root (09 §3.1)
+  and starts its page server — on this machine in place, a remote one on the window's preview
+  session, which comes back to the window when the preview's server ends and stays with the viewer
+  after the hand-over (06 §13's rule for a stream) — and the view is made on the frame. The
+  hand-over keeps the same view: the shield goes, the budget lifts (§4.3) and a page it cut reloads
+  once. Where there is no web engine, or one that does not contain a file view (09 §4), a page file
+  previews as its source (a preview has no rows, so no line); in a terminal the page is the
+  terminal's hand-off box and no engine is asked (10 §11).
 - **Wrapped text** needs the text viewer's wrap mode, which the text-wrap branch adds (PR #14,
   `feat/text-wrap`). **It lands before slice S1** (§8), and P1 and the browser workstream's final
   acceptance require it; S1-B builds the preview's text on the wrap mode, never on a stop-gap.
@@ -221,6 +230,7 @@ bar does not have to move).
 | video | `ffprobe` 5 s, then the first frame 5 s; above 8 bits, then the encoder question 5 s — each step its own time |
 | audio | `ffprobe` 5 s; then the waveform, which decodes at most the first 10 minutes, in 10 s |
 | hex | the rows on screen (the hex window reads pages only) |
+| page | **32 MiB** read in all, local or remote, counted as bytes read — a small range's block and a charset's sample included; each request reserves what it will read before its head, and one that would pass the bound fails before its head (09 §3.1). The page shows what came within it, not the card. Enter lifts it, and a page it cut loads again once, whole |
 | time, text, image and hex | 5 s of preparation after the read (an image's read through its stream shows its progress and is bounded by the 32 MiB; text and hex rows have no read before they show) |
 
 - **A remote video or sound of any size** previews its first frame or its waveform (06 §13, W8b):

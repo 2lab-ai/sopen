@@ -37,6 +37,7 @@
 pub(crate) mod fake;
 #[cfg(target_os = "macos")]
 mod mac;
+pub(crate) mod page;
 #[cfg(test)]
 mod tests;
 

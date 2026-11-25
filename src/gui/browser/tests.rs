@@ -9,6 +9,7 @@ use eframe::egui::{Event, PointerButton, Vec2};
 use std::io::Write;
 use std::path::Path;
 
+mod page;
 mod s1;
 mod s2;
 mod s3;

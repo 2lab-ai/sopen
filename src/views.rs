@@ -178,8 +178,14 @@ pub struct Screen {
 }
 
 impl Screen {
-    /// Today's egui windows, before 09's page view lands.
+    /// Today's egui windows with a web engine that contains a file view (09's page view, WV-D).
     pub const GUI: Screen = Screen {
+        pictures: true,
+        pages: true,
+    };
+    /// A window where file pages show their source (09 §4: no engine here, or one that does not
+    /// contain a file view): HTML, HTM and XML are 1 Text · 2 Hex · 3 Raw (D30).
+    pub const NO_ENGINE: Screen = Screen {
         pictures: true,
         pages: false,
     };

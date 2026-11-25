@@ -21,7 +21,7 @@
 //! - **Held, not drawn** (a viewer covers the panels): the preview is told
 //!   (`Window::set_shown(false)`), so a streamed one does not poll its file (06 §5).
 
-use super::prepare::{self, Budget, HandedOver, Preview, PreviewRequest, Previewed};
+use super::prepare::{self, Budget, HandedOver, Pages, Preview, PreviewRequest, Previewed};
 use super::Connect;
 use crate::gui::chrome;
 #[cfg(test)]
@@ -134,6 +134,11 @@ pub(super) struct Host {
     last_progress: String,
     /// Makes a preparation's budget (02 §4.3's; tests give one on a clock of their own).
     budget: Box<dyn Fn() -> Arc<Budget>>,
+    /// The folder the browser was opened on: a page's root when the page is inside it (09
+    /// §3.1).
+    opened_on: Option<String>,
+    /// A page view the engine refused in this window: page files preview as their source.
+    page_failed: Option<crate::gui::web::Unavailable>,
     #[cfg(test)]
     spawned: usize,
 }
@@ -152,9 +157,22 @@ impl Host {
             prep: None,
             last_progress: String::new(),
             budget: Box::new(Budget::preview),
+            opened_on: None,
+            page_failed: None,
             #[cfg(test)]
             spawned: 0,
         }
+    }
+
+    /// The folder the browser was opened on (09 §3.1's root).
+    pub fn set_opened_on(&mut self, folder: String) {
+        self.opened_on = Some(folder);
+    }
+
+    /// The engine refused a page view in this window (09 §4): page files preview as their source
+    /// from the next preparation on.
+    pub fn set_page_failed(&mut self, why: crate::gui::web::Unavailable) {
+        self.page_failed = Some(why);
     }
 
     /// Tests: the budget each preparation gets.
@@ -272,6 +290,9 @@ impl Host {
             self.cache.clone(),
         );
         let began = std::time::Instant::now();
+        // 09 §4–§6, on the frame: whether a page file shows its page here.
+        let opened_on = self.opened_on.clone();
+        let pages = Pages::here(ctx, &want.name, opened_on, self.page_failed.as_ref());
         let (d, t, stop, limits, waker, path) = (
             done.clone(),
             total.clone(),
@@ -294,7 +315,7 @@ impl Host {
                 wake: &wake,
                 began,
             };
-            let result = prepare::preview(req, &limits, &stop, &mut |now, all| {
+            let result = prepare::preview_paged(req, &pages, &limits, &stop, &mut |now, all| {
                 d.store(now, Ordering::Relaxed);
                 t.store(all, Ordering::Relaxed);
                 waker.request_repaint();
