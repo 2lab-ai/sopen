@@ -101,6 +101,13 @@
 //! start where the encoding's rules say (08 §7.3); where no rule proves a character start
 //! (CP949, D28), the bytes show as placeholder marks. Changing the encoding reads the file
 //! again only when the LF unit changes (D22).
+//!
+//! CP949 proves a start from a sync byte within W before the place, else from the line's start
+//! less than [`REACH`] back — a row's, a restart's and a grid cut's alike — else from a **phase
+//! checkpoint** ([`Phases`]): one bit per GRID point of a line longer than REACH whose start the
+//! index has, made the first time a place past REACH in it is needed, by one read of the line
+//! from its start (or its last checkpoint) to that place, on a worker ([`PhaseRead`]). Until it
+//! ends, the bytes there are placeholder marks; then the page is read again (08 §7.4).
 
 mod wrap;
 
@@ -221,6 +228,8 @@ pub struct TextDoc {
     /// stopped and what it had found, for [`TextDoc::resume`] to go on from. The index covers
     /// the bytes before that point only.
     rest: Option<Scan>,
+    /// CP949's phase checkpoints of this document's lines (08 §7.4).
+    phases: Phases,
     /// Tests: the worker's copy ([`TextDoc::share`]) fails every read (not as a change).
     #[cfg(test)]
     pub(crate) fail_worker_reads: bool,
@@ -231,6 +240,71 @@ pub struct TextDoc {
     pub(crate) stale_worker_reads: bool,
     #[cfg(test)]
     stale_reads: bool,
+}
+
+/// CP949's phase checkpoints (08 §7.4, D28): for a line longer than [`REACH`] whose start the
+/// index has, one bit per GRID point past its start — whether a lead is pending there
+/// ([`Encoding::phase`]) — so a start is proven at that point or the byte before it. Made lazily:
+/// the first time a place past REACH in such a line is needed, the line is read once from its
+/// start, or from its last checkpoint, up to the GRID point at or before the place
+/// ([`TextDoc::phases_of`], on a worker: [`PhaseRead`]); no stretch is read twice. A document
+/// made again (a re-read, a reload, another index) starts with none.
+struct Phases {
+    /// Which document they are of: a read that ends after its document was made again is
+    /// dropped.
+    epoch: u64,
+    /// Per line start (a file offset): bit k is the phase at (k + 1) × GRID past it.
+    lines: std::collections::HashMap<u64, Vec<bool>>,
+    /// Per line of `lines`: the page read that last asked for its checkpoints ([`Phases::page`]).
+    used: std::collections::HashMap<u64, u64>,
+    /// Page reads so far: the lines the latest one asked for are never forgotten to make room —
+    /// it would ask for them again, and again.
+    page: u64,
+    /// What a rule asked for and found no checkpoint for: a line's start and the GRID point
+    /// (counted from it) a place needs.
+    wanted: Option<(u64, u64)>,
+}
+
+/// Lines whose checkpoints a document keeps; past it the one asked for longest ago goes (memory
+/// stays bounded — a bit is a byte per 16 KiB of a line — but by the lines of a page at least).
+const PHASE_LINES: usize = 64;
+
+impl Phases {
+    fn new() -> Self {
+        static EPOCH: AtomicU64 = AtomicU64::new(0);
+        Self {
+            epoch: EPOCH.fetch_add(1, Ordering::Relaxed),
+            lines: std::collections::HashMap::new(),
+            used: std::collections::HashMap::new(),
+            page: 0,
+            wanted: None,
+        }
+    }
+
+    /// The bits a read found for the line that starts at `line`, after its first `from` — the
+    /// latest page asked for them. Room is made by forgetting the line asked for longest ago,
+    /// never one the latest page asked for.
+    fn install(&mut self, line: u64, from: usize, bits: Vec<bool>) {
+        if self.lines.len() >= PHASE_LINES && !self.lines.contains_key(&line) {
+            let page = self.page;
+            let oldest = self
+                .used
+                .iter()
+                .filter(|&(_, &used)| used < page)
+                .min_by_key(|&(_, &used)| used)
+                .map(|(&l, _)| l);
+            if let Some(old) = oldest {
+                self.lines.remove(&old);
+                self.used.remove(&old);
+            }
+        }
+        self.used.insert(line, self.page);
+        let kept = self.lines.entry(line).or_default();
+        if kept.len() >= from {
+            kept.truncate(from);
+            kept.extend(bits);
+        }
+    }
 }
 
 /// What a document reads through (06 §5's `Bytes`): a local file in place, or a remote one's
@@ -498,6 +572,7 @@ impl TextDoc {
             shown,
             page_reads: 0,
             rest: None,
+            phases: Phases::new(),
             #[cfg(test)]
             fail_worker_reads: false,
             #[cfg(test)]
@@ -569,6 +644,7 @@ impl TextDoc {
             shown: String::new(),
             page_reads: 0,
             rest: None,
+            phases: Phases::new(),
             #[cfg(test)]
             fail_worker_reads: false,
             #[cfg(test)]
@@ -903,6 +979,9 @@ impl TextDoc {
         );
         self.enc = enc;
         self.chosen = Some(enc);
+        // CP949's checkpoints are of the bytes as CP949 reads them: afresh, a new epoch (a read
+        // under way is dropped, nothing asked is kept).
+        self.phases = Phases::new();
         let first = self.first_start();
         if let Some(mark) = self.marks.first_mut() {
             mark.offset = first;
@@ -1144,6 +1223,7 @@ impl TextDoc {
             shown: self.shown.clone(),
             page_reads: 0,
             rest: self.rest.clone(),
+            phases: Phases::new(),
             #[cfg(test)]
             fail_worker_reads: false,
             #[cfg(test)]
@@ -1517,7 +1597,18 @@ impl TextDoc {
     /// encoding's look-back before `g` (or from `lo`, a character start, when that is nearer).
     /// `None`: no character start is proven there (CP949, D28): the piece after it shows its
     /// bytes as placeholder marks ([`Span::blind`]).
-    fn grid_cut(&mut self, g: u64, lo: u64, window: &mut Window_) -> Result<Option<u64>> {
+    ///
+    /// CP949 with no sync byte within W before `g` (§7.4): from `lo` when it is a `line`'s start
+    /// less than [`REACH`] back — the bound a line found from any place past it has too
+    /// ([`TextDoc::piece_holding`]), so the cut at `g` is the same whichever way `g` is reached
+    /// — else from the phase checkpoint at `g` of the index's open line ([`Phases`]).
+    fn grid_cut(
+        &mut self,
+        g: u64,
+        lo: u64,
+        line: bool,
+        window: &mut Window_,
+    ) -> Result<Option<u64>> {
         let enc = self.enc;
         let from = g.saturating_sub(enc.look_back() as u64).max(lo);
         let bytes = window.take(self, from, (g - from) as usize)?;
@@ -1526,7 +1617,135 @@ impl TextDoc {
             bytes: &bytes,
             anchored: from == lo,
         };
-        Ok(enc.grid_cut(near, g))
+        let cut = enc.grid_cut(near, g);
+        if cut.is_some() || !enc.needs_phase() {
+            return Ok(cut);
+        }
+        let proof = if line && g - lo < REACH {
+            Some(lo)
+        } else {
+            self.open_line_proof(g)
+        };
+        let Some(p) = proof else {
+            return Ok(None);
+        };
+        let bytes = window.take(self, p, (g - p) as usize)?;
+        Ok(enc.grid_cut(Around::anchored(p, &bytes), g))
+    }
+
+    /// The cut at grid point `g` as the piece that ends there got it (D36: a function of `g`),
+    /// for a piece that begins on `g` and does not know how it was reached: from `g` alone, else
+    /// — CP949 — from its line's start less than REACH back, found again by the LF before it
+    /// (the start the line's first piece was anchored at: [`TextDoc::grid_cut`]'s `line`).
+    fn cut_at(&mut self, g: u64, window: &mut Window_) -> Result<Option<u64>> {
+        let cut = self.grid_cut(g, 0, false, window)?;
+        if cut.is_some() || !self.enc.needs_phase() {
+            return Ok(cut);
+        }
+        let first = self.first_start();
+        let lo = g.saturating_sub(REACH).max(first);
+        let start = match self.newline_before(g, lo, window)? {
+            Some(lf) => lf + self.enc.unit() as u64,
+            None if g - first < REACH => first,
+            None => return Ok(None),
+        };
+        self.grid_cut(g, start, true, window)
+    }
+
+    /// CP949 (§7.4): a character start at or before byte `x` of the line that starts at byte
+    /// `line` (a start the index has), within a GRID of it, proven by the line's phase
+    /// checkpoint at the GRID point at or before `x` — counted from the line's start; the start
+    /// itself before the first GRID point. `None` while that checkpoint is not made: it is asked
+    /// for ([`Phases::wanted`]), and the window reads it ([`TextWindow::start_phases`]).
+    fn phase_proof(&mut self, line: u64, x: u64) -> Option<u64> {
+        let k = x / GRID;
+        if k == 0 {
+            return Some(0);
+        }
+        if let Some(used) = self.phases.used.get_mut(&line) {
+            *used = self.phases.page;
+        }
+        let bits = self.phases.lines.get(&line);
+        if let Some(&bit) = bits.and_then(|b| b.get(k as usize - 1)) {
+            return Some(k * GRID - u64::from(bit));
+        }
+        // The furthest GRID point the page needs of one line; another line's waits.
+        match &mut self.phases.wanted {
+            Some((at, upto)) if *at == line => *upto = (*upto).max(k),
+            Some(_) => {}
+            wanted => *wanted = Some((line, k)),
+        }
+        None
+    }
+
+    /// CP949 (§7.4): a proof before byte `x` of `span` (counted from its start) further back than
+    /// W — the span's own start within [`REACH`] (a line's, a piece's that a rule proved), else
+    /// a line of the index's phase checkpoint — for wrapping's rows and restarts
+    /// ([`wrap::Wrapper::start_at`]). `None` for a piece that begins blind, and while the
+    /// checkpoint is not made.
+    fn proof_in(&mut self, span: &Span, x: u64) -> Option<u64> {
+        if span.blind {
+            return None;
+        }
+        if x <= REACH {
+            return Some(0);
+        }
+        // (A line of the index: its start is known.)
+        span.line?;
+        self.phase_proof(span.start, x)
+    }
+
+    /// CP949 (§7.4): the phase checkpoint at file byte `g` of the index's open line — its last
+    /// line, which the lines known end inside: its start is the index's — when `g` is REACH or
+    /// more from that start (nearer, the start itself proves it: [`TextDoc::grid_cut`]) and
+    /// inside the indexed prefix. Past the index no line start is known, and there is no
+    /// checkpoint.
+    fn open_line_proof(&mut self, g: u64) -> Option<u64> {
+        let (_, known) = self.known();
+        let open = self.open_at;
+        if known != open || open >= self.size || g < open + REACH || g > self.size {
+            return None;
+        }
+        self.phase_proof(open, g - open).map(|p| open + p)
+    }
+
+    /// The phase checkpoints of the line that starts at byte `line`, those after `have` up to
+    /// GRID point `upto` (08 §7.4): the line's bytes read once, in order, from the start the last
+    /// one proves — each GRID point's bit the phase of the bytes from the start before it.
+    /// Stops when `cancel` is set. A file shorter than its index said is [`Stale`].
+    fn phases_of(
+        &mut self,
+        line: u64,
+        have: &[bool],
+        upto: u64,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<bool>> {
+        let enc = self.enc;
+        if !enc.needs_phase() {
+            // Another encoding's bytes have no CP949 phase: nothing is made, nothing trusted.
+            return Err(anyhow::Error::new(crate::remote::Cancelled));
+        }
+        let mut k = have.len() as u64;
+        let mut proof = match have.last() {
+            Some(&bit) => line + k * GRID - u64::from(bit),
+            None => line,
+        };
+        let mut out = Vec::new();
+        let mut window = Window_::default();
+        while k < upto {
+            stopped(cancel)?;
+            let g = line + (k + 1) * GRID;
+            let want = (g - proof) as usize;
+            let bytes = window.take(self, proof, want)?;
+            if bytes.len() < want {
+                return Err(anyhow::Error::new(Stale));
+            }
+            let bit = enc.phase(&bytes).unwrap_or(false);
+            out.push(bit);
+            proof = g - u64::from(bit);
+            k += 1;
+        }
+        Ok(out)
     }
 
     /// Rule 3 (08 §7.3), a jump's place `x`: rounded down to the unit, and in UTF-16 back
@@ -1565,7 +1784,7 @@ impl TextDoc {
         let blind = loose
             && enc.needs_phase()
             && start.is_multiple_of(GRID)
-            && self.grid_cut(start, 0, window)?.is_none();
+            && self.cut_at(start, window)? != Some(start);
         let piece = |len: u64, next: u64, ends: bool, cr: bool| Span {
             line: None,
             start,
@@ -1598,9 +1817,40 @@ impl TextDoc {
         if bound >= total {
             return Ok(piece(total - start, total, true, total > start));
         }
-        // No character start proven at the grid point: the next piece begins on it, blind.
-        let cut = self.grid_cut(bound, start, window)?.unwrap_or(bound);
-        Ok(piece(cut - start, cut, false, false))
+        match self.grid_cut(bound, start, !loose, window)? {
+            Some(cut) => Ok(piece(cut - start, cut, false, false)),
+            // No character start proven at the grid point: the next piece begins on it, blind.
+            None => {
+                let end = self.unproven_end(start, bound, blind, window)?;
+                Ok(piece(end - start, bound, false, false))
+            }
+        }
+    }
+
+    /// CP949 (§7.4, D28): the bytes a piece from `start` that ends at grid point `g`, where no
+    /// character start is proven, shows: up to `g` — or g − 1 when a lead is pending there,
+    /// decoded from the piece's own proof (its start, else its first sync byte, a blind piece's
+    /// first start). That lead's character is out of reach of the piece after `g`, which
+    /// begins blind, so neither piece shows it: never as a U+FFFD the whole-file decode lacks.
+    fn unproven_end(
+        &mut self,
+        start: u64,
+        g: u64,
+        blind: bool,
+        window: &mut Window_,
+    ) -> Result<u64> {
+        let enc = self.enc;
+        let bytes = window.take(self, start, (g - start) as usize)?;
+        let from = match blind {
+            false => start,
+            true => match enc.restart_start(Around::new(start, &bytes), start) {
+                Some(s) => s,
+                // Marks to its end.
+                None => return Ok(g),
+            },
+        };
+        let tail = &bytes[((from - start) as usize).min(bytes.len())..];
+        Ok(g - u64::from(enc.phase(tail).unwrap_or(false)))
     }
 
     /// The line byte `x` (past the index) is in, when its start is within reach — after the
@@ -1626,7 +1876,7 @@ impl TextDoc {
             Some(start) => self.scan_span(start, false, window)?,
             None => {
                 // (No character start proven at the grid point: the piece begins on it, blind.)
-                let cut = self.grid_cut(grid, lo, window)?.unwrap_or(grid);
+                let cut = self.grid_cut(grid, lo, false, window)?.unwrap_or(grid);
                 self.scan_span(cut, true, window)?
             }
         };
@@ -3675,6 +3925,11 @@ struct TextWindow {
     /// `SOPEN_STATE` `enc=` (08 D34): the encoding chosen for this opening, applied on the
     /// first pass ([`TextWindow::choose`]).
     enc_wanted: Option<Encoding>,
+    /// CP949's checkpoint read under way, if one is (08 §7.4).
+    phase_read: Option<PhaseRead>,
+    /// Called as a checkpoint read's worker starts (tests: hold it).
+    #[cfg(test)]
+    phase_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Called as a re-read's worker starts (tests: hold it).
     #[cfg(test)]
     reindex_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -3719,6 +3974,24 @@ struct Rebuild {
 }
 
 impl Drop for Reindex {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// CP949's checkpoint read on a worker (08 §7.4, [`TextDoc::phases_of`]): the line that starts at
+/// byte `line`, from its checkpoint `from` on, through a handle of its own (a stream's waits for
+/// its bytes). Dropping it (the viewer gone) stops it; it is never waited for.
+struct PhaseRead {
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<Result<Vec<bool>>>,
+    /// The document it reads for ([`Phases::epoch`]).
+    epoch: u64,
+    line: u64,
+    from: usize,
+}
+
+impl Drop for PhaseRead {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -3788,6 +4061,9 @@ impl TextWindow {
             preview: false,
             preview_index: None,
             enc_wanted: None,
+            phase_read: None,
+            #[cfg(test)]
+            phase_hook: None,
             #[cfg(test)]
             reindex_hook: None,
             #[cfg(test)]
@@ -3985,6 +4261,7 @@ impl TextWindow {
         self.seeking = None;
         // In the encoding chosen for this opening, if one was (D21).
         self.doc = TextDoc::streamed_as(source, self.doc.chosen);
+        self.phase_read = None;
         self.syntax_due = syntax_by_name(&self.name).is_none();
         if self.syntax_due {
             self.syntax = None;
@@ -4276,6 +4553,7 @@ impl TextWindow {
             (self.top, self.top_off, self.top_loose, self.line) = (0, 0, false, None);
             self.seeking = None;
             self.doc = TextDoc::streamed_as(source, Some(enc));
+            self.phase_read = None;
             self.regutter = true;
             self.failure = None;
             self.streamed = self.doc.source().map(Source::state);
@@ -4407,6 +4685,92 @@ impl TextWindow {
     /// the new end if the viewer was at the end. A file grown meanwhile is re-read again, no
     /// sooner than the usual wait. Any other change meanwhile: the page on screen stays and the
     /// next pass waits the usual time.
+    /// The checkpoint read the page asked for (08 §7.4, [`Phases::wanted`]), on a worker: one at
+    /// a time, never from a preview (it has no keys to go past its first screen with) or through
+    /// an index the file no longer matches.
+    fn start_phases(&mut self, ctx: &egui::Context) {
+        if self.phase_read.is_some() || self.preview {
+            return;
+        }
+        let Some((line, upto)) = self.doc.phases.wanted.take() else {
+            return;
+        };
+        if self.frozen() {
+            return;
+        }
+        let have = self
+            .doc
+            .phases
+            .lines
+            .get(&line)
+            .cloned()
+            .unwrap_or_default();
+        if have.len() as u64 >= upto {
+            return;
+        }
+        let mut doc = match self.doc.share() {
+            Ok(doc) => doc,
+            Err(e) => {
+                self.status = Status::error(format!("{e:#}"));
+                return;
+            }
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        doc.block_until(cancel.clone());
+        let (tx, rx) = mpsc::channel();
+        let (stop, waker) = (cancel.clone(), ctx.clone());
+        let from = have.len();
+        #[cfg(test)]
+        let hook = self.phase_hook.clone();
+        std::thread::spawn(move || {
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook();
+            }
+            let result = doc.phases_of(line, &have, upto, &stop);
+            let _ = tx.send(result);
+            waker.request_repaint();
+        });
+        self.phase_read = Some(PhaseRead {
+            cancel,
+            rx,
+            epoch: self.doc.phases.epoch,
+            line,
+            from,
+        });
+    }
+
+    /// A checkpoint read that ended: its bits go in — unless the document was made again since —
+    /// and what wrapping found without them goes, so the page is read again from the place it was
+    /// at (08 §7.4: until then its bytes were placeholder marks).
+    fn poll_phases(&mut self) {
+        let Some(read) = &self.phase_read else {
+            return;
+        };
+        if read.epoch != self.doc.phases.epoch {
+            // Of a document made again since, or read in another encoding: stopped at once.
+            self.phase_read = None;
+            return;
+        }
+        match read.rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => return,
+            Ok(Ok(bits)) => {
+                self.doc.phases.install(read.line, read.from, bits);
+                self.memo.reset(self.room);
+                self.stale_page = true;
+                self.resnap = true;
+            }
+            Ok(Err(e)) if !e.is::<crate::remote::Cancelled>() => {
+                self.status = Status::error(format!(
+                    "{}: the line's character boundaries could not be read: {e:#}",
+                    self.doc.encoding().label()
+                ));
+            }
+            _ => {}
+        }
+        self.phase_read = None;
+    }
+
     fn poll_reindex(&mut self) {
         let Some(reindex) = &self.reindex else {
             return;
@@ -4451,6 +4815,7 @@ impl TextWindow {
                 let grew = doc.size() > self.doc.size();
                 self.index_took = doc.indexed_in;
                 self.doc = doc;
+                self.phase_read = None;
                 // The first line may have changed (another shebang): the grammar follows it
                 // (asked again on the next pass if it could not be read now).
                 let picked = syntax_of(&self.name, &mut self.doc);
@@ -4757,6 +5122,8 @@ impl TextWindow {
         rows: usize,
     ) -> Result<Page> {
         use wrap::{Measure, Pos, Wrapper};
+        // (CP949: the checkpoints this page asks for are kept while it is on screen.)
+        self.doc.phases.page += 1;
         let total = self.doc.total();
         // While the pass is on its way, a place it will reach waits for it (06 §7.2: the
         // lines there get their numbers); a place past where it stops is a jump by bytes.
@@ -5414,7 +5781,11 @@ impl TextWindow {
                 };
             }
         }
+        // A checkpoint read that ended is in before the page is read (08 §7.4); one the page
+        // asked for starts after it.
+        self.poll_phases();
         self.ensure_page(&ctx, p.text, &font);
+        self.start_phases(&ctx);
         if self.live && !self.preview && !self.frozen() && self.at_end() {
             // At the end of a local file: looked at again each second with no input (one stat),
             // so a growing log is followed.
@@ -5795,7 +6166,9 @@ impl Window for TextWindow {
             // A preview whose file changed keeps what it shows: it is not re-read.
             return self.painted && (page || self.frozen());
         }
-        let still = !self.waiting && self.reindex.is_none() && !self.reloading;
+        // (A CP949 checkpoint read the page asked for: its rows are placeholders until it ends.)
+        let phases = self.phase_read.is_none() && self.doc.phases.wanted.is_none();
+        let still = !self.waiting && self.reindex.is_none() && !self.reloading && phases;
         // (Go to's pass is a jump on its way.)
         self.painted && still && self.seeking.is_none() && page
     }
