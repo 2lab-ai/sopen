@@ -36,6 +36,45 @@ impl LocalFs {
     }
 }
 
+/// What the exchange answers where it is not offered (12 §9.1): an older kernel or a seccomp
+/// filter (`ENOSYS`), a filesystem without it (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`).
+const NO_EXCHANGE: [i32; 4] = [libc::ENOSYS, libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP];
+
+#[cfg(target_os = "macos")]
+fn swap(a: &std::ffi::CStr, b: &std::ffi::CStr) -> std::io::Result<()> {
+    // SAFETY: two NUL-terminated paths that outlive the call.
+    match unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn swap(a: &std::ffi::CStr, b: &std::ffi::CStr) -> std::io::Result<()> {
+    // The system call itself, so a C library without its wrapper still exchanges; a kernel
+    // without it answers ENOSYS.
+    // SAFETY: two NUL-terminated paths that outlive the call, relative to the working folder.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    match rc {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn swap(_: &std::ffi::CStr, _: &std::ffi::CStr) -> std::io::Result<()> {
+    Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
+}
+
 pub(crate) fn stat_of(meta: &fs::Metadata) -> Stat {
     Stat {
         is_dir: meta.is_dir(),
@@ -235,6 +274,46 @@ impl RemoteFs for LocalFs {
 
     fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
         fs::hard_link(from, to).with_context(|| format!("cannot link {from} to {to}"))
+    }
+
+    /// 12 §9.1: one call that swaps the two names, so the target is never missing and the file
+    /// it displaced stays at hand to be checked.
+    fn exchange(&mut self, a: &str, b: &str) -> Result<()> {
+        let path = |p: &str| {
+            std::ffi::CString::new(p).with_context(|| format!("{p}: a path with a NUL byte"))
+        };
+        match swap(&path(a)?, &path(b)?) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let what = format!("cannot exchange {a} and {b}");
+                match e.raw_os_error() {
+                    Some(n) if NO_EXCHANGE.contains(&n) => {
+                        Err(anyhow::Error::new(super::NoExchange(n)).context(what))
+                    }
+                    _ => Err(e).context(what),
+                }
+            }
+        }
+    }
+
+    fn file_id(&mut self, path: &str) -> Result<Option<(super::FileId, u64)>> {
+        match fs::symlink_metadata(path) {
+            Ok(m) => Ok(Some((
+                super::FileId {
+                    dev: m.dev(),
+                    ino: m.ino(),
+                },
+                m.nlink(),
+            ))),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("cannot stat {path}")),
+        }
+    }
+
+    fn sync_dir(&mut self, dir: &str) -> Result<()> {
+        fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("cannot make the folder {dir} durable"))
     }
 
     fn remove(&mut self, path: &str) -> Result<()> {

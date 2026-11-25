@@ -2272,6 +2272,7 @@ fn sample_intents() -> Vec<SaveIntent> {
             staged,
             post: hex_post(&staged),
         },
+        guard: None,
     };
     let writing = SaveIntent {
         route: Route::InPlace,
@@ -2938,6 +2939,7 @@ fn intent(kind: Kind, route: Route, baseline: Fingerprint, seen: Seen, phase: Ph
         baseline,
         seen,
         phase,
+        guard: None,
     }
 }
 
@@ -4389,6 +4391,8 @@ fn every_save_the_journal_records_reads_back_as_written() {
                 ("media pending", pending(&media_small)),
                 ("media small unfit", unfit(&media_small)),
             ],
+            // A text journal's own records: `text_*` below.
+            Kind::Text => Vec::new(),
         }
     }
     fn plans() -> Vec<(String, Plan)> {
@@ -4606,5 +4610,687 @@ fn a_refused_fsync_of_the_cache_roots_folder_always_stops_the_journal() {
                 "{log:?}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Text (12 §9.5, E25; ES-3) and the guarded Save's record and reconciliation (12 §9.1, E32).
+
+/// The edits of a text generation over `original` (generation `k`) and the add buffer's
+/// `chunks`: the original's first half, then all of the add buffer.
+fn text_edits(k: u32, original: &[u8], chunks: &[Chunk]) -> TextEdits {
+    let add = chunks.last().map_or(0, |c| c.start + c.len);
+    let mut pieces = vec![TextPiece::Original(0..original.len() as u64 / 2)];
+    if add > 0 {
+        pieces.push(TextPiece::Add(0..add));
+    }
+    TextEdits {
+        encoding: "UTF-8".into(),
+        id: Some(FileId { dev: 7, ino: 42 }),
+        original: OriginalRef {
+            k,
+            len: original.len() as u64,
+            sha256: sha256(original),
+        },
+        chunks: chunks.to_vec(),
+        add,
+        saved: false,
+        pieces,
+    }
+}
+
+fn text_snap(edits: &TextEdits, file: &[u8]) -> Snapshot {
+    Snapshot {
+        baseline: fp(file.len() as u64, 1_794_389_076, Some(sha256(file))),
+        seen: Seen::whole(sha256(file)),
+        edits: edits.to_text(),
+        pastes: Vec::new(),
+    }
+}
+
+/// The text edits read back as written, and nothing else is read: a gap between chunks, chunks
+/// that do not hold the add buffer, a piece outside what it names, any other form.
+#[test]
+fn text_edits_read_back_as_written_and_refuse_any_other_form() {
+    let chunks = [
+        Chunk {
+            n: 1,
+            start: 0,
+            len: 5,
+            sha256: [1; 32],
+        },
+        Chunk {
+            n: 2,
+            start: 5,
+            len: 3,
+            sha256: [2; 32],
+        },
+    ];
+    let edits = text_edits(2, b"0123456789", &chunks);
+    let text = edits.to_text();
+    assert_eq!(TextEdits::parse(&text).unwrap(), edits);
+    assert!(text.starts_with("text 1\nencoding UTF-8\nid 7 42\noriginal 2 10 "));
+    let bad = [
+        text.replace("chunk 2 5 3", "chunk 3 5 3"),
+        text.replace("chunk 2 5 3", "chunk 2 6 3"),
+        text.replace("add 8", "add 9"),
+        text.replace("a 0 8", "a 0 9"),
+        text.replace("o 0 5", "o 5 5"),
+        text.replace("saved 0", "saved 2"),
+        format!("{text}x"),
+        text.replace('\n', "\r\n"),
+    ];
+    for b in bad {
+        assert!(TextEdits::parse(&b).is_err(), "{b}");
+    }
+}
+
+/// E25: no text generation is published before the original it names is durable; once a re-read
+/// replaced the original (generation `k` + 1), a generation naming `k` is refused, and one naming
+/// `k` + 1 published. A chunk a generation names must be kept first.
+#[test]
+fn a_text_generation_waits_for_its_original_and_its_chunks() {
+    let (mem, _, mut j) = mem_journal(Kind::Text);
+    let first = b"first read\n".to_vec();
+    let edits = text_edits(1, &first, &[]);
+    let e = j.publish(&text_snap(&edits, &first)).unwrap_err();
+    assert!(format!("{e:#}").contains("is not kept yet"), "{e:#}");
+    assert_eq!(j.current(), None);
+    let kept = j.keeping().write(1, &first).unwrap();
+    assert_eq!(
+        mem.read(&j.dir().join("original")).unwrap(),
+        first,
+        "raw bytes"
+    );
+    j.original_kept(kept).unwrap();
+    let chunk = Chunk {
+        n: 1,
+        start: 0,
+        len: 2,
+        sha256: sha256(b"ab"),
+    };
+    let e = j
+        .publish(&text_snap(&text_edits(1, &first, &[chunk]), &first))
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("chunk that is not kept"), "{e:#}");
+    assert_eq!(j.keep_add(&[b"a", b"b"]).unwrap(), chunk);
+    assert_eq!(mem.read(&j.dir().join("add-1")).unwrap(), b"ab");
+    j.publish(&text_snap(&text_edits(1, &first, &[chunk]), &first))
+        .unwrap();
+
+    let second = b"read again\n".to_vec();
+    let kept = j.keeping().write(2, &second).unwrap();
+    j.original_kept(kept).unwrap();
+    assert!(j
+        .publish(&text_snap(&text_edits(1, &first, &[chunk]), &first))
+        .is_err());
+    j.publish(&text_snap(&text_edits(2, &second, &[chunk]), &second))
+        .unwrap();
+    assert_eq!(mem.read(&j.dir().join("original")).unwrap(), second);
+}
+
+/// ES-3, on the real disk: Restore reads the journal alone — the original, the chunks — each
+/// against what the generation names; once `original` was replaced (a re-read) before any
+/// generation named the new one, the generation is refused, never applied. The recovery row's
+/// size is the journal's; a journal with an original and no generation holds nothing.
+#[test]
+fn a_text_journal_restores_from_itself_and_refuses_a_replaced_original() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    let fs = disk();
+    let first = b"first read\n".to_vec();
+    let mut j = Journal::create(fs.clone(), &cache, HOST, PATH, Kind::Text).unwrap();
+    let kept = j.keeping().write(1, &first).unwrap();
+    j.original_kept(kept).unwrap();
+    let chunk = j.keep_add(&[b"typed"]).unwrap();
+    let edits = text_edits(1, &first, &[chunk]);
+    j.publish(&text_snap(&edits, &first)).unwrap();
+    let dir = j.dir().to_path_buf();
+    drop(j);
+    let listed = orphans(&settled_disk(), &cache, HOST, PATH).unwrap();
+    assert_eq!(listed.len(), 1);
+    let size: u64 = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().metadata().unwrap().len())
+        .sum();
+    assert_eq!(listed[0].size(), size);
+    let back = listed[0].text().unwrap();
+    assert_eq!(
+        (back.edits, back.original, back.add),
+        (edits.clone(), first.clone(), b"typed".to_vec())
+    );
+    // A re-read wrote the new original; the generation naming the old one is all there is.
+    let j = listed.into_iter().next().unwrap().adopt().unwrap();
+    j.keeping().write(2, b"read again\n").unwrap();
+    drop(j);
+    let listed = orphans(&settled_disk(), &cache, HOST, PATH).unwrap();
+    let e = listed[0].text().unwrap_err();
+    assert!(
+        format!("{e:#}").contains("was replaced by a later read; they are not applied"),
+        "{e:#}"
+    );
+    drop(listed);
+
+    // Killed between the journal's original and its first generation: nothing to offer.
+    std::fs::remove_dir_all(&dir).unwrap();
+    let j = Journal::create(fs.clone(), &cache, HOST, PATH, Kind::Text).unwrap();
+    j.keeping().write(1, &first).unwrap();
+    drop(j);
+    assert!(orphans(&settled_disk(), &cache, HOST, PATH)
+        .unwrap()
+        .is_empty());
+}
+
+/// ES-3: a 50 MB paste is one `add-<n>`, written once — the generations after it name it and do
+/// not write it again; the next bytes typed are the next chunk.
+#[test]
+fn a_large_paste_is_one_chunk_that_later_generations_do_not_rewrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    let mut j = Journal::create(disk(), &cache, HOST, PATH, Kind::Text).unwrap();
+    let first = b"file\n".to_vec();
+    let kept = j.keeping().write(1, &first).unwrap();
+    j.original_kept(kept).unwrap();
+    let paste = vec![b'p'; 50_000_000];
+    let big = j
+        .keep_add(&[&paste[..25_000_000], &paste[25_000_000..]])
+        .unwrap();
+    j.publish(&text_snap(&text_edits(1, &first, &[big]), &first))
+        .unwrap();
+    let add1 = j.dir().join("add-1");
+    let before = std::fs::metadata(&add1).unwrap();
+    assert_eq!(before.len(), 50_000_000);
+    let small = j.keep_add(&[b"x"]).unwrap();
+    j.publish(&text_snap(&text_edits(1, &first, &[big, small]), &first))
+        .unwrap();
+    let after = std::fs::metadata(&add1).unwrap();
+    use std::os::unix::fs::MetadataExt as _;
+    assert_eq!(
+        (after.ino(), after.mtime(), after.mtime_nsec()),
+        (before.ino(), before.mtime(), before.mtime_nsec()),
+        "add-1 is not written again"
+    );
+    let names = std::fs::read_dir(j.dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("add-"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(names, ["add-1", "add-2"].map(String::from).into());
+}
+
+/// A disk that says how much room it has, or fills.
+struct Full {
+    inner: Arc<dyn Fs>,
+    free: Option<u64>,
+    enospc: bool,
+}
+
+impl Fs for Full {
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        self.inner.create_dir(path)
+    }
+    fn write_new(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        if self.enospc && path.ends_with("original.tmp") {
+            self.inner.write_new(path, &bytes[..bytes.len() / 2])?;
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
+        self.inner.write_new(path, bytes)
+    }
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        self.inner.sync_file(path)
+    }
+    fn sync_dir(&self, path: &Path) -> io::Result<()> {
+        self.inner.sync_dir(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        self.inner.remove_dir(path)
+    }
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.inner.read(path)
+    }
+    fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+        self.inner.list(dir)
+    }
+    fn node(&self, path: &Path, follow: bool) -> io::Result<Option<Node>> {
+        self.inner.node(path, follow)
+    }
+    fn lock(&self, path: &Path, create: bool) -> io::Result<Option<Held>> {
+        self.inner.lock(path, create)
+    }
+    fn free_space(&self, _path: &Path) -> Option<u64> {
+        self.free
+    }
+}
+
+/// E25: with less free space than the file, or a disk that fills while `original` is written,
+/// the write is refused as no room — nothing is left of it — and no generation can be published.
+#[test]
+fn no_room_for_the_original_keeps_nothing() {
+    for (free, enospc) in [(Some(4), false), (None, true)] {
+        let mem = MemFs::with_cache();
+        let fs: Arc<dyn Fs> = Arc::new(Full {
+            inner: Arc::new(mem.clone()),
+            free,
+            enospc,
+        });
+        let mut j = Journal::create(fs, Path::new(MEM_CACHE), HOST, PATH, Kind::Text).unwrap();
+        let e = j.keeping().write(1, b"a file of some size\n").unwrap_err();
+        assert!(is_no_room(&e), "{e:#}");
+        assert_eq!(NoRoom.to_string(), "no room for a copy of the file");
+        assert!(
+            mem_journal_names(&mem)
+                .iter()
+                .all(|n| !n.contains("original")),
+            "{:?}",
+            mem_journal_names(&mem)
+        );
+        let first = b"a file of some size\n";
+        assert!(j
+            .publish(&text_snap(&text_edits(1, first, &[]), first))
+            .is_err());
+    }
+}
+
+fn text_intent(route: Route, phase: Phase, guard: Option<Guarded>) -> SaveIntent {
+    let (orig, _) = text_files();
+    SaveIntent {
+        saved: GenRef {
+            n: 2,
+            sha256: [2; 32],
+        },
+        kind: Kind::Text,
+        route,
+        target: PATH.into(),
+        started: at(1_794_389_000),
+        baseline: baseline_of(&orig, Some(orig.whole())),
+        seen: Seen::whole(orig.whole()),
+        phase,
+        guard,
+    }
+}
+
+/// The version read, and the version a text Save stages.
+fn text_files() -> (FakeFile, FakeFile) {
+    let orig = FakeFile::new(b"line one\nline two\n", 1_794_389_076);
+    let mut new = FakeFile::new(b"line one\nline 2\n", 1_794_389_600);
+    new.mode = 0o640;
+    (orig, new)
+}
+
+fn text_renaming(temp: &str) -> Phase {
+    let (_, new) = text_files();
+    Phase::Renaming {
+        temp: temp.into(),
+        created: new.file_stat(),
+        staged: new.file_stat(),
+        post: PostEvidence::text(&new.file_stat(), new.whole()).unwrap(),
+    }
+}
+
+/// E32: every guard a text Save records reads back as written; a guard on another kind, on a
+/// route that has no such phase, or at a phase it cannot come at, is refused.
+#[test]
+fn a_text_saves_guard_reads_back_and_only_where_it_belongs() {
+    let ids = (FileId { dev: 1, ino: 2 }, FileId { dev: 1, ino: 3 });
+    let (_, new) = text_files();
+    let created = Phase::Created {
+        temp: TEMP.into(),
+        created: new.file_stat(),
+    };
+    let good = [
+        (
+            Route::Exchange,
+            text_renaming(TEMP),
+            Guarded::Exchanging {
+                temp: ids.0,
+                target: ids.1,
+            },
+        ),
+        (
+            Route::Exchange,
+            text_renaming(TEMP),
+            Guarded::SwappedBack {
+                temp: ids.0,
+                target: ids.1,
+            },
+        ),
+        (
+            Route::Link,
+            created.clone(),
+            Guarded::Linked {
+                link: "/data/.model.bin.sopen-prev-x".into(),
+            },
+        ),
+        (
+            Route::Link,
+            text_renaming(TEMP),
+            Guarded::Committed {
+                link: "/data/.l".into(),
+            },
+        ),
+        (
+            Route::Link,
+            text_renaming(TEMP),
+            Guarded::Verified {
+                link: "/data/.l".into(),
+            },
+        ),
+        (
+            Route::Exchange,
+            text_renaming(TEMP),
+            Guarded::Kept {
+                from: TEMP.into(),
+                kept: "/data/model.bin.sopen-replaced-x".into(),
+            },
+        ),
+    ];
+    for (route, phase, guard) in good {
+        let intent = text_intent(route, phase, Some(guard));
+        let bytes = intent.text();
+        assert_eq!(parse_save(bytes.as_bytes()).unwrap(), intent, "{bytes}");
+    }
+    let bad = [
+        text_intent(
+            Route::Link,
+            text_renaming(TEMP),
+            Some(Guarded::Exchanging {
+                temp: ids.0,
+                target: ids.1,
+            }),
+        ),
+        text_intent(
+            Route::Link,
+            created,
+            Some(Guarded::Committed {
+                link: "/data/.l".into(),
+            }),
+        ),
+        SaveIntent {
+            kind: Kind::Image,
+            route: Route::Upload,
+            ..text_intent(
+                Route::Upload,
+                text_renaming(TEMP),
+                Some(Guarded::Linked {
+                    link: "/data/.l".into(),
+                }),
+            )
+        },
+    ];
+    for intent in bad {
+        assert!(check_intent(&intent).is_err(), "{intent:?}");
+    }
+}
+
+/// A [`FakeRemote`] whose files have devices and inodes.
+struct WithIds(FakeRemote, BTreeMap<String, FileId>);
+
+impl Inspect for WithIds {
+    fn lstat(&mut self, path: &str) -> Result<Option<Stat>> {
+        self.0.lstat(path)
+    }
+    fn read_at(&mut self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.0.read_at(path, offset, len)
+    }
+    fn whole_sha256(&mut self, path: &str, size: u64) -> Result<Option<Sha>> {
+        self.0.whole_sha256(path, size)
+    }
+    fn file_id(&mut self, path: &str) -> Result<Option<FileId>> {
+        Ok(self.1.get(path).copied())
+    }
+}
+
+/// 12 §9.1's reconciliation of a local text Save cut off from `exchanging` on: the exchange
+/// stood when the target is the staged file (by device and inode, and its content) — then what is
+/// at the temp's name is removed only when it is the version read, else kept beside the file;
+/// the staged file still at the temp's name means the exchange never happened or was undone,
+/// and it is removed; anything else removes nothing.
+#[test]
+fn a_cut_off_exchange_is_reconciled_from_what_is_at_each_name() {
+    let (orig, new) = text_files();
+    let other = FakeFile::new(b"line one\nTHEIRS 2\n", 1_794_389_700);
+    let (t_id, s_id) = (FileId { dev: 1, ino: 10 }, FileId { dev: 1, ino: 20 });
+    let exchanging = Guarded::Exchanging {
+        temp: s_id,
+        target: t_id,
+    };
+    let swapped = Guarded::SwappedBack {
+        temp: s_id,
+        target: t_id,
+    };
+    // (case, guard, at the target, at the temp, outcome, temp verdict, other verdict)
+    type At<'a> = (&'a FakeFile, FileId);
+    type Case<'a> = (
+        &'a str,
+        Guarded,
+        At<'a>,
+        Option<At<'a>>,
+        Outcome,
+        Temp,
+        Other,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "exchanged, the version read displaced",
+            exchanging.clone(),
+            (&new, s_id),
+            Some((&orig, t_id)),
+            Outcome::Landed,
+            Temp::None,
+            Other::Remove(TEMP.into()),
+        ),
+        (
+            "exchanged, another version displaced",
+            exchanging.clone(),
+            (&new, s_id),
+            Some((&other, t_id)),
+            Outcome::Landed,
+            Temp::None,
+            Other::Rename(TEMP.into()),
+        ),
+        (
+            "exchanged, the displaced file gone",
+            exchanging.clone(),
+            (&new, s_id),
+            None,
+            Outcome::Landed,
+            Temp::None,
+            Other::Gone(TEMP.into()),
+        ),
+        (
+            "never exchanged",
+            exchanging.clone(),
+            (&orig, t_id),
+            Some((&new, s_id)),
+            Outcome::NotLanded,
+            Temp::Remove(TEMP.into()),
+            Other::None,
+        ),
+        (
+            "exchanged back",
+            swapped.clone(),
+            (&other, t_id),
+            Some((&new, s_id)),
+            Outcome::NotLanded,
+            Temp::Remove(TEMP.into()),
+            Other::None,
+        ),
+        (
+            "the exchange back not yet made",
+            swapped,
+            (&new, s_id),
+            Some((&other, t_id)),
+            Outcome::Landed,
+            Temp::None,
+            Other::Rename(TEMP.into()),
+        ),
+        (
+            "never exchanged, the temp removed",
+            exchanging.clone(),
+            (&orig, t_id),
+            None,
+            Outcome::NotLanded,
+            Temp::Gone(TEMP.into()),
+            Other::None,
+        ),
+        (
+            "exchanged back, sopen's version removed",
+            exchanging.clone(),
+            (&other, t_id),
+            None,
+            Outcome::NotLanded,
+            Temp::Gone(TEMP.into()),
+            Other::None,
+        ),
+        (
+            "neither is sopen's",
+            exchanging,
+            (&other, FileId { dev: 1, ino: 30 }),
+            Some((&orig, t_id)),
+            Outcome::Unknown,
+            Temp::Keep {
+                path: TEMP.into(),
+                why: "the outcome is unknown".into(),
+            },
+            Other::None,
+        ),
+    ];
+    for (case, guard, (t, tid), temp, outcome, want_temp, want_other) in cases {
+        let mut files = vec![(PATH, t)];
+        let mut ids: BTreeMap<String, FileId> = [(PATH.to_string(), tid)].into();
+        if let Some((f, id)) = temp {
+            files.push((TEMP, f));
+            ids.insert(TEMP.into(), id);
+        }
+        let mut remote = WithIds(FakeRemote::with(&files), ids);
+        let intent = text_intent(Route::Exchange, text_renaming(TEMP), Some(guard));
+        let r = reconcile(&intent, HOST, &mut remote);
+        assert_eq!(
+            (r.outcome, &r.temp, &r.other),
+            (outcome, &want_temp, &want_other),
+            "{case}"
+        );
+        if outcome == Outcome::Landed {
+            let (base, _) = r.next.clone().unwrap();
+            assert_eq!(base.sha256, Some(new.whole()), "{case}");
+        }
+    }
+}
+
+/// 12 §9.1's reconciliation of a remote text Save: `linked` without `committed` — not
+/// committed, the link (a second name of the file in place) removed when it is the version read;
+/// `committed` without `verified` — committed, the link checked now: the version read removed,
+/// another kept and named; `kept` — the link already moved: named where it is.
+#[test]
+fn a_cut_off_link_check_is_reconciled_by_hashing_the_link() {
+    let (orig, new) = text_files();
+    let other = FakeFile::new(b"line one\nTHEIRS 2\n", 1_794_389_700);
+    const LINK: &str = "/data/.model.bin.sopen-prev-0123";
+    const KEPT: &str = "/data/model.bin.sopen-replaced-x";
+    let link = || LINK.to_string();
+    let created = Phase::Created {
+        temp: TEMP.into(),
+        created: new.file_stat(),
+    };
+    type Case<'a> = (
+        &'a str,
+        Phase,
+        Guarded,
+        Vec<(&'a str, &'a FakeFile)>,
+        Outcome,
+        Other,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "linked, nothing moved",
+            created.clone(),
+            Guarded::Linked { link: link() },
+            vec![(PATH, &orig), (LINK, &orig), (TEMP, &new)],
+            Outcome::NotLanded,
+            Other::Remove(link()),
+        ),
+        (
+            "linked, then written in place",
+            created,
+            Guarded::Linked { link: link() },
+            vec![(PATH, &other), (LINK, &other)],
+            Outcome::Unknown,
+            Other::Rename(link()),
+        ),
+        (
+            "committed, the version read replaced",
+            text_renaming(TEMP),
+            Guarded::Committed { link: link() },
+            vec![(PATH, &new), (LINK, &orig)],
+            Outcome::Landed,
+            Other::Remove(link()),
+        ),
+        (
+            "committed, another version replaced",
+            text_renaming(TEMP),
+            Guarded::Committed { link: link() },
+            vec![(PATH, &new), (LINK, &other)],
+            Outcome::Landed,
+            Other::Rename(link()),
+        ),
+        (
+            "verified, the removal not done",
+            text_renaming(TEMP),
+            Guarded::Verified { link: link() },
+            vec![(PATH, &new), (LINK, &orig)],
+            Outcome::Landed,
+            Other::Remove(link()),
+        ),
+        (
+            "kept",
+            text_renaming(TEMP),
+            Guarded::Kept {
+                from: link(),
+                kept: KEPT.into(),
+            },
+            vec![(PATH, &new), (KEPT, &other)],
+            Outcome::Landed,
+            Other::Kept(KEPT.into()),
+        ),
+    ];
+    for (case, phase, guard, files, outcome, want) in cases {
+        let mut remote = FakeRemote::with(&files);
+        let intent = text_intent(Route::Link, phase, Some(guard));
+        let r = reconcile(&intent, HOST, &mut remote);
+        assert_eq!((r.outcome, &r.other), (outcome, &want), "{case}");
+    }
+}
+
+/// 12 §9.5: a text Restore applies whatever the file is now; only the line says whether the
+/// edits are against it — the same file, no line; changed or gone, the line, and Save will ask.
+#[test]
+fn a_text_restore_check_says_whether_the_file_is_the_one_the_edits_were_made_against() {
+    let (orig, new) = text_files();
+    let gen = generation(
+        Kind::Text,
+        baseline_of(&orig, Some(orig.whole())),
+        Seen::whole(orig.whole()),
+    );
+    let mut same = FakeRemote::with(&[(PATH, &orig)]);
+    assert_eq!(
+        restore_check(&gen, Kind::Text, &mut same),
+        Restore::Apply { notes: Vec::new() }
+    );
+    for files in [vec![(PATH, &new)], vec![]] {
+        let mut remote = FakeRemote::with(&files);
+        assert_eq!(
+            restore_check(&gen, Kind::Text, &mut remote),
+            Restore::Apply {
+                notes: vec![NOTE_TEXT_CHANGED.to_string()]
+            }
+        );
     }
 }

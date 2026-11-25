@@ -16,13 +16,20 @@
 //!   their content against the file as it is now ([`restore_check`]) and offers Restore, Later or
 //!   Discard.
 //!
+//! - A text journal (`.prd/12-editor.md` §9.5, E25) is self-contained: beside its generations
+//!   it keeps `original`, the bytes as read, durable before any generation names it and
+//!   replaced at every re-read (generation `k`), and the add buffer in immutable chunks
+//!   `add-<n>`. A generation names the original (`k`, size, SHA-256), the chunks and the pieces
+//!   ([`TextEdits`]), so Restore rebuilds the buffer from the journal alone ([`Orphan::text`]).
+//!   Its Save records the guarded replace's phases beside [`Phase`] ([`Guarded`], E32).
+//!
 //! The editors' edits are opaque text here (`.hexpatch` lines, image operations, the media
-//! timeline); the evidence is typed ([`Seen`], [`PostEvidence`]). All file system work goes
+//! timeline), but for text's [`TextEdits`]; the evidence is typed ([`Seen`], [`PostEvidence`]). All file system work goes
 //! through [`Fs`], so the tests stop the process — or cut the power — before any step. Nothing
 //! here talks to a remote: what reconciliation and Restore need from it comes through
 //! [`Inspect`], which the save code implements.
 
-use crate::remote::{Fingerprint, Stat, HASH_CHECK_MAX};
+use crate::remote::{FileId, Fingerprint, Stat, HASH_CHECK_MAX};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,6 +55,10 @@ pub const DELAY: Duration = Duration::from_millis(250);
 pub const ASK_PENDING: &str = "these edits were made before the file could be checked";
 /// Restore's note when the metadata changed but the edited pages did not.
 pub const NOTE_PAGES: &str = "the file changed elsewhere since; the bytes under your edits did not";
+/// A text Restore's note when the file is not the one the edits were made against (12 §9.5),
+/// after the file's name.
+pub const NOTE_TEXT_CHANGED: &str =
+    "changed since these edits were made — restored from the journal; Save will ask";
 /// Restore's note for media above 256 MiB.
 pub const NOTE_ENDS: &str =
     "checked size, modification time and the first and last MiB, not the whole content";
@@ -110,6 +121,19 @@ pub trait Fs: Send + Sync {
     /// holder has it. With `create` the file is made first, exclusively (`AlreadyExists` when
     /// it is there); without, a missing file is `NotFound`.
     fn lock(&self, path: &Path, create: bool) -> io::Result<Option<Held>>;
+    /// [`Fs::write_new`] of `parts` one after the other (a text journal's chunk, written from
+    /// the add buffer's blocks without joining them first).
+    fn write_new_parts(&self, path: &Path, parts: &[&[u8]]) -> io::Result<()> {
+        self.write_new(path, &parts.concat())
+    }
+    /// The size of the file at `path`, never through a link.
+    fn size(&self, path: &Path) -> io::Result<u64> {
+        self.read(path).map(|bytes| bytes.len() as u64)
+    }
+    /// Bytes free to this user on the filesystem holding `path`; `None` when not known.
+    fn free_space(&self, _path: &Path) -> Option<u64> {
+        None
+    }
 }
 
 /// The local disk.
@@ -223,6 +247,24 @@ impl Fs for Disk {
             _ => Ok(None),
         }
     }
+
+    fn write_new_parts(&self, path: &Path, parts: &[&[u8]]) -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        parts.iter().try_for_each(|part| file.write_all(part))
+    }
+
+    fn size(&self, path: &Path) -> io::Result<u64> {
+        std::fs::symlink_metadata(path).map(|m| m.len())
+    }
+
+    fn free_space(&self, path: &Path) -> Option<u64> {
+        crate::remote::LocalFs::free_space_at(path)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -234,6 +276,8 @@ pub enum Kind {
     Hex,
     Image,
     Media,
+    /// xtools's editor (12 §9.5): self-contained, its `edits` a [`TextEdits`].
+    Text,
 }
 
 impl Kind {
@@ -242,6 +286,7 @@ impl Kind {
             Kind::Hex => "hex",
             Kind::Image => "image",
             Kind::Media => "media",
+            Kind::Text => "text",
         }
     }
 
@@ -250,6 +295,7 @@ impl Kind {
             b"hex" => Kind::Hex,
             b"image" => Kind::Image,
             b"media" => Kind::Media,
+            b"text" => Kind::Text,
             _ => bail!("unknown kind"),
         })
     }
@@ -454,6 +500,11 @@ pub enum Route {
     Upload,
     /// Hex: the runs written into the target itself (§4.4).
     InPlace,
+    /// Text, a local file: the staged temp exchanged with the target (12 §9.1, E32).
+    Exchange,
+    /// Text, a remote file: the target hard-linked, the temp renamed over it, the link checked
+    /// (12 §9.1, E32).
+    Link,
 }
 
 impl Route {
@@ -463,6 +514,8 @@ impl Route {
             Route::StreamedRewrite => "streamed-rewrite",
             Route::Upload => "upload",
             Route::InPlace => "in-place",
+            Route::Exchange => "exchange",
+            Route::Link => "link",
         }
     }
 
@@ -472,6 +525,8 @@ impl Route {
             b"streamed-rewrite" => Route::StreamedRewrite,
             b"upload" => Route::Upload,
             b"in-place" => Route::InPlace,
+            b"exchange" => Route::Exchange,
+            b"link" => Route::Link,
             _ => bail!("unknown route"),
         })
     }
@@ -545,6 +600,24 @@ impl PostEvidence {
         Ok(PostEvidence {
             kind: Kind::Image,
             check,
+            next_baseline: staged.fingerprint(Some(whole)),
+            next_seen: Seen::whole(whole),
+        })
+    }
+
+    /// Text (12 §9.1): the staged bytes' whole SHA-256 (sopen staged them; a text file is at most
+    /// 256 MiB) — for both parts.
+    pub fn text(staged: &FileStat, whole: Sha) -> Result<PostEvidence> {
+        ensure!(
+            staged.size <= HASH_CHECK_MAX,
+            "a text file is at most 256 MiB"
+        );
+        Ok(PostEvidence {
+            kind: Kind::Text,
+            check: Evidence {
+                whole: Some(whole),
+                ..Evidence::default()
+            },
             next_baseline: staged.fingerprint(Some(whole)),
             next_seen: Seen::whole(whole),
         })
@@ -654,6 +727,38 @@ impl Phase {
     }
 }
 
+/// Where a text Save's guarded replace is (12 §9.1, E32), recorded beside its [`Phase`], each
+/// before the request that moves the Save to it ([`Journal::save_guard`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Guarded {
+    /// Local, the exchange next: the temp's and the target's devices and inodes — what tells,
+    /// on the next open, whether the exchange happened.
+    Exchanging { temp: FileId, target: FileId },
+    /// Local, the exchange back next: the displaced file was not the version read.
+    SwappedBack { temp: FileId, target: FileId },
+    /// Remote, the hard link of the target to `link` next; the phase may still be `created`.
+    Linked { link: String },
+    /// Remote, the rename got its reply: the link check next.
+    Committed { link: String },
+    /// Remote, the link checked equal to the version read: its removal next.
+    Verified { link: String },
+    /// The other writer's version at `from` is renamed `kept` next.
+    Kept { from: String, kept: String },
+}
+
+impl Guarded {
+    fn word(&self) -> &'static str {
+        match self {
+            Guarded::Exchanging { .. } => "exchanging",
+            Guarded::SwappedBack { .. } => "swapped-back",
+            Guarded::Linked { .. } => "linked",
+            Guarded::Committed { .. } => "committed",
+            Guarded::Verified { .. } => "verified",
+            Guarded::Kept { .. } => "kept",
+        }
+    }
+}
+
 /// The `save` file: what a Save is doing, with the generation whose edits it writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaveIntent {
@@ -668,6 +773,9 @@ pub struct SaveIntent {
     pub baseline: Fingerprint,
     pub seen: Seen,
     pub phase: Phase,
+    /// A text Save's guard (12 §9.1), `None` for every other kind and before the guard's first
+    /// phase.
+    pub guard: Option<Guarded>,
 }
 
 /// How a Save will write, given to [`Journal::begin_save`].
@@ -685,6 +793,300 @@ pub enum Plan {
         undo: PathBuf,
         runs: Vec<Run>,
     },
+}
+
+// ---------------------------------------------------------------------------------------------
+// Text: the backing files and the edits (12 §9.5, E25).
+
+/// `original` as kept: the original of re-read generation `k`, its size and SHA-256. A
+/// generation names it, so Restore applies no piece to an original it was not made on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OriginalRef {
+    pub k: u32,
+    pub len: u64,
+    pub sha256: Sha,
+}
+
+/// One `add-<n>`: the add buffer's bytes `start..start + len`, appended since the chunk before,
+/// written, fsynced and named once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chunk {
+    pub n: u64,
+    pub start: u64,
+    pub len: u64,
+    pub sha256: Sha,
+}
+
+/// A piece of a text generation: a range of the original, or of the add buffer counted as one
+/// run of bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextPiece {
+    Original(std::ops::Range<u64>),
+    Add(std::ops::Range<u64>),
+}
+
+/// A text generation's `edits` (12 §9.5): the encoding, the baseline's device and inode (a
+/// local file's, for the exchange), the original the pieces were made on, the chunks holding the
+/// add buffer's bytes they may use, whether the pieces are the version saved, and the pieces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextEdits {
+    pub encoding: String,
+    pub id: Option<FileId>,
+    pub original: OriginalRef,
+    /// `add-1`, `add-2`, … in order, together the add buffer's first `add` bytes.
+    pub chunks: Vec<Chunk>,
+    pub add: u64,
+    /// Nothing is unsaved: the pieces are the file as last saved (a journal kept across a Save).
+    pub saved: bool,
+    pub pieces: Vec<TextPiece>,
+}
+
+const TEXT_MAGIC: &str = "text 1";
+
+impl TextEdits {
+    /// The `edits` block of a text generation.
+    pub fn to_text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = format!("{TEXT_MAGIC}\nencoding {}\n", self.encoding);
+        match self.id {
+            Some(id) => writeln!(out, "id {} {}", id.dev, id.ino),
+            None => writeln!(out, "id -"),
+        }
+        .ok();
+        let o = &self.original;
+        writeln!(
+            out,
+            "original {} {} {}",
+            o.k,
+            o.len,
+            crate::cache::hex(&o.sha256)
+        )
+        .ok();
+        for c in &self.chunks {
+            let sha = crate::cache::hex(&c.sha256);
+            writeln!(out, "chunk {} {} {} {sha}", c.n, c.start, c.len).ok();
+        }
+        writeln!(out, "add {}", self.add).ok();
+        writeln!(out, "saved {}", u8::from(self.saved)).ok();
+        for p in &self.pieces {
+            let (tag, r) = match p {
+                TextPiece::Original(r) => ('o', r),
+                TextPiece::Add(r) => ('a', r),
+            };
+            writeln!(out, "{tag} {} {}", r.start, r.end).ok();
+        }
+        out
+    }
+
+    /// Reads the form [`TextEdits::to_text`] writes, and nothing else: chunks numbered from 1,
+    /// each starting where the one before ended, together exactly `add` bytes; every piece
+    /// non-empty and within what it names.
+    pub fn parse(text: &str) -> Result<TextEdits> {
+        let parsed = (|| -> Result<TextEdits> {
+            let mut lines = text.split_inclusive('\n').map(|l| {
+                l.strip_suffix('\n')
+                    .ok_or_else(|| anyhow!("a line without its newline"))
+            });
+            let mut next = || lines.next().context("cut short")?;
+            ensure!(next()? == TEXT_MAGIC, "not text edits");
+            let field = |line: &str, key: &str| -> Result<Vec<String>> {
+                let rest = line
+                    .strip_prefix(key)
+                    .and_then(|r| r.strip_prefix(' '))
+                    .with_context(|| format!("expected {key}"))?;
+                Ok(rest.split(' ').map(str::to_string).collect())
+            };
+            let num = |w: &str| parse_u64(w.as_bytes());
+            let encoding = field(next()?, "encoding")?.join(" ");
+            let id = match field(next()?, "id")?.as_slice() {
+                [dash] if dash == "-" => None,
+                [dev, ino] => Some(FileId {
+                    dev: num(dev)?,
+                    ino: num(ino)?,
+                }),
+                _ => bail!("id is `-` or a device and an inode"),
+            };
+            let original = match field(next()?, "original")?.as_slice() {
+                [k, len, sha] => OriginalRef {
+                    k: u32::try_from(num(k)?)?,
+                    len: num(len)?,
+                    sha256: parse_sha(sha.as_bytes())?,
+                },
+                _ => bail!("original is `<k> <len> <sha256>`"),
+            };
+            let mut chunks = Vec::new();
+            let mut line = next()?;
+            while line.starts_with("chunk ") {
+                let [n, start, len, sha] = <[String; 4]>::try_from(field(line, "chunk")?)
+                    .map_err(|_| anyhow!("chunk is `<n> <start> <len> <sha256>`"))?;
+                let chunk = Chunk {
+                    n: num(&n)?,
+                    start: num(&start)?,
+                    len: num(&len)?,
+                    sha256: parse_sha(sha.as_bytes())?,
+                };
+                let want = chunks
+                    .last()
+                    .map_or((1, 0), |c: &Chunk| (c.n + 1, c.start + c.len));
+                ensure!(
+                    (chunk.n, chunk.start) == want && chunk.len > 0,
+                    "the chunks follow one another"
+                );
+                chunks.push(chunk);
+                line = next()?;
+            }
+            let add = match field(line, "add")?.as_slice() {
+                [n] => num(n)?,
+                _ => bail!("add is one number"),
+            };
+            ensure!(
+                chunks.last().map_or(0, |c| c.start + c.len) == add,
+                "the chunks hold the add buffer's bytes"
+            );
+            let saved = match field(next()?, "saved")?.as_slice() {
+                [v] if v == "0" => false,
+                [v] if v == "1" => true,
+                _ => bail!("saved is 0 or 1"),
+            };
+            let mut pieces = Vec::new();
+            for line in lines {
+                let line = line?;
+                let (tag, rest) = line
+                    .split_once(' ')
+                    .context("a piece is `o|a <start> <end>`")?;
+                let (a, b) = rest
+                    .split_once(' ')
+                    .context("a piece is `o|a <start> <end>`")?;
+                let range = num(a)?..num(b)?;
+                let size = match tag {
+                    "o" => original.len,
+                    "a" => add,
+                    _ => bail!("a piece is of the original (o) or the add buffer (a)"),
+                };
+                ensure!(
+                    range.start < range.end && range.end <= size,
+                    "a piece lies within what it names"
+                );
+                pieces.push(match tag {
+                    "o" => TextPiece::Original(range),
+                    _ => TextPiece::Add(range),
+                });
+            }
+            Ok(TextEdits {
+                encoding,
+                id,
+                original,
+                chunks,
+                add,
+                saved,
+                pieces,
+            })
+        })();
+        let edits = parsed.context("the text edits cannot be read")?;
+        ensure!(
+            edits.to_text() == text,
+            "the text edits are not in the form sopen writes"
+        );
+        Ok(edits)
+    }
+}
+
+/// A text journal's bytes as Restore needs them ([`Orphan::text`]): the edits, the original
+/// they were made on and the add buffer, each checked against its hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextBacking {
+    pub edits: TextEdits,
+    pub original: Vec<u8>,
+    pub add: Vec<u8>,
+}
+
+/// No room on the local disk for a copy of the file (12 §9.5): no journal is published.
+#[derive(Debug)]
+pub struct NoRoom;
+
+impl std::fmt::Display for NoRoom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no room for a copy of the file")
+    }
+}
+
+impl std::error::Error for NoRoom {}
+
+pub fn is_no_room(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<NoRoom>())
+}
+
+fn room(e: io::Error, what: &str, path: &Path) -> anyhow::Error {
+    if e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(libc::ENOSPC) {
+        return anyhow::Error::new(NoRoom).context(format!("cannot {what} {}", path.display()));
+    }
+    io_err(e, what, path)
+}
+
+/// Writes a text journal's `original` (12 §9.5) away from the journal's own thread — the bytes
+/// as read, once, on a worker — into its directory, whose lock the journal holds; the result is
+/// given back to [`Journal::original_kept`].
+#[derive(Clone)]
+pub struct Keeping {
+    fs: Arc<dyn Fs>,
+    dir: PathBuf,
+}
+
+impl Keeping {
+    /// `original.tmp` (a stale one removed first), fsynced, renamed over `original`, the folder
+    /// fsynced. [`NoRoom`] when the disk has less free space than `bytes`, or fills.
+    pub fn write(&self, k: u32, bytes: &[u8]) -> Result<OriginalRef> {
+        let fs = self.fs.as_ref();
+        let len = bytes.len() as u64;
+        if fs.free_space(&self.dir).is_some_and(|free| free < len) {
+            return Err(anyhow::Error::new(NoRoom));
+        }
+        let to = self.dir.join(ORIGINAL);
+        let tmp = self.dir.join(format!("{ORIGINAL}.tmp"));
+        if fs
+            .node(&tmp, false)
+            .map_err(|e| io_err(e, "look at", &tmp))?
+            .is_some()
+        {
+            fs.remove_file(&tmp)
+                .map_err(|e| io_err(e, "remove", &tmp))?;
+        }
+        let written = fs
+            .write_new(&tmp, bytes)
+            .map_err(|e| room(e, "write", &tmp))
+            .and_then(|()| {
+                fs.sync_file(&tmp)
+                    .map_err(|e| room(e, "make durable", &tmp))
+            });
+        if let Err(e) = written {
+            let _ = fs.remove_file(&tmp);
+            return Err(e);
+        }
+        fs.rename(&tmp, &to)
+            .map_err(|e| io_err(e, "publish", &to))?;
+        fs.sync_dir(&self.dir)
+            .map_err(|e| io_err(e, "make durable the folder", &self.dir))?;
+        Ok(OriginalRef {
+            k,
+            len,
+            sha256: sha256(bytes),
+        })
+    }
+}
+
+const ORIGINAL: &str = "original";
+
+fn add_name(n: u64) -> String {
+    format!("add-{n}")
+}
+
+/// A text journal's own files: `original`, `add-<n>`, and those being written.
+fn backing(name: &str) -> bool {
+    let name = name.strip_suffix(".tmp").unwrap_or(name);
+    name == ORIGINAL
+        || name
+            .strip_prefix("add-")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -717,6 +1119,10 @@ pub struct Journal {
     saved_pastes: Vec<Sha>,
     /// A Save is running: no new generation until it ends (§3.1, §10).
     running: bool,
+    /// Text: `original` as made durable ([`Journal::original_kept`]).
+    original: Option<OriginalRef>,
+    /// Text: the `add-<n>` made durable, in order.
+    chunks: Vec<Chunk>,
 }
 
 const LOCK: &str = "lock";
@@ -924,7 +1330,7 @@ fn check_seen(kind: Kind, baseline: &Fingerprint, seen: &Seen, edits: &str) -> R
     );
     let ok = match kind {
         Kind::Hex => ev.whole.is_none() && ev.ends.is_none(),
-        Kind::Image => ev.pages.is_empty() && ev.ends.is_none() && ev.whole.is_some(),
+        Kind::Image | Kind::Text => ev.pages.is_empty() && ev.ends.is_none() && ev.whole.is_some(),
         Kind::Media if baseline.size <= HASH_CHECK_MAX => {
             ev.pages.is_empty() && ev.ends.is_none() && ev.whole.is_some()
         }
@@ -936,7 +1342,7 @@ fn check_seen(kind: Kind, baseline: &Fingerprint, seen: &Seen, edits: &str) -> R
         kind.word(),
         match kind {
             Kind::Hex => "the edited pages",
-            Kind::Image => "the whole file's SHA-256",
+            Kind::Image | Kind::Text => "the whole file's SHA-256",
             Kind::Media => "the whole SHA-256 up to 256 MiB, else the first and last MiB",
         }
     );
@@ -954,6 +1360,9 @@ fn check_shape(kind: Kind, snap: &Snapshot) -> Result<()> {
             sha256(&p.png) == p.sha256,
             "a paste does not match its hash"
         );
+    }
+    if kind == Kind::Text {
+        TextEdits::parse(&snap.edits)?;
     }
     check_seen(kind, &snap.baseline, &snap.seen, &snap.edits)
 }
@@ -990,6 +1399,13 @@ fn check_post(kind: Kind, staged: &FileStat, post: &PostEvidence) -> Result<()> 
             PostEvidence::image(staged, whole, post.check.ends)?
         }
         Kind::Media => PostEvidence::media(staged, post.check.whole, post.check.ends)?,
+        Kind::Text => {
+            let whole = post
+                .next_baseline
+                .sha256
+                .context("a text save's next baseline is its whole SHA-256")?;
+            PostEvidence::text(staged, whole)?
+        }
     };
     ensure!(
         rebuilt == *post,
@@ -1022,6 +1438,41 @@ fn check_intent(intent: &SaveIntent) -> Result<()> {
     if let Some((staged, post)) = intent.phase.staged() {
         check_post(kind, staged, post)?;
     }
+    if let Some(guard) = &intent.guard {
+        ensure!(kind == Kind::Text, "only a text save records a guard");
+        let (route_ok, phase_ok) = match guard {
+            Guarded::Exchanging { .. } | Guarded::SwappedBack { .. } => (
+                intent.route == Route::Exchange,
+                matches!(intent.phase, Phase::Renaming { .. }),
+            ),
+            Guarded::Linked { .. } => (
+                intent.route == Route::Link,
+                matches!(
+                    intent.phase,
+                    Phase::Created { .. } | Phase::Staged { .. } | Phase::Renaming { .. }
+                ),
+            ),
+            Guarded::Committed { .. } | Guarded::Verified { .. } => (
+                intent.route == Route::Link,
+                matches!(intent.phase, Phase::Renaming { .. }),
+            ),
+            Guarded::Kept { .. } => (
+                matches!(intent.route, Route::Exchange | Route::Link),
+                matches!(intent.phase, Phase::Renaming { .. }),
+            ),
+        };
+        ensure!(
+            route_ok,
+            "a {} save records no {} guard",
+            intent.route.word(),
+            guard.word()
+        );
+        ensure!(
+            phase_ok,
+            "the {} guard comes at another phase",
+            guard.word()
+        );
+    }
     Ok(())
 }
 
@@ -1033,6 +1484,7 @@ fn route_fits(kind: Kind, route: Route) -> bool {
             Route::ServerCopy | Route::StreamedRewrite | Route::InPlace
         ),
         Kind::Image | Kind::Media => route == Route::Upload,
+        Kind::Text => matches!(route, Route::Upload | Route::Exchange | Route::Link),
     }
 }
 
@@ -1123,6 +1575,8 @@ impl Journal {
                 save: None,
                 saved_pastes: Vec::new(),
                 running: false,
+                original: None,
+                chunks: Vec::new(),
             });
         }
         bail!(
@@ -1134,6 +1588,93 @@ impl Journal {
     /// The journal directory (for `kept at <journal>`).
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Text: `original` as kept, once durable.
+    pub fn original(&self) -> Option<OriginalRef> {
+        self.original
+    }
+
+    /// Text: the `add-<n>` kept, in order.
+    pub fn chunks(&self) -> &[Chunk] {
+        &self.chunks
+    }
+
+    /// Text: what writes `original` on a worker ([`Keeping::write`]).
+    pub fn keeping(&self) -> Keeping {
+        Keeping {
+            fs: self.fs.clone(),
+            dir: self.dir.clone(),
+        }
+    }
+
+    /// Text: `original` is durable as `kept` — from now on a generation may name it, and none
+    /// may name the one before it (whose file the rename replaced).
+    pub fn original_kept(&mut self, kept: OriginalRef) -> Result<()> {
+        ensure!(
+            self.kind == Kind::Text,
+            "only a text journal keeps an original"
+        );
+        self.original = Some(kept);
+        Ok(())
+    }
+
+    /// Text: the add buffer's bytes appended since the last chunk, `parts` in order, as
+    /// `add-<n>`: written, fsynced, named once (`add-<n>.tmp` renamed), the folder fsynced.
+    pub fn keep_add(&mut self, parts: &[&[u8]]) -> Result<Chunk> {
+        ensure!(
+            self.kind == Kind::Text,
+            "only a text journal keeps an add buffer"
+        );
+        let len: u64 = parts.iter().map(|p| p.len() as u64).sum();
+        ensure!(len > 0, "a chunk holds bytes");
+        let mut hasher = Sha256::new();
+        parts.iter().for_each(|p| hasher.update(p));
+        let chunk = Chunk {
+            n: self.chunks.last().map_or(1, |c| c.n + 1),
+            start: self.chunks.last().map_or(0, |c| c.start + c.len),
+            len,
+            sha256: hasher.finalize().into(),
+        };
+        let fs = self.fs.as_ref();
+        let name = add_name(chunk.n);
+        let to = self.dir.join(&name);
+        let tmp = self.dir.join(format!("{name}.tmp"));
+        if fs
+            .node(&tmp, false)
+            .map_err(|e| io_err(e, "look at", &tmp))?
+            .is_some()
+        {
+            fs.remove_file(&tmp)
+                .map_err(|e| io_err(e, "remove", &tmp))?;
+        }
+        fs.write_new_parts(&tmp, parts)
+            .map_err(|e| room(e, "write", &tmp))?;
+        fs.sync_file(&tmp)
+            .map_err(|e| room(e, "make durable", &tmp))?;
+        fs.rename(&tmp, &to)
+            .map_err(|e| io_err(e, "publish", &to))?;
+        fs.sync_dir(&self.dir)
+            .map_err(|e| io_err(e, "make durable the folder", &self.dir))?;
+        self.chunks.push(chunk);
+        Ok(chunk)
+    }
+
+    /// A text generation names only what is durable here: this journal's `original`, and chunks
+    /// it kept.
+    fn check_backing(&self, edits: &TextEdits) -> Result<()> {
+        ensure!(
+            self.original == Some(edits.original),
+            "the original of generation {} is not kept yet: no generation names it before it is \
+             durable",
+            edits.original.k
+        );
+        ensure!(
+            edits.chunks.len() <= self.chunks.len()
+                && edits.chunks.iter().zip(&self.chunks).all(|(a, b)| a == b),
+            "a generation names an add buffer chunk that is not kept"
+        );
+        Ok(())
     }
 
     pub fn kind(&self) -> Kind {
@@ -1166,6 +1707,9 @@ impl Journal {
 
     fn write_generation(&mut self, snap: &Snapshot, force: bool) -> Result<GenRef> {
         check_shape(self.kind, snap)?;
+        if self.kind == Kind::Text {
+            self.check_backing(&TextEdits::parse(&snap.edits)?)?;
+        }
         let content = Content::of(snap);
         if let (Some(current), Some(last), false) = (self.current, &self.last, force) {
             if *last == content {
@@ -1256,7 +1800,10 @@ impl Journal {
             return;
         };
         for name in names {
-            let stale = if name.ends_with(".tmp") {
+            let stale = if name == format!("{ORIGINAL}.tmp") {
+                // A worker may be writing it (`Keeping`); the next one removes a stale one.
+                false
+            } else if name.ends_with(".tmp") {
                 true
             } else if let Some(n) = gen_number(&name) {
                 !gens.contains(&n) && self.unsettled.is_none_or(|from| n < from)
@@ -1317,6 +1864,7 @@ impl Journal {
             baseline: snap.baseline,
             seen: snap.seen.clone(),
             phase,
+            guard: None,
         };
         // Everything the record will hold is checked before anything is written.
         check_intent(&intent)?;
@@ -1331,16 +1879,27 @@ impl Journal {
 
     /// Moves the running save to `phase`, durably, before the request that needs it.
     fn advance(&mut self, phase: Phase) -> Result<()> {
+        self.record(|next| next.phase = phase)
+    }
+
+    /// The running save changed by `change`, checked and made durable.
+    fn record(&mut self, change: impl FnOnce(&mut SaveIntent)) -> Result<()> {
         let Some(save) = &self.save else {
             bail!("no save is running");
         };
         ensure!(self.running, "the save is no longer running");
         let mut next = save.clone();
-        next.phase = phase;
+        change(&mut next);
         check_intent(&next)?;
         self.replace(SAVE, &intent_bytes(&next))?;
         self.save = Some(next);
         Ok(())
+    }
+
+    /// A text Save's guard (12 §9.1) moves to `guard`, durably, before the request that needs it;
+    /// `None` when the guard is not offered after all (today's rename follows). The phase stays.
+    pub fn save_guard(&mut self, guard: Option<Guarded>) -> Result<()> {
+        self.record(|next| next.guard = guard)
     }
 
     /// Phase `created`: after the exclusive create's reply, with the temp's stat then.
@@ -1663,8 +2222,10 @@ pub fn orphans(fs: &Arc<dyn Fs>, cache: &Path, host: &str, path: &str) -> Result
 /// a session still between the folder and its lock (that session then makes another,
 /// [`Journal::create`]). Anything else in it may hold an edit or a Save's record: it is offered.
 fn holds_nothing(fs: &dyn Fs, dir: &Path) -> bool {
+    // A text journal's original and chunks without a generation hold no edit either: the
+    // session ended before its first one was published.
     fs.list(dir)
-        .is_ok_and(|names| names.iter().all(|name| name == LOCK))
+        .is_ok_and(|names| names.iter().all(|name| name == LOCK || backing(name)))
 }
 
 /// Reads `gen-<n>` and checks it is whole and is generation `n`.
@@ -1793,6 +2354,7 @@ impl Orphan {
             SaveFile::Unreadable(why) => Some(Reconciled {
                 outcome: Outcome::Unknown,
                 temp: Temp::None,
+                other: Other::None,
                 next: None,
                 line: format!(
                     "a save was cut off, and its record cannot be read ({why}); check {}:{}",
@@ -1868,7 +2430,17 @@ impl Orphan {
             .max()
             .unwrap_or(0)
             + 1;
+        // Text: what the restored generation names is durable here (read back by `text`).
+        let (original, chunks) = match gen.head.kind {
+            Kind::Text => {
+                let edits = TextEdits::parse(&gen.edits)?;
+                (Some(edits.original), edits.chunks)
+            }
+            _ => (None, Vec::new()),
+        };
         Ok(Journal {
+            original,
+            chunks,
             kind: gen.head.kind,
             current: Some(gen.at),
             current_pastes: gen.pastes.clone(),
@@ -1890,6 +2462,54 @@ impl Orphan {
     /// Discard: the journal is removed.
     pub fn remove(self) -> Result<()> {
         retire(self.fs.as_ref(), &self.dir)
+    }
+
+    /// The journal's size on the local disk, for the recovery row (12 §9.5): every file in it.
+    pub fn size(&self) -> u64 {
+        let fs = self.fs.as_ref();
+        fs.list(&self.dir)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| fs.size(&self.dir.join(name)).ok())
+            .sum()
+    }
+
+    /// A text journal's bytes (12 §9.5, ES-3): its generation's edits, the `original` they were
+    /// made on and the add buffer from its chunks, each checked against what the generation
+    /// names. Refused when the original is not that one — a re-read replaced it before a
+    /// generation named the new one — or a chunk is missing or torn: nothing is applied then.
+    pub fn text(&self) -> Result<TextBacking> {
+        let Found::Edits(gen) = &self.found else {
+            bail!("these edits cannot be restored: Later or Discard");
+        };
+        ensure!(gen.head.kind == Kind::Text, "not a text journal");
+        let edits = TextEdits::parse(&gen.edits)?;
+        let fs = self.fs.as_ref();
+        let at = self.dir.join(ORIGINAL);
+        let original = fs.read(&at).map_err(|e| io_err(e, "read", &at))?;
+        let want = &edits.original;
+        ensure!(
+            original.len() as u64 == want.len && sha256(&original) == want.sha256,
+            "the original these edits were made on (read generation {}) was replaced by a later \
+             read; they are not applied",
+            want.k
+        );
+        let mut add = Vec::with_capacity(edits.add as usize);
+        for chunk in &edits.chunks {
+            let path = self.dir.join(add_name(chunk.n));
+            let bytes = fs.read(&path).map_err(|e| io_err(e, "read", &path))?;
+            ensure!(
+                bytes.len() as u64 == chunk.len && sha256(&bytes) == chunk.sha256,
+                "{} is torn (its bytes do not match the generation)",
+                add_name(chunk.n)
+            );
+            add.extend_from_slice(&bytes);
+        }
+        Ok(TextBacking {
+            edits,
+            original,
+            add,
+        })
     }
 }
 
@@ -1934,6 +2554,12 @@ pub trait Inspect {
             return Ok(None);
         }
         Ok(Some(hasher.finalize().into()))
+    }
+
+    /// The device and inode of `path` itself, where the file layer has them (the local disk);
+    /// `None` otherwise — the default.
+    fn file_id(&mut self, _path: &str) -> Result<Option<FileId>> {
+        Ok(None)
     }
 
     /// The SHA-256 of the first and last MiB of a file of `size` bytes.
@@ -2026,6 +2652,22 @@ pub fn restore_check(gen: &Generation, opened_as: Kind, inspect: &mut dyn Inspec
 fn check_restore(gen: &Generation, ev: &Evidence, inspect: &mut dyn Inspect) -> Result<Restore> {
     let path = gen.head.path.as_str();
     let base = &gen.head.baseline;
+    if gen.head.kind == Kind::Text {
+        // Rebuilt from the journal alone (12 §9.5): the file decides only whether the edits are
+        // against it as it is now, or Save must ask.
+        let now = inspect.lstat(path)?.filter(|s| s.is_file && !s.is_symlink);
+        let same = match now {
+            Some(now) if now.size == base.size && now.mtime == base.mtime => {
+                ev.whole.is_some() && inspect.whole_sha256(path, now.size)? == ev.whole
+            }
+            _ => false,
+        };
+        let notes = match same {
+            true => Vec::new(),
+            false => vec![NOTE_TEXT_CHANGED.to_string()],
+        };
+        return Ok(Restore::Apply { notes });
+    }
     let changed = || Restore::Refuse {
         why: "the file's content changed since these edits were made".to_string(),
     };
@@ -2093,6 +2735,7 @@ fn check_restore(gen: &Generation, ev: &Evidence, inspect: &mut dyn Inspect) -> 
         }
         // Known but empty of what the kind needs: as good as pending.
         Kind::Image | Kind::Media => Restore::Ask,
+        Kind::Text => unreachable!("a text generation is decided above"),
     })
 }
 
@@ -2125,12 +2768,32 @@ pub enum Temp {
     Keep { path: String, why: String },
 }
 
-/// [`reconcile`]'s verdict: the outcome, what to do with the temp, the next baseline when it
-/// landed, and the row's line.
+/// What may be done with the other file a guarded text Save holds (12 §9.1, E32): what its
+/// exchange displaced, or the link to what its rename replaced. Never removed unhashed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Other {
+    /// The Save holds none.
+    None,
+    /// Nothing is at its path.
+    Gone(String),
+    /// The version the Save started from (its SHA-256 the baseline's): remove it.
+    Remove(String),
+    /// Another writer's version: rename it `<name>.sopen-replaced-<stamp>` beside the file and
+    /// name it.
+    Rename(String),
+    /// Already kept at this path.
+    Kept(String),
+    /// It could not be checked: kept where it is, and named.
+    Keep { path: String, why: String },
+}
+
+/// [`reconcile`]'s verdict: the outcome, what to do with the temp and with a guarded Save's
+/// other file, the next baseline when it landed, and the row's line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reconciled {
     pub outcome: Outcome,
     pub temp: Temp,
+    pub other: Other,
     pub next: Option<(Fingerprint, Seen)>,
     pub line: String,
 }
@@ -2152,6 +2815,9 @@ fn when(t: SystemTime) -> String {
 pub fn reconcile(intent: &SaveIntent, host: &str, inspect: &mut dyn Inspect) -> Reconciled {
     if let Phase::Writing { undo, runs } = &intent.phase {
         return reconcile_in_place(intent, host, undo, runs, inspect);
+    }
+    if intent.route == Route::Exchange && intent.guard.is_some() {
+        return reconcile_exchange(intent, host, inspect);
     }
     let target = intent.target.as_str();
     let temp = intent.phase.temp().unwrap_or_default().to_string();
@@ -2192,6 +2858,10 @@ pub fn reconcile(intent: &SaveIntent, host: &str, inspect: &mut dyn Inspect) -> 
         ),
     };
     let verdict = temp_verdict(intent, &temp, outcome, inspect);
+    let other = match &intent.guard {
+        Some(guard) => other_verdict(intent, guard, inspect),
+        None => Other::None,
+    };
     let named = |v: &Temp| match v {
         Temp::Keep { path, why } => format!("; {host}:{path} is kept ({why})"),
         _ => String::new(),
@@ -2215,9 +2885,183 @@ pub fn reconcile(intent: &SaveIntent, host: &str, inspect: &mut dyn Inspect) -> 
     Reconciled {
         outcome,
         temp: verdict,
+        other,
         next,
         line,
     }
+}
+
+/// A guarded text Save's other file (12 §9.1) — the link, or what is at `from` before its rename
+/// to `kept` — against the version the Save started from.
+fn other_verdict(intent: &SaveIntent, guard: &Guarded, inspect: &mut dyn Inspect) -> Other {
+    match guard {
+        Guarded::Linked { link } | Guarded::Committed { link } | Guarded::Verified { link } => {
+            judge(intent, link, inspect)
+        }
+        Guarded::Kept { from, kept } => match judge(intent, from, inspect) {
+            Other::Gone(_) if matches!(inspect.lstat(kept), Ok(Some(_))) => {
+                Other::Kept(kept.clone())
+            }
+            other => other,
+        },
+        Guarded::Exchanging { .. } | Guarded::SwappedBack { .. } => Other::None,
+    }
+}
+
+/// The file at `path` against the version a Save started from: its baseline's size and
+/// SHA-256 (read whole) — equal, it is removed; anything else is another writer's and kept.
+fn judge(intent: &SaveIntent, path: &str, inspect: &mut dyn Inspect) -> Other {
+    let keep = |why: String| Other::Keep {
+        path: path.to_string(),
+        why,
+    };
+    let now = match inspect.lstat(path) {
+        Ok(None) => return Other::Gone(path.to_string()),
+        Ok(Some(now)) => now,
+        Err(e) => return keep(format!("it could not be checked: {e:#}")),
+    };
+    if !now.is_file || now.is_symlink {
+        return keep("it is not a regular file".to_string());
+    }
+    let whole = match &intent.seen {
+        Seen::Known(ev) => ev.whole,
+        Seen::Pending => None,
+    };
+    let Some(want) = intent.baseline.sha256.or(whole) else {
+        return keep("there is no hash of the version read to check it against".to_string());
+    };
+    if now.size != intent.baseline.size {
+        return Other::Rename(path.to_string());
+    }
+    if now.size > HASH_CHECK_MAX {
+        return keep("it is over 256 MiB".to_string());
+    }
+    match inspect.whole_sha256(path, now.size) {
+        Ok(Some(sha)) if sha == want => Other::Remove(path.to_string()),
+        Ok(_) => Other::Rename(path.to_string()),
+        Err(e) => keep(format!("it could not be read: {e:#}")),
+    }
+}
+
+/// A local text Save cut off from `exchanging` on (12 §9.1): which file is at each name decides
+/// — the device and inode recorded, where the file layer tells them, else the content. The
+/// target is sopen's staged file: the exchange stood (landed), and what is at the temp's name is
+/// the displaced version, judged against the baseline. The temp's name holds the staged file:
+/// the exchange never happened or was undone (not landed), and it is removed. Anything else:
+/// unknown, nothing removed.
+fn reconcile_exchange(intent: &SaveIntent, host: &str, inspect: &mut dyn Inspect) -> Reconciled {
+    let target = intent.target.as_str();
+    let temp = intent.phase.temp().unwrap_or_default().to_string();
+    let ids = match &intent.guard {
+        Some(Guarded::Exchanging { temp, target })
+        | Some(Guarded::SwappedBack { temp, target }) => Some((*temp, *target)),
+        _ => None,
+    };
+    let from = match &intent.guard {
+        Some(Guarded::Kept { from, kept }) => Some((from.clone(), kept.clone())),
+        _ => None,
+    };
+    let decided = (|| -> Result<(Outcome, Temp, Other)> {
+        if staged_at(intent, ids, target, inspect)? {
+            let other = match &from {
+                Some((from, kept)) => match judge(intent, from, inspect) {
+                    Other::Gone(_) if matches!(inspect.lstat(kept), Ok(Some(_))) => {
+                        Other::Kept(kept.clone())
+                    }
+                    other => other,
+                },
+                None => judge(intent, &temp, inspect),
+            };
+            return Ok((Outcome::Landed, Temp::None, other));
+        }
+        if from.is_none() && staged_at(intent, ids, &temp, inspect)? {
+            return Ok((Outcome::NotLanded, Temp::Remove(temp.clone()), Other::None));
+        }
+        // Nothing at the temp's name and the target not sopen's file — another inode, or the
+        // version the Save started from: the staged copy was removed (a failed exchange, an
+        // exchange back) and the Save did not land.
+        if from.is_none() && inspect.lstat(&temp)?.is_none() {
+            let now = inspect
+                .lstat(target)?
+                .filter(|s| s.is_file && !s.is_symlink);
+            let not_ours = match (ids, &now) {
+                (Some((temp_id, _)), Some(_)) => {
+                    inspect.file_id(target)?.is_some_and(|id| id != temp_id)
+                }
+                _ => false,
+            };
+            let as_read = match &now {
+                Some(now) => matches_pre(intent, now, inspect)? == Verdict::Holds,
+                None => false,
+            };
+            if not_ours || as_read {
+                return Ok((Outcome::NotLanded, Temp::Gone(temp.clone()), Other::None));
+            }
+        }
+        let keep = Temp::Keep {
+            path: temp.clone(),
+            why: "the outcome is unknown".to_string(),
+        };
+        Ok((Outcome::Unknown, keep, Other::None))
+    })();
+    let (outcome, verdict, other, why) = match decided {
+        Ok((outcome, temp, other)) => (outcome, temp, other, None),
+        Err(e) => {
+            let keep = Temp::Keep {
+                path: temp.clone(),
+                why: "it could not be checked".to_string(),
+            };
+            let why = format!("the file could not be read ({e:#})");
+            (Outcome::Unknown, keep, Other::None, Some(why))
+        }
+    };
+    let next = match (outcome, intent.phase.staged()) {
+        (Outcome::Landed, Some((_, post))) => Some((post.next_baseline, post.next_seen.clone())),
+        _ => None,
+    };
+    let line = match outcome {
+        Outcome::Landed => format!(
+            "the save at {} landed (found on reopen)",
+            when(intent.started)
+        ),
+        Outcome::NotLanded => format!(
+            "the save at {} did not land; your edits are kept",
+            when(intent.started)
+        ),
+        Outcome::InPart | Outcome::Unknown => format!(
+            "a save was cut off{}; check {host}:{target} and {host}:{temp}",
+            why.map_or(String::new(), |why| format!(" ({why})"))
+        ),
+    };
+    Reconciled {
+        outcome,
+        temp: verdict,
+        other,
+        next,
+        line,
+    }
+}
+
+/// Whether the file at `path` is the one a local text Save staged, as recorded: its device and
+/// inode where the file layer tells them, its exact stat and its hash.
+fn staged_at(
+    intent: &SaveIntent,
+    ids: Option<(FileId, FileId)>,
+    path: &str,
+    inspect: &mut dyn Inspect,
+) -> Result<bool> {
+    let Some((staged, post)) = intent.phase.staged() else {
+        return Ok(false);
+    };
+    let Some(now) = inspect.lstat(path)? else {
+        return Ok(false);
+    };
+    if let (Some((temp_id, _)), Some(id)) = (ids, inspect.file_id(path)?) {
+        if id != temp_id {
+            return Ok(false);
+        }
+    }
+    Ok(staged.matches(&now) && holds(inspect, path, now.size, &post.check)? == Verdict::Holds)
 }
 
 /// Whether the target still holds the file the Save started from: `(size, mtime)` of the
@@ -2345,6 +3189,7 @@ fn reconcile_in_place(
     Reconciled {
         outcome,
         temp: Temp::None,
+        other: Other::None,
         next,
         line,
     }
@@ -2755,6 +3600,22 @@ fn intent_bytes(i: &SaveIntent) -> Vec<u8> {
             }
         }
     }
+    if let Some(guard) = &i.guard {
+        put(&mut out, "guard", guard.word().as_bytes());
+        match guard {
+            Guarded::Exchanging { temp, target } | Guarded::SwappedBack { temp, target } => {
+                let ids = format!("{} {} {} {}", temp.dev, temp.ino, target.dev, target.ino);
+                put(&mut out, "ids", ids.as_bytes());
+            }
+            Guarded::Linked { link } | Guarded::Committed { link } | Guarded::Verified { link } => {
+                put(&mut out, "link", &esc(link.as_bytes()))
+            }
+            Guarded::Kept { from, kept } => {
+                put(&mut out, "from", &esc(from.as_bytes()));
+                put(&mut out, "kept", &esc(kept.as_bytes()));
+            }
+        }
+    }
     signed(out)
 }
 
@@ -2922,6 +3783,9 @@ pub fn parse_generation(bytes: &[u8]) -> Result<Generation> {
         kind == Kind::Image || gen.pastes.is_empty(),
         "only image edits paste pictures"
     );
+    if kind == Kind::Text {
+        TextEdits::parse(&gen.edits)?;
+    }
     check_seen(kind, &gen.head.baseline, &gen.seen, &gen.edits)?;
     Ok(gen)
 }
@@ -3023,6 +3887,40 @@ pub fn parse_save(bytes: &[u8]) -> Result<SaveIntent> {
         }
         _ => bail!("unknown phase"),
     };
+    let guard = match r.next_key() {
+        Some(b"guard") => Some(match r.field("guard")? {
+            word @ (b"exchanging" | b"swapped-back") => {
+                let [a, b, c, d] = r.words("ids")?;
+                let temp = FileId {
+                    dev: parse_u64(a)?,
+                    ino: parse_u64(b)?,
+                };
+                let target = FileId {
+                    dev: parse_u64(c)?,
+                    ino: parse_u64(d)?,
+                };
+                match word {
+                    b"exchanging" => Guarded::Exchanging { temp, target },
+                    _ => Guarded::SwappedBack { temp, target },
+                }
+            }
+            b"linked" => Guarded::Linked {
+                link: r.text("link")?,
+            },
+            b"committed" => Guarded::Committed {
+                link: r.text("link")?,
+            },
+            b"verified" => Guarded::Verified {
+                link: r.text("link")?,
+            },
+            b"kept" => Guarded::Kept {
+                from: r.text("from")?,
+                kept: r.text("kept")?,
+            },
+            _ => bail!("unknown guard"),
+        }),
+        _ => None,
+    };
     r.end()?;
     let intent = SaveIntent {
         saved,
@@ -3033,6 +3931,7 @@ pub fn parse_save(bytes: &[u8]) -> Result<SaveIntent> {
         baseline,
         seen,
         phase,
+        guard,
     };
     ensure!(
         intent_bytes(&intent) == bytes,
