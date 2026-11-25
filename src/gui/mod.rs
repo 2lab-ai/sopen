@@ -542,6 +542,9 @@ impl Choice {
 pub struct Hooks {
     /// `SOPEN_SCREENSHOT=<png>`: render the state, write a screenshot, exit.
     pub screenshot: Option<PathBuf>,
+    /// `SOPEN_CELLS=<path>` (10 §15): once the window or the terminal has settled, write its
+    /// grid there as text ([`term::cells_text`]), exit. A local path: never forwarded.
+    pub cells: Option<PathBuf>,
     /// `SOPEN_STATE`.
     pub state: State,
     /// `SOPEN_AUTOSAVE=1`: apply the state and Save, without a window.
@@ -623,6 +626,9 @@ impl Hooks {
             screenshot: std::env::var_os("SOPEN_SCREENSHOT")
                 .filter(|p| !p.is_empty())
                 .map(PathBuf::from),
+            cells: std::env::var_os("SOPEN_CELLS")
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from),
             state,
             autosave: flag("SOPEN_AUTOSAVE"),
             autoexport: flag("SOPEN_AUTOEXPORT"),
@@ -642,8 +648,17 @@ impl Hooks {
 
     /// A hook drives this run: user input is ignored and closing never prompts.
     pub fn scripted(&self) -> bool {
-        self.screenshot.is_some() || self.autosave || self.autoexport
+        self.screenshot.is_some() || self.cells.is_some() || self.autosave || self.autoexport
     }
+}
+
+/// How long a receipt may wait for its window or terminal to settle: `SOPEN_WATCHDOG` seconds,
+/// default 30.
+pub(crate) fn watchdog_secs() -> u64 {
+    std::env::var("SOPEN_WATCHDOG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1253,6 +1268,91 @@ struct Shot {
     result: Arc<Mutex<Option<Result<String, String>>>>,
 }
 
+/// A window run with `SOPEN_CELLS` (10 §15): its grid is written as the terminal writes its own
+/// ([`term::window_receipt`]) once it has been ready for three passes in a row, as the
+/// screenshot waits — with `help=1`, the help open — from the third pass's whole record, so what
+/// that pass's end paints above the window (F1's help, `help::end_pass`) is in it; then it
+/// closes — after the screenshot, when one is asked for too. Every other run's window passes
+/// through as it is.
+struct Receipted<W: Window> {
+    inner: W,
+    dump: Option<Dump>,
+}
+
+struct Dump {
+    path: PathBuf,
+    /// A screenshot is taken too: it closes the window.
+    shot: bool,
+    /// `help=1`: the key help is open before the passes are counted.
+    help: bool,
+    ready_frames: u32,
+    /// The pass the receipt is of, ended: it is written at the start of the next.
+    taken: Option<term::WindowPass>,
+    written: bool,
+    /// The watchdog's word.
+    done: Arc<AtomicBool>,
+    result: Arc<Mutex<Option<Result<String, String>>>>,
+}
+
+impl<W: Window> Window for Receipted<W> {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let Some(dump) = self.dump.as_mut() else {
+            self.inner.ui(ui);
+            return;
+        };
+        if let Some(pass) = dump.taken.take() {
+            let text = term::window_receipt(&ctx, &pass);
+            cells::set_recording(&ctx, false);
+            *dump.result.lock().unwrap() = Some(match std::fs::write(&dump.path, text) {
+                Ok(()) => Ok(format!(
+                    "cells {} {}x{}",
+                    dump.path.display(),
+                    pass.cols,
+                    pass.rows
+                )),
+                Err(e) => Err(format!("cannot write {}: {e}", dump.path.display())),
+            });
+            dump.written = true;
+            if !dump.shot {
+                dump.done.store(true, Ordering::SeqCst);
+            }
+        }
+        if dump.written {
+            self.inner.ui(ui);
+            if !dump.shot {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
+        // This pass's cells only (recording on, the record cleared): egui runs the pass again
+        // after one it discards.
+        cells::set_recording(&ctx, true);
+        self.inner.ui(ui);
+        if !self.inner.ready() || (dump.help && !help::is_open(&ctx)) {
+            dump.ready_frames = 0;
+            return;
+        }
+        ctx.request_repaint();
+        dump.ready_frames += 1;
+        if dump.ready_frames >= 3 {
+            dump.taken = Some(term::keep_window_pass(&ctx));
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.inner.ready()
+    }
+
+    fn close_requested(&mut self) -> bool {
+        self.inner.close_requested()
+    }
+
+    fn keys(&self) -> &'static [chrome::FKey] {
+        self.inner.keys()
+    }
+}
+
 struct Shell<W: Window> {
     inner: W,
     scripted: bool,
@@ -1840,8 +1940,8 @@ pub(crate) fn give_up(why: &str) -> ! {
     std::process::exit(1);
 }
 
-/// Runs `window` until it closes. With the screenshot hook a watchdog ends a stalled run after
-/// `SOPEN_WATCHDOG` seconds (default 30).
+/// Runs `window` until it closes. With the screenshot or the cells hook a watchdog ends a
+/// stalled run after `SOPEN_WATCHDOG` seconds (default 30, [`watchdog_secs`]).
 pub fn run_window<W: Window + 'static>(
     title: &str,
     size: [f32; 2],
@@ -1869,22 +1969,38 @@ pub fn run_window_sized<W: Window + 'static>(
     // terminal backend's, which still holds its terminal.
     let disarm = shot_done.clone();
     let shot_result: Arc<Mutex<Option<Result<String, String>>>> = Arc::default();
+    let dump_result: Arc<Mutex<Option<Result<String, String>>>> = Arc::default();
     let closed = Arc::new(AtomicBool::new(false));
-    if hooks.screenshot.is_some() {
-        let secs: u64 = std::env::var("SOPEN_WATCHDOG")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30);
+    if hooks.screenshot.is_some() || hooks.cells.is_some() {
+        let secs = watchdog_secs();
+        let hook = if hooks.screenshot.is_some() {
+            "screenshot"
+        } else {
+            "cells"
+        };
         let done = shot_done.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(secs));
             if !done.load(Ordering::SeqCst) {
-                give_up(&format!("the screenshot hook stalled for {secs} s"));
+                give_up(&format!("the {hook} hook stalled for {secs} s"));
             }
         });
     }
+    let dump = hooks.cells.clone().map(|path| Dump {
+        path,
+        shot: hooks.screenshot.is_some(),
+        help: hooks.state.help,
+        ready_frames: 0,
+        taken: None,
+        written: false,
+        done: shot_done.clone(),
+        result: dump_result.clone(),
+    });
     let shell = Shell {
-        inner: window,
+        inner: Receipted {
+            inner: window,
+            dump,
+        },
         scripted: hooks.scripted(),
         shot: hooks.screenshot.clone().map(|path| Shot {
             path,
@@ -1935,6 +2051,13 @@ pub fn run_window_sized<W: Window + 'static>(
     });
     disarm.store(true, Ordering::SeqCst);
     started?;
+    if hooks.cells.is_some() {
+        match dump_result.lock().unwrap().take() {
+            Some(Ok(line)) => println!("{line}"),
+            Some(Err(e)) => bail!("{e}"),
+            None => bail!("the window closed before its cells were written"),
+        }
+    }
     if hooks.screenshot.is_some() {
         match shot_result.lock().unwrap().take() {
             Some(Ok(line)) => println!("{line}"),
@@ -3546,6 +3669,7 @@ mod tests {
         };
         for hook in [
             "SOPEN_SCREENSHOT",
+            "SOPEN_CELLS",
             "SOPEN_AUTOSAVE",
             "SOPEN_AUTOEXPORT",
             "SOPEN_LIST",
