@@ -35,14 +35,19 @@ const EDITING_SAVING: State = State::Hex(Hex {
     read_only: false,
     saving: true,
 });
+/// The Text view in the editor (12 §3), and while its Ctrl+K or `^S` waits.
+const EDITOR: State = State::Editing(Editing { arming: false });
+const EDITOR_ARMING: State = State::Editing(Editing { arming: true });
 
-const STATES: [State; 8] = [
+const STATES: [State; 10] = [
     State::Free,
     VIEWING,
     READ_ONLY,
     VIEWING_SAVING,
     EDITING,
     EDITING_SAVING,
+    EDITOR,
+    EDITOR_ARMING,
     State::Field,
     State::Question,
 ];
@@ -168,6 +173,8 @@ fn each_state_is_one_of_the_four_rows() {
             Row::Free,
             Row::DigitsAreData,
             Row::DigitsAreData,
+            Row::DigitsAreData,
+            Row::DigitsAreData,
             Row::Field,
             Row::Question,
         ]
@@ -176,7 +183,7 @@ fn each_state_is_one_of_the_four_rows() {
 
 /// §4's table, unarmed: each state × `PRESSES` (1, 2, 3, F9, Esc, F3, Enter, Insert, any other).
 #[rustfmt::skip]
-const UNARMED: [(State, [Command; 9]); 8] = [
+const UNARMED: [(State, [Command; 9]); 10] = [
     (State::Free,     [Choose(1), Choose(2), Choose(3), Arm(Ending::Nothing), Leave,      Leave, Pass,         Pass,         Pass]),
     (VIEWING,         [Choose(1), Choose(2), Choose(3), Arm(Ending::Nothing), Leave,      Leave, StartEditing, StartEditing, Pass]),
     (READ_ONLY,       [Choose(1), Choose(2), Choose(3), Arm(Ending::Nothing), Leave,      Leave, ReadOnly,     ReadOnly,     Pass]),
@@ -184,6 +191,10 @@ const UNARMED: [(State, [Command; 9]); 8] = [
     (VIEWING_SAVING,  [Choose(1), Choose(2), Choose(3), Arm(Ending::Nothing), Pass,       Leave, StartEditing, StartEditing, Pass]),
     (EDITING,         [Pass,      Pass,      Pass,      Arm(Ending::Editing), EndEditing, Leave, Pass,         Pass,         Pass]),
     (EDITING_SAVING,  [Pass,      Pass,      Pass,      Arm(Ending::Editing), Pass,       Leave, Pass,         Pass,         Pass]),
+    // The editor: digits typed; F9 arms and the editor stays; Esc and F3 are its own (12 §6.4).
+    (EDITOR,          [Pass,      Pass,      Pass,      Arm(Ending::Nothing), Pass,       Pass,  Pass,         Pass,         Pass]),
+    // Its Ctrl+K or ^S waiting: every key is the editor's, F9 too (12 §5.4).
+    (EDITOR_ARMING,   [Pass; 9]),
     // A field withholds F3 from the viewer's rows; its own Esc closes it.
     (State::Field,    [Pass,      Pass,      Pass,      Arm(Ending::Field),   Pass,       Pass,  Pass,         Pass,         Pass]),
     (State::Question, [Pass; 9]),
@@ -212,7 +223,7 @@ fn the_table_unarmed() {
 #[test]
 fn the_table_armed() {
     for state in STATES {
-        let row = if state == State::Question {
+        let row = if state == State::Question || state == EDITOR_ARMING {
             [Pass; 9]
         } else {
             ARMED
@@ -866,6 +877,74 @@ fn a_fields_own_esc_ends_the_input() {
 }
 
 /// A view chosen otherwise — a click on the strip — disarms: the next key is the view's again.
+/// 12 §5.1, §5.4, §6.4 at the model: the editor types digits, keeps its Esc and F3, and F9 arms
+/// without leaving it; while its own Ctrl+K or `^S` waits every key is its own, F9 too.
+#[test]
+fn an_editing_text_view_is_digits_are_data_with_its_own_esc_f3_and_armings() {
+    let esc = || tap(Key::Escape, None);
+    let f3 = || tap(Key::F3, None);
+    let f9 = || tap(Key::F9, None);
+    // 1, 2, 3 are typed, their text with them.
+    for n in [1, 2, 3] {
+        let input = digit(n);
+        let mut left = input.clone();
+        assert!(gui().take(EDITOR, &mut left).is_empty(), "{n}");
+        assert_eq!(left, input);
+    }
+    // F9 arms and the editor stays; Esc disarms; F9 then 2 chooses (the editor is left, asking
+    // first with unsaved edits: the view set's rules).
+    let mut keys = gui();
+    assert_eq!(keys.route(EDITOR, &f9()), [Arm(Ending::Nothing)]);
+    assert_eq!(keys.route(EDITOR, &[up(Key::F9)]), [Drop]);
+    assert_eq!(keys.route(EDITOR, &esc()), [Disarm]);
+    assert_eq!(keys.route(EDITOR, &[up(Key::Escape)]), [Drop]);
+    assert_eq!(
+        keys.route(EDITOR, &cat(&[&f9(), &digit(2)])),
+        [Arm(Ending::Nothing), Choose(2), DropText]
+    );
+    // Esc and F3 go to the editor; what follows in the same input is dropped — never typed into
+    // the view the editor left for — but Esc and F3, which leave.
+    for leave in [esc(), f3()] {
+        assert_eq!(
+            gui().route(EDITOR, &cat(&[&leave, &digit(1), &tap(Key::X, Some("x"))])),
+            [Pass, Drop, DropText, Drop, DropText]
+        );
+    }
+    assert_eq!(
+        gui().route(EDITOR, &cat(&[&esc(), &[up(Key::Escape)], &f3()])),
+        [Pass, Pass, Leave]
+    );
+    // Enter and Insert are the editor's (a new line, Insert ↔ Overwrite).
+    for key in [Key::Enter, Key::Insert] {
+        assert_eq!(gui().route(EDITOR, &tap(key, None)), [Pass], "{key:?}");
+    }
+    // While its arming waits: F9, digits, Esc and F3 all reach the editor, and the rest of the
+    // input is still the editor's.
+    let mut keys = gui();
+    let input = cat(&[&f9(), &digit(2), &esc(), &f3(), &tap(Key::X, Some("x"))]);
+    assert_eq!(keys.route(EDITOR_ARMING, &input), [Pass; 7]);
+    assert!(!keys.armed());
+    // An armed F9 meeting the editor's arming is disarmed, as a question disarms it.
+    let mut keys = armed();
+    assert!(keys.route(EDITOR_ARMING, &[]).is_empty());
+    assert!(!keys.armed());
+    // A terminal: Ctrl+K arms the editor (its key passes), then F9 and 1 reach it.
+    let mut keys = terminal();
+    let ctrl_k = Event::Key {
+        key: Key::K,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::COMMAND,
+    };
+    assert_eq!(keys.route(EDITOR, &[ctrl_k]), [Pass]);
+    assert_eq!(keys.route(EDITOR_ARMING, &[term(Key::F9)]), [Pass]);
+    assert_eq!(
+        keys.route(EDITOR, &[term(Key::F9), Event::Text("1".to_string())]),
+        [Arm(Ending::Nothing), Choose(1)]
+    );
+}
+
 #[test]
 fn disarm_ends_an_armed_f9() {
     let mut keys = armed();
