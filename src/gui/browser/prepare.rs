@@ -19,7 +19,7 @@
 
 mod shared;
 
-pub use shared::{SaveSlot, Shared, Stream};
+pub use shared::{GiveBack, SaveSlot, Shared, Stream};
 
 use super::Connect;
 use crate::cache::{self, Claim};

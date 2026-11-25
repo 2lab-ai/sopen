@@ -127,11 +127,8 @@ fn d13_d14_over(sftp: bool) {
         shows(&fx, "A/ a comment"),
         "Text made again: the file saved"
     );
-    assert_eq!(
-        live(&meter),
-        1,
-        "hidden, Hex gave its save session back (D14)"
-    );
+    // Hidden, Hex gives its save session back (D14), once the Save's lease is over.
+    until_live(&mut fx, &meter, 1);
     digit(&mut fx, 2);
     save_byte_at_the_start(&mut fx, &file, 0x42);
     assert_eq!(live(&meter), 2, "its next Save connected again");
@@ -171,11 +168,13 @@ fn d14_an_image_and_its_hex_view_both_saved_hold_at_most_two_sessions() {
     );
     digit(&mut fx, 2);
     assert!(hex_row(&fx, "89 50 4E 47"), "Hex: the file as saved");
-    assert_eq!(live(&meter), 1, "the hidden image gave its session back");
+    // The hidden image gives its session back.
+    until_live(&mut fx, &meter, 1);
     save_byte_at_the_start(&mut fx, &file, 0x41);
     assert_eq!(live(&meter), 2);
     digit(&mut fx, 1);
-    assert_eq!(live(&meter), 1, "the hidden hex view gave it back");
+    // The hidden hex view gives it back.
+    until_live(&mut fx, &meter, 1);
     assert!(
         peak(&meter) <= 2,
         "at most 2 at any point: {}",
@@ -237,12 +236,100 @@ fn d13_a_remote_page_files_page_hex_and_text_hold_two_sessions() {
         "the stream and the save session: Page closed"
     );
     digit(&mut fx, 3);
-    assert_eq!(live(&meter), 1, "hidden, Hex gave the save session back");
+    // Hidden, Hex gives the save session back.
+    until_live(&mut fx, &meter, 1);
     assert_eq!(
         peak(&meter),
         3,
         "Page's, the stream and the save session while it ran"
     );
+}
+
+/// Passes until the meter's live sessions are `n` (a session given back closes beside the
+/// window's pass, once its operation's lease is over), at most 5 s.
+fn until_live(fx: &mut Fx, meter: &Meter, n: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while live(meter) != n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} sessions alive, not {n}",
+            live(meter)
+        );
+        fx.drv.idle(&mut fx.b, 1);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// D14 after D2: the Hex view closed by its close prompt's Save (the switch to 1 it asked
+/// for) gives its save session back — the viewer is at its stream alone again, and stays so.
+#[test]
+fn d14_a_view_closed_by_its_prompts_save_gives_the_session_back() {
+    let (mut fx, meter) = metered();
+    let file = format!("{}/main.rs", fx.root);
+    fx.open("main.rs");
+    digit(&mut fx, 2);
+    fx.key(Key::Enter);
+    digit(&mut fx, 4);
+    digit(&mut fx, 1);
+    fx.key(Key::F9);
+    digit(&mut fx, 1);
+    assert!(fx.drv.find_text("Unsaved changes").is_some(), "the prompt");
+    fx.drv.click_text_on_top(&mut fx.b, "Save");
+    fx.drv.until(&mut fx.b, 20, |b| {
+        b.ready() && std::fs::read(&file).unwrap()[0] == 0x41
+    });
+    fx.settle();
+    assert!(on_strip(&fx, "1 Text"), "view 1 once the Save landed");
+    until_live(&mut fx, &meter, 1);
+    digit(&mut fx, 3);
+    fx.drv.idle(&mut fx.b, 10);
+    assert_eq!(live(&meter), 1, "and stays so");
+}
+
+/// A hex Save's own reload leaves the stream on the file saved (06 §5): the view made next
+/// reads it as it is — no second reload of the stream.
+#[test]
+fn a_hex_saves_own_reload_leaves_the_stream_current() {
+    let (mut fx, meter) = metered();
+    let file = format!("{}/main.rs", fx.root);
+    fx.open("main.rs");
+    digit(&mut fx, 2);
+    save_byte_at_the_start(&mut fx, &file, 0x41);
+    digit(&mut fx, 1);
+    assert!(
+        shows(&fx, "A/ a comment"),
+        "Text made again: the file saved"
+    );
+    assert_eq!(
+        transports(&meter),
+        2,
+        "the opening's handle and the Save's reload — none more"
+    );
+}
+
+/// D25 at the show (07 §7's review): a reload of the stream that lands after the pass's reload
+/// receipt and before its view key makes the hidden Hex stale all the same — 2 makes it again,
+/// on the file as reloaded, never the hidden one of before.
+#[test]
+fn d25_a_reload_between_the_receipt_and_the_show_makes_the_hidden_view_again() {
+    let (mut fx, _meter) = metered();
+    let file = format!("{}/main.rs", fx.root);
+    fx.open("main.rs");
+    digit(&mut fx, 2);
+    digit(&mut fx, 1);
+    let makes = |fx: &Fx| fx.b.viewer.as_ref().unwrap().views.makes;
+    assert_eq!(makes(&fx), 1, "Hex made once, hidden");
+    std::fs::write(&file, "ZZ changed on the remote\n").unwrap();
+    let source = fx.b.viewer.as_ref().unwrap().views.kept_source().unwrap();
+    let mut once = Some(source);
+    fx.b.viewer.as_mut().unwrap().views.between = Some(Box::new(move || {
+        if let Some(source) = once.take() {
+            source.reload().unwrap();
+        }
+    }));
+    digit(&mut fx, 2);
+    assert_eq!(makes(&fx), 2, "the stale Hex was made again");
+    assert!(hex_row(&fx, "5A 5A 20 63"), "the file as reloaded: `ZZ c`");
 }
 
 /// D25's reload half: Cmd/Ctrl+R in the text view after the file changed on the remote makes
@@ -532,7 +619,8 @@ fn d13_d14_on_the_default_route_a_handed_over_texts_views_hold_at_most_two_sessi
         shows(&fx, "A/ a comment"),
         "Text made again: the file saved"
     );
-    assert_eq!(live(&meter), 1, "Hex hidden gave the save session back");
+    // Hex hidden gives the save session back.
+    until_live(&mut fx, &meter, 1);
     assert!(
         peak(&meter) <= 2,
         "at most 2 at any point: {}",
@@ -563,15 +651,13 @@ fn d14_on_the_default_route_a_handed_over_image_and_its_hex_view_saved_hold_at_m
     assert_eq!(live(&meter) - window, 1, "the views' save session");
     digit(&mut fx, 2);
     assert!(hex_row(&fx, "89 50 4E 47"));
-    assert_eq!(
-        live(&meter) - window,
-        1,
-        "Hex's stream; the hidden image gave the save session back"
-    );
+    // Hex's stream; the hidden image gives the save session back.
+    until_live(&mut fx, &meter, window + 1);
     save_byte_at_the_start(&mut fx, &file, 0x41);
     assert_eq!(live(&meter) - window, 2, "the stream and the save session");
     digit(&mut fx, 1);
-    assert_eq!(live(&meter) - window, 1, "Hex hidden gave it back");
+    // Hex hidden gives it back.
+    until_live(&mut fx, &meter, window + 1);
     assert!(
         peak(&meter) - window <= 2,
         "the viewer's at most: {}",
