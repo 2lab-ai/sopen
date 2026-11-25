@@ -3484,9 +3484,23 @@ fn ts6_the_hex_view_is_the_windows_cells_in_both_terminals() {
         };
         let shown = column(&wide);
         assert!(!shown.chars().any(ambiguous), "{name}:\n{shown}");
+        // The views strip on the title row, whole: its `·` (between two views, and joining a
+        // binary's `1·2`) is §10's stand-in `.` at the source, so no entry is cut (`1·2 H~`).
+        let strip = if name == "every.bin" {
+            "1.2 Hex . 3 Text"
+        } else {
+            "1 Text . 2 Hex . 3 Raw"
+        };
+        assert!(wide.row(0).contains(strip), "{name}: {strip:?}:\n{text}");
         // The window's cells through the table: chrome by the printer, and the CP437 column by
-        // the viewer at the source — §10's stand-in, `.` for a letter the table leaves.
+        // the viewer and the strip's `·` by the title row at the source — §10's stand-in, `.`
+        // for a letter the table leaves.
         let mut window = through_the_table(&painted, &grid);
+        for cell in &mut window.0[..100] {
+            if cell.symbol == "·" {
+                cell.symbol = ".".into();
+            }
+        }
         let mut letters = 0;
         for y in rows.clone() {
             for x in 62..78 {
@@ -3536,12 +3550,7 @@ fn ts6_the_hex_view_is_the_windows_cells_in_both_terminals() {
             let row: String = (0..100)
                 .map(|x| window.0[usize::from(y) * 100 + x].symbol.as_str())
                 .collect();
-            // The title row's views strip is the browser's (VM-7), not the hex view's: a `·`
-            // inside one entry's run (`1·2 Hex`, a binary's) has no blank to take and cuts the
-            // entry (`1·2 H~`), as the printer cuts any run (XW-receipts). Its frames still stand.
-            if y > 0 {
-                assert_eq!(words(&wide.row(y)), words(&row), "{name}: row {y}:\n{text}");
-            }
+            assert_eq!(words(&wide.row(y)), words(&row), "{name}: row {y}:\n{text}");
             for x in 0..100u16 {
                 if at(x).symbol.chars().any(cells::frame_glyph) && chrome(&grid, x, y) {
                     let want = stand_in(&grid, x, y).unwrap_or(&at(x).symbol);
@@ -3550,17 +3559,13 @@ fn ts6_the_hex_view_is_the_windows_cells_in_both_terminals() {
             }
         }
         let d = differences_but(&window, &wide, Ink::Rgb, &wide_rows);
-        if wide_rows.contains(&0) {
-            // The title row (the mode button's): its frames above, its place and button here.
-            let title = wide.row(0);
-            assert!(
-                title.contains("[GUI]") && title.contains("root"),
-                "{name}:\n{text}"
-            );
-            assert!(d.is_empty(), "{name}, ambiguous-wide:\n{}", d.join("\n"));
-        } else {
-            only_the_mode_button(&d, &wide, &format!("{name}, ambiguous-wide"));
-        }
+        // The title row cell by cell (its strip's `.` at the source): only the mode button
+        // differs.
+        assert!(
+            !wide_rows.contains(&0),
+            "{name}: the title row laid wide:\n{text}"
+        );
+        only_the_mode_button(&d, &wide, &format!("{name}, ambiguous-wide"));
     }
 }
 

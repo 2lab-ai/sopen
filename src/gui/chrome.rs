@@ -851,13 +851,21 @@ pub fn title_row_with(ui: &mut egui::Ui, place: &str, strip: Option<&Strip>) {
     if let Some(strip) = strip {
         let entries = strip.entries();
         let width = cells::width(&strip.text()) + 2;
+        // `·` is of width A: in a terminal that draws it in two cells, §10's stand-in `.` (one
+        // cell, as there), or the printer would lay it in two and cut an entry (`1·2 H~`).
+        let dot = if cells::ambiguous_wide(ui.ctx()) {
+            "."
+        } else {
+            "·"
+        };
         if !entries.is_empty() && end >= x + 1 + width {
             let mut at = end - width + 1;
             end -= width;
             let rest = if strip.armed { p.warn } else { p.title_text };
             for (i, (slots, text)) in entries.iter().enumerate() {
+                let text = &text.replace('·', dot);
                 if i > 0 {
-                    at += cells::put(&mut buf, at as u16, 0, " · ", cols, pen);
+                    at += cells::put(&mut buf, at as u16, 0, &format!(" {dot} "), cols, pen);
                 }
                 let on = strip.on.is_some_and(|on| text.ends_with(&format!(" {on}")));
                 let entry_pen = if on {
