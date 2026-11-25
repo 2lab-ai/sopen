@@ -732,8 +732,9 @@ fn cell_row(ui: &mut egui::Ui) -> (Rect, cells::Grid, cells::Buffer) {
 }
 
 /// The top row, in cells: the tool's name ([`PROGRAM`]) in its red block, then where the browser
-/// is, black on cyan — its end kept, after "…", when it is cut (the whole on hover) — and the
-/// clock at the right end after a `│`.
+/// is, black on cyan — its end kept, after "…", when it is cut (the whole on hover) — the mode
+/// button where a backend set one ([`set_mode_button`]), and the clock at the right end after a
+/// `│`.
 pub fn title_row(ui: &mut egui::Ui, place: &str) {
     let p = PALETTE;
     let (rect, grid, mut buf) = cell_row(ui);
@@ -750,7 +751,8 @@ pub fn title_row(ui: &mut egui::Ui, place: &str) {
     let clock_x = cols.saturating_sub(cells::width(&clock) + 1);
     cells::put(&mut buf, clock_x as u16, 0, &clock, cols, pen);
     let x = block + 1;
-    let room = clock_x.saturating_sub(x + 1);
+    let (end, mode) = mode_button(ui.ctx(), &mut buf, x, clock_x, pen);
+    let room = end.saturating_sub(x + 1);
     let shown = cells::fit_left(place, room);
     cells::put(&mut buf, x as u16, 0, &shown, room, pen);
     cells::paint(&ui.painter_at(rect), grid.origin, &buf, None);
@@ -758,9 +760,72 @@ pub fn title_row(ui: &mut egui::Ui, place: &str) {
         ui.interact(rect, ui.scope_id().with("title"), egui::Sense::hover())
             .on_hover_text(place);
     }
+    mode_click(ui, &grid, mode);
     // The clock turns over at the next minute.
     let rest = 60 - now.rem_euclid(60) as u64;
     ui.ctx().request_repaint_after(Duration::from_secs(rest));
+}
+
+/// The mode button (10 §7, T4): what a click on it switches to — `[GUI]` on the terminal's title
+/// row, `[TUI]` on a window a switch opened — set by that backend before each pass; a window
+/// started directly sets none and shows none.
+#[derive(Debug, Clone, Copy)]
+struct ModeButton(&'static str);
+
+/// The mode button was clicked.
+#[derive(Debug, Clone, Copy, Default)]
+struct ModeClicked;
+
+fn mode_button_id() -> egui::Id {
+    egui::Id::unique("sopen-mode-button")
+}
+
+fn mode_clicked_id() -> egui::Id {
+    egui::Id::unique("sopen-mode-button-clicked")
+}
+
+/// The title row shows the mode button `label` ([`title_row`]).
+pub fn set_mode_button(ctx: &egui::Context, label: &'static str) {
+    ctx.data_mut(|d| d.insert_temp(mode_button_id(), ModeButton(label)));
+}
+
+/// Whether the mode button was clicked since this was last asked, taken: the switch, as F12.
+pub fn take_mode_click(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|d| d.remove_temp::<ModeClicked>(mode_clicked_id()))
+        .is_some()
+}
+
+/// The mode button in `buf` right before the clock at `clock_x`, a blank either side, when the
+/// row has room for it after the place's start `x`: where the place's room ends, and its cells.
+fn mode_button(
+    ctx: &egui::Context,
+    buf: &mut cells::Buffer,
+    x: usize,
+    clock_x: usize,
+    pen: cells::Pen,
+) -> (usize, Option<cells::Cells>) {
+    let Some(ModeButton(label)) = ctx.data(|d| d.get_temp(mode_button_id())) else {
+        return (clock_x, None);
+    };
+    let w = cells::width(label);
+    let Some(at) = clock_x.checked_sub(w + 1).filter(|&at| at > x) else {
+        return (clock_x, None);
+    };
+    cells::put(buf, at as u16, 0, label, w, pen);
+    (at, Some(cells::Cells::new(at as u16, 0, w as u16, 1)))
+}
+
+/// A click on the mode button's cells (not focusable, as the F-key row's slots: the keyboard
+/// stays where it was) is remembered for [`take_mode_click`].
+fn mode_click(ui: &mut egui::Ui, grid: &cells::Grid, mode: Option<cells::Cells>) {
+    let Some(at) = mode else {
+        return;
+    };
+    let id = ui.scope_id().with("sopen-mode-button");
+    if ui.interact(grid.rect(at), id, egui::Sense::CLICK).clicked() {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(mode_clicked_id(), ModeClicked));
+    }
 }
 
 /// The title row as a panel at the top of `ui`.

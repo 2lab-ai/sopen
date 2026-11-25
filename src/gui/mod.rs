@@ -23,6 +23,7 @@ pub mod playback;
 pub mod save_as;
 mod select;
 pub mod streamed;
+pub mod term;
 pub mod term_input;
 #[cfg(test)]
 pub(crate) mod testkit;

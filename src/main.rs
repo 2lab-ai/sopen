@@ -67,6 +67,13 @@ struct Cli {
     /// Open the file in the xtools hex editor, whatever its type (no dialog first)
     #[arg(long, conflicts_with = "app")]
     hex: bool,
+    /// Run xtools in this terminal: a folder in its file browser, a file in its folder with
+    /// its viewer open. F12 (Alt+G) moves it into a window and back.
+    #[arg(
+        long,
+        conflicts_with_all = ["app", "hex", "browser", "hold_until_eof", "selftest_audio", "raise_window", "fkeys_watchdog"]
+    )]
+    tui: bool,
     /// Open the http(s):// address in the default browser of the machine it opens on
     // Refused beside the modes that open no address (they would ignore it); with a file SOURCE,
     // a usage error past clap (run_source).
@@ -272,6 +279,7 @@ fn main() -> ExitCode {
                 cli.browser,
                 cli.app.as_deref(),
                 cli.hex,
+                cli.tui,
                 dirs,
                 &mut rec,
             )
@@ -295,6 +303,14 @@ fn exit(result: Result<u8>) -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             let line = format!("{e:#}").replace('\n', " ");
+            let signalled = e.chain().find_map(|c| c.downcast_ref());
+            if let Some(signalled) = signalled {
+                // Not `eprintln!`, which panics on a write error: a terminal that hung up (the
+                // TUI's SIGHUP) fails every write.
+                let _ = writeln!(std::io::stderr(), "sopen: {line}");
+                let signalled: &gui::term::Signalled = signalled;
+                return ExitCode::from(signalled.exit_code());
+            }
             eprintln!("sopen: {line}");
             let interrupted = e.chain().find_map(|c| c.downcast_ref());
             if let Some(interrupted) = interrupted {
@@ -518,14 +534,27 @@ fn run_source(
     browser: bool,
     app_name: Option<&str>,
     hex: bool,
+    tui: bool,
     dirs: &Dirs,
     rec: &mut Record,
 ) -> Result<u8> {
     // An address before anything reads SOURCE as a path or `host:path` (`http` would be a host).
     if let Some(url) = sopen::url::parse(source) {
+        if tui {
+            return Err(Usage(format!(
+                "--tui opens a folder or a file; {} is an address",
+                sopen::url::redacted(source)
+            ))
+            .into());
+        }
         return run_url(
             source, url, flag, here, hold, browser, app_name, hex, dirs, rec,
         );
+    }
+    // The terminal is here whatever the destination: the destination is where the switch opens
+    // the window, read when the owner switches (10 §7.1, §11 row 3).
+    if tui {
+        return run_tui(source, flag, here, dirs, rec).map(|()| 0);
     }
     for (given, flag_name) in [(hold, forward::HOLD_FLAG), (browser, forward::BROWSER_FLAG)] {
         if given {
@@ -786,6 +815,71 @@ fn open_in_browser(mut place: Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
         }
         FolderRun::Browser => {}
     }
+    let start = browser_for(place, abs, dirs);
+    let outcome = gui::browser::open(start, &hooks)?;
+    rec.action = Some(outcome.action());
+    rec.conflict = outcome.conflict;
+    match outcome.refused {
+        Some(message) => Err(Refused(message).into()),
+        None => Ok(()),
+    }
+}
+
+/// `sopen --tui SOURCE` (10 §11 row 3, T39): xtools in this terminal — a folder in its file
+/// browser; a file in its folder's, the bar on it and its viewer open (`SOPEN_STATE`'s
+/// `open=`, unless the state names another). Its input and output must be the terminal: else a
+/// usage error (exit 2) before anything is read.
+fn run_tui(
+    source: &str,
+    flag: Option<&str>,
+    here: bool,
+    dirs: &Dirs,
+    rec: &mut Record,
+) -> Result<()> {
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        bail!(Usage(
+            "--tui runs in a terminal: its input and output must be one".to_string()
+        ));
+    }
+    // A window the switch opens feeds the macOS F-key switch, as any window of a run does.
+    gui::fkeys_for_run(dirs.state.clone());
+    let target = target::parse(source).map_err(anyhow::Error::msg)?;
+    let (mut place, path) = Place::connect(&target, dirs, rec)?;
+    let abs = place.fs().realpath(&path)?;
+    let stat = place.fs().stat(&abs)?;
+    rec.kind = Some(if stat.is_dir {
+        Kind::Directory
+    } else {
+        kind::detect_sniffed(place.fs(), &abs, &stat)?.0
+    });
+    rec.ext = kind::extension(remote::split_parent(&abs).1);
+    rec.bytes = stat.size;
+    rec.action = Some("open");
+    let mut hooks = gui::Hooks::from_env()?;
+    let folder = if stat.is_dir {
+        abs.clone()
+    } else {
+        let (parent, name) = remote::split_parent(&abs);
+        hooks.state.open.get_or_insert_with(|| name.to_string());
+        parent.to_string()
+    };
+    let start = browser_for(place, &folder, dirs);
+    let to = gui::term::Destination {
+        here,
+        target: flag.map(str::to_string),
+    };
+    let outcome = gui::term::open(start, &hooks, to)?;
+    rec.action = Some(outcome.action());
+    rec.conflict = outcome.conflict;
+    match outcome.refused {
+        Some(message) => Err(Refused(message).into()),
+        None => Ok(()),
+    }
+}
+
+/// The file browser's start on `abs` over `place`: its connections, F4's launch of the editor
+/// (VS Code, else Zed), the host.
+fn browser_for(place: Place, abs: &str, dirs: &Dirs) -> gui::browser::Start {
     let remote = match &place {
         Place::Remote(spec, _) => Some(spec.clone()),
         Place::Local(_) => None,
@@ -829,14 +923,7 @@ fn open_in_browser(mut place: Place, abs: &str, dirs: &Dirs, rec: &mut Record) -
         Ok(line)
     });
     let (fs, _, _) = place.into_parts(dirs);
-    let start = browser_start(fs, connect, launch, host.as_ref(), abs, dirs);
-    let outcome = gui::browser::open(start, &hooks)?;
-    rec.action = Some(outcome.action());
-    rec.conflict = outcome.conflict;
-    match outcome.refused {
-        Some(message) => Err(Refused(message).into()),
-        None => Ok(()),
-    }
+    browser_start(fs, connect, launch, host.as_ref(), abs, dirs)
 }
 
 /// What the browser starts from: the folder's connection and how to open more, the host (`None`
@@ -1603,6 +1690,17 @@ mod tests {
         assert_eq!(cli.source.as_deref(), Some("src:/a.png"));
         assert!(Cli::try_parse_from(["sopen", "--here", "--target", "box", "a"]).is_err());
         assert!(Cli::try_parse_from(["sopen", "--target", "box", "cut", "a", "1", "2"]).is_err());
+        // `--tui` (10 §11 row 3): with `--here` or `--target` (where F12 opens the window), never
+        // with a flag that opens something else.
+        let cli = Cli::try_parse_from(["sopen", "--tui", "--here", "box:~/p"]).unwrap();
+        assert!(cli.tui && cli.here && !cli.hex);
+        let cli = Cli::try_parse_from(["sopen", "--tui", "--target", "me@box", "."]).unwrap();
+        assert!(cli.tui && cli.target.as_deref() == Some("me@box"));
+        for other in [&["--app", "X"][..], &["--hex"], &["--browser"]] {
+            let args = ["sopen", "--tui"].into_iter().chain(other.iter().copied());
+            assert!(Cli::try_parse_from(args.chain(["a"])).is_err(), "{other:?}");
+        }
+        assert!(!Cli::try_parse_from(["sopen", "a"]).unwrap().tui);
         // `--browser` (09 §7), as typed and as HOST's half of a tunnel is given it.
         let cli = Cli::try_parse_from(["sopen", "--browser", "http://x/"]).unwrap();
         assert!(cli.browser && !cli.hold_until_eof);

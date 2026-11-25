@@ -1708,6 +1708,10 @@ struct MediaWindow {
     marks: Marks,
     sel: Selection,
     tex: Option<TextureHandle>,
+    /// Whose textures `tex` is among (`image::textures_of`), and the frame's pixels, to make it
+    /// again in another context's (a switch, 10 §7.2).
+    tex_in: usize,
+    frame: Option<Arc<egui::ColorImage>>,
     /// The frame on screen (timeline time, source frame when known) and the one asked for.
     tex_at: Option<(f64, Option<Tick>)>,
     /// Tests: the pixels of the frame on screen, as they were put up.
@@ -1971,6 +1975,8 @@ impl MediaWindow {
             marks,
             sel,
             tex: None,
+            tex_in: 0,
+            frame: None,
             tex_at: None,
             #[cfg(test)]
             shown_rgba: Vec::new(),
@@ -2120,15 +2126,37 @@ impl MediaWindow {
             && self.restoring.is_none()
     }
 
+    /// The frame on screen as one of `ctx`'s textures: made there again from its pixels when the
+    /// texture kept is another context's (a switch, 10 §7.2).
+    fn rehome(&mut self, ctx: &egui::Context) {
+        let here = super::image::textures_of(ctx);
+        if let (Some(_), Some(frame)) = (&self.tex, &self.frame) {
+            if self.tex_in != here {
+                let tex = ctx.load_texture("frame", frame.clone(), egui::TextureOptions::LINEAR);
+                (self.tex, self.tex_in) = (Some(tex), here);
+            }
+        }
+    }
+
     fn show_frame(&mut self, ctx: &egui::Context, rgba: &[u8], t: f64, key: Option<Tick>) {
         let Some((w, h)) = self.media.decode_size() else {
             return;
         };
-        let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba);
+        let image = Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+            [w as usize, h as usize],
+            rgba,
+        ));
+        let here = super::image::textures_of(ctx);
         match &mut self.tex {
-            Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
-            None => self.tex = Some(ctx.load_texture("frame", image, egui::TextureOptions::LINEAR)),
+            Some(tex) if self.tex_in == here => {
+                tex.set(image.clone(), egui::TextureOptions::LINEAR)
+            }
+            _ => {
+                let tex = ctx.load_texture("frame", image.clone(), egui::TextureOptions::LINEAR);
+                (self.tex, self.tex_in) = (Some(tex), here);
+            }
         }
+        self.frame = Some(image);
         self.tex_at = Some((t, key));
         self.frame_failed = None;
         #[cfg(test)]
@@ -4462,6 +4490,7 @@ impl MediaWindow {
         let Some(src) = self.media.source_size() else {
             return;
         };
+        self.rehome(ui.ctx());
         // The window's frame; the frame on black inside it.
         let outer = ui.max_rect();
         let p = super::chrome::PALETTE;
@@ -4647,6 +4676,7 @@ impl MediaWindow {
     /// start says so). Nothing in it takes input, and it runs nothing.
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.rehome(&ctx);
         if self.tex.is_none() {
             if let Some(rgba) = self.first.clone() {
                 self.show_frame(&ctx, &rgba, 0.0, Some(0));

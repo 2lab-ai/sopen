@@ -7,6 +7,7 @@ Open a file or folder on another machine as if it were local:
 
 ```sh
 sopen myserver:~/project           # folder → the xtools file browser: two panels, Enter views any file
+sopen --tui myserver:~/project     # the same file browser in this terminal; F12 moves it into a window and back
 sopen myserver:/var/log/app.log    # text → VS Code remote (Remote - SSH), else Zed
 sopen myserver:/tmp/shot.png       # image → view, rectangle crop / pixelize, cut / copy / paste, save back
 sopen myserver:/tmp/talk.mp4       # video → play, cut / copy / paste, crop → save back or a new file
@@ -50,7 +51,8 @@ brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64
   on the machine whose screen shows the file (the one you sit at, or the `--target`), not on the
   remote. The file browser, the image and media windows, the binary-file dialog and the hex window
   need a desktop session (X11 or Wayland); without one a folder opens in the editor and a binary,
-  image or media file is fetched and its path printed.
+  image or media file is fetched and its path printed — or, with `--tui`, the file browser runs in
+  the terminal.
 
 ## What the remote needs
 
@@ -284,6 +286,40 @@ there.
 | `↑` / `↓`, `PgUp` / `PgDn`, the wheel | wrapped: move by rows (a page keeps one row); unwrapped: by lines |
 | `Home` / `End` | wrapped, inside a long line: its first / last row first, then the start / end of the file; otherwise the start / end of the file |
 | `⌘Home` / `⌘End` (`Ctrl` elsewhere) | the start / end of the file |
+
+## In the terminal: `--tui`
+
+```sh
+sopen --tui myserver:/srv/app      # the file browser in this terminal
+sopen --tui ./notes.txt            # its folder with its viewer open: F12 shows it, Esc the list
+```
+
+`--tui` runs xtools in the terminal you typed it in, drawn in the same cells as its window — the
+same frames, colours and keys — Korean and other wide names two cells a character. Its input and
+output must be that terminal (in a pipe it is a usage error, exit 2). Without `--tui` nothing
+changes: a folder still opens in a window.
+
+- **F12**, **Alt+G** (for a terminal that keeps F12) or a click on the title row's **`[GUI]`**
+  moves it into a window on this machine, at the terminal's size, and back: F12 there, its
+  `[TUI]`, or closing the window (Cmd/Ctrl+Q and +W too) returns
+  to the terminal with everything as it was — the bar, a dialog with what you typed in it. Keys
+  typed into the terminal meanwhile are dropped. With `--target`, `SOPEN_TARGET` or a config
+  `target` naming another machine, it stays in the terminal and says so (the switch to another
+  machine comes later); on Linux without a display it says how to get one.
+- What the terminal does not draw yet — the preview, the viewers, the directory tree, the git
+  panel, their dialogs — is a box saying `F12 shows it in the window`; a click on it is F12.
+  F1's key help is the window's for now: in the terminal F1 says so on the status row.
+- **Keys**: where the terminal offers the kitty keyboard protocol sopen turns it on and every key
+  arrives as in the window. Elsewhere Ctrl+digits and some Ctrl+Shift chords cannot arrive, so
+  **Alt+1…0 are F1…F10** (on a Mac the terminal must send Option as Alt). Ctrl is the window's
+  Cmd/Ctrl on every machine: Ctrl+Q quits, Ctrl+C copies.
+- **Mouse**: clicks and the wheel act on the rows and the F-key row; to select text with the
+  terminal itself, hold Shift while dragging (in most terminals).
+- **Copy** goes to the clipboard through the terminal (OSC 52; some terminals ask first, or need it
+  turned on); paste with the terminal's own paste.
+- **Colours** are 24-bit where `COLORTERM` says `truecolor` or `24bit`, else the nearest of the
+  256-colour palette.
+- The terminal is left as it was found however xtools ends — quit, a crash, SIGTERM, SIGHUP.
 
 ## Images
 
