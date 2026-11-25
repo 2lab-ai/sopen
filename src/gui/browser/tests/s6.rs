@@ -154,9 +154,10 @@ fn k_r1_slots_7_and_8_make_a_folder_and_delete() {
             _ => fx.drv.key(&mut fx.b, Key::Num7, command(false)),
         }
         fx.drv.idle(&mut fx.b, 2);
-        assert!(fx.drv.find_text(&asked).is_some(), "F7, way {way}");
+        // The folder's path makes the line wider than the dialog: it wraps by cells.
+        assert!(ops::shown_wrapped(&fx.drv, &asked), "F7, way {way}");
         fx.key(Key::Escape);
-        assert!(fx.drv.find_text(&asked).is_none(), "Esc closed it");
+        assert!(!ops::shown_wrapped(&fx.drv, &asked), "Esc closed it");
     }
     for way in 0..3 {
         match way {
@@ -209,10 +210,7 @@ fn k_r3_f8_asks_for_the_trash_and_shift_f8_is_permanent() {
         wait(&mut fx, |b| !b.ops.checking_trash());
         let asked = fx.drv.find_text("Delete zeta.md?").is_some();
         assert_eq!(asked, opens.is_some(), "{key:?} {mods:?}");
-        assert!(
-            fx.drv.find_text("Make a folder in").is_none(),
-            "{key:?} {mods:?}"
-        );
+        assert!(fx.drv.find_text("[ Make ]").is_none(), "{key:?} {mods:?}");
         if let Some(line) = opens {
             assert!(fx.drv.find_text(line).is_some(), "{key:?} {mods:?}: {line}");
             assert_eq!(in_error_colour(&fx, line), line == "permanent", "{line}");
@@ -259,10 +257,8 @@ fn k_k1_f7_makes_a_folder_and_the_bar_goes_on_it() {
     fx.key(Key::Enter);
     ended(&mut fx);
     assert!(fx.b.ops.holds_keyboard(), "the report is up");
-    assert!(fx
-        .drv
-        .find_text(&format!("Make folder new in {}: 1 failed", fx.root))
-        .is_some());
+    let head = format!("Make folder new in {}: 1 failed", fx.root);
+    assert!(ops::shown_wrapped(&fx.drv, &head), "{head}");
     assert!(fx.drv.find_text("failed      new — new exists").is_some());
     assert_eq!(
         std::fs::read_to_string(format!("{new}/kept")).unwrap(),
@@ -282,10 +278,8 @@ fn k_k1_f7_on_a_remote_is_one_mkdir() {
     };
     let mut fx = remote_fixture(&remote);
     fx.key(Key::F7);
-    assert!(fx
-        .drv
-        .find_text(&format!("Make a folder in box:{}", fx.root))
-        .is_some());
+    let asked = format!("Make a folder in box:{}", fx.root);
+    assert!(ops::shown_wrapped(&fx.drv, &asked), "{asked}");
     fx.typed("a/b");
     fx.key(Key::Enter);
     assert!(fx.drv.find_text("a/b: a name cannot hold a /").is_some());
@@ -774,12 +768,12 @@ fn a_trash_that_refuses_after_yes_leaves_the_file_and_is_never_permanent() {
     fx.key(Key::Enter);
     ended(&mut fx);
     assert!(fx.b.ops.holds_keyboard(), "the report is up");
-    assert!(fx
-        .drv
-        .find_text(&format!("Delete from {} to the Trash: 1 failed", fx.root))
-        .is_some());
+    let head = format!("Delete from {} to the Trash: 1 failed", fx.root);
+    assert!(ops::shown_wrapped(&fx.drv, &head), "{head}");
     let failed = fx.drv.text_starting_with("failed").expect("its line");
-    assert!(failed.contains(&name), "{failed}");
+    // The 250-byte name is wider than the report: in cells it wraps under its outcome.
+    let line = format!("failed {name}");
+    assert!(ops::shown_wrapped(&fx.drv, &line), "{failed}: {name}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n", "intact");
     assert_eq!(LocalFs::trashed_by_tests(&path), None);
     fx.key(Key::Enter);

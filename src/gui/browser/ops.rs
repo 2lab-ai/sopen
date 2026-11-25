@@ -6,6 +6,10 @@
 //! [`crate::fileops`]'s, behind [`Run`]. S1-D writes it (S6-B the make-folder and delete
 //! dialogs).
 //!
+//! Every dialog and the rename field are cells on the window's grid (10 §4–§6, X1b): [`dialog`]
+//! lays each out from what it says and draws it; egui keeps the keyboard, the focus and the
+//! field's editing.
+//!
 //! The browser holds one [`Ops`] and calls it: `open_*` from its commands, [`Ops::rename_field`]
 //! in the row being renamed, [`Ops::ui`] after the panels, [`Ops::status`] for the status row,
 //! [`Ops::holds_keyboard`] to keep its own keys and its claim on the keyboard back meanwhile
@@ -15,11 +19,16 @@
 //! The integration (S1-E) wired it in: `browser.rs` holds the [`Ops`], and its [`Run`] is
 //! [`crate::fileops::run`] on the worker [`start`] makes.
 
+mod dialog;
+
 use super::panel::{self, Panel};
 use crate::fileops::{Answer, Clash, Item, ItemOutcome, Progress, Reply, Report};
-use crate::gui::{chrome, Status};
+use crate::gui::cells::{Buffer, Cells, Grid, Position};
+use crate::gui::chrome;
+use crate::gui::Status;
 use crate::remote::{Entry, EntryKind};
-use eframe::egui::{self, Color32, Key, Modifiers, Rect, RichText};
+use dialog::{Button, Ink, Inputs, Layout, Part};
+use eframe::egui::{self, Color32, Key, Modifiers};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -499,14 +508,14 @@ impl Running {
     pub fn ui(&mut self, ctx: &egui::Context) -> Option<Report> {
         let report = self.poll();
         if report.is_none() {
-            self.dialog(ctx);
+            self.dialog(ctx, dialog::grid(ctx));
         }
         report
     }
 
     /// The name-in-the-way dialog, while one is asked; its answer goes to the engine.
-    fn dialog(&mut self, ctx: &egui::Context) {
-        let Some(reply) = self.clash.as_mut().and_then(|d| d.ui(ctx)) else {
+    fn dialog(&mut self, ctx: &egui::Context, grid: Grid) {
+        let Some(reply) = self.clash.as_mut().and_then(|d| d.ui(ctx, grid)) else {
             return;
         };
         self.clash = None;
@@ -667,6 +676,8 @@ pub struct ReportView {
     title: String,
     head: String,
     report: Report,
+    /// The first of its rows that scroll on screen.
+    top: usize,
 }
 
 /// The report's word for each outcome, the order its head counts them in.
@@ -714,6 +725,7 @@ impl ReportView {
             title: format!("{title} report"),
             head,
             report,
+            top: 0,
         }
     }
 
@@ -726,58 +738,57 @@ impl ReportView {
         lines
     }
 
-    /// Shows it; true once it is closed.
-    pub fn ui(&mut self, ctx: &egui::Context) -> bool {
+    /// The dialog on `grid`: the head, then an item a row — a failure in the error colour, one
+    /// not reached in the weak one — and the notes after a blank row, sixteen rows at most on
+    /// screen (the wheel scrolls them), then Close.
+    fn layout(&self, grid: Grid) -> Layout {
+        let mut rows: Vec<(String, Ink)> = (self.report.items.iter())
+            .map(|item| {
+                let ink = match item.outcome {
+                    ItemOutcome::Failed(_) => Ink::Error,
+                    ItemOutcome::NotReached => Ink::Weak,
+                    _ => Ink::Text,
+                };
+                (item_line(item), ink)
+            })
+            .collect();
+        if !self.report.notes.is_empty() {
+            rows.push((String::new(), Ink::Text));
+            rows.extend(self.report.notes.iter().map(|n| (n.clone(), Ink::Text)));
+        }
+        let parts = [
+            Part::Text(self.head.clone(), Ink::Text),
+            Part::Blank,
+            Part::Scroll {
+                rows,
+                most: 16,
+                top: self.top,
+            },
+            Part::Blank,
+            Part::Buttons(vec![Button::new("Close", report_close_id())]),
+        ];
+        dialog::layout(grid, &self.title, 72, &parts)
+    }
+
+    /// Shows it on `grid` (the area between the window's title and status rows); true once it
+    /// is closed.
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> bool {
         let close_key = ctx.input_mut(|i| {
             i.consume_key(Modifiers::NONE, Key::Enter)
                 || i.consume_key(Modifiers::NONE, Key::Escape)
         });
-        let mut closed = false;
-        let modal = chrome::dialog(
-            ctx,
-            egui::Id::unique("sopen-ops-report"),
-            &self.title,
-            |ui| {
-                ui.set_width(dialog_width(ctx, 72.0));
-                ui.add(egui::Label::new(&self.head).wrap());
-                ui.add_space(chrome::CELL.y / 2.0);
-                let (error, weak) = (ui.visuals().error_fg_color, ui.visuals().weak_text_color());
-                egui::ScrollArea::vertical()
-                    .max_height(chrome::CELL.y * 16.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for item in &self.report.items {
-                            let text = RichText::new(item_line(item));
-                            let text = match item.outcome {
-                                ItemOutcome::Failed(_) => text.color(error),
-                                ItemOutcome::NotReached => text.color(weak),
-                                _ => text,
-                            };
-                            ui.add(egui::Label::new(text).wrap());
-                        }
-                        if !self.report.notes.is_empty() {
-                            ui.add_space(chrome::CELL.y / 2.0);
-                            for note in &self.report.notes {
-                                ui.add(egui::Label::new(note.as_str()).wrap());
-                            }
-                        }
-                    });
-                ui.add_space(chrome::CELL.y / 2.0);
-                if ui.button("Close").clicked() {
-                    closed = true;
-                }
-            },
-        );
-        closed || close_key || modal.should_close()
+        let layout = self.layout(grid);
+        let inputs = Inputs {
+            top: Some(&mut self.top),
+            ..Inputs::default()
+        };
+        let shown = dialog::show(ctx, egui::Id::unique("sopen-ops-report"), &layout, inputs);
+        shown.clicked(report_close_id()) || close_key || shown.modal.should_close()
     }
 }
 
-/// A dialog's width: `cells` character cells, less on a narrow window.
-fn dialog_width(ctx: &egui::Context, cells: f32) -> f32 {
-    let room = ctx.content_rect().width() - 8.0 * chrome::CELL.x;
-    (cells * chrome::CELL.x)
-        .min(room)
-        .max(20.0 * chrome::CELL.x)
+fn report_close_id() -> egui::Id {
+    egui::Id::unique("sopen-ops-report-close")
 }
 
 /// A dialog's hold on the keyboard: the widgets it laid out on its last pass. While the focus is
@@ -830,9 +841,9 @@ impl Keyboard {
         Keys { enter, escape }
     }
 
-    /// A widget of the dialog (a button that may keep the focus).
-    fn laid(&mut self, response: &egui::Response) {
-        self.ids.push(response.id);
+    /// The dialog's controls this pass (a button that may keep the focus).
+    fn laid(&mut self, ids: &[egui::Id]) {
+        self.ids.extend_from_slice(ids);
     }
 
     /// Selects the field's first `select` characters again on the next pass (after a refusal,
@@ -870,6 +881,19 @@ pub struct CopyDialog {
 fn copy_field_id() -> egui::Id {
     egui::Id::unique("sopen-ops-copy-target")
 }
+
+fn copy_go_id() -> egui::Id {
+    egui::Id::unique("sopen-ops-copy-go")
+}
+
+fn copy_cancel_id() -> egui::Id {
+    egui::Id::unique("sopen-ops-copy-cancel")
+}
+
+/// The Copy / Move dialog's hint while its field holds the other panel's folder, and after an
+/// edit.
+const OTHER_HINT: &str = "the other panel's folder";
+const EDITED_HINT: &str = "host:/abs on a remote · /abs here · a name: inside this folder";
 
 impl CopyDialog {
     /// F5 / F6 in `panel` (its folder on `host`, `None` here): on [`Panel::acted_on`], to `to`.
@@ -912,45 +936,51 @@ impl CopyDialog {
         self.error.as_deref()
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context) -> Option<CopyEnd> {
+    /// The dialog on `grid`: what, the target field after `to`, a hint — the other panel's
+    /// folder while the field holds it, else how a target reads — the refusal, the buttons. As
+    /// wide as the longer hint, so typing never resizes it.
+    fn layout(&self, grid: Grid) -> Layout {
+        let word = self.kind.word();
+        let hint = if self.target == self.other {
+            OTHER_HINT
+        } else {
+            EDITED_HINT
+        };
+        let mut parts = vec![
+            Part::Text(format!("{word} {}", self.what()), Ink::Text),
+            Part::Blank,
+            Part::Field {
+                label: "to".to_string(),
+                id: copy_field_id(),
+            },
+            Part::Text(hint.to_string(), Ink::Weak),
+        ];
+        if let Some(error) = &self.error {
+            parts.push(Part::Text(error.clone(), Ink::Error));
+        }
+        parts.push(Part::Blank);
+        parts.push(Part::Buttons(vec![
+            Button::new(word, copy_go_id()),
+            Button::new("Cancel", copy_cancel_id()),
+        ]));
+        let widest = crate::gui::cells::width(EDITED_HINT).max(60);
+        dialog::layout(grid, word, widest, &parts)
+    }
+
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> Option<CopyEnd> {
         let field_id = copy_field_id();
         let all = self.target.chars().count();
         let keys = self.keyboard.begin(ctx, field_id, &self.target, all);
-        let word = self.kind.word();
-        let (mut go, mut cancel) = (keys.enter, keys.escape);
-        let modal = chrome::dialog(ctx, egui::Id::unique("sopen-ops-copy"), word, |ui| {
-            ui.set_width(dialog_width(ctx, 60.0));
-            ui.label(format!("{word} {}", self.what()));
-            ui.add_space(chrome::CELL.y / 2.0);
-            ui.horizontal(|ui| {
-                ui.label("to");
-                ui.add(
-                    chrome::field(&mut self.target)
-                        .id(field_id)
-                        .desired_width(ui.available_width()),
-                );
-            });
-            let hint = if self.target == self.other {
-                "the other panel's folder"
-            } else {
-                "host:/abs on a remote · /abs here · a name: inside this folder"
-            };
-            ui.label(RichText::new(hint).weak());
-            if let Some(error) = &self.error {
-                let color = ui.visuals().error_fg_color;
-                crate::gui::disclosures(ui, &[(error.clone(), color)]);
-            }
-            ui.add_space(chrome::CELL.y / 2.0);
-            ui.horizontal(|ui| {
-                let ok = ui.button(word);
-                let no = ui.button("Cancel");
-                self.keyboard.laid(&ok);
-                self.keyboard.laid(&no);
-                go |= ok.clicked();
-                cancel |= no.clicked();
-            });
-        });
-        if cancel || modal.backdrop_response.clicked() {
+        let layout = self.layout(grid);
+        let inputs = Inputs {
+            field: Some(&mut self.target),
+            ..Inputs::default()
+        };
+        let shown = dialog::show(ctx, egui::Id::unique("sopen-ops-copy"), &layout, inputs);
+        self.keyboard.laid(&shown.controls);
+        let go = keys.enter || shown.clicked(copy_go_id());
+        let cancel = keys.escape || shown.clicked(copy_cancel_id());
+        if cancel || shown.modal.backdrop_response.clicked() {
             return Some(CopyEnd::Cancel);
         }
         if !go {
@@ -998,6 +1028,10 @@ pub enum GroupEnd {
     Cancel,
 }
 
+fn group_id() -> egui::Id {
+    egui::Id::unique("sopen-ops-group")
+}
+
 /// `+` and `-`'s one-line dialog (04 §4): a pattern, `*` at first.
 pub struct GroupDialog {
     pub select: bool,
@@ -1014,32 +1048,41 @@ impl GroupDialog {
         }
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context) -> Option<GroupEnd> {
-        let field_id = egui::Id::unique("sopen-ops-group-pattern");
+    /// The dialog on `grid`: what it does, the pattern field, how a pattern reads, the buttons.
+    fn layout(&self, grid: Grid) -> Layout {
+        let id = group_id();
+        let word = if self.select { "Select" } else { "Unselect" };
+        let parts = [
+            Part::Text(format!("{word} the names that match"), Ink::Text),
+            Part::Field {
+                label: String::new(),
+                id: id.with("pattern"),
+            },
+            Part::Text("* any characters · ? one · any case".to_string(), Ink::Weak),
+            Part::Blank,
+            Part::Buttons(vec![
+                Button::new(word, id.with("go")),
+                Button::new("Cancel", id.with("cancel")),
+            ]),
+        ];
+        dialog::layout(grid, word, 44, &parts)
+    }
+
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> Option<GroupEnd> {
+        let id = group_id();
+        let (field_id, go_id, cancel_id) = (id.with("pattern"), id.with("go"), id.with("cancel"));
         let all = self.pattern.chars().count();
         let keys = self.keyboard.begin(ctx, field_id, &self.pattern, all);
-        let word = if self.select { "Select" } else { "Unselect" };
-        let (mut go, mut cancel) = (keys.enter, keys.escape);
-        let modal = chrome::dialog(ctx, egui::Id::unique("sopen-ops-group"), word, |ui| {
-            ui.set_width(dialog_width(ctx, 44.0));
-            ui.label(format!("{word} the names that match"));
-            ui.add(
-                chrome::field(&mut self.pattern)
-                    .id(field_id)
-                    .desired_width(ui.available_width()),
-            );
-            ui.label(RichText::new("* any characters · ? one · any case").weak());
-            ui.add_space(chrome::CELL.y / 2.0);
-            ui.horizontal(|ui| {
-                let ok = ui.button(word);
-                let no = ui.button("Cancel");
-                self.keyboard.laid(&ok);
-                self.keyboard.laid(&no);
-                go |= ok.clicked();
-                cancel |= no.clicked();
-            });
-        });
-        if cancel || modal.backdrop_response.clicked() {
+        let layout = self.layout(grid);
+        let inputs = Inputs {
+            field: Some(&mut self.pattern),
+            ..Inputs::default()
+        };
+        let shown = dialog::show(ctx, id, &layout, inputs);
+        self.keyboard.laid(&shown.controls);
+        let go = keys.enter || shown.clicked(go_id);
+        let cancel = keys.escape || shown.clicked(cancel_id);
+        if cancel || shown.modal.backdrop_response.clicked() {
             Some(GroupEnd::Cancel)
         } else if go {
             Some(GroupEnd::Apply {
@@ -1050,6 +1093,10 @@ impl GroupDialog {
             None
         }
     }
+}
+
+fn clash_id() -> egui::Id {
+    egui::Id::unique("sopen-ops-clash")
 }
 
 /// The name-in-the-way dialog (04 §5.2): Skip, Rename (the next free name prefilled, editable),
@@ -1078,58 +1125,64 @@ impl ClashDialog {
         }
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context) -> Option<Reply> {
-        let field_id = egui::Id::unique("sopen-ops-clash-rename");
+    /// The dialog on `grid`: the name and where, the rule, the Rename field, the refusal, "the
+    /// same for the rest", the buttons and what Enter and Esc do.
+    fn layout(&self, grid: Grid) -> Layout {
+        let id = clash_id();
+        let mut parts = vec![
+            Part::Text(
+                format!("{} is already in {}.", self.clash.name, self.place),
+                Ink::Text,
+            ),
+            Part::Text("Nothing is ever written over it.".to_string(), Ink::Text),
+            Part::Blank,
+            Part::Field {
+                label: "Rename to".to_string(),
+                id: id.with("rename"),
+            },
+        ];
+        if let Some(error) = &self.error {
+            parts.push(Part::Text(error.clone(), Ink::Error));
+        }
+        parts.extend([
+            Part::Check {
+                label: "the same for the rest".to_string(),
+                id: id.with("rest"),
+            },
+            Part::Blank,
+            Part::Buttons(vec![
+                Button::new("Skip", id.with("skip")),
+                Button::new("Rename", id.with("go")),
+                Button::new("Cancel", id.with("cancel")),
+            ]),
+            Part::Text(
+                "Enter renames · Esc cancels the rest".to_string(),
+                Ink::Weak,
+            ),
+        ]);
+        dialog::layout(grid, "Name exists", 60, &parts)
+    }
+
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> Option<Reply> {
+        let id = clash_id();
+        let field_id = id.with("rename");
         let stem = stem_chars(&self.rename, false);
         let keys = self.keyboard.begin(ctx, field_id, &self.rename, stem);
+        let layout = self.layout(grid);
+        let inputs = Inputs {
+            field: Some(&mut self.rename),
+            check: Some(&mut self.same_for_rest),
+            ..Inputs::default()
+        };
+        let shown = dialog::show(ctx, id, &layout, inputs);
+        self.keyboard.laid(&shown.controls);
         let mut answer = None;
-        if keys.escape {
+        if keys.escape || shown.clicked(id.with("cancel")) {
             answer = Some(Answer::Cancel);
+        } else if shown.clicked(id.with("skip")) {
+            answer = Some(Answer::Skip);
         }
-        let mut rename = keys.enter;
-        chrome::dialog(
-            ctx,
-            egui::Id::unique("sopen-ops-clash"),
-            "Name exists",
-            |ui| {
-                ui.set_width(dialog_width(ctx, 60.0));
-                let line = format!("{} is already in {}.", self.clash.name, self.place);
-                ui.add(egui::Label::new(line).wrap());
-                ui.label("Nothing is ever written over it.");
-                ui.add_space(chrome::CELL.y / 2.0);
-                ui.horizontal(|ui| {
-                    ui.label("Rename to");
-                    ui.add(
-                        chrome::field(&mut self.rename)
-                            .id(field_id)
-                            .desired_width(ui.available_width()),
-                    );
-                });
-                if let Some(error) = &self.error {
-                    let color = ui.visuals().error_fg_color;
-                    crate::gui::disclosures(ui, &[(error.clone(), color)]);
-                }
-                let rest = ui.checkbox(&mut self.same_for_rest, "the same for the rest");
-                self.keyboard.laid(&rest);
-                ui.add_space(chrome::CELL.y / 2.0);
-                ui.horizontal(|ui| {
-                    let skip = ui.button("Skip");
-                    let ren = ui.button("Rename");
-                    let cancel = ui.button("Cancel");
-                    for b in [&skip, &ren, &cancel] {
-                        self.keyboard.laid(b);
-                    }
-                    if skip.clicked() {
-                        answer = Some(Answer::Skip);
-                    }
-                    rename |= ren.clicked();
-                    if cancel.clicked() {
-                        answer = Some(Answer::Cancel);
-                    }
-                });
-                ui.label(RichText::new("Enter renames · Esc cancels the rest").weak());
-            },
-        );
+        let rename = keys.enter || shown.clicked(id.with("go"));
         match answer {
             Some(answer) => Some(Reply {
                 answer,
@@ -1155,6 +1208,10 @@ impl ClashDialog {
             }
         }
     }
+}
+
+fn make_folder_id() -> egui::Id {
+    egui::Id::unique("sopen-ops-make-folder")
 }
 
 /// F7's one-line dialog (04 §5.4): the new folder's name, in the panel's folder, which it
@@ -1183,42 +1240,45 @@ impl MakeFolderDialog {
         }
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context) -> Option<CopyEnd> {
-        let field_id = egui::Id::unique("sopen-ops-make-folder-name");
+    /// The dialog on `grid`: where, the name field, the rule, the refusal, the buttons.
+    fn layout(&self, grid: Grid) -> Layout {
+        let id = make_folder_id();
+        let rule = "one level: no / in the name · a name that exists is an error";
+        let mut parts = vec![
+            Part::Text(format!("Make a folder in {}", self.dir.shown()), Ink::Text),
+            Part::Blank,
+            Part::Field {
+                label: "name".to_string(),
+                id: id.with("name"),
+            },
+            Part::Text(rule.to_string(), Ink::Weak),
+        ];
+        if let Some(error) = &self.error {
+            parts.push(Part::Text(error.clone(), Ink::Error));
+        }
+        parts.push(Part::Blank);
+        parts.push(Part::Buttons(vec![
+            Button::new("Make", id.with("go")),
+            Button::new("Cancel", id.with("cancel")),
+        ]));
+        dialog::layout(grid, "Make folder", 60, &parts)
+    }
+
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> Option<CopyEnd> {
+        let id = make_folder_id();
+        let (field_id, go_id, cancel_id) = (id.with("name"), id.with("go"), id.with("cancel"));
         let all = self.name.chars().count();
         let keys = self.keyboard.begin(ctx, field_id, &self.name, all);
-        let (mut go, mut cancel) = (keys.enter, keys.escape);
-        let id = egui::Id::unique("sopen-ops-make-folder");
-        let modal = chrome::dialog(ctx, id, "Make folder", |ui| {
-            ui.set_width(dialog_width(ctx, 60.0));
-            let line = format!("Make a folder in {}", self.dir.shown());
-            ui.add(egui::Label::new(line).wrap());
-            ui.add_space(chrome::CELL.y / 2.0);
-            ui.horizontal(|ui| {
-                ui.label("name");
-                ui.add(
-                    chrome::field(&mut self.name)
-                        .id(field_id)
-                        .desired_width(ui.available_width()),
-                );
-            });
-            let rule = "one level: no / in the name · a name that exists is an error";
-            ui.label(RichText::new(rule).weak());
-            if let Some(error) = &self.error {
-                let color = ui.visuals().error_fg_color;
-                crate::gui::disclosures(ui, &[(error.clone(), color)]);
-            }
-            ui.add_space(chrome::CELL.y / 2.0);
-            ui.horizontal(|ui| {
-                let ok = ui.button("Make");
-                let no = ui.button("Cancel");
-                self.keyboard.laid(&ok);
-                self.keyboard.laid(&no);
-                go |= ok.clicked();
-                cancel |= no.clicked();
-            });
-        });
-        if cancel || modal.backdrop_response.clicked() {
+        let layout = self.layout(grid);
+        let inputs = Inputs {
+            field: Some(&mut self.name),
+            ..Inputs::default()
+        };
+        let shown = dialog::show(ctx, id, &layout, inputs);
+        self.keyboard.laid(&shown.controls);
+        let go = keys.enter || shown.clicked(go_id);
+        let cancel = keys.escape || shown.clicked(cancel_id);
+        if cancel || shown.modal.backdrop_response.clicked() {
             return Some(CopyEnd::Cancel);
         }
         if !go {
@@ -1366,44 +1426,44 @@ impl DeleteDialog {
         })
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context) -> Option<CopyEnd> {
-        let keys = self.keyboard.claim(ctx, delete_focus_id());
-        let (mut go, mut cancel) = (keys.enter, keys.escape);
+    /// The dialog on `grid`: the question (the keyboard's holder), where it goes — this
+    /// machine's Trash, the check still running in the weak colour, permanent in the error colour
+    /// — a link's rule, the buttons (Delete off while the Trash is checked) and what Enter and
+    /// Esc do.
+    fn layout(&self, grid: Grid) -> Layout {
         let id = egui::Id::unique("sopen-ops-delete");
-        let modal = chrome::dialog(ctx, id, "Delete", |ui| {
-            ui.set_width(dialog_width(ctx, 60.0));
-            let asked = ui.add(egui::Label::new(self.question.as_str()).wrap());
-            ui.interact(
-                asked.rect,
-                delete_focus_id(),
-                egui::Sense::focusable_noninteractive(),
-            );
-            let line = self.bin.line();
-            if self.bin == Bin::Trash {
-                ui.label(line);
-            } else if self.bin == Bin::Checking {
-                ui.label(RichText::new(line).weak());
-            } else {
-                let color = ui.visuals().error_fg_color;
-                crate::gui::disclosures(ui, &[(line, color)]);
-            }
-            if self.link {
-                let rule = "a link goes as a link, never what it points at";
-                ui.label(RichText::new(rule).weak());
-            }
-            ui.add_space(chrome::CELL.y / 2.0);
-            let checking = self.bin == Bin::Checking;
-            ui.horizontal(|ui| {
-                let ok = ui.add_enabled(!checking, egui::Button::new("Delete"));
-                let no = ui.button("Cancel");
-                self.keyboard.laid(&ok);
-                self.keyboard.laid(&no);
-                go |= ok.clicked();
-                cancel |= no.clicked();
-            });
-            ui.label(RichText::new("Enter deletes · Esc cancels").weak());
-        });
-        if cancel || modal.backdrop_response.clicked() {
+        let ink = match self.bin {
+            Bin::Trash => Ink::Text,
+            Bin::Checking => Ink::Weak,
+            _ => Ink::Error,
+        };
+        let mut parts = vec![
+            Part::Held(self.question.clone(), Ink::Text, delete_focus_id()),
+            Part::Text(self.bin.line(), ink),
+        ];
+        if self.link {
+            let rule = "a link goes as a link, never what it points at";
+            parts.push(Part::Text(rule.to_string(), Ink::Weak));
+        }
+        let mut delete = Button::new("Delete", id.with("go"));
+        delete.on = self.bin != Bin::Checking;
+        parts.extend([
+            Part::Blank,
+            Part::Buttons(vec![delete, Button::new("Cancel", id.with("cancel"))]),
+            Part::Text("Enter deletes · Esc cancels".to_string(), Ink::Weak),
+        ]);
+        dialog::layout(grid, "Delete", 60, &parts)
+    }
+
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> Option<CopyEnd> {
+        let keys = self.keyboard.claim(ctx, delete_focus_id());
+        let id = egui::Id::unique("sopen-ops-delete");
+        let layout = self.layout(grid);
+        let shown = dialog::show(ctx, id, &layout, Inputs::default());
+        self.keyboard.laid(&shown.controls);
+        let go = keys.enter || shown.clicked(id.with("go"));
+        let cancel = keys.escape || shown.clicked(id.with("cancel"));
+        if cancel || shown.modal.backdrop_response.clicked() {
             Some(CopyEnd::Cancel)
         } else if go && self.bin != Bin::Checking {
             Some(CopyEnd::Start(Job::Delete {
@@ -1492,25 +1552,37 @@ impl Rename {
         self.pending
     }
 
-    /// The field over `rect` (the Name and Ext columns of its row). It holds the keyboard while
-    /// it is open, and consumes the Enter and Esc it acts on.
-    pub fn ui(&mut self, ui: &mut egui::Ui, rect: Rect) -> Option<RenameEnd> {
-        fn field(text: &mut String, width: f32) -> egui::TextEdit<'_> {
-            chrome::field(text)
-                .id(rename_id())
-                .lock_focus(true)
-                .margin(egui::Margin::ZERO)
-                .desired_width(width)
-        }
-        let field = |text| field(text, rect.width());
-        if self.pending {
-            ui.put(rect, field(&mut self.text).interactive(false));
-            return None;
-        }
+    /// The field at cells `at` of `grid` (the Name and Ext columns of its row), written into
+    /// `buf`, the row's cells ([`dialog::field_cells`]); the caret's cell while it has the
+    /// keyboard. It holds the keyboard while it is open, and consumes the Enter and Esc it acts
+    /// on.
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        grid: &Grid,
+        at: Cells,
+        buf: &mut Buffer,
+    ) -> (Option<RenameEnd>, Option<Position>) {
         let ctx = ui.ctx().clone();
+        if self.pending {
+            dialog::field(ui, grid, at, rename_id(), &mut self.text, |e| {
+                e.lock_focus(true).interactive(false)
+            });
+            dialog::field_cells(&ctx, buf, at, rename_id(), &self.text, false);
+            return (None, None);
+        }
         let stem = stem_chars(&self.text, self.folder);
         let keys = self.keyboard.begin(&ctx, rename_id(), &self.text, stem);
-        ui.put(rect, field(&mut self.text));
+        dialog::field(ui, grid, at, rename_id(), &mut self.text, |e| {
+            e.lock_focus(true)
+        });
+        let focused = ctx.memory(|m| m.has_focus(rename_id()));
+        let caret = dialog::field_cells(&ctx, buf, at, rename_id(), &self.text, focused);
+        (self.end(keys), caret)
+    }
+
+    /// What the keys of this pass did to the field.
+    fn end(&mut self, keys: Keys) -> Option<RenameEnd> {
         if keys.escape {
             return Some(RenameEnd::Cancel);
         }
@@ -1748,22 +1820,42 @@ impl Ops {
         Some(Status::error(error))
     }
 
+    /// What the field of the dialog on top holds — the question's, else the select-group,
+    /// Copy / Move or make-folder dialog's, else the rename field's: its cells show only what
+    /// fits around the caret (a long path scrolls), so a test reads the whole here.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
+    pub fn field_text(&self) -> Option<&str> {
+        let asked = self.running.as_ref().and_then(|r| r.clash.as_ref());
+        (asked.map(|d| d.rename.as_str()))
+            .or(self.group.as_ref().map(|d| d.pattern.as_str()))
+            .or(self.copy.as_ref().map(|d| d.target.as_str()))
+            .or(self.make.as_ref().map(|d| d.name.as_str()))
+            .or(self.rename.as_ref().map(|r| r.text.as_str()))
+    }
+
     /// The entry the rename field is open on, if any (its row draws [`Ops::rename_field`]).
     pub fn renaming(&self) -> Option<&str> {
         self.rename.as_ref().map(Rename::name)
     }
 
-    /// The rename field over `rect` in the row of the entry it renames ([`Ops::renaming`]);
-    /// Enter starts the job.
-    pub fn rename_field(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let Some(rename) = &mut self.rename else {
-            return;
-        };
-        match rename.ui(ui, rect) {
+    /// The rename field at cells `at` of `grid`, in the row of the entry it renames
+    /// ([`Ops::renaming`]), written into that row's `buf`; Enter starts the job. The caret's
+    /// cell, for the painting of `buf`, while the field has the keyboard.
+    pub fn rename_field(
+        &mut self,
+        ui: &mut egui::Ui,
+        grid: &Grid,
+        at: Cells,
+        buf: &mut Buffer,
+    ) -> Option<Position> {
+        let rename = self.rename.as_mut()?;
+        let (end, caret) = rename.ui(ui, grid, at, buf);
+        match end {
             Some(RenameEnd::Commit(job)) => self.running = Some(start(&self.run, job, ui.ctx())),
             Some(RenameEnd::Cancel) => self.rename = None,
             None => {}
         }
+        caret
     }
 
     /// Each pass, after the panels: the running job's news, then one dialog over them — the
@@ -1776,7 +1868,7 @@ impl Ops {
     #[cfg_attr(not(test), allow(dead_code))] // The browser calls `poll` and `dialogs` apart.
     pub fn ui(&mut self, ctx: &egui::Context, active: &mut Panel) -> Option<Changed> {
         let changed = self.poll(active);
-        self.dialogs(ctx, active);
+        self.dialogs(ctx, ctx.content_rect(), active);
         changed
     }
 
@@ -1807,33 +1899,53 @@ impl Ops {
         })
     }
 
-    /// One dialog over the panels (see [`Ops::ui`]).
-    pub fn dialogs(&mut self, ctx: &egui::Context, active: &mut Panel) {
+    /// The cells of `grid` — the area [`Ops::dialogs`] is given, as the list's grid stands on it
+    /// — that the dialog shown there covers, its box and its shadow, for the list to blank before
+    /// it is painted: one buffer of cells laid over another (cells.rs), so a wide glyph half
+    /// under the dialog's edge is gone from the list too, as a terminal erases it.
+    pub fn covered(&self, grid: &Grid) -> Vec<Cells> {
+        let grid = *grid;
+        let asked = self.running.as_ref().and_then(|r| r.clash.as_ref());
+        let layout = match (asked, &self.report) {
+            (Some(d), _) => Some(d.layout(grid)),
+            (None, Some(view)) => Some(view.layout(grid)),
+            (None, None) => (self.group.as_ref().map(|d| d.layout(grid)))
+                .or_else(|| self.copy.as_ref().map(|d| d.layout(grid)))
+                .or_else(|| self.make.as_ref().map(|d| d.layout(grid)))
+                .or_else(|| self.delete.as_ref().map(|d| d.layout(grid))),
+        };
+        layout.iter().flat_map(Layout::covers).collect()
+    }
+
+    /// One dialog over the panels (see [`Ops::ui`]), on the cells of `area` — the window between
+    /// its title and status rows: it is cut to them, never drawn past them.
+    pub fn dialogs(&mut self, ctx: &egui::Context, area: egui::Rect, active: &mut Panel) {
+        let grid = Grid::over(area);
         if let Some(running) = self.running.as_mut().filter(|r| r.asking()) {
-            running.dialog(ctx);
+            running.dialog(ctx, grid);
         } else if let Some(view) = &mut self.report {
-            if view.ui(ctx) {
+            if view.ui(ctx, grid) {
                 self.report = None;
             }
         } else {
-            self.owners_dialogs(ctx, active);
+            self.owners_dialogs(ctx, grid, active);
         }
     }
 
     /// The select-group, Copy / Move, make-folder and delete dialogs (one is open at a time in
     /// practice: each holds the keyboard the others' keys would need).
-    fn owners_dialogs(&mut self, ctx: &egui::Context, active: &mut Panel) {
-        if let Some(end) = self.group.as_mut().and_then(|d| d.ui(ctx)) {
+    fn owners_dialogs(&mut self, ctx: &egui::Context, grid: Grid, active: &mut Panel) {
+        if let Some(end) = self.group.as_mut().and_then(|d| d.ui(ctx, grid)) {
             if let GroupEnd::Apply { select, pattern } = end {
                 active.select_group(&pattern, select);
             }
             self.group = None;
         }
-        let end = self.copy.as_mut().and_then(|d| d.ui(ctx));
+        let end = self.copy.as_mut().and_then(|d| d.ui(ctx, grid));
         self.started(ctx, end, |ops| ops.copy = None);
-        let end = self.make.as_mut().and_then(|d| d.ui(ctx));
+        let end = self.make.as_mut().and_then(|d| d.ui(ctx, grid));
         self.started(ctx, end, |ops| ops.make = None);
-        let end = self.delete.as_mut().and_then(|d| d.ui(ctx));
+        let end = self.delete.as_mut().and_then(|d| d.ui(ctx, grid));
         self.started(ctx, end, |ops| ops.delete = None);
     }
 
@@ -1912,6 +2024,50 @@ impl Ops {
     }
 }
 
+/// Tests: the cells of the last pass show `text` whole — on one row, or wrapped by cells over
+/// rows one under the other of one layer (a dialog's text wider than the dialog): blanks and
+/// the frame's glyphs left out, as a wrap drops the blank it breaks at.
+#[cfg(test)]
+pub(crate) fn shown_wrapped(drv: &crate::gui::testkit::Driver, text: &str) -> bool {
+    let bare = |s: &str| -> String {
+        let keep = |c: &char| !c.is_whitespace() && !crate::gui::cells::frame_glyph(*c);
+        s.chars().filter(keep).collect()
+    };
+    let want = bare(text);
+    assert!(
+        !want.is_empty(),
+        "{text:?}: nothing to look for but blanks and frames"
+    );
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, drv.ctx.content_rect().size());
+    let rows = drv.column(screen);
+    (0..rows.len()).any(|i| {
+        let mut joined = String::new();
+        let mut last: Option<egui::Rect> = None;
+        for (r, row) in &rows[i..] {
+            let follows = last.is_none_or(|l| r.left() == l.left() && r.top() == l.bottom());
+            if !follows || joined.len() > want.len() {
+                return false;
+            }
+            joined.push_str(&bare(row));
+            if joined.contains(&want) {
+                return true;
+            }
+            last = Some(*r);
+        }
+        false
+    })
+}
+
+/// Tests: `text` stands nowhere on screen — in no galley's text and no row of cells, not even
+/// as a part of a longer text (a button reads `[ text ]`).
+#[cfg(test)]
+pub(crate) fn nowhere(drv: &crate::gui::testkit::Driver, text: &str) -> bool {
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, drv.ctx.content_rect().size());
+    let galleys = drv.galleys();
+    !(drv.column(screen).iter()).any(|(_, row)| row.contains(text))
+        && !galleys.iter().any(|(_, g)| g.text().contains(text))
+}
+
 #[cfg(test)]
 mod tests {
     //! The pieces driven by real egui events through the test kit, in a stand-in host shaped
@@ -1923,12 +2079,14 @@ mod tests {
     //! engine is a stand-in [`Run`].
 
     mod s6;
+    mod x1b;
 
     use super::*;
     use crate::fileops::Item;
+    use crate::gui::cells;
     use crate::gui::testkit::Driver;
     use crate::gui::Window;
-    use eframe::egui::{Event, Pos2, Sense, Vec2};
+    use eframe::egui::{Event, Pos2, Rect, Sense, Vec2};
     use std::sync::Mutex;
     use std::time::SystemTime;
 
@@ -2137,8 +2295,12 @@ mod tests {
                             color,
                         );
                     }
+                    // The field in its row of cells, as the list's row holds it.
                     if let Some(rect) = field {
-                        self.ops.rename_field(ui, rect);
+                        let grid = Grid::over(rect);
+                        let mut buf = Buffer::empty(grid.all());
+                        let caret = self.ops.rename_field(ui, &grid, grid.all(), &mut buf);
+                        cells::paint(ui.painter(), grid.origin, &buf, caret);
                     }
                 });
             if let Some(changed) = self.ops.ui(&ctx, &mut self.panel) {
@@ -2556,8 +2718,13 @@ mod tests {
             drv.find_text("a-1.txt").is_some(),
             "the free name, prefilled"
         );
-        assert!(drv.find_text("Overwrite").is_none(), "never offered");
-        drv.click_text(&mut h, "Skip");
+        assert!(drv.find_text("[ Overwrite ]").is_none(), "never offered");
+        assert!(nowhere(&drv, "Overwrite"), "not even in a longer text");
+        assert!(
+            !nowhere(&drv, "Skip"),
+            "the control: a button's word is found"
+        );
+        drv.click_text(&mut h, "[ Skip ]");
         asked(&mut drv, &mut h, "b.txt");
         drv.key(&mut h, Key::Enter, Modifiers::NONE);
         asked(&mut drv, &mut h, "c.txt");
@@ -2565,8 +2732,8 @@ mod tests {
         type_text(&mut drv, &mut h, "c 사본.txt");
         drv.key(&mut h, Key::Enter, Modifiers::NONE);
         asked(&mut drv, &mut h, "d.txt");
-        drv.click_text(&mut h, "the same for the rest");
-        drv.click_text(&mut h, "Skip");
+        drv.click_text(&mut h, "[ ] the same for the rest");
+        drv.click_text(&mut h, "[ Skip ]");
         drv.until(&mut h, 5, |h| !h.changed.is_empty());
         drv.idle(&mut h, 2);
         let replies = log.lock().unwrap().replies.clone();
@@ -2629,8 +2796,8 @@ mod tests {
             if esc {
                 drv.key(&mut h, Key::Escape, Modifiers::NONE);
             } else {
-                drv.click_text(&mut h, "the same for the rest");
-                drv.click_text(&mut h, "Rename");
+                drv.click_text(&mut h, "[ ] the same for the rest");
+                drv.click_text(&mut h, "[ Rename ]");
             }
             drv.until(&mut h, 5, |h| !h.changed.is_empty());
             drv.idle(&mut h, 2);
@@ -2780,7 +2947,7 @@ mod tests {
         struct One<'a>(&'a mut ReportView, bool);
         impl Window for One<'_> {
             fn ui(&mut self, ui: &mut egui::Ui) {
-                self.1 |= self.0.ui(ui.ctx());
+                self.1 |= self.0.ui(ui.ctx(), dialog::grid(ui.ctx()));
             }
             fn ready(&self) -> bool {
                 true
@@ -2789,7 +2956,12 @@ mod tests {
         let mut drv = Driver::new(900.0, 600.0);
         let mut win = One(&mut view, false);
         drv.idle(&mut win, 2);
-        for line in lines {
+        // The head is wider than the dialog's 76 cells: it wraps by cells; every other line is
+        // a row.
+        let (head, rows) = lines.split_first().unwrap();
+        assert!(shown_wrapped(&drv, head), "{head}");
+        assert!(drv.find_text(head).is_none(), "the head on no one row");
+        for line in rows {
             assert!(drv.find_text(line).is_some(), "{line}");
         }
         let failed = drv

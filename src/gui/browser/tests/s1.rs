@@ -58,9 +58,10 @@ impl Fx {
             .any(|(r, t)| t == text && r.left() >= 500.0)
     }
 
-    /// `text` is laid out somewhere in the window, whole or scrolled (a long path in a field).
-    fn laid_out(&self, text: &str) -> bool {
-        self.drv.galleys().iter().any(|(_, g)| g.text() == text)
+    /// The open dialog's field holds `text`, whole or scrolled — read from the field: its cells
+    /// show what fits around the caret (a long path scrolls).
+    fn field_holds(&self, text: &str) -> bool {
+        self.b.ops.field_text() == Some(text)
     }
 
     /// The first painted text starting with `prefix` in the right half.
@@ -1359,7 +1360,7 @@ fn k_c1_f5_copies_the_file_to_the_other_panels_folder() {
     fx.key(Key::F5);
     assert!(fx.drv.find_text("Copy main.rs").is_some(), "asked first");
     assert!(
-        fx.laid_out(&alpha),
+        fx.field_holds(&alpha),
         "the target is the other panel's folder"
     );
     assert!(!Path::new(&format!("{alpha}/main.rs")).exists());
@@ -1406,12 +1407,25 @@ fn k_c2_a_name_in_the_way_asks_skip_rename_or_cancel() {
         fx.key(Key::Enter);
         fx.wait(|b| b.ops.holds_keyboard());
         assert!(fx.drv.find_text("Name exists").is_some());
-        assert!(fx.drv.find_text("Overwrite").is_none(), "never offered");
+        assert!(fx.drv.find_text("[ Overwrite ]").is_none(), "never offered");
+        assert!(
+            ops::nowhere(&fx.drv, "Overwrite"),
+            "not even in a longer text"
+        );
+        assert!(
+            !ops::nowhere(&fx.drv, "Skip"),
+            "the control: a button's word"
+        );
     };
     ask(&mut fx);
-    fx.drv.click_text(&mut fx.b, "Skip");
+    fx.drv.click_text(&mut fx.b, "[ Skip ]");
     fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
-    let line = fx.drv.text_starting_with("skipped").expect("the report");
+    // A report row starts with its outcome's column, as the report lays it out (in cells, two
+    // blanks end a text).
+    let line = fx
+        .drv
+        .text_starting_with("skipped     ")
+        .expect("the report");
     assert!(line.ends_with("notes.txt"), "{line}");
     untouched("Skip");
     fx.key(Key::Enter);
@@ -1426,7 +1440,10 @@ fn k_c2_a_name_in_the_way_asks_skip_rename_or_cancel() {
         "plain notes\n"
     );
     untouched("Rename");
-    let line = fx.drv.text_starting_with("renamed").expect("the report");
+    let line = fx
+        .drv
+        .text_starting_with("renamed     ")
+        .expect("the report");
     assert!(line.ends_with("notes.txt → notes-1.txt"), "{line}");
     fx.key(Key::Enter);
 
@@ -1487,7 +1504,10 @@ fn k_c3_a_folder_copy_keeps_its_link_and_reports_the_fifo() {
         Path::new("inner.txt")
     );
     assert!(!Path::new(&format!("{copy}/pipe")).exists());
-    let line = fx.drv.text_starting_with("skipped").expect("the report");
+    let line = fx
+        .drv
+        .text_starting_with("skipped     ")
+        .expect("the report");
     assert!(line.contains("alpha/pipe"), "{line}");
     fx.key(Key::Enter);
     assert!(!fx.b.ops.holds_keyboard());
@@ -1598,7 +1618,7 @@ fn k_c5_the_target_field_takes_another_host() {
     fx.key(Key::F5);
     // The field's text is selected: typing replaces it.
     fx.typed(&format!("box:{alpha}"));
-    assert!(fx.laid_out(&format!("box:{alpha}")));
+    assert!(fx.field_holds(&format!("box:{alpha}")));
     fx.key(Key::Enter);
     fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     assert_eq!(
@@ -1647,7 +1667,7 @@ fn k_m1_f6_moves_within_a_host_over_one_connection() {
     let alpha = fx.other_into("alpha");
     fx.select("notes.txt");
     fx.key(Key::F6);
-    assert!(fx.laid_out(&format!("box:{alpha}")), "the remote form");
+    assert!(fx.field_holds(&format!("box:{alpha}")), "the remote form");
     fx.key(Key::Enter);
     fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     assert!(!Path::new(&format!("{}/notes.txt", fx.root)).exists());
@@ -1904,7 +1924,7 @@ fn the_status_row_names_the_item_a_question_is_about() {
         fx.status(),
         "copying 2/2 · notes.txt · waiting for an answer"
     );
-    fx.drv.click_text(&mut fx.b, "Skip");
+    fx.drv.click_text(&mut fx.b, "[ Skip ]");
     fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     fx.key(Key::Enter);
 }
@@ -2005,7 +2025,7 @@ fn a_question_waits_for_the_list_while_a_viewer_is_open() {
         fx.drv.find_text("Name exists").is_some(),
         "asked in the list"
     );
-    fx.drv.click_text(&mut fx.b, "Skip");
+    fx.drv.click_text(&mut fx.b, "[ Skip ]");
     fx.wait(|b| !b.ops.busy() && b.listing.is_empty());
     assert!(fx.drv.text_starting_with("skipped").is_some(), "the report");
     fx.key(Key::Enter);
@@ -2304,7 +2324,7 @@ fn k_c4_esc_mid_transfer_leaves_nothing_half_made() {
     );
     let line = fx
         .drv
-        .text_starting_with("failed")
+        .text_starting_with("failed      ")
         .expect("the stopped item");
     assert!(
         line.contains("large.bin") && line.contains("stopped"),
