@@ -879,5 +879,56 @@ fn f8_a_rebuild_esc_stops_leaves_the_sets_encoding_as_it_reads() {
     );
 }
 
+/// A `connect` over this machine that refuses every session once `refuse` is set, in ssh's own
+/// words for a session sshd would not open (06 §6).
+fn refusing(refuse: &Arc<AtomicBool>) -> Connect {
+    let refuse = refuse.clone();
+    Arc::new(move || {
+        if refuse.load(Ordering::SeqCst) {
+            anyhow::bail!("channel 3: open failed: administratively prohibited: open failed");
+        }
+        Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)
+    })
+}
+
+/// 06 §6: a view whose make is refused after the view on screen closed (its prompt answered)
+/// leaves the viewer — and the refusal is said on the list's status row, not lost with it. A
+/// Hex view after an image's Discard, a Text view after a binary's.
+#[test]
+fn a_refused_make_after_a_discard_is_said_on_the_list() {
+    for (name, slot) in [("photo.png", 2u8), ("data.bin", 3)] {
+        let refuse = Arc::new(AtomicBool::new(false));
+        let mut fx = fixture_with(None, refusing(&refuse), None);
+        fx.open(name);
+        if name == "photo.png" {
+            edit_image(&mut fx);
+        } else {
+            fx.key(Key::Enter);
+            fx.typed("7A");
+            fx.key(Key::Escape);
+        }
+        digit(&mut fx, slot);
+        assert!(
+            fx.drv.find_text("Unsaved changes").is_some(),
+            "{name}: the prompt"
+        );
+        refuse.store(true, Ordering::SeqCst);
+        fx.drv.click_text_on_top(&mut fx.b, "Discard");
+        fx.settle();
+        fx.drv.idle(&mut fx.b, 2);
+        assert!(fx.b.viewer.is_none(), "{name}: back at the list");
+        assert_eq!(
+            fx.b.status.text,
+            crate::stream::SESSION_REFUSED,
+            "{name}: the refusal said"
+        );
+        assert!(
+            shows(&fx, "the remote refused another SSH session"),
+            "{name}"
+        );
+    }
+}
+
 use crate::views::{Hold, View};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};

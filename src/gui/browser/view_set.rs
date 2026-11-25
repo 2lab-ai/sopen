@@ -294,6 +294,16 @@ fn blank() -> Embedded {
     }
 }
 
+/// What the set says (`Effect::Say`), on the status row: a refused session in the error colour,
+/// as the opening says it (06 §6).
+fn said(words: String) -> Status {
+    if crate::stream::session_refused(&words) {
+        Status::error(words)
+    } else {
+        Status::info(words)
+    }
+}
+
 /// Text and Raw are one document (D8): one window.
 fn same_doc(a: View, b: View) -> bool {
     let doc = |v: View| match v {
@@ -606,6 +616,8 @@ impl Browser {
     fn view_effects(&mut self, ctx: &egui::Context, effects: Vec<Effect>, ready: Option<Made>) {
         let mut ready = ready;
         let mut next = None;
+        // What this batch said: a Leave after it keeps it (below).
+        let mut words: Option<Status> = None;
         for effect in effects {
             let Some(viewer) = self.viewer.as_mut() else {
                 return;
@@ -714,10 +726,18 @@ impl Browser {
                     }
                 }
                 Effect::WaitForSave => self.status = Status::info("saving…"),
-                Effect::Say(words) => self.status = Status::info(words),
+                Effect::Say(said_now) => {
+                    self.status = said(said_now);
+                    words = Some(self.status.clone());
+                }
                 Effect::Leave => {
+                    // What this batch said is said on the list (a make refused after the view on
+                    // screen closed, 06 §6): leaving would put the list's own line over it.
                     self.drop_viewer();
                     self.after_viewer(ctx);
+                    if let Some(words) = words {
+                        self.status = words;
+                    }
                     return;
                 }
             }
