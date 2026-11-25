@@ -3769,3 +3769,58 @@ fn a_window_receipt_that_stalls_after_its_dump_ends_at_the_deadline() {
     assert!(err.contains("the cells hook stalled for 1 s"), "{err}");
     assert!(took < Duration::from_secs(10), "{took:?}");
 }
+
+/// The probe reads every answer that came with the device attributes: a terminal that sends them
+/// first, then the report and the kitty flags, in one read, is still read whole.
+#[test]
+fn ts6_the_probe_reads_the_answers_after_the_attributes_in_the_same_read() {
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: two out-pointers to live ints; no name, termios or size asked for.
+    let made = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(made, 0, "openpty");
+    // SAFETY: the slave this test opened; a zeroed termios is overwritten by tcgetattr.
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        assert_eq!(libc::tcgetattr(slave, &mut t), 0);
+        libc::cfmakeraw(&mut t);
+        assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &t), 0);
+    }
+    let reply = "\x1b[?1;2c\x1b[1;3R\x1b[?0u";
+    // SAFETY: writes a live buffer to the master this test opened (read once the probe asks).
+    unsafe { libc::write(master, reply.as_ptr().cast(), reply.len()) };
+    let at = Instant::now();
+    let probed = probe(slave, slave, Duration::from_secs(5)).unwrap();
+    // SAFETY: closes the two ends this test opened.
+    unsafe {
+        libc::close(slave);
+        libc::close(master);
+    }
+    assert!(probed.ambiguous, "the report after the attributes");
+    assert!(probed.kitty, "the kitty flags after the attributes");
+    assert!(at.elapsed() < Duration::from_secs(2), "{:?}", at.elapsed());
+}
+
+/// A name's box line between a wide glyph and a letter (`한─b`, `b─한`) is content: the glyphs on
+/// either side are judged whole, a wide one's second cell no blank. Sent as written.
+#[test]
+fn ts6_a_box_line_beside_a_wide_glyph_in_a_name_stays_as_written() {
+    let p = chrome::PALETTE;
+    let text = Pen::new(p.text, p.back);
+    for name in ["한─b", "b─한"] {
+        let screen = one_row(10, &[(name, text)]);
+        let x = (0..10u16)
+            .find(|&x| screen.buf[(x, 0)].symbol() == "─")
+            .unwrap();
+        assert!(!chrome(&screen.buf, x, 0), "{name}: a name's");
+        let shown: String = row_of(&shown_wide(&screen)).concat();
+        assert!(shown.starts_with(name), "{name}: {shown:?}");
+    }
+}

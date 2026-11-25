@@ -118,8 +118,9 @@ pub(crate) trait Tty {
     fn stopped(&self) -> Option<i32>;
 }
 
-/// The terminal sopen runs in: crossterm's raw mode, size, keyboard query and events, each read
-/// only once the input is known not to have hung up ([`wait_input`]); the system's input queue;
+/// The terminal sopen runs in: crossterm's raw mode, size and events, each read only once the
+/// input is known not to have hung up ([`wait_input`]); the start's probe ([`probe`]: the
+/// ambiguous width and the kitty keyboard protocol in one round trip); the system's input queue;
 /// SIGTERM, SIGHUP and SIGINT caught around raw mode ([`Signals`]); the standard error held
 /// while the terminal is ([`Stderr`]).
 #[derive(Default)]
@@ -333,11 +334,13 @@ struct Answered {
     report: Option<(u16, u16)>,
     /// The kitty flags came (`CSI ? flags u`).
     kitty: bool,
-    /// The device attributes (`CSI ? … c`), the last answer, came.
+    /// The device attributes (`CSI ? … c`), the last answer asked for, came.
     all_in: bool,
 }
 
-/// What the answers in `got` (keys typed meanwhile among them) say, up to the device attributes.
+/// What the answers in `got` (keys typed meanwhile among them) say: all of them, those read with
+/// the device attributes too (a terminal may send them first) — the attributes end the wait, not
+/// the reading.
 fn answers(got: &[u8]) -> Answered {
     let mut out = Answered::default();
     let mut at = 0;
@@ -360,10 +363,7 @@ fn answers(got: &[u8]) -> Answered {
                 out.report = read.or(out.report);
             }
             b'u' if body.starts_with('?') => out.kitty = true,
-            b'c' if body.starts_with('?') => {
-                out.all_in = true;
-                return out;
-            }
+            b'c' if body.starts_with('?') => out.all_in = true,
             _ => {}
         }
         at = end + 1;
@@ -1035,8 +1035,9 @@ fn glyphs(buf: &Buffer, y: u16) -> Vec<Glyph> {
 
 /// Whether the cell at (`x`, `y`) of `buf` is sopen's own chrome, which §10's stand-ins are for
 /// (content is not substituted, 10 §10): the cut's `…`, or a frame's cell — a box line or block,
-/// a scroll bar's arrow ([`cells::frame_cell`]) — but for a box line between two letters of its
-/// colours, which is a name's (`a─b`).
+/// a scroll bar's arrow ([`cells::frame_cell`]) — but for a box line between two glyphs of its
+/// colours that are no blank and no frame's, judged whole (a wide one's second cell is no
+/// blank), which is a name's (`a─b`, `한─b`).
 pub(crate) fn chrome(buf: &Buffer, x: u16, y: u16) -> bool {
     let cell = &buf[(x, y)];
     let symbol = cell.symbol();
@@ -1047,13 +1048,22 @@ pub(crate) fn chrome(buf: &Buffer, x: u16, y: u16) -> bool {
         return false;
     }
     let a = buf.area;
+    // The glyphs on either side, whole: the one before may be a wide glyph, `x - 1` its second
+    // cell.
+    let wide_before = x >= a.left() + 2 && cells::width(buf[(x - 2, y)].symbol()) > 1;
+    let before = if wide_before {
+        x.checked_sub(2)
+    } else {
+        x.checked_sub(1)
+    };
     let letter = |k: u16| {
         let c = &buf[(k, y)];
         (c.fg, c.bg) == (cell.fg, cell.bg)
             && !c.symbol().trim().is_empty()
             && !c.symbol().chars().any(cells::frame_glyph)
     };
-    let inside = x > a.left() && x + 1 < a.right() && letter(x - 1) && letter(x + 1);
+    let inside =
+        before.is_some_and(|k| k >= a.left() && letter(k)) && x + 1 < a.right() && letter(x + 1);
     !inside
 }
 
