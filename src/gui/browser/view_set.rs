@@ -107,7 +107,9 @@ pub(super) struct Views {
     /// A give-back asked for (the view that saved hidden or closed), as the session's requests
     /// stood then; refused for now while an operation holds the session, it is asked again on
     /// a later pass ([`SaveSlot::give_back`]).
-    giving: Option<u64>,
+    giving: Option<prepare::Asked>,
+    /// The view a switch chose that waits for what the view on screen runs (D2).
+    waited: Option<Slot>,
 }
 
 /// The stream the views of a remote file share, and where it stood (its epoch, 06 §5) when
@@ -160,11 +162,18 @@ impl KeptStream {
         }
     }
 
-    /// A reload the set was not told of yet (the file is the version open now).
+    /// A reload the set was not told of yet.
     fn reloaded(&mut self) -> bool {
         let moved = self.told.moved();
-        self.behind &= !moved;
+        self.caught_up(moved);
         moved
+    }
+
+    /// A reload was seen (`moved`): the stream is on the file again — if it reads it. A reload
+    /// that failed (the file gone meanwhile) leaves it behind, so the next make reloads.
+    fn caught_up(&mut self, moved: bool) {
+        let live = matches!(self.stream.source.state(), State::Live | State::Replaced);
+        self.behind &= !(moved && live);
     }
 }
 
@@ -300,6 +309,7 @@ pub(super) fn open_paged(
         stream: stream.map(KeptStream::new),
         save,
         giving: None,
+        waited: None,
     }
 }
 
@@ -570,6 +580,18 @@ impl Views {
         }
     }
 
+    /// Tests: a give-back is asked for and not done yet.
+    #[cfg(test)]
+    pub(super) fn giving(&self) -> bool {
+        self.giving.is_some()
+    }
+
+    /// Tests: the stream the views share is behind the file ([`KeptStream::behind`]).
+    #[cfg(test)]
+    pub(super) fn behind(&self) -> bool {
+        self.stream.as_ref().is_some_and(|k| k.behind)
+    }
+
     /// Tests: the stream the views share.
     #[cfg(test)]
     pub(super) fn kept_source(&self) -> Option<crate::stream::Source> {
@@ -769,6 +791,8 @@ impl Browser {
                     kept.behind = true;
                 }
             }
+            // The set goes on with a switch that waited for it.
+            viewer.views.waited = None;
             self.view_input(ctx, Input::SaveEnded { landed: true });
         }
     }
@@ -891,7 +915,16 @@ impl Browser {
             return;
         };
         let now = views_now(viewer);
+        let chose = match input {
+            Input::Choose(slot) => Some(slot),
+            _ => None,
+        };
         let effects = viewer.views.set.apply(input, now);
+        // A switch that waits for what the view on screen runs (D2): asked again if that ends
+        // without a Save that landed ([`Browser::poll_saves`]).
+        if effects.contains(&Effect::WaitForSave) {
+            viewer.views.waited = chose;
+        }
         self.view_effects(ctx, effects, None);
     }
 
@@ -953,7 +986,21 @@ impl Browser {
                 }
                 // D14: the view just hidden gives its save session back; its `Origin` connects
                 // again on its next use.
-                Effect::ReleaseSaveConnection(_) => ask_give_back(&mut viewer.views, ctx),
+                // Only for a window that holds nothing (D2: the switch waited for its Save, Save
+                // copy, Save As or Export): its operation, publish and cleanup included, ended.
+                Effect::ReleaseSaveConnection(view) => {
+                    let views = &mut viewer.views;
+                    let kept = views
+                        .hidden
+                        .iter_mut()
+                        .rev()
+                        .find(|k| same_doc(k.view, view));
+                    let clean = kept.is_none_or(|k| k.embedded.window.hold() == Hold::Clean);
+                    debug_assert!(clean, "a give-back for {view:?}, which holds something");
+                    if clean {
+                        ask_give_back(views, ctx);
+                    }
+                }
                 // A view made with no stream kept opens one, and the set keeps it from then on
                 // (`poll_making`): nothing to do ahead of the make.
                 Effect::OpenStream => {}
@@ -1152,12 +1199,13 @@ impl Browser {
         let (ticket, view) = (making.ticket, making.view);
         if making.reload {
             // The make's own reload of the kept stream (`KeptStream::behind`): the set moves past
-            // it — it is no view's reload — and the stream is on the file again, whether or not
-            // the view was made.
+            // it — it is no view's reload. Only a reload seen puts the stream on the file again:
+            // a make that failed before it (the file gone meanwhile) leaves it behind, and the
+            // next make reloads.
             if let Some(kept) = viewer.views.stream.as_mut() {
-                kept.told.moved();
+                let seen = kept.told.moved();
                 kept.at_save.moved();
-                kept.behind = false;
+                kept.caught_up(seen);
             }
         }
         let made = result.and_then(|opened| {
@@ -1231,10 +1279,16 @@ impl Browser {
         }
         let hold = viewer.embedded.window.hold();
         if waiting && hold != Hold::Saving {
-            // The switch's `saving…` is over: the Save did not land, so the view stays (07
-            // §10), the window saying why.
+            // The switch's `saving…` is over with no Save that landed: an Export or a Save copy
+            // (they leave the file as it was), or a Save that did not. The set lets the view
+            // stay (07 §10), and the switch is asked again: clean, it goes ahead; with edits
+            // still unsaved, it asks the close prompt (D2).
             self.status = Status::default();
+            let again = viewer.views.waited.take();
             self.view_input(ctx, Input::SaveEnded { landed: false });
+            if let Some(slot) = again {
+                self.view_input(ctx, Input::Choose(slot));
+            }
             return;
         }
         let question = viewer.embedded.window.view_state() == view_keys::State::Question;
@@ -1367,7 +1421,7 @@ fn kept(view: View, made: Made, read_only: bool) -> Kept {
 /// or (an operation holds it) on a later pass ([`give_back`]).
 fn ask_give_back(views: &mut Views, ctx: &egui::Context) {
     if let Some(save) = &views.save {
-        views.giving = Some(save.mark());
+        views.giving = Some(save.ask());
         give_back(views, ctx);
     }
 }
@@ -1375,10 +1429,10 @@ fn ask_give_back(views: &mut Views, ctx: &egui::Context) {
 /// A give-back asked for, asked again: done, or the session is the view on screen's now (it
 /// used it since), or — an operation holds it — again on a later pass.
 fn give_back(views: &mut Views, ctx: &egui::Context) {
-    let (Some(save), Some(since)) = (&views.save, views.giving) else {
+    let (Some(save), Some(asked)) = (&views.save, views.giving) else {
         return;
     };
-    match save.give_back(since) {
+    match save.give_back(asked) {
         prepare::GiveBack::NotNow => ctx.request_repaint_after(GIVE_BACK_AGAIN),
         prepare::GiveBack::Done | prepare::GiveBack::InUse => views.giving = None,
     }

@@ -419,10 +419,11 @@ window on that host shares that one budget.
   Text, a view 1 made again) reads through it — no session of its own, nothing read again. Their
   `Origin`s connect through one save session, opened at the first use by the view on screen (a
   Save, Save copy, Save As or Export; hex: the recovery of an earlier session's journal), one
-  connect at a time, and given back when that view is hidden or closed — once the operation on
-  it is over (no request running, no file open on it, its last request a second old), asked
-  again on later passes until then, and closed beside the window's pass; its next use connects
-  again. So a viewer holds 1, and 2 from its
+  connect at a time, and given back when that view is hidden or closed — only once its window
+  holds nothing (a switch waits for its Save, Save copy, Save As or Export, 08 D2, and goes ahead
+  when it ends), so the operation, its publish and cleanup included, is over; never while a
+  request runs or a file is open on it (asked again on later passes until then); closed beside
+  the window's pass; its next use connects again. So a viewer holds 1, and 2 from its
   first Save, however many of its views saved. A page file's Page view serves the page on a
   connection of its own (09 §3.1), which it keeps while hidden (until WV-F): with Hex and Text,
   which open and read one stream, 2 — and 3 while a Save of the Hex view runs; once it lands the

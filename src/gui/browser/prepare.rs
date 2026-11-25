@@ -19,7 +19,7 @@
 
 mod shared;
 
-pub use shared::{GiveBack, SaveSlot, Shared, Stream};
+pub use shared::{Asked, GiveBack, SaveSlot, Shared, Stream};
 
 use super::Connect;
 use crate::cache::{self, Claim};
@@ -255,9 +255,10 @@ impl Request<'_> {
     /// A remote view's `Origin`, at `at`: it connects on its first use through `save`, the
     /// session its views share and a hidden one gives back (D14).
     fn saving_origin(&self, label: &str, save: &SaveSlot, at: Stat) -> Origin {
+        let (fs, reconnect) = save.origin_fs(self.connect.clone());
         Origin::new(
-            save.handle(),
-            Some(save.reconnect(self.connect.clone())),
+            fs,
+            Some(reconnect),
             Some(label.to_string()),
             self.abs.to_string(),
             at,
@@ -1604,9 +1605,10 @@ fn preview_parts(
     // what the preview connection's server can do where that was asked of it.
     let origin = |answers: Placeholder, at: Stat| {
         let save = SaveSlot::new(answers);
+        let (fs, reconnect) = save.origin_fs(connect.clone());
         let origin = Origin::new(
-            save.handle(),
-            Some(save.reconnect(connect.clone())),
+            fs,
+            Some(reconnect),
             Some(label.to_string()),
             real.clone(),
             at,

@@ -11,14 +11,17 @@
 //!   first after a give-back — connects under the slot's lock: a second use at the same moment
 //!   waits for that session and uses it, never a second one. `Origin::fs`'s reconnect replaces a
 //!   session only when it failed a request, so two of them replace it once.
-//! - **A give-back waits for the operation** ([`SaveSlot::give_back`]): never while a request
-//!   runs, a file handle is open (a hex Save's by handle, 07 §4) or its last request is less than
-//!   [`LEASE_QUIET`] old (its publish and cleanup may follow: an operation's end is known only
-//!   once its requests stop); never once another view used the session after it was asked for.
-//!   Refused for now, it is asked again on a later pass. The session goes out of the slot under
+//! - **A give-back comes after the operation** ([`SaveSlot::give_back`]). It is asked for only
+//!   for a view whose window holds nothing — no Save, Save copy, Save As or Export running (08
+//!   D2: a switch waits for one) — so the operation, its publish and cleanup included, has ended.
+//!   Beside that, never while a request runs or a file handle is open (a hex Save's by handle,
+//!   07 §4); refused for now, it is asked again on a later pass. Requests of the view it was
+//!   asked for — its owner ([`Asked`]) — never make the session another's; another view's
+//!   request since does, and the give-back is dropped. The session goes out of the slot under
 //!   its lock and is closed beside the caller — an SFTP session's close waits for its reply — so
 //!   the window's pass never waits for it.
-//! - **A file handle reaches only the session it was opened on**: once that one went back it is
+//! - **A file handle reaches only the session it was opened on** — the open and its stamp in
+//!   one hold of the slot's lock: once that session went back or was replaced, the handle is
 //!   refused, never sent on the session made since.
 //! - **What the server can do** (`can_replace`, `can_link`, `can_copy`, `can_fsync`, the hash
 //!   limit) is kept beside the lock, as the session last made answered (before the first, as
@@ -39,10 +42,6 @@ use anyhow::{anyhow, Result};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
-use std::time::{Duration, Instant};
-
-/// How long an operation keeps the session after its last request (a give-back waits so long).
-pub const LEASE_QUIET: Duration = Duration::from_secs(1);
 
 /// The stream of a remote file, kept beside its views (D13): a view made later reads through
 /// it, so nothing it shows is read again.
@@ -85,10 +84,25 @@ pub struct SaveSlot(Arc<Inner>);
 struct Inner {
     slot: Mutex<Slot>,
     answers: Answers,
-    /// Requests sent so far: a give-back asked for at `n` gives nothing once one came since.
+    /// Requests sent so far, numbered: the last one's number and its owner (an `Origin`, as
+    /// [`SaveSlot::origin_fs`] made it; 0: none yet).
     requests: AtomicU64,
+    last_owner: AtomicU64,
+    /// Owners given out so far.
+    owners: AtomicU64,
     /// File handles open on the session: each holds it.
     handles: Arc<AtomicUsize>,
+}
+
+/// The last handle on the slot gone (the viewer closed): its session closes beside, never on the
+/// window's thread that dropped it.
+impl Drop for Inner {
+    fn drop(&mut self) {
+        let slot = self.slot.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = slot.conn.take() {
+            close_beside(conn);
+        }
+    }
 }
 
 /// What the server can do, as the session last made answered (as given before the first).
@@ -112,10 +126,20 @@ struct Slot {
     /// The connect of this use just failed: `Origin::fs`'s reconnect, right after, says so
     /// rather than ask the server a second time.
     refused: Option<anyhow::Error>,
-    /// When the last request ended.
-    last: Option<Instant>,
-    /// [`LEASE_QUIET`]; tests shorten it.
-    quiet: Duration,
+    /// Each owner's last request number: a give-back asked for one owner is dropped once another
+    /// sent one since.
+    by_owner: Vec<(u64, u64)>,
+    /// Tests: run between a file's open and its stamp (a reconnect forced there).
+    #[cfg(test)]
+    after_open: Option<Box<dyn FnMut() + Send>>,
+}
+
+/// A give-back asked for ([`SaveSlot::ask`]): where the requests stood, and whose the session
+/// was — the owner of the last request, the view hidden or closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Asked {
+    mark: u64,
+    owner: u64,
 }
 
 /// What [`SaveSlot::give_back`] did.
@@ -125,7 +149,7 @@ pub enum GiveBack {
     Done,
     /// An operation holds the session: ask again later.
     NotNow,
-    /// Another view used the session since it was asked for: it is that one's now.
+    /// Another owner used the session since it was asked for: it is that one's now.
     InUse,
 }
 
@@ -189,8 +213,9 @@ impl SaveSlot {
                 session: 0,
                 failed: false,
                 refused: None,
-                last: None,
-                quiet: LEASE_QUIET,
+                by_owner: Vec::new(),
+                #[cfg(test)]
+                after_open: None,
             }),
             answers: Answers {
                 can_replace: AtomicBool::new(can.can_replace),
@@ -200,6 +225,8 @@ impl SaveSlot {
                 hash_limit: AtomicU64::new(crate::remote::HASH_CHECK_MAX),
             },
             requests: AtomicU64::new(0),
+            last_owner: AtomicU64::new(0),
+            owners: AtomicU64::new(0),
             handles: Arc::default(),
         }))
     }
@@ -208,16 +235,38 @@ impl SaveSlot {
         self.0.slot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// An `Origin`'s connection: the slot's session, connected at its first use.
+    fn owner(&self) -> u64 {
+        self.0.owners.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// An `Origin`'s connection and reconnect ([`SaveSlot::handle`], [`SaveSlot::reconnect`]),
+    /// one owner for both: its requests, across a reconnect, are one view's.
+    pub fn origin_fs(&self, connect: Connect) -> (Box<dyn RemoteFs + Send>, Reconnect) {
+        let owner = self.owner();
+        (self.handle_of(owner), self.reconnect_of(owner, connect))
+    }
+
+    /// A connection onto the slot's session, connected at its first use: an owner of its own.
+    #[cfg_attr(not(test), allow(dead_code))] // The tests' handles.
     pub fn handle(&self) -> Box<dyn RemoteFs + Send> {
-        Box::new(SlotFs(self.clone()))
+        self.handle_of(self.owner())
+    }
+
+    fn handle_of(&self, owner: u64) -> Box<dyn RemoteFs + Send> {
+        Box::new(SlotFs(self.clone(), owner))
+    }
+
+    /// An `Origin`'s reconnect, an owner of its own ([`SaveSlot::origin_fs`]).
+    #[cfg_attr(not(test), allow(dead_code))] // The tests' reconnects.
+    pub fn reconnect(&self, connect: Connect) -> Reconnect {
+        self.reconnect_of(self.owner(), connect)
     }
 
     /// An `Origin`'s reconnect, for when its probe failed: the slot's session replaced when it
     /// failed a request (closed beside), connected when there is none — the one connect path,
     /// so another `Origin`'s reconnect at the same moment finds the new one and connects no
-    /// more — and a handle onto it.
-    pub fn reconnect(&self, connect: Connect) -> Reconnect {
+    /// more — and a handle onto it, of `owner`.
+    fn reconnect_of(&self, owner: u64, connect: Connect) -> Reconnect {
         let slot = self.clone();
         slot.lock().connect.get_or_insert(connect);
         Box::new(move || {
@@ -232,34 +281,36 @@ impl SaveSlot {
             }
             held.conn(&slot.0.answers)?;
             drop(held);
-            Ok(slot.handle())
+            Ok(slot.handle_of(owner))
         })
     }
 
-    /// Where the slot's requests stand: a give-back asked for now gives nothing back once
-    /// another request comes ([`GiveBack::InUse`]).
-    pub fn mark(&self) -> u64 {
-        self.0.requests.load(Ordering::SeqCst)
+    /// A give-back asked for now — for the owner of the last request, the view that used the
+    /// session — given back by [`SaveSlot::give_back`]. Never waits.
+    pub fn ask(&self) -> Asked {
+        Asked {
+            mark: self.0.requests.load(Ordering::SeqCst),
+            owner: self.0.last_owner.load(Ordering::SeqCst),
+        }
     }
 
     /// D14: the session goes back — out of the slot under its lock, closed beside — so the slot
-    /// is empty until the next use connects again. Not while an operation holds it
-    /// ([`GiveBack::NotNow`]: ask again), and not once a request came since `since`
-    /// ([`GiveBack::InUse`]). Never waits: for the window's pass.
-    pub fn give_back(&self, since: u64) -> GiveBack {
-        if self.mark() > since {
-            return GiveBack::InUse;
-        }
+    /// is empty until the next use connects again. Not while a request runs or a file is open
+    /// on it ([`GiveBack::NotNow`]: ask again), and not once another owner than `asked`'s sent
+    /// a request since ([`GiveBack::InUse`]: the session is that one's). Never waits: for the
+    /// window's pass.
+    pub fn give_back(&self, asked: Asked) -> GiveBack {
         let mut slot = match self.0.slot.try_lock() {
             Ok(slot) => slot,
             Err(TryLockError::Poisoned(p)) => p.into_inner(),
             Err(TryLockError::WouldBlock) => return GiveBack::NotNow,
         };
-        if self.mark() > since {
+        let adopted =
+            (slot.by_owner.iter()).any(|&(owner, at)| owner != asked.owner && at > asked.mark);
+        if adopted {
             return GiveBack::InUse;
         }
-        let recent = slot.last.is_some_and(|at| at.elapsed() < slot.quiet);
-        if self.0.handles.load(Ordering::SeqCst) > 0 || recent {
+        if self.0.handles.load(Ordering::SeqCst) > 0 {
             return GiveBack::NotNow;
         }
         let conn = slot.conn.take();
@@ -273,13 +324,13 @@ impl SaveSlot {
     /// [`SaveSlot::give_back`] asked now; `true`: done.
     #[cfg_attr(not(test), allow(dead_code))] // The tests' give-back.
     pub fn release(&self) -> bool {
-        self.give_back(self.mark()) == GiveBack::Done
+        self.give_back(self.ask()) == GiveBack::Done
     }
 
-    /// Tests: how long an operation keeps the session after its last request.
+    /// Tests: what runs between a file's open and its stamp.
     #[cfg(test)]
-    pub fn set_quiet(&self, quiet: Duration) {
-        self.lock().quiet = quiet;
+    pub fn after_open(&self, hook: Box<dyn FnMut() + Send>) {
+        self.lock().after_open = Some(hook);
     }
 
     /// The slot holds a session now.
@@ -321,13 +372,24 @@ impl Drop for Held {
     }
 }
 
-/// A handle onto a [`SaveSlot`]'s session: every call goes to the session the slot holds at
-/// that moment, connected first when there is none.
-struct SlotFs(SaveSlot);
+/// A handle onto a [`SaveSlot`]'s session, of one owner: every call goes to the session the
+/// slot holds at that moment, connected first when there is none.
+struct SlotFs(SaveSlot, u64);
 
 impl SlotFs {
     fn inner(&self) -> &Inner {
         &self.0 .0
+    }
+
+    /// A request of this handle's owner begins (the slot's lock held).
+    fn count(&self, slot: &mut Slot) {
+        let inner = self.inner();
+        let n = inner.requests.fetch_add(1, Ordering::SeqCst) + 1;
+        inner.last_owner.store(self.1, Ordering::SeqCst);
+        match slot.by_owner.iter_mut().find(|(owner, _)| *owner == self.1) {
+            Some(entry) => entry.1 = n,
+            None => slot.by_owner.push((self.1, n)),
+        }
     }
 
     /// One request on the session (or a composed one: the slot's lock is held throughout, so
@@ -339,13 +401,12 @@ impl SlotFs {
     ) -> std::result::Result<T, E> {
         let inner = self.inner();
         let mut slot = self.0.lock();
-        inner.requests.fetch_add(1, Ordering::SeqCst);
+        self.count(&mut slot);
         let result = match slot.conn(&inner.answers) {
             Ok(conn) => f(conn.as_mut()),
             Err(e) => Err(refused(e)),
         };
         slot.failed |= result.is_err() && slot.conn.is_some();
-        slot.last = Some(Instant::now());
         result
     }
 
@@ -361,7 +422,8 @@ impl SlotFs {
     }
 
     /// A file opened (or created) on the session the slot holds, stamped with that session and
-    /// holding it while it is open.
+    /// holding it while it is open — the open, the stamp and the hold in one hold of the slot's
+    /// lock, so no reconnect comes between: the stamp is the session the open went to.
     fn opening<E>(
         &self,
         path: &str,
@@ -369,16 +431,27 @@ impl SlotFs {
         f: impl FnOnce(&mut dyn PatchFs) -> std::result::Result<Handle, E>,
     ) -> std::result::Result<Handle, E> {
         let inner = self.inner();
-        let mut session = 0;
-        let handle = self.request(&refused, |conn| match conn.patcher() {
-            Some(patcher) => f(patcher),
-            None => Err(refused(no_patcher())),
-        });
-        if handle.is_ok() {
-            session = self.0.lock().session;
+        let mut slot = self.0.lock();
+        self.count(&mut slot);
+        let opened = match slot.conn(&inner.answers).map(|c| c.patcher()) {
+            Ok(Some(patcher)) => f(patcher),
+            Ok(None) => Err(refused(no_patcher())),
+            Err(e) => Err(refused(e)),
+        };
+        #[cfg(test)]
+        if let Some(mut hook) = slot.after_open.take() {
+            hook();
+            slot.after_open = Some(hook);
         }
-        let handle = handle?;
-        let _held = Held::new(&inner.handles);
+        let handle = match opened {
+            Ok(handle) => handle,
+            Err(e) => {
+                slot.failed |= slot.conn.is_some();
+                return Err(e);
+            }
+        };
+        let (session, _held) = (slot.session, Held::new(&inner.handles));
+        drop(slot);
         Ok(Handle::new(
             path,
             Stamped {
@@ -398,9 +471,8 @@ impl SlotFs {
         other: Option<&mut Handle>,
         f: impl FnOnce(&mut dyn PatchFs, &mut Handle, Option<&mut Handle>) -> Result<T>,
     ) -> Result<T> {
-        let inner = self.inner();
         let mut slot = self.0.lock();
-        inner.requests.fetch_add(1, Ordering::SeqCst);
+        self.count(&mut slot);
         let session = slot.session;
         let gone = |h: &Handle| {
             anyhow!(
@@ -427,7 +499,6 @@ impl SlotFs {
             None => Err(no_patcher()),
         };
         slot.failed |= result.is_err();
-        slot.last = Some(Instant::now());
         result
     }
 }
@@ -519,7 +590,7 @@ impl RemoteFs for SlotFs {
         let taken = {
             let inner = self.inner();
             let mut slot = self.0.lock();
-            inner.requests.fetch_add(1, Ordering::SeqCst);
+            self.count(&mut slot);
             match slot.conn(&inner.answers) {
                 Ok(_) => Ok((slot.conn.take().expect("connected"), slot.session)),
                 Err(error) => Err(error),
@@ -676,15 +747,13 @@ impl PatchFs for SlotFs {
             handle,
             _held,
         } = stamped;
-        let inner = self.inner();
         let mut slot = self.0.lock();
-        inner.requests.fetch_add(1, Ordering::SeqCst);
+        self.count(&mut slot);
         if slot.session == session {
             if let Some(patcher) = slot.conn.as_mut().and_then(|c| c.patcher()) {
                 patcher.close(handle);
             }
         }
-        slot.last = Some(Instant::now());
     }
 }
 
@@ -709,9 +778,10 @@ mod tests {
 
     fn origin(slot: &SaveSlot, connect: Connect, abs: &str) -> Origin {
         let at = LocalFs::new().stat(abs).unwrap();
+        let (fs, reconnect) = slot.origin_fs(connect);
         Origin::new(
-            slot.handle(),
-            Some(slot.reconnect(connect)),
+            fs,
+            Some(reconnect),
             Some("box".to_string()),
             abs.to_string(),
             at,
@@ -729,7 +799,6 @@ mod tests {
         let abs = abs.to_str().unwrap();
         let n = Arc::new(AtomicUsize::new(0));
         let slot = SaveSlot::new(Placeholder::YES);
-        slot.set_quiet(Duration::ZERO);
         let (mut a, mut b) = (
             origin(&slot, counted(&n), abs),
             origin(&slot, counted(&n), abs),
@@ -796,7 +865,6 @@ mod tests {
         let abs = abs.to_str().unwrap();
         let n = Arc::new(AtomicUsize::new(0));
         let slot = SaveSlot::new(Placeholder::YES);
-        slot.set_quiet(Duration::ZERO);
         let mut origin = origin(&slot, counted(&n), abs);
         let fs = origin.fs().unwrap();
         assert!(slot.release(), "given back between two requests");
@@ -918,9 +986,10 @@ mod tests {
     }
 
     fn probe_origin(slot: &SaveSlot, connect: Connect) -> Origin {
+        let (fs, reconnect) = slot.origin_fs(connect);
         Origin::new(
-            slot.handle(),
-            Some(slot.reconnect(connect)),
+            fs,
+            Some(reconnect),
             Some("box".to_string()),
             "/f".to_string(),
             a_stat(),
@@ -936,9 +1005,9 @@ mod tests {
         }
     }
 
-    /// A hex Save's requests by handle are one operation: the session is not given back between
-    /// two `write_at`s — nor right after the last request (its publish may follow) — and is
-    /// once the operation is over.
+    /// A hex Save's requests by handle hold the session: it is not given back between two
+    /// `write_at`s, and is once the file is closed (the rest of the operation — its publish — is
+    /// the window's to finish before a give-back is asked: 08 D2).
     #[test]
     fn the_session_is_not_given_back_inside_an_operation() {
         let tmp = tempfile::tempdir().unwrap();
@@ -956,9 +1025,8 @@ mod tests {
         patcher.write_at(&mut file, 2, b"cd").unwrap();
         patcher.close(file);
         patcher.rename_over(&temp, abs).unwrap();
-        assert!(!slot.release(), "right after the last request: refused");
         assert_eq!(n.load(Ordering::SeqCst), 1, "one session throughout");
-        within("the give-back", || slot.release());
+        assert!(slot.release(), "the file closed: given back");
         assert_eq!(std::fs::read(abs).unwrap(), b"abcd");
     }
 
@@ -1042,6 +1110,24 @@ mod tests {
         within("closed beside", || alive.load(Ordering::SeqCst) == 0);
     }
 
+    /// The viewer closing drops the slot's last handle on the window's thread: its session
+    /// closes beside, the drop never waits for it.
+    #[test]
+    fn dropping_the_last_handle_does_not_wait_for_the_close() {
+        let (connect, _made, alive) = probes(Duration::ZERO, Duration::from_millis(600));
+        let slot = SaveSlot::new(Placeholder::YES);
+        let mut origin = probe_origin(&slot, connect);
+        origin.fs().unwrap();
+        let at = std::time::Instant::now();
+        drop((origin, slot));
+        let took = at.elapsed();
+        assert!(
+            took < Duration::from_millis(200),
+            "the drop waited {took:?}"
+        );
+        within("closed beside", || alive.load(Ordering::SeqCst) == 0);
+    }
+
     /// What the server can do is answered at once while a request holds the session (an upload
     /// on a worker): the window's pass asks it.
     #[test]
@@ -1085,6 +1171,195 @@ mod tests {
         worker.join().unwrap();
         answers.join().unwrap();
         assert!(said.is_ok(), "the answers waited for the request");
+    }
+
+    /// A connection that opens files: its number is every byte a read by handle gives, so a
+    /// request sent to another session is seen; `read_head` fails (a failed request).
+    struct Opener(u8);
+
+    impl RemoteFs for Opener {
+        fn stat_opt(&mut self, _: &str) -> Result<Option<Stat>> {
+            Ok(Some(a_stat()))
+        }
+        fn lstat_opt(&mut self, _: &str) -> Result<Option<Stat>> {
+            Ok(Some(a_stat()))
+        }
+        fn realpath(&mut self, p: &str) -> Result<String> {
+            Ok(p.to_string())
+        }
+        fn read_head(&mut self, _: &str, _: usize) -> Result<Vec<u8>> {
+            Err(anyhow!("a failed request"))
+        }
+        fn list_dir(&mut self, _: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn list_entries(&mut self, _: &str) -> Result<Vec<Entry>> {
+            Ok(Vec::new())
+        }
+        fn read_to(
+            &mut self,
+            _: &str,
+            _: &mut dyn std::io::Write,
+            _: &mut dyn FnMut(u64),
+        ) -> Result<u64> {
+            Ok(0)
+        }
+        fn create_from(
+            &mut self,
+            _: &Path,
+            _: &str,
+            _: Option<Like>,
+        ) -> std::result::Result<Uploaded, CreateError> {
+            Ok(uploaded())
+        }
+        fn set_mode(&mut self, _: &str, _: u32) -> Result<()> {
+            Ok(())
+        }
+        fn rename_over(&mut self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn link_new(&mut self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn remove(&mut self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn patcher(&mut self) -> Option<&mut dyn PatchFs> {
+            Some(self)
+        }
+    }
+
+    impl PatchFs for Opener {
+        fn can_copy(&self) -> bool {
+            false
+        }
+        fn open(&mut self, path: &str, _: OpenFor) -> Result<Handle> {
+            Ok(Handle::new(path, ()))
+        }
+        fn create_temp(&mut self, path: &str) -> std::result::Result<Handle, CreateError> {
+            Ok(Handle::new(path, ()))
+        }
+        fn fstat(&mut self, _: &mut Handle) -> Result<Stat> {
+            Ok(a_stat())
+        }
+        fn read_at(&mut self, _: &mut Handle, _: u64, len: usize) -> Result<Vec<u8>> {
+            Ok(vec![self.0; len])
+        }
+        fn read_through(
+            &mut self,
+            _: &mut Handle,
+            _: u64,
+            _: Option<&mut Handle>,
+            _: &mut Each<'_>,
+        ) -> Result<u64> {
+            Ok(0)
+        }
+        fn write_at(&mut self, _: &mut Handle, _: u64, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn set_owner(&mut self, _: &mut Handle, _: u32, _: u32) -> Result<()> {
+            Ok(())
+        }
+        fn set_handle_mode(&mut self, _: &mut Handle, _: u32) -> Result<()> {
+            Ok(())
+        }
+        fn fsync(&mut self, _: &mut Handle) -> Result<()> {
+            Ok(())
+        }
+        fn copy(
+            &mut self,
+            _: &mut Handle,
+            _: &mut Handle,
+            _: u64,
+            _: &mut CopyCtl<'_>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn close(&mut self, _: Handle) {}
+    }
+
+    /// Connects [`Opener`]s numbered from 1.
+    fn openers() -> Connect {
+        let n = Arc::new(AtomicUsize::new(0));
+        Arc::new(move || {
+            let id = n.fetch_add(1, Ordering::SeqCst) as u8 + 1;
+            Ok(Box::new(Opener(id)) as Box<dyn RemoteFs + Send>)
+        })
+    }
+
+    /// A file opened on one session is stamped with that one, even when a reconnect lands right
+    /// after its open: its reads are refused, never sent to the session made since.
+    #[test]
+    fn a_file_is_stamped_with_the_session_it_was_opened_on() {
+        let slot = SaveSlot::new(Placeholder::YES);
+        let connect = openers();
+        let mut origin = probe_origin(&slot, connect.clone());
+        let fs = origin.fs().unwrap();
+        assert!(
+            fs.read_head("/f", 1).is_err(),
+            "the session failed a request"
+        );
+        // Right after the open, another `Origin`'s reconnect replaces the failed session — as
+        // soon as it can take the slot (waited for here at most a moment).
+        let mut reconnect = Some(slot.reconnect(connect));
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let replacing: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        let joined = replacing.clone();
+        slot.after_open(Box::new(move || {
+            if let Some(mut reconnect) = reconnect.take() {
+                let tx = done_tx.clone();
+                let worker = std::thread::spawn(move || {
+                    drop(reconnect().unwrap());
+                    let _ = tx.send(());
+                });
+                *joined.lock().unwrap() = Some(worker);
+                let _ = done.recv_timeout(Duration::from_millis(300));
+            }
+        }));
+        let patcher = fs.patcher().unwrap();
+        let mut file = patcher.open("/f", OpenFor::Read).unwrap();
+        if let Some(worker) = replacing.lock().unwrap().take() {
+            worker.join().unwrap();
+        }
+        let read = patcher.read_at(&mut file, 0, 1);
+        assert!(read.is_err(), "sent to the session made since: {read:?}");
+        patcher.close(file);
+    }
+
+    /// Requests of the view a give-back was asked for — its own operation going on — never make
+    /// the session another's: the give-back waits for it to end, then is done. Another view's
+    /// request is what makes it that view's.
+    #[test]
+    fn a_hidden_views_own_requests_do_not_adopt_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let abs = tmp.path().join("f.bin");
+        std::fs::write(&abs, b"bytes").unwrap();
+        let abs = abs.to_str().unwrap();
+        let n = Arc::new(AtomicUsize::new(0));
+        let slot = SaveSlot::new(Placeholder::YES);
+        let (mut own, mut other) = (
+            origin(&slot, counted(&n), abs),
+            origin(&slot, counted(&n), abs),
+        );
+        let patcher = own.fs().unwrap().patcher().unwrap();
+        let temp = format!("{abs}.temp");
+        let mut file = patcher.create_temp(&temp).unwrap();
+        patcher.write_at(&mut file, 0, b"ab").unwrap();
+        let asked = slot.ask();
+        assert_eq!(slot.give_back(asked), GiveBack::NotNow, "a file is open");
+        patcher.write_at(&mut file, 2, b"cd").unwrap();
+        assert_eq!(
+            slot.give_back(asked),
+            GiveBack::NotNow,
+            "its own write: still"
+        );
+        patcher.close(file);
+        assert_eq!(slot.give_back(asked), GiveBack::Done, "its operation ended");
+        // Asked for `own` again, `other`'s use makes the session that one's.
+        own.fs().unwrap().stat(abs).unwrap();
+        let asked = slot.ask();
+        other.fs().unwrap().stat(abs).unwrap();
+        assert_eq!(slot.give_back(asked), GiveBack::InUse);
     }
 
     /// The names of the methods a block names at its first indent (`    fn name`): a trait's
@@ -1394,6 +1669,8 @@ mod tests {
             a_stat(),
         );
         let fs = origin.fs().unwrap();
+        // What the connect itself asked (its answers, `patcher`) is not what is driven below.
+        calls.0.lock().unwrap().clear();
         let (p, local) = ("/f", Path::new("/nowhere"));
         let print = Fingerprint {
             size: 0,
@@ -1480,7 +1757,16 @@ mod tests {
         assert!(slot.connected(), "the refused session is the slot's again");
 
         let heard = calls.0.lock().unwrap().clone();
-        for name in &driven {
+        // The server's answers are the session's as it gave them when made (checked by value
+        // above: each unlike the slot's own before it); every other method is heard now.
+        let answers = [
+            "can_link",
+            "can_replace",
+            "hash_check_limit",
+            "can_copy",
+            "can_fsync",
+        ];
+        for name in driven.iter().filter(|n| !answers.contains(n)) {
             assert!(
                 heard.contains(name),
                 "{name} did not reach the session: {heard:?}"

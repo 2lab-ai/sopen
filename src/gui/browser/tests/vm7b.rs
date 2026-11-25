@@ -332,6 +332,272 @@ fn d25_a_reload_between_the_receipt_and_the_show_makes_the_hidden_view_again() {
     assert!(hex_row(&fx, "5A 5A 20 63"), "the file as reloaded: `ZZ c`");
 }
 
+/// A Save that did not reload the stream (the image's) leaves it behind the file; a make whose
+/// reload fails (the file gone meanwhile) leaves it so — only a reload seen ends it — and the
+/// next make reloads: Hex shows the file as it is then.
+#[test]
+fn a_failed_reload_leaves_the_stream_behind_for_the_next_make() {
+    let (mut fx, _meter) = metered();
+    let file = format!("{}/photo.png", fx.root);
+    fx.open("photo.png");
+    pass_until(&mut fx, "the picture", |b| b.ready());
+    edit_image(&mut fx);
+    fx.drv.key(&mut fx.b, Key::S, command(false));
+    let before = std::fs::read(&file).unwrap().len();
+    pass_until(&mut fx, "the image's Save", |b| {
+        b.ready() && std::fs::read(&file).unwrap().len() != before
+    });
+    fx.settle();
+    fx.drv.idle(&mut fx.b, 2);
+    let behind = |fx: &Fx| fx.b.viewer.as_ref().unwrap().views.behind();
+    assert!(behind(&fx), "the image's Save left the stream behind");
+    let saved = std::fs::read(&file).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    digit(&mut fx, 2);
+    fx.drv.idle(&mut fx.b, 4);
+    assert!(
+        fx.b.viewer.as_ref().unwrap().views.set.on_screen() == Some(View::Image),
+        "the make failed: the image stays ({:?})",
+        fx.b.status.text
+    );
+    assert!(behind(&fx), "no reload was seen: still behind");
+    let mut back = b"ZZZZ".to_vec();
+    back.extend(&saved[4..]);
+    std::fs::write(&file, back).unwrap();
+    digit(&mut fx, 2);
+    assert!(
+        hex_row(&fx, "5A 5A 5A 5A"),
+        "the retry reloaded: the file as it is"
+    );
+    assert!(!behind(&fx));
+}
+
+/// This machine's disk posing as a remote whose `rename_over` — a Save's publish, after its last
+/// `write_at` — takes 2 s once `slow` is set.
+struct SlowPublish {
+    fs: LocalFs,
+    slow: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RemoteFs for SlowPublish {
+    fn stat_opt(&mut self, p: &str) -> anyhow::Result<Option<Stat>> {
+        self.fs.stat_opt(p)
+    }
+    fn lstat_opt(&mut self, p: &str) -> anyhow::Result<Option<Stat>> {
+        self.fs.lstat_opt(p)
+    }
+    fn realpath(&mut self, p: &str) -> anyhow::Result<String> {
+        self.fs.realpath(p)
+    }
+    fn read_head(&mut self, p: &str, max: usize) -> anyhow::Result<Vec<u8>> {
+        self.fs.read_head(p, max)
+    }
+    fn list_dir(&mut self, p: &str) -> anyhow::Result<Vec<String>> {
+        self.fs.list_dir(p)
+    }
+    fn list_entries(&mut self, p: &str) -> anyhow::Result<Vec<crate::remote::Entry>> {
+        self.fs.list_entries(p)
+    }
+    fn read_to(
+        &mut self,
+        p: &str,
+        out: &mut dyn std::io::Write,
+        progress: &mut dyn FnMut(u64),
+    ) -> anyhow::Result<u64> {
+        self.fs.read_to(p, out, progress)
+    }
+    fn create_from(
+        &mut self,
+        local: &Path,
+        p: &str,
+        like: Option<crate::remote::Like>,
+    ) -> Result<crate::remote::Uploaded, crate::remote::CreateError> {
+        self.fs.create_from(local, p, like)
+    }
+    fn set_mode(&mut self, p: &str, mode: u32) -> anyhow::Result<()> {
+        self.fs.set_mode(p, mode)
+    }
+    fn rename_over(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
+        if self.slow.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        self.fs.rename_over(from, to)
+    }
+    fn link_new(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.fs.link_new(from, to)
+    }
+    fn remove(&mut self, p: &str) -> anyhow::Result<()> {
+        self.fs.remove(p)
+    }
+    fn patcher(&mut self) -> Option<&mut dyn crate::remote::patch::PatchFs> {
+        Some(self)
+    }
+    fn into_ranged(
+        self: Box<Self>,
+        path: &str,
+    ) -> Result<Box<dyn crate::remote::Ranged>, crate::remote::Refused> {
+        Box::new(self.fs).into_ranged(path)
+    }
+}
+
+impl crate::remote::patch::PatchFs for SlowPublish {
+    fn can_copy(&self) -> bool {
+        self.fs.can_copy()
+    }
+    fn open(
+        &mut self,
+        p: &str,
+        how: crate::remote::patch::OpenFor,
+    ) -> anyhow::Result<crate::remote::patch::Handle> {
+        self.fs.open(p, how)
+    }
+    fn create_temp(
+        &mut self,
+        p: &str,
+    ) -> Result<crate::remote::patch::Handle, crate::remote::CreateError> {
+        self.fs.create_temp(p)
+    }
+    fn fstat(&mut self, f: &mut crate::remote::patch::Handle) -> anyhow::Result<Stat> {
+        self.fs.fstat(f)
+    }
+    fn read_at(
+        &mut self,
+        f: &mut crate::remote::patch::Handle,
+        off: u64,
+        len: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.fs.read_at(f, off, len)
+    }
+    fn read_through(
+        &mut self,
+        src: &mut crate::remote::patch::Handle,
+        size: u64,
+        dst: Option<&mut crate::remote::patch::Handle>,
+        each: &mut crate::remote::patch::Each<'_>,
+    ) -> anyhow::Result<u64> {
+        self.fs.read_through(src, size, dst, each)
+    }
+    fn write_at(
+        &mut self,
+        f: &mut crate::remote::patch::Handle,
+        off: u64,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        self.fs.write_at(f, off, bytes)
+    }
+    fn set_owner(
+        &mut self,
+        f: &mut crate::remote::patch::Handle,
+        uid: u32,
+        gid: u32,
+    ) -> anyhow::Result<()> {
+        self.fs.set_owner(f, uid, gid)
+    }
+    fn set_handle_mode(
+        &mut self,
+        f: &mut crate::remote::patch::Handle,
+        mode: u32,
+    ) -> anyhow::Result<()> {
+        self.fs.set_handle_mode(f, mode)
+    }
+    fn can_fsync(&self) -> bool {
+        self.fs.can_fsync()
+    }
+    fn fsync(&mut self, f: &mut crate::remote::patch::Handle) -> anyhow::Result<()> {
+        self.fs.fsync(f)
+    }
+    fn copy(
+        &mut self,
+        src: &mut crate::remote::patch::Handle,
+        dst: &mut crate::remote::patch::Handle,
+        size: u64,
+        ctl: &mut crate::remote::patch::CopyCtl<'_>,
+    ) -> anyhow::Result<()> {
+        self.fs.copy(src, dst, size, ctl)
+    }
+    fn close(&mut self, f: crate::remote::patch::Handle) {
+        self.fs.close(f)
+    }
+}
+
+/// D14 is operation-level: a switch asked during a hex Save whose publish takes 2 s waits for
+/// the Save (`saving…`), and only once it landed does the hidden Hex give the session back —
+/// the Save runs on one session from start to end, no reconnect in the middle.
+#[test]
+fn d14_a_switch_during_a_slow_publish_waits_and_the_session_goes_back_after() {
+    let meter = Meter::new(u64::MAX, u64::MAX);
+    let slow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let theirs = slow.clone();
+    let connect = meter.connect(move || {
+        Ok(Box::new(SlowPublish {
+            fs: LocalFs::new(),
+            slow: theirs.clone(),
+        }) as Box<dyn RemoteFs + Send>)
+    });
+    let mut fx = fixture_with(Some("box"), connect, None);
+    fx.b.mode = view::Mode::Dual;
+    fx.drv.idle(&mut fx.b, 2);
+    let file = format!("{}/main.rs", fx.root);
+    fx.open("main.rs");
+    digit(&mut fx, 2);
+    fx.key(Key::Enter);
+    digit(&mut fx, 4);
+    digit(&mut fx, 1);
+    fx.key(Key::Escape);
+    from_here(&meter);
+    let connects = meter.connects.load(Ordering::SeqCst);
+    slow.store(true, Ordering::SeqCst);
+    fx.key(Key::F5);
+    fx.drv.idle(&mut fx.b, 2);
+    fx.drv.press_typed(&mut fx.b, Key::Num1, "1");
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(shows(&fx, "saving…"), "the switch waits for the Save");
+    assert!(on_strip(&fx, "2 Hex"));
+    let views = &fx.b.viewer.as_ref().unwrap().views;
+    assert!(views.set.waiting() && !views.giving(), "no give-back asked");
+    pass_until(&mut fx, "the Save and the switch", |b| {
+        b.ready() && b.viewer.as_ref().unwrap().views.set.on_screen() == Some(View::Text)
+    });
+    assert_eq!(std::fs::read(&file).unwrap()[0], 0x41, "the Save landed");
+    assert_eq!(
+        meter.connects.load(Ordering::SeqCst),
+        connects + 1,
+        "one save session from start to end"
+    );
+    until_live(&mut fx, &meter, 1);
+    assert!(peak(&meter) <= 2, "{}", peak(&meter));
+}
+
+/// D2 with an Export: a switch asked while one runs waits for it (`saving…`), and when it ends —
+/// no Save landed, the window clean — the switch goes ahead: 2 shows Hex.
+#[test]
+fn a_switch_asked_during_an_export_goes_ahead_when_it_ends() {
+    let Some(tools) = crate::gui::media::fixtures::tools() else {
+        return;
+    };
+    let mut fx = fixture();
+    fx.b.mode = view::Mode::Dual;
+    let clip = PathBuf::from(format!("{}/clip.mp4", fx.root));
+    crate::gui::media::fixtures::clip(&tools, &clip, (320, 240));
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    fx.open("clip.mp4");
+    assert!(on_strip(&fx, "1 Video"));
+    for key in [Key::I, Key::ArrowRight, Key::ArrowRight, Key::O] {
+        fx.key(key);
+    }
+    fx.key(Key::E);
+    fx.drv.press_typed(&mut fx.b, Key::Num2, "2");
+    fx.drv.idle(&mut fx.b, 1);
+    assert!(shows(&fx, "saving…"), "the switch waits for the Export");
+    assert!(on_strip(&fx, "1 Video"));
+    pass_until(&mut fx, "the Export, then Hex", |b| {
+        b.ready() && b.viewer.as_ref().unwrap().views.set.on_screen() == Some(View::Hex)
+    });
+    assert!(on_strip(&fx, "2 Hex"), "the switch went ahead");
+}
+
 /// D25's reload half: Cmd/Ctrl+R in the text view after the file changed on the remote makes
 /// the hidden Hex stale — 2 makes it again, and it shows the file as reloaded.
 #[test]
