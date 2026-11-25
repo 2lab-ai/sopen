@@ -35,6 +35,8 @@
 
 #[cfg(test)]
 pub(crate) mod fake;
+#[cfg(target_os = "macos")]
+mod mac;
 #[cfg(test)]
 mod tests;
 
@@ -463,7 +465,14 @@ pub(crate) fn choose(
     }
 }
 
-/// The platform's engine: none in this build yet (WV-A, WV-B).
+/// The platform's engine: WKWebView on macOS (WV-A).
+#[cfg(target_os = "macos")]
+fn platform() -> Result<Rc<dyn Engine>, String> {
+    mac::engine()
+}
+
+/// The platform's engine: none in this build yet (WV-B).
+#[cfg(not(target_os = "macos"))]
 fn platform() -> Result<Rc<dyn Engine>, String> {
     Err("not in this build".to_string())
 }
