@@ -550,15 +550,17 @@ fn a_reread_starts_over_on_a_new_original() {
     type_text(&mut b, 0, b"Z", 1);
     let old = b.pieces_in(0..b.len());
     let typed = b.pieces_in(0..1);
-    b.reread(Original::new(b"three\n".to_vec(), Utf8));
+    // ES-3: the file read at F4 is `k = 1`, its first re-read `k = 2`.
     assert_eq!(b.generation(), 1);
+    b.reread(Original::new(b"three\n".to_vec(), Utf8));
+    assert_eq!(b.generation(), 2);
     assert_eq!(bytes_of(&b), b"three\n");
     assert_eq!(b.steps(), 0);
     assert!(b.is_saved());
     assert_eq!(b.undo(), None);
     assert!(matches!(
         b.span(&b.pieces()[0]),
-        Span::Original { k: 1, .. }
+        Span::Original { k: 2, .. }
     ));
     // The old original's pieces belong to no buffer now; typed text is still the session's.
     let mut e = b.edit(Group::Single, sel(0));
@@ -566,6 +568,94 @@ fn a_reread_starts_over_on_a_new_original() {
     assert_eq!(e.insert_pieces(0, &typed), Ok(0..1));
     e.end(sel(1));
     assert_eq!(bytes_of(&b), b"Zthree\n");
+}
+
+#[test]
+fn a_piece_from_another_buffer_is_stale() {
+    // E36's clipboard across two editors: file A's block pasted into file B's editor.
+    let a = open(b"abcd", Utf8);
+    let mut b = open(b"\n\n\n\n", Utf8);
+    let from_a = a.pieces_in(0..4);
+    let mut e = b.edit(Group::Single, sel(0));
+    assert_eq!(e.insert_pieces(0, &from_a), Err(Stale));
+    e.end(sel(0));
+    assert_eq!(bytes_of(&b), b"\n\n\n\n");
+    assert_eq!(b.lines(), 5);
+    let mut e = b.edit(Group::Single, sel(1));
+    assert_eq!(e.delete(1..2), 1..2);
+    e.end(sel(1));
+    assert_eq!(b.lines(), 4);
+}
+
+#[test]
+fn restore_rebuilds_from_spans_and_keeps_the_add_numbering() {
+    let original = Original::new(b"one\ntwo\n".to_vec(), Utf8);
+    let spans = [
+        Span::Original { k: 1, range: 0..4 },
+        Span::Add(0..2),
+        Span::Original { k: 1, range: 4..8 },
+    ];
+    let mut r = Buffer::<Sel>::restore(original.clone(), 1, b"x\n".to_vec(), &spans).unwrap();
+    assert_eq!(bytes_of(&r), b"one\nx\ntwo\n");
+    assert_eq!(r.generation(), 1);
+    assert_eq!(r.steps(), 0);
+    assert!(!r.is_saved(), "restored edits are unsaved");
+    assert_eq!((r.lines(), r.line_start(2), r.line_of(6)), (4, Some(6), 2));
+    assert_eq!(r.add_len(), 2);
+    // Typed after it, the add buffer goes on from where the journal's left off.
+    type_text(&mut r, 0, b"Z", 1);
+    assert_eq!(r.span(&r.pieces()[0]), Span::Add(2..3));
+    assert_eq!(r.undo(), Some(sel(0)));
+    assert!(!r.is_saved());
+    // Spans it cannot hold: another generation, past the original, past the add buffer.
+    for bad in [
+        Span::Original { k: 2, range: 0..4 },
+        Span::Original { k: 1, range: 4..9 },
+        Span::Add(1..3),
+    ] {
+        let got = Buffer::<Sel>::restore(
+            original.clone(),
+            1,
+            b"x\n".to_vec(),
+            std::slice::from_ref(&bad),
+        );
+        assert!(got.is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn undo_and_redo_end_a_typing_run() {
+    let mut b = open(b"0123456789", Utf8);
+    type_text(&mut b, 0, b"ab", 1);
+    type_text(&mut b, 12, b"x", 1);
+    b.undo();
+    // Typing where the first run ended starts a step of its own.
+    type_text(&mut b, 2, b"c", 1);
+    assert_eq!(b.steps(), 2);
+    let mut b = open(b"0123456789", Utf8);
+    type_text(&mut b, 0, b"ab", 1);
+    b.undo();
+    b.redo();
+    type_text(&mut b, 2, b"c", 1);
+    assert_eq!(b.steps(), 2);
+    assert_eq!(bytes_of(&b), b"abc0123456789");
+}
+
+#[test]
+fn an_add_block_is_never_reallocated() {
+    let mut b = open(b"", Utf8);
+    type_text(&mut b, 0, b"a", 1);
+    let first = b.add.blocks[0].bytes.as_ptr();
+    let at = type_text(&mut b, 1, &[b'b'; 1000], 1);
+    assert_eq!(b.add.blocks.len(), 1);
+    assert_eq!(b.add.blocks[0].bytes.as_ptr(), first, "appended in place");
+    // More than the block has room for goes to a new block; the first stays where it is.
+    let mut e = b.edit(Group::Single, sel(at));
+    e.insert(at, &vec![b'c'; BLOCK]);
+    e.end(sel(at));
+    assert_eq!(b.add.blocks.len(), 2);
+    assert_eq!(b.add.blocks[0].bytes.as_ptr(), first);
+    assert_eq!(b.len(), 1001 + BLOCK as u64);
 }
 
 #[test]
@@ -806,6 +896,24 @@ fn random_run(encoding: Encoding, seed: u64) {
                 assert!(r.end <= b.add_len());
             }
         }
+    }
+    // The journal's view of the last document, rebuilt as ES-3's Restore rebuilds it: the add
+    // buffer in one piece, the pieces by their spans.
+    let spans: Vec<Span> = b.pieces().iter().map(|p| b.span(p)).collect();
+    let mut add = Vec::new();
+    for c in b.add_chunks(0..b.add_len()) {
+        add.extend_from_slice(c);
+    }
+    let r = Buffer::<Sel>::restore(b.original().clone(), b.generation(), add, &spans).unwrap();
+    assert_eq!(bytes_of(&r), doc, "seed {seed}: restored");
+    assert_eq!((r.steps(), r.is_saved()), (0, false), "seed {seed}");
+    let lfs = oracle_lfs(&doc, encoding);
+    assert_eq!(r.lines(), lfs + 1, "seed {seed}");
+    for n in 0..=lfs + 1 {
+        assert_eq!(r.line_start(n), oracle_line_start(&doc, encoding, n));
+    }
+    for x in (0..=doc.len()).step_by(u) {
+        assert_eq!(r.line_of(x as u64), oracle_lfs(&doc[..x], encoding));
     }
 }
 

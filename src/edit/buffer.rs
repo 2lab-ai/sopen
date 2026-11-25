@@ -6,7 +6,8 @@
 //!   every byte typed or pasted, already encoded (ED-enc), in blocks that are appended to and
 //!   never reallocated, so a piece never moves. The document is the list of [`Piece`]s in a
 //!   `Vec`, found by a scan (E11's first cut). A Save rebases nothing ([`Buffer::mark_saved`]);
-//!   only a re-read ([`Buffer::reread`]) brings a new original, generation `k` + 1 (§9.5).
+//!   only a re-read ([`Buffer::reread`]) brings a new original, generation `k` + 1 (§9.5), and
+//!   [`Buffer::restore`] rebuilds a buffer from what a journal names (ES-3).
 //! - **Lines end at the encoding's LF unit** (08 §7.3), never at a 0x0A byte inside another
 //!   unit. Each buffer keeps its line starts as the count of LF units before every 4 KiB, so a
 //!   split or a lookup costs a binary search and a scan of at most 4 KiB, and the index costs
@@ -21,13 +22,14 @@
 //! - **Serialising** ([`Buffer::write_to`]) writes the pieces in order, as they are.
 //!
 //! Every offset and length handed in is a multiple of the encoding's unit (a character start,
-//! 08 §7.3): the line index counts LF units at the unit's alignment. Pieces belong to the buffer
-//! that made them.
+//! 08 §7.3): the line index counts LF units at the unit's alignment. A piece carries the id of
+//! the buffer that made it, and any other buffer refuses it ([`Stale`]).
 
 use crate::encoding::Encoding;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::ops::{Deref, Range};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Undo steps kept (§7.3, E17; 07 §11's bound for hex): past it the oldest go.
@@ -38,6 +40,10 @@ const STRIDE: usize = 4096;
 
 /// A new add block's capacity: a longer insert gets a block of its own size.
 const BLOCK: usize = 64 * 1024;
+
+/// Every buffer's id, so a piece of another one (E36's clipboard, copied in one editor and pasted
+/// in another) is told apart.
+static BUFFERS: AtomicU64 = AtomicU64::new(1);
 
 /// The LF units wholly in `bytes` (read from offset `at`), at the unit's alignment.
 fn count_lf(encoding: Encoding, bytes: &[u8], at: u64) -> u64 {
@@ -174,6 +180,8 @@ enum Run {
 /// block kept for the clipboard (E36) are pieces, never bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Piece {
+    /// The buffer that made it.
+    buffer: u64,
     run: Run,
     start: u64,
     len: u64,
@@ -192,7 +200,7 @@ impl Piece {
 }
 
 fn follows(a: &Piece, b: &Piece) -> bool {
-    a.run == b.run && a.start + a.len == b.start
+    a.buffer == b.buffer && a.run == b.run && a.start + a.len == b.start
 }
 
 fn total(pieces: &[Piece]) -> u64 {
@@ -220,7 +228,8 @@ pub enum Span {
     Add(Range<u64>),
 }
 
-/// Pieces this buffer no longer holds: the original's before a re-read.
+/// Pieces this buffer does not hold: another buffer's, the original's before a re-read, a span
+/// past the end of what it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stale;
 
@@ -256,7 +265,7 @@ struct Add {
 impl Add {
     /// Appends `bytes` in one block (a new one when the last cannot hold them, or holds a
     /// partial unit): their piece.
-    fn append(&mut self, bytes: &[u8], encoding: Encoding) -> Piece {
+    fn append(&mut self, bytes: &[u8], encoding: Encoding, buffer: u64) -> Piece {
         let fits = self.blocks.last().is_some_and(|b| {
             b.bytes.capacity() - b.bytes.len() >= bytes.len()
                 && b.bytes.len().is_multiple_of(encoding.unit())
@@ -275,6 +284,7 @@ impl Add {
         b.lines.extend(&b.bytes, encoding);
         self.len += bytes.len() as u64;
         Piece {
+            buffer,
             run: Run::Add(index as u32),
             start: start as u64,
             len: bytes.len() as u64,
@@ -332,8 +342,10 @@ struct Step<S> {
 /// The document: the original, the add buffer, the pieces and the undo steps. `S` is the
 /// caller's state an undo or a redo gives back (the caret and the block).
 pub struct Buffer<S> {
+    /// This buffer's id, carried by its pieces.
+    id: u64,
     original: Original,
-    /// The original's re-read generation (§9.5's `k`).
+    /// The original's re-read generation (§9.5's `k`): 1 for the file read at F4 (ES-3).
     k: u32,
     add: Add,
     pieces: Vec<Piece>,
@@ -359,8 +371,9 @@ impl<S> Buffer<S> {
     fn with_block(original: Original, block: usize) -> Self {
         let stride = original.0.lines.stride;
         let mut buffer = Buffer {
+            id: BUFFERS.fetch_add(1, Ordering::Relaxed),
             original,
-            k: 0,
+            k: 1,
             add: Add {
                 blocks: Vec::new(),
                 starts: Vec::new(),
@@ -382,6 +395,56 @@ impl<S> Buffer<S> {
         buffer
     }
 
+    /// The buffer a journal names (§9.5, ES-3's Restore): `original` as generation `k`, the
+    /// add buffer's bytes `add` (one block, so its offsets, its length and the add bytes typed
+    /// from now on keep the journal's numbering), and the document as `spans`. No undo steps,
+    /// and unsaved. [`Stale`] when a span names another generation or lies past what it names.
+    pub fn restore(
+        original: Original,
+        k: u32,
+        add: Vec<u8>,
+        spans: &[Span],
+    ) -> Result<Self, Stale> {
+        let mut buffer = Self::new(original);
+        buffer.k = k;
+        let encoding = buffer.encoding();
+        let mut lines = Lines::new(buffer.add.stride);
+        lines.extend(&add, encoding);
+        buffer.add.len = add.len() as u64;
+        if !add.is_empty() {
+            buffer.add.starts.push(0);
+            buffer.add.blocks.push(Block { bytes: add, lines });
+        }
+        let mut pieces = Vec::with_capacity(spans.len());
+        for span in spans {
+            let (run, range) = match span {
+                Span::Original { k: sk, range } if *sk == k => (Run::Original(k), range),
+                Span::Original { .. } => return Err(Stale),
+                Span::Add(range) => (Run::Add(0), range),
+            };
+            let piece = Piece {
+                buffer: buffer.id,
+                run,
+                start: range.start,
+                len: range.end.checked_sub(range.start).ok_or(Stale)?,
+                lfs: 0,
+            };
+            if !buffer.holds(&piece) {
+                return Err(Stale);
+            }
+            let (bytes, lines) = buffer.run(run);
+            let (s, e) = (range.start as usize, range.end as usize);
+            let lfs = lines.count(bytes, encoding, s..e);
+            push(&mut pieces, &[Piece { lfs, ..piece }]);
+        }
+        buffer.pieces = pieces;
+        buffer.len = total(&buffer.pieces);
+        buffer.lfs = buffer.pieces.iter().map(|p| p.lfs).sum();
+        // A state no step will ever have: unsaved until a Save.
+        buffer.saved = u64::MAX;
+        Ok(buffer)
+    }
+
     /// The document as the original alone.
     fn start_over(&mut self) {
         let o = &self.original;
@@ -390,6 +453,7 @@ impl<S> Buffer<S> {
         self.pieces.clear();
         if self.len > 0 {
             self.pieces.push(Piece {
+                buffer: self.id,
                 run: Run::Original(self.k),
                 start: 0,
                 len: self.len,
@@ -422,7 +486,8 @@ impl<S> Buffer<S> {
         self.original.encoding()
     }
 
-    /// The original's re-read generation `k`: 0 for the file as read at F4.
+    /// The original's re-read generation `k`: 1 for the file read at F4, then one more for each
+    /// re-read (ES-3).
     pub fn generation(&self) -> u32 {
         self.k
     }
@@ -479,8 +544,11 @@ impl<S> Buffer<S> {
         &self.run(p.run).0[p.start as usize..(p.start + p.len) as usize]
     }
 
-    /// Whether `p` is a range of a buffer this one holds now.
+    /// Whether `p` is this buffer's, a range of a buffer it holds now.
     fn holds(&self, p: &Piece) -> bool {
+        if p.buffer != self.id {
+            return false;
+        }
         let size = match p.run {
             Run::Original(k) if k == self.k => self.original.len(),
             Run::Original(_) => return false,
@@ -781,7 +849,7 @@ impl<S: Clone> Edit<'_, S> {
         if bytes.is_empty() {
             return at..at;
         }
-        let piece = b.add.append(bytes, b.original.encoding());
+        let piece = b.add.append(bytes, b.original.encoding(), b.id);
         b.put(at, &[piece]);
         self.record(Change {
             at,
