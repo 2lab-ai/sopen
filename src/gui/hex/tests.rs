@@ -9179,9 +9179,10 @@ mod x3 {
         assert_eq!(std::fs::read(&fx.remote).unwrap(), FIXTURE, "the original");
     }
 
-    /// TS-6 at the source (10 §10's last row): the terminal backend says its probe's answer to
-    /// the passes, so in an ambiguous-wide terminal the ASCII column's glyphs of width A are `.`
-    /// in the terminal's cells, while the window shows their CP437 glyphs.
+    /// TS-6 at the source (10 §10): the terminal backend says its probe's answer to the passes,
+    /// so in an ambiguous-wide terminal the ASCII column's glyphs of width A are §10's stand-ins
+    /// in the terminal's cells — `+ - = | # ^ v < >` from its table, `.` for the letters it
+    /// leaves — while the window shows their CP437 glyphs.
     #[test]
     fn an_ambiguous_wide_terminal_shows_the_stand_ins_and_the_window_cp437() {
         let all: Vec<u8> = (0..=255u8).collect();
@@ -9225,9 +9226,10 @@ mod x3 {
         }
     }
 
-    /// 10 §10's last row at the source: in an ambiguous-wide terminal no glyph of the ASCII column
-    /// is of ambiguous width (`.` stands in), elsewhere every one is its CP437 glyph — all 256
-    /// bytes.
+    /// 10 §10 at the source: in an ambiguous-wide terminal no glyph of the ASCII column is of
+    /// ambiguous width — the table's stand-in (`+ - = | # ^ v < >`, `.` for `·` and the other
+    /// symbols) where it has one, `.` for the letters it leaves — elsewhere every one is its
+    /// CP437 glyph; all 256 bytes.
     #[test]
     fn the_ascii_column_stands_in_for_ambiguous_glyphs_in_an_ambiguous_wide_terminal() {
         for b in 0..=255u8 {

@@ -3359,20 +3359,30 @@ fn ts6_the_hex_view_is_the_windows_cells_in_both_terminals() {
             }
         }
         // Prose of width A (the status row's `—`) is laid in two cells, as a name's `é` is: those
-        // rows equal as text; every other cell is the window's through the table.
+        // rows equal as text — never a row of the hex frame (its left border in column 0), and
+        // each frame glyph in them where the window has it, so no moved border or arrow hides
+        // behind the words; every other cell is the window's through the table.
         let wide_rows: Vec<u16> = (0..30u16)
             .filter(|&y| (0..100).any(|x| laid_wide(&window.0[usize::from(y) * 100 + x].symbol)))
             .collect();
         let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
         for &y in &wide_rows {
+            let at = |x: u16| &painted.0[usize::from(y) * 100 + usize::from(x)];
             assert!(
-                !rows.contains(&y),
-                "{name}: row {y} of the grid laid wide:\n{text}"
+                !rows.contains(&y) && !at(0).symbol.chars().any(cells::frame_glyph),
+                "{name}: row {y} of the hex frame laid wide:\n{text}"
             );
             let row: String = (0..100)
                 .map(|x| window.0[usize::from(y) * 100 + x].symbol.as_str())
                 .collect();
             assert_eq!(words(&wide.row(y)), words(&row), "{name}: row {y}:\n{text}");
+            for x in 0..100u16 {
+                let p = at(x);
+                if p.symbol.chars().any(cells::frame_glyph) {
+                    let want = narrow(&p.symbol).unwrap_or(&p.symbol);
+                    assert_eq!(wide.cell(x, y).symbol, want, "{name}: ({x},{y}):\n{text}");
+                }
+            }
         }
         let d = differences_but(&window, &wide, Ink::Rgb, &wide_rows);
         only_the_mode_button(&d, &wide, &format!("{name}, ambiguous-wide"));
