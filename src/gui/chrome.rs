@@ -750,8 +750,9 @@ fn cell_row(ui: &mut egui::Ui) -> (Rect, cells::Grid, cells::Buffer) {
 }
 
 /// The top row, in cells: the tool's name ([`PROGRAM`]) in its red block, then where the browser
-/// is, black on cyan — its end kept, after "…", when it is cut (the whole on hover) — and the
-/// clock at the right end after a `│`.
+/// is, black on cyan — its end kept, after "…", when it is cut (the whole on hover) — the mode
+/// button where a backend set one ([`set_mode_button`]), and the clock at the right end after a
+/// `│`.
 pub fn title_row(ui: &mut egui::Ui, place: &str) {
     title_row_with(ui, place, None);
 }
@@ -814,8 +815,10 @@ pub fn title_row_with(ui: &mut egui::Ui, place: &str, strip: Option<&Strip>) {
     let clock_x = cols.saturating_sub(cells::width(&clock) + 1);
     cells::put(&mut buf, clock_x as u16, 0, &clock, cols, pen);
     let x = block + 1;
-    // The strip stands right before the clock, a blank either side; the place has what is left.
-    let mut end = clock_x;
+    let (room, mode) = mode_button(ui.ctx(), &mut buf, x, clock_x, pen);
+    // The strip stands right before the mode button (or the clock), a blank either side; the
+    // place has what is left.
+    let mut end = room;
     let mut clicks = vec![];
     if let Some(strip) = strip {
         let entries = strip.entries();
@@ -848,6 +851,9 @@ pub fn title_row_with(ui: &mut egui::Ui, place: &str, strip: Option<&Strip>) {
         ui.interact(rect, ui.scope_id().with("title"), egui::Sense::hover())
             .on_hover_text(place);
     }
+    let at = mode.map(|at| grid.rect(at));
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(mode_rect_id(), ModeRect(at)));
     for (slot, at) in clicks {
         // Not focusable, as the F-key row's slots: a click leaves the keyboard where it was.
         let id = ui.scope_id().with(("sopen-view-strip", slot));
@@ -859,6 +865,57 @@ pub fn title_row_with(ui: &mut egui::Ui, place: &str, strip: Option<&Strip>) {
     // The clock turns over at the next minute.
     let rest = 60 - now.rem_euclid(60) as u64;
     ui.ctx().request_repaint_after(Duration::from_secs(rest));
+}
+
+/// The mode button (10 §7, T4): what a click on it switches to — `[GUI]` on the terminal's title
+/// row, `[TUI]` on a window a switch opened — set by that backend before each pass; a window
+/// started directly sets none and shows none.
+#[derive(Debug, Clone, Copy)]
+struct ModeButton(&'static str);
+
+/// Where the title row drew the mode button in its last pass (`None`: nowhere).
+#[derive(Debug, Clone, Copy, Default)]
+struct ModeRect(Option<Rect>);
+
+fn mode_button_id() -> egui::Id {
+    egui::Id::unique("sopen-mode-button")
+}
+
+fn mode_rect_id() -> egui::Id {
+    egui::Id::unique("sopen-mode-button-rect")
+}
+
+/// The title row shows the mode button `label` ([`title_row`]).
+pub fn set_mode_button(ctx: &egui::Context, label: &'static str) {
+    ctx.data_mut(|d| d.insert_temp(mode_button_id(), ModeButton(label)));
+}
+
+/// Where the mode button stands on screen, as the last pass drew it: the shell's input hook
+/// takes a press there before anything else sees it (`gui::FKeyInput`) — the switch, as F12,
+/// whatever is open; a modal's backdrop never gets it.
+pub fn mode_button_rect(ctx: &egui::Context) -> Option<Rect> {
+    ctx.data(|d| d.get_temp::<ModeRect>(mode_rect_id()))
+        .and_then(|r| r.0)
+}
+
+/// The mode button in `buf` right before the clock at `clock_x`, a blank either side, when the
+/// row has room for it after the place's start `x`: where the place's room ends, and its cells.
+fn mode_button(
+    ctx: &egui::Context,
+    buf: &mut cells::Buffer,
+    x: usize,
+    clock_x: usize,
+    pen: cells::Pen,
+) -> (usize, Option<cells::Cells>) {
+    let Some(ModeButton(label)) = ctx.data(|d| d.get_temp(mode_button_id())) else {
+        return (clock_x, None);
+    };
+    let w = cells::width(label);
+    let Some(at) = clock_x.checked_sub(w + 1).filter(|&at| at > x) else {
+        return (clock_x, None);
+    };
+    cells::put(buf, at as u16, 0, label, w, pen);
+    (at, Some(cells::Cells::new(at as u16, 0, w as u16, 1)))
 }
 
 /// An entry of the strip clicked: its first slot.

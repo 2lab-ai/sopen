@@ -1741,6 +1741,14 @@ fn autosave(mut file: ImageFile, doc: &Doc, hooks: &Hooks) -> Result<Outcome> {
 // ---------------------------------------------------------------------------------------------
 // The window.
 
+/// Which context's textures `ctx` paints from (10 §7.2): a texture a window keeps is one
+/// context's, and the terminal's context and a window's take turns with one viewer across a
+/// switch — in the other, its id names nothing (or another texture). The manager's address: a
+/// kept handle holds its manager alive, so no other manager has that address meanwhile.
+pub(crate) fn textures_of(ctx: &egui::Context) -> usize {
+    Arc::as_ptr(&ctx.tex_manager()) as usize
+}
+
 /// A picture for the clipboard: egui keeps premultiplied alpha, so a pixel that is neither
 /// opaque nor fully transparent is rounded on the way (8-bit premultiplied).
 fn color_image(picture: &image::RgbaImage) -> egui::ColorImage {
@@ -1967,6 +1975,8 @@ struct ImageWindow {
     doc: Doc,
     file: Arc<Mutex<ImageFile>>,
     tex: Option<TextureHandle>,
+    /// Whose textures `tex` is among ([`textures_of`]).
+    tex_in: usize,
     tex_rev: Option<u64>,
     sel: Selection,
     block: u32,
@@ -2144,6 +2154,7 @@ impl ImageWindow {
             doc,
             file: Arc::new(Mutex::new(file)),
             tex: None,
+            tex_in: 0,
             tex_rev: None,
             sel,
             block,
@@ -3539,6 +3550,11 @@ impl ImageWindow {
     }
 
     fn texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
+        // Another context's texture (a switch, 10 §7.2) is let go: it is made here from the
+        // picture.
+        if self.tex_in != textures_of(ctx) {
+            self.tex = None;
+        }
         if self.tex_rev != Some(self.doc.rev()) || self.tex.is_none() {
             let max = ctx.input(|i| i.max_texture_side) as u32;
             let (w, h) = self.doc.size();
@@ -3562,7 +3578,10 @@ impl ImageWindow {
             };
             match &mut self.tex {
                 Some(tex) => tex.set(ci, options),
-                None => self.tex = Some(ctx.load_texture("image", ci, options)),
+                None => {
+                    self.tex = Some(ctx.load_texture("image", ci, options));
+                    self.tex_in = textures_of(ctx);
+                }
             }
             self.tex_rev = Some(self.doc.rev());
         }
@@ -4529,6 +4548,8 @@ struct Streaming {
     /// Why the file cannot be shown after all ([`super::Window::failure`]).
     failed: Arc<Mutex<Option<String>>>,
     tex: Option<(Sketch, TextureHandle)>,
+    /// Whose textures `tex` is among ([`textures_of`]).
+    tex_in: usize,
     preview: bool,
     /// A file at a revision ([`super::Window::set_read_only`]): the image window, once made,
     /// is told so before its first pass.
@@ -4604,6 +4625,7 @@ impl Streaming {
             leftover: Arc::default(),
             failed: Arc::default(),
             tex: None,
+            tex_in: 0,
             preview: false,
             read_only: false,
             drawn: Drawn::Nothing,
@@ -4920,13 +4942,15 @@ impl Streaming {
                     let src = Vec2::new(w as f32, h as f32);
                     let scale = (panel.width() / src.x).min(panel.height() / src.y);
                     let disp = Rect::from_center_size(panel.center(), src * scale);
-                    if self.tex.as_ref().is_none_or(|(of, _)| *of != which) {
+                    let here = textures_of(&ctx);
+                    if self.tex.as_ref().is_none_or(|(of, _)| *of != which) || self.tex_in != here {
                         let tex = ctx.load_texture(
                             "image-loading",
                             color_image(&picture),
                             egui::TextureOptions::LINEAR,
                         );
                         self.tex = Some((which, tex));
+                        self.tex_in = here;
                     }
                     if let Some((_, tex)) = &self.tex {
                         painter.image(

@@ -23,6 +23,7 @@ pub mod playback;
 pub mod save_as;
 mod select;
 pub mod streamed;
+pub mod term;
 pub mod term_input;
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -908,6 +909,8 @@ pub(crate) struct FKeyInput {
     digits: [Digit; 10],
     /// G is down as Alt+G, the terminal's switch: its repeats and release are taken too.
     g: bool,
+    /// The primary button went down on the title row's mode button: its release is taken too.
+    mode: bool,
 }
 
 /// A digit key between its press and its release: the shell decides at the press what it is,
@@ -929,6 +932,14 @@ impl egui::Plugin for FKeyInput {
     }
 
     fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        // A switch between backends ended every gesture under way: their releases went to the
+        // other backend, or were dropped with the terminal's unread input (10 §7.2).
+        if ctx
+            .data_mut(|d| d.remove_temp::<GesturesEnded>(gestures_id()))
+            .is_some()
+        {
+            self.mode = false;
+        }
         // The focus as the last pass left it: what has the typing now.
         let typing = ctx.text_edit_focused();
         let clicked = chrome::take_clicked(ctx);
@@ -940,6 +951,10 @@ impl egui::Plugin for FKeyInput {
             typing,
             input.focused,
             clicked,
+        ) | mode_button(
+            &mut input.events,
+            &mut self.mode,
+            chrome::mode_button_rect(ctx),
         );
         // The viewer's view keys (08 §8), once the digits that are F-keys are F-keys.
         route_view_keys(ctx, &mut input.events);
@@ -1094,6 +1109,58 @@ fn key_aliases(
     }
     *events = out;
     switch
+}
+
+/// The title row's mode button (10 §7, T4; `chrome::mode_button_rect`, where the last pass drew
+/// it): a press of the primary button there is the switch and is taken, with its release, before
+/// anything sees them — a modal's backdrop would close its dialog on that click (§9: the button
+/// always works). The press's release is the next primary release only: a primary press elsewhere
+/// or the focus lost ends the gesture (as a switch does, [`gestures_ended`]), so a release it
+/// never got does not take another click's. Whether this pass asked.
+fn mode_button(events: &mut Vec<egui::Event>, down: &mut bool, at: Option<egui::Rect>) -> bool {
+    let mut asked = false;
+    events.retain(|e| match e {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            ..
+        } => {
+            let on = at.is_some_and(|r| r.contains(*pos));
+            *down = on;
+            asked |= on;
+            !on
+        }
+        egui::Event::PointerButton {
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            ..
+        } if *down => {
+            *down = false;
+            false
+        }
+        egui::Event::WindowFocused(false) => {
+            *down = false;
+            true
+        }
+        _ => true,
+    });
+    asked
+}
+
+/// The backend switched ([`gestures_ended`]): the next pass's hook forgets the gestures under way.
+#[derive(Debug, Clone, Copy, Default)]
+struct GesturesEnded;
+
+fn gestures_id() -> egui::Id {
+    egui::Id::unique("sopen-gestures-ended")
+}
+
+/// `ctx`'s backend gives the screen to the other, or takes it back (10 §7.2): a press under way
+/// there — the mode button's, whose release the other backend got or the terminal's dropped
+/// input took — is over; the shell's input hook forgets it at the next pass ([`FKeyInput`]).
+pub fn gestures_ended(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(gestures_id(), GesturesEnded));
 }
 
 /// A pass asked for the switch ([`switch_asked`]).
@@ -1791,6 +1858,10 @@ pub fn run_window_sized<W: Window + 'static>(
 ) -> Result<()> {
     let choice = renderer_choice()?;
     let shot_done = Arc::new(AtomicBool::new(false));
+    // The watchdog's word: set once the window is gone too, however it went (a window that
+    // closed or did not start stalls nothing), so it never ends a process that goes on — the
+    // terminal backend's, which still holds its terminal.
+    let disarm = shot_done.clone();
     let shot_result: Arc<Mutex<Option<Result<String, String>>>> = Arc::default();
     let closed = Arc::new(AtomicBool::new(false));
     if hooks.screenshot.is_some() {
@@ -1844,7 +1915,7 @@ pub fn run_window_sized<W: Window + 'static>(
                 .map_or(min, |[w, h]| [w.min(min[0]), h.min(min[1])]),
         )
         .with_active(true);
-    start(choice, &slot, |renderer| {
+    let started = start(choice, &slot, |renderer| {
         let options = eframe::NativeOptions {
             viewport: viewport.clone(),
             renderer,
@@ -1855,7 +1926,9 @@ pub fn run_window_sized<W: Window + 'static>(
             error,
             closed: closed.load(Ordering::SeqCst),
         })
-    })?;
+    });
+    disarm.store(true, Ordering::SeqCst);
+    started?;
     if hooks.screenshot.is_some() {
         match shot_result.lock().unwrap().take() {
             Some(Ok(line)) => println!("{line}"),

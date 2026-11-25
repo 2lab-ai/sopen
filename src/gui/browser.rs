@@ -134,6 +134,18 @@ pub(crate) enum BrowserEvent {
 /// Shows the browser until its window closes; then waits for anything a viewer may still be
 /// writing (printed as the viewer's own window prints it) and returns what the viewers did.
 pub fn open(start: Start, hooks: &Hooks) -> Result<Outcome> {
+    open_on(start, hooks, |title, browser| {
+        super::run_window(title, WINDOW, browser, hooks)
+    })
+}
+
+/// [`open`] with the browser shown by `run` (its title, the browser) — a window, or the
+/// terminal (`super::term`); then the same wait for what is still writing.
+pub(crate) fn open_on(
+    start: Start,
+    hooks: &Hooks,
+    run: impl FnOnce(&str, Browser) -> Result<()>,
+) -> Result<Outcome> {
     let title = show(start.label.as_deref(), &start.abs);
     let script = match std::env::var("SOPEN_KEYS") {
         Ok(text) => parse_keys(&text).map_err(|e| anyhow::anyhow!("SOPEN_KEYS: {e}"))?,
@@ -143,7 +155,7 @@ pub fn open(start: Start, hooks: &Hooks) -> Result<Outcome> {
     browser.scripted(&hooks.state);
     browser.script = script.into();
     let leftover = browser.leftover.clone();
-    let run = super::run_window(&title, WINDOW, browser, hooks);
+    let run = run(&title, browser);
     let outcome = leftover.borrow_mut().finish();
     run?;
     Ok(outcome)
