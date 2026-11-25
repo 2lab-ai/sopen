@@ -182,9 +182,14 @@ impl Browser {
         };
         let body = Pen::new(p.text, p.back);
         cells::put(&mut buf, inner.x + gap as u16, foot, &shown, room, body);
-        // A dialog over the list: the cells under it blank first (cells.rs, one buffer over
-        // another), so a wide glyph half under its edge goes as a terminal erases it.
-        for under in self.ops.covered(grid) {
+        // A dialog or the key help over the list: the cells under it blank first (cells.rs, one
+        // buffer over another), so a wide glyph half under its edge goes as a terminal erases it.
+        for under in self
+            .ops
+            .covered(grid)
+            .into_iter()
+            .chain(help::covered(&ctx, grid))
+        {
             cells::fill(&mut buf, under, body);
         }
         // The field after the rows' interactions — on top of its row's, it takes its clicks —

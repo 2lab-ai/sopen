@@ -800,6 +800,69 @@ fn x1b_the_reports_scroll_bar_takes_clicks_and_a_drag() {
     assert!(in_cells(&drv, last), "the thumb dragged to the end");
 }
 
+/// F1's help over the report (a job that ended while the help was open): the F-key row's Help
+/// slot clicked under the help closes the help and not the report — the help takes the whole
+/// pointer, so no click reaches the report's backdrop; a click on the help's box, or on
+/// another slot, leaves both; the Exit slot closes the help, not the window.
+#[test]
+fn x1b_a_slot_clicked_under_the_help_closes_it_not_the_report_under_it() {
+    let report = Report {
+        items: vec![
+            item("a.txt", ItemOutcome::Done),
+            item("b.txt", ItemOutcome::Done),
+        ],
+        notes: vec![],
+    };
+    let Finished::Report(mut view) = finish(&copy_job(&["a.txt", "b.txt"]), report) else {
+        panic!("a report");
+    };
+    struct Under<'a> {
+        view: &'a mut ReportView,
+        closed: bool,
+    }
+    impl Window for Under<'_> {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            crate::gui::own_keys(ui, &[]);
+            if !self.closed && self.view.ui(ui.ctx(), dialog::grid(ui.ctx())) {
+                self.closed = true;
+            }
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+    let mut drv = Driver::new(900.0, 600.0);
+    let mut win = Under {
+        view: &mut view,
+        closed: false,
+    };
+    drv.idle(&mut win, 2);
+    framed(&drv, "Copy report");
+    let open = |drv: &Driver| crate::gui::help::is_open(&drv.ctx);
+    crate::gui::help::open(&drv.ctx, crate::gui::help::for_window(&[]));
+    drv.idle(&mut win, 2);
+    assert!(open(&drv));
+    let middle = Pos2::new(450.0, 300.0);
+    drv.click(&mut win, middle);
+    drv.click_text(&mut win, "10");
+    drv.idle(&mut win, 1);
+    assert!(
+        open(&drv) && !win.closed,
+        "a click on the box or an empty slot: nothing"
+    );
+    drv.click_text(&mut win, "Help   ");
+    drv.idle(&mut win, 1);
+    assert!(!open(&drv), "the Help slot closes the help");
+    assert!(!win.closed, "and not the report under it");
+    framed(&drv, "Copy report");
+    crate::gui::help::open(&drv.ctx, crate::gui::help::for_window(&[]));
+    drv.idle(&mut win, 2);
+    drv.click_text(&mut win, "Exit   ");
+    drv.idle(&mut win, 1);
+    assert!(!open(&drv) && !win.closed, "the Exit slot: the help only");
+    assert!(!drv.closed(), "not the window");
+}
+
 /// On a middle of four cells by four — below the smallest window — F7's dialog registers no
 /// control outside those cells: its field's editor and its buttons, which the layout puts below
 /// and right of them, are not there to click or to hold the keyboard. Esc still closes it.
