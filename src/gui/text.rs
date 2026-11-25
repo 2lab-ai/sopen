@@ -255,13 +255,18 @@ struct Phases {
     epoch: u64,
     /// Per line start (a file offset): bit k is the phase at (k + 1) × GRID past it.
     lines: std::collections::HashMap<u64, Vec<bool>>,
+    /// Per line of `lines`: the page read that last asked for its checkpoints ([`Phases::page`]).
+    used: std::collections::HashMap<u64, u64>,
+    /// Page reads so far: the lines the latest one asked for are never forgotten to make room —
+    /// it would ask for them again, and again.
+    page: u64,
     /// What a rule asked for and found no checkpoint for: a line's start and the GRID point
     /// (counted from it) a place needs.
     wanted: Option<(u64, u64)>,
 }
 
-/// Lines whose checkpoints a document keeps before it forgets them all (memory stays bounded:
-/// a bit is a byte per 16 KiB of a line).
+/// Lines whose checkpoints a document keeps; past it the one asked for longest ago goes (memory
+/// stays bounded — a bit is a byte per 16 KiB of a line — but by the lines of a page at least).
 const PHASE_LINES: usize = 64;
 
 impl Phases {
@@ -270,15 +275,30 @@ impl Phases {
         Self {
             epoch: EPOCH.fetch_add(1, Ordering::Relaxed),
             lines: std::collections::HashMap::new(),
+            used: std::collections::HashMap::new(),
+            page: 0,
             wanted: None,
         }
     }
 
-    /// The bits a read found for the line that starts at `line`, after its first `from`.
+    /// The bits a read found for the line that starts at `line`, after its first `from` — the
+    /// latest page asked for them. Room is made by forgetting the line asked for longest ago,
+    /// never one the latest page asked for.
     fn install(&mut self, line: u64, from: usize, bits: Vec<bool>) {
         if self.lines.len() >= PHASE_LINES && !self.lines.contains_key(&line) {
-            self.lines.clear();
+            let page = self.page;
+            let oldest = self
+                .used
+                .iter()
+                .filter(|&(_, &used)| used < page)
+                .min_by_key(|&(_, &used)| used)
+                .map(|(&l, _)| l);
+            if let Some(old) = oldest {
+                self.lines.remove(&old);
+                self.used.remove(&old);
+            }
         }
+        self.used.insert(line, self.page);
         let kept = self.lines.entry(line).or_default();
         if kept.len() >= from {
             kept.truncate(from);
@@ -959,6 +979,9 @@ impl TextDoc {
         );
         self.enc = enc;
         self.chosen = Some(enc);
+        // CP949's checkpoints are of the bytes as CP949 reads them: afresh, a new epoch (a read
+        // under way is dropped, nothing asked is kept).
+        self.phases = Phases::new();
         let first = self.first_start();
         if let Some(mark) = self.marks.first_mut() {
             mark.offset = first;
@@ -1610,6 +1633,25 @@ impl TextDoc {
         Ok(enc.grid_cut(Around::anchored(p, &bytes), g))
     }
 
+    /// The cut at grid point `g` as the piece that ends there got it (D36: a function of `g`),
+    /// for a piece that begins on `g` and does not know how it was reached: from `g` alone, else
+    /// — CP949 — from its line's start less than REACH back, found again by the LF before it
+    /// (the start the line's first piece was anchored at: [`TextDoc::grid_cut`]'s `line`).
+    fn cut_at(&mut self, g: u64, window: &mut Window_) -> Result<Option<u64>> {
+        let cut = self.grid_cut(g, 0, false, window)?;
+        if cut.is_some() || !self.enc.needs_phase() {
+            return Ok(cut);
+        }
+        let first = self.first_start();
+        let lo = g.saturating_sub(REACH).max(first);
+        let start = match self.newline_before(g, lo, window)? {
+            Some(lf) => lf + self.enc.unit() as u64,
+            None if g - first < REACH => first,
+            None => return Ok(None),
+        };
+        self.grid_cut(g, start, true, window)
+    }
+
     /// CP949 (§7.4): a character start at or before byte `x` of the line that starts at byte
     /// `line` (a start the index has), within a GRID of it, proven by the line's phase
     /// checkpoint at the GRID point at or before `x` — counted from the line's start; the start
@@ -1619,6 +1661,9 @@ impl TextDoc {
         let k = x / GRID;
         if k == 0 {
             return Some(0);
+        }
+        if let Some(used) = self.phases.used.get_mut(&line) {
+            *used = self.phases.page;
         }
         let bits = self.phases.lines.get(&line);
         if let Some(&bit) = bits.and_then(|b| b.get(k as usize - 1)) {
@@ -1676,6 +1721,10 @@ impl TextDoc {
         cancel: &AtomicBool,
     ) -> Result<Vec<bool>> {
         let enc = self.enc;
+        if !enc.needs_phase() {
+            // Another encoding's bytes have no CP949 phase: nothing is made, nothing trusted.
+            return Err(anyhow::Error::new(crate::remote::Cancelled));
+        }
         let mut k = have.len() as u64;
         let mut proof = match have.last() {
             Some(&bit) => line + k * GRID - u64::from(bit),
@@ -1735,7 +1784,7 @@ impl TextDoc {
         let blind = loose
             && enc.needs_phase()
             && start.is_multiple_of(GRID)
-            && self.grid_cut(start, 0, false, window)?.is_none();
+            && self.cut_at(start, window)? != Some(start);
         let piece = |len: u64, next: u64, ends: bool, cr: bool| Span {
             line: None,
             start,
@@ -4212,6 +4261,7 @@ impl TextWindow {
         self.seeking = None;
         // In the encoding chosen for this opening, if one was (D21).
         self.doc = TextDoc::streamed_as(source, self.doc.chosen);
+        self.phase_read = None;
         self.syntax_due = syntax_by_name(&self.name).is_none();
         if self.syntax_due {
             self.syntax = None;
@@ -4503,6 +4553,7 @@ impl TextWindow {
             (self.top, self.top_off, self.top_loose, self.line) = (0, 0, false, None);
             self.seeking = None;
             self.doc = TextDoc::streamed_as(source, Some(enc));
+            self.phase_read = None;
             self.regutter = true;
             self.failure = None;
             self.streamed = self.doc.source().map(Source::state);
@@ -4696,16 +4747,20 @@ impl TextWindow {
         let Some(read) = &self.phase_read else {
             return;
         };
-        let current = read.epoch == self.doc.phases.epoch;
+        if read.epoch != self.doc.phases.epoch {
+            // Of a document made again since, or read in another encoding: stopped at once.
+            self.phase_read = None;
+            return;
+        }
         match read.rx.try_recv() {
             Err(mpsc::TryRecvError::Empty) => return,
-            Ok(Ok(bits)) if current => {
+            Ok(Ok(bits)) => {
                 self.doc.phases.install(read.line, read.from, bits);
                 self.memo.reset(self.room);
                 self.stale_page = true;
                 self.resnap = true;
             }
-            Ok(Err(e)) if current && !e.is::<crate::remote::Cancelled>() => {
+            Ok(Err(e)) if !e.is::<crate::remote::Cancelled>() => {
                 self.status = Status::error(format!(
                     "{}: the line's character boundaries could not be read: {e:#}",
                     self.doc.encoding().label()
@@ -4760,6 +4815,7 @@ impl TextWindow {
                 let grew = doc.size() > self.doc.size();
                 self.index_took = doc.indexed_in;
                 self.doc = doc;
+                self.phase_read = None;
                 // The first line may have changed (another shebang): the grammar follows it
                 // (asked again on the next pass if it could not be read now).
                 let picked = syntax_of(&self.name, &mut self.doc);
@@ -5066,6 +5122,8 @@ impl TextWindow {
         rows: usize,
     ) -> Result<Page> {
         use wrap::{Measure, Pos, Wrapper};
+        // (CP949: the checkpoints this page asks for are kept while it is on screen.)
+        self.doc.phases.page += 1;
         let total = self.doc.total();
         // While the pass is on its way, a place it will reach waits for it (06 §7.2: the
         // lines there get their numbers); a place past where it stops is a jump by bytes.

@@ -783,21 +783,23 @@ fn ea5_step_3_over_the_corpus() {
     }
     // Each of the others by the criterion it fails. (This EUC-JP decodes with no error, its
     // kanji as Hangul and hanja: 36 % Hangul, under (d).)
-    let stopped = |name: &str, by: usize| {
-        let mut want = [true; 5];
-        want[by] = false;
+    let stopped = |name: &str, by: &[usize]| {
+        let mut want = [true; 6];
+        for &i in by {
+            want[i] = false;
+        }
         assert_eq!(why[name], want, "{name}");
     };
-    stopped("Korean with a hanja word each", 3);
-    stopped("a file with one syllable", 2);
-    stopped("UHC-only syllables mostly", 4);
-    stopped("EUC-JP", 3);
+    stopped("Korean with a hanja word each", &[3]);
+    stopped("a file with one syllable", &[2]);
+    stopped("UHC-only syllables mostly", &[4]);
+    stopped("EUC-JP", &[3, 5]);
     assert!(!why["Korean UTF-8"][0]);
     assert!(!why["hiragana-only EUC-JP"][2], "no syllable");
     // The near misses: hiragana-only Shift-JIS decodes as UHC syllables with no error, stopped
     // by (e) alone (none of them in KS X 1001); a GB2312 text whose every character decodes in
     // CP949 is about 2/3 Hangul, stopped by (d) alone.
-    stopped("hiragana-only Shift-JIS", 4);
+    stopped("hiragana-only Shift-JIS", &[4, 5]);
     let sjis = encoded(SHIFT_JIS, &hiragana);
     let syllables = oracle(&sjis[..SNIFF_BYTES])
         .chars()
@@ -823,7 +825,7 @@ fn ea5_step_3_over_the_corpus() {
     assert_eq!(picked_each_cut("a GB2312 text", &gb2312), none);
     assert_eq!(
         cp949::criteria(&gb2312[..SNIFF_BYTES], true),
-        [true, true, true, false, true]
+        [true, true, true, false, true, false]
     );
     let share = hangul_share(&gb2312[..SNIFF_BYTES]);
     assert!((0.60..0.72).contains(&share), "{share}");
@@ -904,4 +906,214 @@ fn ea5_step_3_thresholds() {
         .flat_map(u16::to_le_bytes)
         .collect();
     assert_eq!(pick(&wide, false).encoding, Utf16Le);
+}
+
+// ---------------------------------------------------------------------------------------------
+// D39 (f) (DEC 2026-11-25): Korean puts ASCII spaces between words; Chinese prose has next to none.
+
+const DOKRIP_ORIGINAL: &str = "吾等은 玆에 我 朝鮮의 獨立國임과 朝鮮人의 自主民임을 宣言하노라. \
+此로써 世界萬邦에 告하야 人類平等의 大義를 克明하며, 此로써 子孫萬代에 誥하야 民族自存의 正權을 \
+永有케 하노라. 半萬年 歷史의 權威를 仗하야 此를 宣言함이며, 二千萬 民衆의 誠忠을 合하야 此를 \
+佈明함이며, 民族의 恒久如一한 自由發展을 爲하야 此를 主張함이며, 人類的 良心의 發露에 基因한 \
+世界改造의 大機運에 順應幷進하기 爲하야 此를 提起함이니, 是ㅣ 天의 明命이며, 時代의 大勢ㅣ며, \
+全人類 共存同生權의 正當한 發動이라, 天下何物이던지 此를 沮止抑制치 못할지니라.";
+
+const DOKRIP_MODERN: &str = "우리는 오늘 조선이 독립한 나라이며, 조선 사람이 자주적인 민족임을 \
+선언한다. 이로써 세계 모든 나라에 알려 인류가 모두 평등하다는 큰 뜻을 분명히 하고, 이로써 자손 \
+만대에 깨우쳐 민족의 독자적 생존의 정당한 권리를 영원히 누리게 하려는 것이다. 반만년 역사의 \
+권위에 의지하여 이를 선언하며, 이천만 민중의 정성을 모아 이를 두루 밝히며, 민족의 한결같은 \
+자유 발전을 위하여 이를 주장하며, 인류의 양심에서 나온 세계 개조의 큰 기회와 시운에 맞추어 \
+함께 나아가기 위하여 이를 제기하니, 이는 하늘의 지시이며 시대의 큰 추세이며, 전 인류 공동 생존권의 \
+정당한 발동이기에, 세상의 어떤 힘이라도 이를 막고 억누르지 못할 것이다.";
+
+const HUNMIN_MODERN: &str = "나라의 말이 중국과 달라 문자와 서로 통하지 아니하므로 이런 까닭으로 \
+어리석은 백성이 이르고자 할 바가 있어도 마침내 제 뜻을 능히 펴지 못하는 사람이 많으니라. 내가 \
+이를 위하여 가엾게 여겨 새로 스물여덟 자를 만드노니 사람마다 하여금 쉬이 익혀 날로 씀에 편안케 \
+하고자 할 따름이니라.";
+
+const HUNMIN_HANMUN: &str = "國之語音 異乎中國 與文字不相流通 故愚民 有所欲言 而終不得伸其情者 \
+多矣 予爲此憫然 新制二十八字 欲使人人易習 便於日用耳";
+
+const HEONBEOP: &str = "유구한 역사와 전통에 빛나는 우리 대한국민은 3·1운동으로 건립된 \
+대한민국임시정부의 법통과 불의에 항거한 4·19민주이념을 계승하고, 조국의 민주개혁과 평화적 \
+통일의 사명에 입각하여 정의·인도와 동포애로써 민족의 단결을 공고히 하고, 모든 사회적 폐습과 \
+불의를 타파하며, 자율과 조화를 바탕으로 자유민주적 기본질서를 더욱 확고히 하여 정치·경제·사회·\
+문화의 모든 영역에 있어서 각인의 기회를 균등히 하고, 능력을 최고도로 발휘하게 하며, 자유와 \
+권리에 따르는 책임과 의무를 완수하게 하여, 안으로는 국민생활의 균등한 향상을 기하고 밖으로는 \
+항구적인 세계평화와 인류공영에 이바지함으로써 우리들과 우리들의 자손의 안전과 자유와 행복을 \
+영원히 확보할 것을 다짐하면서 1948년 7월 12일에 제정되고 8차에 걸쳐 개정된 헌법을 이제 국회의 \
+의결을 거쳐 국민투표에 의하여 개정한다.";
+
+const DAODEJING: &str = "道可道，非常道。名可名，非常名。無名天地之始；有名萬物之母。故常無欲，\
+以觀其妙；常有欲，以觀其徼。此兩者，同出而異名，同謂之玄。玄之又玄，衆妙之門。\n天下皆知美之為美，\
+斯惡已。皆知善之為善，斯不善已。故有無相生，難易相成，長短相較，高下相傾，音聲相和，前後相隨。\
+是以聖人處無為之事，行不言之教；萬物作焉而不辭，生而不有，為而不恃，功成而弗居。夫唯弗居，是以不去。\n\
+不尚賢，使民不爭；不貴難得之貨，使民不為盜；不見可欲，使民心不亂。是以聖人之治，虛其心，實其腹，\
+弱其志，強其骨。常使民無知無欲。使夫智者不敢為也。為無為，則無不治。";
+
+const DAODEJING_SIMPLIFIED: &str = "道可道，非常道。名可名，非常名。无名天地之始；有名万物之母。\
+故常无欲，以观其妙；常有欲，以观其徼。此两者，同出而异名，同谓之玄。玄之又玄，众妙之门。\n\
+天下皆知美之为美，斯恶已。皆知善之为善，斯不善已。故有无相生，难易相成，长短相较，高下相倾，\
+音声相和，前后相随。是以圣人处无为之事，行不言之教；万物作焉而不辞，生而不有，为而不恃，功成而弗居。";
+
+const LUNYU: &str =
+    "子曰：「學而時習之，不亦說乎？有朋自遠方來，不亦樂乎？人不知而不慍，不亦君子乎？」\n\
+有子曰：「其為人也孝弟，而好犯上者，鮮矣；不好犯上，而好作亂者，未之有也。君子務本，本立而道生。\
+孝弟也者，其為仁之本與！」\n子曰：「巧言令色，鮮矣仁！」\n曾子曰：「吾日三省吾身：為人謀而不忠乎？\
+與朋友交而不信乎？傳不習乎？」\n子曰：「道千乘之國，敬事而信，節用而愛人，使民以時。」";
+
+const CHUSHIBIAO: &str = "先帝創業未半，而中道崩殂；今天下三分，益州疲弊，此誠危急存亡之秋也。\
+然侍衛之臣不懈於內，忠志之士忘身於外者，蓋追先帝之殊遇，欲報之於陛下也。誠宜開張聖聽，以光先帝遺德，\
+恢弘志士之氣；不宜妄自菲薄，引喻失義，以塞忠諫之路也。\n宮中府中，俱為一體；陟罰臧否，不宜異同。\
+若有作姦犯科及為忠善者，宜付有司論其刑賞，以昭陛下平明之理；不宜偏私，使內外異法也。";
+
+/// `text` in CP949, leaving out what CP949 cannot hold (a few rare hanja), not as `&#…;`.
+fn cp949_lossy(text: &str) -> Vec<u8> {
+    let kept: String = text
+        .chars()
+        .filter(|c| !EUC_KR.encode(&c.to_string()).2)
+        .collect();
+    cp949(&kept)
+}
+
+/// `text` over and over, a newline between, to `bytes` or a little past.
+fn repeated(text: &str, bytes: usize) -> String {
+    let mut out = String::new();
+    while out.len() < bytes {
+        out.push_str(text);
+        out.push('\n');
+    }
+    out
+}
+
+/// A sample's two-byte characters and ASCII characters (printable, and whitespace) as CP949
+/// decodes its first 8 KiB.
+fn two_byte_and_ascii(sample: &[u8]) -> (usize, usize) {
+    let cells = Cp949
+        .decode(&sample[..sample.len().min(SNIFF_BYTES)], true)
+        .0;
+    let two = cells.iter().filter(|c| c.len == 2).count();
+    let ascii = cells
+        .iter()
+        .filter(|c| c.len == 1 && matches!(c.ch, ' '..='~' | '\t' | '\n' | '\r' | '\x0B' | '\x0C'))
+        .count();
+    (two, ascii)
+}
+
+/// D39 (f) over §7.2's excerpts (public domain, encoded here): each sample's ASCII characters
+/// per two-byte character, as CP949 decodes its first 8 KiB, and the criteria. Korean prose is
+/// 0.33–0.40 (spaces between words); Chinese prose next to none — 0.012 in simplified GBK, up to
+/// 0.12 where CP949 reads GBK and Big5 trail bytes as ASCII, all of it CP949 errors (b) anyway.
+/// An .srt of Chinese subtitles has ASCII timestamps (2.2): (d) stops it, not (f).
+#[test]
+fn ea5_f_korean_puts_spaces_between_words_and_chinese_none() {
+    let srt: String = (1..200)
+        .map(|i| {
+            format!(
+                "{i}\r\n00:{:02}:{:02},000 --> 00:{:02}:{:02},500\r\n\
+                 你好，我们今天学习编码。这是第{i}行字幕。\r\n\r\n",
+                i / 60 % 60,
+                i % 60,
+                i / 60 % 60,
+                (i + 2) % 60
+            )
+        })
+        .collect();
+    let gbk = |text: &str| GBK.encode(&repeated(text, 3000)).0.into_owned();
+    let big5 = |text: &str| BIG5.encode(&repeated(text, 3000)).0.into_owned();
+    let ko = |text: &str| cp949_lossy(&repeated(text, 3000));
+    let ratio = |body: &[u8]| {
+        let (two, ascii) = two_byte_and_ascii(body);
+        ascii as f64 / two as f64
+    };
+    let criteria = |body: &[u8]| {
+        cp949::criteria(
+            &body[..body.len().min(SNIFF_BYTES)],
+            body.len() > SNIFF_BYTES,
+        )
+    };
+    // Korean: well above a tenth; the modern texts are guessed, by every criterion.
+    for (name, body, lo) in [
+        ("기미독립선언서 현대어", ko(DOKRIP_MODERN), 0.35),
+        ("훈민정음 서문 현대어", ko(HUNMIN_MODERN), 0.35),
+        ("헌법 전문", ko(HEONBEOP), 0.33),
+    ] {
+        assert!(ratio(&body) >= lo, "{name}: {}", ratio(&body));
+        assert_eq!(criteria(&body), [true; 6], "{name}");
+        assert_eq!(pick(&body, false).encoding, Cp949, "{name}");
+    }
+    // Thick with hanja: (d) stops it, (f) would not; in hanja alone, (c) and (d).
+    let original = ko(DOKRIP_ORIGINAL);
+    assert!(ratio(&original) >= 0.3, "{}", ratio(&original));
+    assert_eq!(criteria(&original), [true, true, true, false, true, true]);
+    let hanmun = ko(HUNMIN_HANMUN);
+    assert_eq!(criteria(&hanmun), [true, true, false, false, true, true]);
+    // Chinese: under a tenth where the bytes are what they say; every one not CP949.
+    let simplified = gbk(DAODEJING_SIMPLIFIED);
+    assert!(ratio(&simplified) < 0.02, "{}", ratio(&simplified));
+    for (name, body) in [
+        ("道德經 GBK", gbk(DAODEJING)),
+        ("道德經 Big5", big5(DAODEJING)),
+        ("道德经 GBK", simplified),
+        ("論語 GBK", gbk(LUNYU)),
+        ("論語 Big5", big5(LUNYU)),
+        ("出師表 GBK", gbk(CHUSHIBIAO)),
+        ("出師表 Big5", big5(CHUSHIBIAO)),
+    ] {
+        assert!(ratio(&body) < 0.13, "{name}: {}", ratio(&body));
+        assert!(!criteria(&body)[1], "{name}: CP949 errors");
+        assert_eq!(pick(&body, false).encoding, Utf8, "{name}");
+    }
+    let srt = GBK.encode(&srt).0.into_owned();
+    assert!(ratio(&srt) > 2.0, "{}", ratio(&srt));
+    assert_eq!(criteria(&srt), [true, true, true, false, true, true]);
+    assert_eq!(pick(&srt, false).encoding, Utf8);
+}
+
+/// D39 (f)'s floor, both ways: below 32 two-byte characters the guess is (a)–(e), Korean first —
+/// GBK's `你好你好` (`C4E3 BAC3 C4E3 BAC3`, KS X 1001 Hangul to CP949) is guessed CP949, F8 the
+/// way out (08's Tensions); at 32 and more, a sample with no ASCII is not guessed — GBK's
+/// `你好吗啊` over and over, and Korean with no space at all alike — while spaced Korean is.
+#[test]
+fn ea5_f_holds_from_32_two_byte_characters() {
+    let nihao = GBK.encode("你好你好").0.into_owned();
+    assert_eq!(nihao, [0xC4, 0xE3, 0xBA, 0xC3, 0xC4, 0xE3, 0xBA, 0xC3]);
+    assert_eq!(
+        pick(&nihao, false).encoding,
+        Cp949,
+        "below the floor: Korean first"
+    );
+    let short = GBK.encode(&"你好吗啊".repeat(7)).0.into_owned();
+    assert_eq!(
+        pick(&short, false).encoding,
+        Cp949,
+        "28 two-byte characters"
+    );
+    let long = GBK.encode(&"你好吗啊".repeat(8)).0.into_owned();
+    assert_eq!(
+        cp949::criteria(&long, false),
+        [true, true, true, true, true, false]
+    );
+    assert_eq!(pick(&long, false).encoding, Utf8, "32: (f) alone stops it");
+    let unspaced = cp949(&"가나다라".repeat(8));
+    assert!(!cp949::criteria(&unspaced, false)[5]);
+    assert_eq!(
+        pick(&unspaced, false).encoding,
+        Utf8,
+        "Korean with no space at all"
+    );
+    let spaced = cp949(&"가나다라 ".repeat(8));
+    assert_eq!(pick(&spaced, false).encoding, Cp949);
+    let one_space = cp949(&format!(
+        "{} {}",
+        "가나다라".repeat(5),
+        "가나다라".repeat(4)
+    ));
+    assert_eq!(
+        pick(&one_space, false).encoding,
+        Utf8,
+        "one space to 36: under a tenth"
+    );
+    let enough = cp949(&"가나다 라마바 사아자 차카타 ".repeat(3));
+    assert_eq!(pick(&enough, false).encoding, Cp949);
 }

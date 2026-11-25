@@ -8,11 +8,11 @@ use super::super::tests::cp949::{check_rows, korean_lines, syllables, Whole};
 use super::*;
 use crate::encoding::{Encoding::Cp949, W};
 
-/// A line: `a`, then `n` syllables — with a space after every `spaced` of them when given —
-/// then LF. Where it starts and ends (before its LF).
-fn long_line(body: &mut Vec<u8>, n: usize, spaced: Option<usize>) -> (u64, u64) {
+/// A line: `head` (ASCII), then `n` syllables — with a space after every `spaced` of them when
+/// given — then LF. Where it starts and ends (before its LF).
+fn long_line(body: &mut Vec<u8>, head: &[u8], n: usize, spaced: Option<usize>) -> (u64, u64) {
     let start = body.len() as u64;
-    body.push(b'a');
+    body.extend_from_slice(head);
     match spaced {
         Some(k) => {
             for i in 0..n / k {
@@ -48,12 +48,12 @@ fn ea3_cp949_inside_and_past_the_16_mib_index_reads_as_the_whole_file_decode() {
         let (block, _) = korean_lines(400);
         let mut body = Vec::new();
         lines_to(&mut body, &block, 1 << 20);
-        let ii = long_line(&mut body, 128 * 1024, None);
+        let ii = long_line(&mut body, b"a", 128 * 1024, None);
         lines_to(&mut body, &block, HIGHLIGHT_MAX as usize + (1 << 20));
-        let i = long_line(&mut body, 128 * 1024, Some(20));
+        let i = long_line(&mut body, b"a", 128 * 1024, Some(20));
         let to = body.len() + 200 * 1024;
         lines_to(&mut body, &block, to);
-        let iii = long_line(&mut body, 128 * 1024, None);
+        let iii = long_line(&mut body, b"a", 128 * 1024, None);
         let to = body.len() + 200 * 1024;
         lines_to(&mut body, &block, to);
         // (iv) starts 10 KiB past a grid point: its first piece ends 54 KiB in.
@@ -63,7 +63,18 @@ fn ea3_cp949_inside_and_past_the_16_mib_index_reads_as_the_whole_file_decode() {
             (off - body.len() as u64) as usize,
         ));
         body.push(b'\n');
-        let iv = long_line(&mut body, 30 * 1024, None);
+        let iv = long_line(&mut body, b"a", 30 * 1024, None);
+        let to = body.len() + 200 * 1024;
+        lines_to(&mut body, &block, to);
+        // (iv) again with two ASCII bytes first: no lead pending at its first piece's cut, so
+        // the piece after it begins on the grid point itself, proven by the line start too.
+        let off = (body.len() as u64 / GRID + 1) * GRID + 10 * 1024 - 1;
+        body.extend(std::iter::repeat_n(
+            b'x',
+            (off - body.len() as u64) as usize,
+        ));
+        body.push(b'\n');
+        let iv_b = long_line(&mut body, b"ab", 30 * 1024, None);
         let to = body.len() + 200 * 1024;
         lines_to(&mut body, &block, to);
         // (v) spaced, then a stretch with no sync byte across a grid point more than W into it
@@ -103,6 +114,7 @@ fn ea3_cp949_inside_and_past_the_16_mib_index_reads_as_the_whole_file_decode() {
         lines_to(&mut body, &block, to);
         let whole = |(s, e): (u64, u64)| Whole::of(&body, s, e);
         let (w_i, w_ii, w_iii, w_iv, w_v) = (whole(i), whole(ii), whole(iii), whole(iv), whole(v));
+        let w_iv_b = whole(iv_b);
 
         let mut net = net(&body, gate());
         let mut win = net.window("big.txt");
@@ -208,6 +220,13 @@ fn ea3_cp949_inside_and_past_the_16_mib_index_reads_as_the_whole_file_decode() {
         drv.key(&mut win, Key::PageUp, Modifiers::NONE);
         run(&mut drv, &mut win, &mut net, "(iv) back", settled);
         assert_eq!(check_rows(&win, &w_iv, "(iv) back"), 0);
+        let cut = iv_b.0 / GRID * GRID + REACH;
+        assert!(!Cp949.phase(&body[iv_b.0 as usize..cut as usize]).unwrap());
+        for at in [cut - 1, cut + 1, cut + 3 * 1024] {
+            go_to(&mut drv, &mut win, &mut net, at);
+            run(&mut drv, &mut win, &mut net, "(iv) b", settled);
+            assert_eq!(check_rows(&win, &w_iv_b, &format!("(iv) b {at}")), 0);
+        }
 
         // (v) a piece proven from its start that ends at a grid point nothing proves: the lead
         // pending there is shown by neither piece, never as a U+FFFD the decode lacks; the piece
@@ -222,6 +241,33 @@ fn ea3_cp949_inside_and_past_the_16_mib_index_reads_as_the_whole_file_decode() {
                 check_rows(&win, &w_v, &format!("(v) {at} {key:?}"));
             }
         }
+        // The piece from g is marks only up to its first sync byte, characters from there.
+        let first_sync = (g as usize..).find(|&i| body[i] == b' ').unwrap() as u64;
+        go_to(&mut drv, &mut win, &mut net, first_sync - 20);
+        run(
+            &mut drv,
+            &mut win,
+            &mut net,
+            "(v) its first sync byte",
+            settled,
+        );
+        check_rows(&win, &w_v, "(v) its first sync byte");
+        let rows = &win.page.as_ref().unwrap().rows;
+        let row = rows
+            .iter()
+            .find(|r| {
+                let at = r.at + r.start;
+                at <= first_sync && first_sync < at + r.cut.bytes as u64
+            })
+            .expect("the row holding the sync byte");
+        assert!(row.loose, "a piece from the grid");
+        let at = row.at + row.start;
+        assert_eq!(
+            at + row.cut.dim as u64,
+            first_sync,
+            "marks up to it, no further"
+        );
+        assert!(row.cut.dim < row.cut.shown.len(), "characters from it");
     });
 }
 
@@ -241,7 +287,7 @@ fn the_open_lines_grid_cuts_take_its_checkpoints_inside_the_index() {
         let next = (body.len() as u64 / GRID + 2) * GRID;
         body.extend(std::iter::repeat_n(b'x', (next - 1) as usize - body.len()));
         body.push(b'\n');
-        let o = long_line(&mut body, 200 * 1024, None);
+        let o = long_line(&mut body, b"a", 200 * 1024, None);
         let to = body.len() + 100 * 1024;
         lines_to(&mut body, &block, to);
         let bound = o.0 + REACH;
@@ -316,5 +362,46 @@ fn the_open_lines_grid_cuts_take_its_checkpoints_inside_the_index() {
         let rows = win.page.as_ref().unwrap().rows.len();
         assert_eq!(check_rows(&win, &w_o, "past the cap"), rows);
         assert!(win.phase_read.is_none() && win.doc.phases.wanted.is_none());
+    });
+}
+
+/// MF-1 (review of VM-4): the open line one byte past a grid point — its first piece's cut, REACH
+/// minus one past its start, is proven by the line start and falls on the grid point itself (no
+/// lead pending): the piece after it is proven too, never blind marks.
+#[test]
+fn a_piece_after_a_cut_its_line_start_proves_is_not_blind() {
+    bounded("the piece after a line-start cut", || {
+        let (block, _) = korean_lines(400);
+        let mut body = Vec::new();
+        lines_to(&mut body, &block, HIGHLIGHT_MAX as usize - 200 * 1024);
+        let next = (body.len() as u64 / GRID + 2) * GRID + 1;
+        body.extend(std::iter::repeat_n(b'x', (next - 1) as usize - body.len()));
+        body.push(b'\n');
+        let o = long_line(&mut body, b"a", 200 * 1024, None);
+        let to = body.len() + 100 * 1024;
+        lines_to(&mut body, &block, to);
+        let bound = o.0 / GRID * GRID + REACH;
+        assert_eq!((o.0 % GRID, bound - o.0), (1, REACH - 1));
+        assert!(!Cp949.phase(&body[o.0 as usize..bound as usize]).unwrap());
+        let w_o = Whole::of(&body, o.0, o.1);
+        let mut net = net(&body, gate());
+        let mut win = net.window("open.txt");
+        let mut drv = Driver::new(500.0, 200.0);
+        run(&mut drv, &mut win, &mut net, "the pass", |w, _| {
+            w.doc.size() >= HIGHLIGHT_MAX
+        });
+        net.settle();
+        drv.idle(&mut win, 3);
+        let settled = |w: &TextWindow, _: &Driver| w.ready() && w.jump.is_none() && has_rows(w);
+        for at in [bound + 100, bound - 100] {
+            win.jump_to(Jump::Byte(at));
+            run(&mut drv, &mut win, &mut net, "the jump", settled);
+            assert_eq!(check_rows(&win, &w_o, &format!("{at}")), 0);
+            for key in [Key::PageDown, Key::PageDown, Key::PageUp] {
+                drv.key(&mut win, key, Modifiers::NONE);
+                run(&mut drv, &mut win, &mut net, "paging", settled);
+                assert_eq!(check_rows(&win, &w_o, &format!("{at} {key:?}")), 0);
+            }
+        }
     });
 }

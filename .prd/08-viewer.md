@@ -188,7 +188,10 @@ and 4 with step 3's slot empty; VM-4 filled step 3 (`src/encoding/cp949.rs`).
    allowance (a character cut by the sample's end is no error when the file goes on); (b) it decodes as
    CP949 with no error (a lead as its last byte is none either when the file goes on); (c) it holds at
    least 4 Hangul syllables (U+AC00–U+D7A3); (d) they are at least **3/4** of its decoded non-ASCII
-   characters; (e) at least **3/4** of them are KS X 1001's 2,350 (both bytes ≥ 0xA1).
+   characters; (e) at least **3/4** of them are KS X 1001's 2,350 (both bytes ≥ 0xA1); (f) with at
+   least **32** two-byte characters, its ASCII characters (printable and whitespace, as CP949 decodes
+   it) are at least **1/10** of them (DEC 2026-11-25: Korean puts spaces between words, Chinese prose
+   next to none — GBK's `你好吗啊` is all KS X 1001 Hangul to CP949).
 4. **Else UTF-8**, valid or not, as today. ASCII, UCS-2, Latin-1 and CP437 are never defaults.
 
 - **Steps 1–2 over a corpus** (a python model, 2026-11-24; the same answers at 64 KiB): BOM-less English
@@ -203,8 +206,17 @@ and 4 with step 3's slot empty; VM-4 filled step 3 (`src/encoding/cp949.rs`).
   1001), Korean UTF-8 (valid), BOM-less Korean UTF-16LE, GBK, GB2312, Big5, EUC-JP, Shift-JIS with kanji,
   Latin-1, Windows-1252, random bytes, a Mach-O binary, a TrueType font (all CP949 errors), hiragana-only
   EUC-JP (no syllable). **Near misses**: hiragana-only Shift-JIS decodes as 4,048 UHC syllables with no
-  error and is stopped by (e) alone (0 of 4,048 in KS X 1001); a GB2312 text whose every character
-  decodes in CP949 is 66–68 % Hangul, stopped by (d) alone.
+  error and is stopped by (e) alone among (a)–(e) (0 of 4,048 in KS X 1001); a GB2312 text whose
+  every character decodes in CP949 is 66–68 % Hangul, stopped by (d) alone among (a)–(e). (f) stops
+  both as well, their only ASCII a newline a line.
+- **(f) over public-domain excerpts** (VM-4's tests, encoded with encoding_rs; ASCII characters per
+  two-byte character in the first 8 KiB, as CP949 decodes it): Korean prose — 기미독립선언서 in
+  today's Korean 0.40, 훈민정음 서문 in today's Korean 0.39, 대한민국 헌법 전문 0.35, all guessed;
+  the 1919 original, thick with hanja, 0.33 (stopped by (d)); 훈민정음's 한문 text 0.20 (stopped by
+  (c) and (d)). Chinese — 道德经 in simplified GBK 0.012; 道德經, 論語, 出師表 in GBK and Big5
+  0.06–0.12, where CP949 reads trail bytes as ASCII, every one a CP949 error (b). An .srt of Chinese
+  subtitles, ASCII timestamps and all, is 2.2: (d) stops it, not (f). A tenth sits 3.5 times under
+  Korean prose.
 - **A BOM is skipped only under its own encoding** (D26, D37): `EF BB BF` under UTF-8; `FF FE` / `FE FF`
   under UTF-16 or UCS-2 of that order; `FF FE 00 00` / `00 00 FE FF` under UTF-32 of that order (so a file starting `FF FE 00 00`, picked as UTF-32LE, switched by F8 to UTF-16LE or UCS-2LE has its `FF FE` skipped as that encoding's own BOM and `00 00` is its first unit). Line 1
   then starts after it, so `#!/bin/sh` after a UTF-8 BOM picks the syntax (*trace* §3 T14). Under any
@@ -312,11 +324,14 @@ and 4 with step 3's slot empty; VM-4 filled step 3 (`src/encoding/cp949.rs`).
   the line's bytes before the place, inside the indexed prefix: ≤ 16 MiB through a stream (all 16 MiB
   take 2–8 s on 06's rig), fewer when the block cache still holds them `[추정]`; a local file is read in
   place. A line shorter than REACH needs none, since its start is within REACH. Until the read ends,
-  rule 3 or the placeholders apply. VM-4 keeps the bits per line start (`text.rs`'s `Phases`, at
-  most 64 lines), reads them on a worker through a handle of the document's own (`PhaseRead`; a
-  stream's waits for its bytes), never from a preview, and drops them with the document (a re-read, a
-  reload, another index); `ready` waits for a read the page asked for, so a screenshot shows its rows,
-  and the page is read again from the same place once the bits are in.
+  rule 3 or the placeholders apply. VM-4 keeps the bits per line start (`text.rs`'s `Phases`: past
+  64 lines the one asked for longest ago goes, never one the page on screen asked for, so a page of
+  more long lines than that settles), reads them on a worker through a handle of the document's own
+  (`PhaseRead`; a stream's waits for its bytes), never from a preview, and drops them — the read under
+  way stopped at once — with the document (a re-read, a reload, another index) and on any change of
+  encoding (they are CP949's: a read under another encoding makes none); `ready` waits for a read the
+  page asked for, so a screenshot shows its rows, and the page is read again from the same place once
+  the bits are in.
 - **The grid cut** (§7.3 rule 1): decode forward from the line start within REACH, else the checkpoint
   at g, else the last sync byte in [g − W, g); the cut is g − 1 when a lead is pending there, else g. With neither, the placeholders
   above. "Within REACH" is a line start less than REACH before g — the bound a jump's look-back
@@ -326,7 +341,14 @@ and 4 with step 3's slot empty; VM-4 filled step 3 (`src/encoding/cp949.rs`).
   inside the indexed prefix, read to the grid point that ends the piece holding the place (at most
   GRID past it); past the prefix no line start is known. A piece that ends at a grid point
   nothing proves stops before a lead pending there (decoded from the piece's own proof): the piece
-  after begins blind, so neither shows that character, never as a U+FFFD the whole decode lacks. **A restart's start** (rule 2) is the window's first sync byte, or the exact start a line start
+  after begins blind, so neither shows that character, never as a U+FFFD the whole decode lacks.
+  A piece that begins on a grid point finds its cut there as the piece before got it — from g alone,
+  else from its line start less than REACH back, found again by the LF before it — so the piece after
+  a cut the line start proves is proven too, not blind (`TextDoc::cut_at`). A line that starts
+  exactly on a grid point is REACH from its first piece's end, so that first cut never has the
+  line-start proof (the strict "less than"): a sync byte or the open line's checkpoint, else marks.
+  A wrapped row that ends at a restart nothing proves is not decoded whole: a lead pending there goes
+  to the row after it, as one mark, never a U+FFFD. **A restart's start** (rule 2) is the window's first sync byte, or the exact start a line start
   or checkpoint gives; "first sync byte in the window" is for restarts only.
 - **The new dependency**: `encoding_rs = "0.8.35"`, for CP949 only (VM-4): its 17,048-pair table is data
   sopen should not write by hand, and encoding_rs is the WHATWG decoder Gecko uses (since Firefox 56, its
@@ -438,7 +460,7 @@ Every decision is reversible; the owner may change any of them.
 | D36 | One grid-cut function per encoding, used by both pieces, in [g − 3, g]; VM-1 exposes its look-back | the text view's `grid_cut` before VM-2 looked back only; two pieces that cut apart show a character twice or lose it | a forward skip at each piece |
 | D37 | BOM: the longest first, whatever the size; skipped only under its own encoding (UTF-16's for UCS-2, UTF-32's for UCS-4); a place inside it is line 1's start | `FF FE 00 00` is UTF-32LE's BOM before UTF-16LE's; under another encoding it is bytes like any other; `span_at`'s fallback would show the last line | the draft's size-dependent pick |
 | D38 | UTF-16 resync looks at the preceding unit and moves only across a valid pair; a standalone low surrogate is one U+FFFD | a low surrogate pairs only with the high one right before it, so one unit of look-back equals whole-file decoding | skip every low surrogate (hides a standalone one) |
-| D39 | CP949 is the default's step 3, by (a)–(e), shown `(guessed)`, F8 overriding; routing unchanged | the owner is Korean; over §7.2's corpus it picks every Korean CP949/EUC-KR sample up to 8 % hanja and nothing else; (e) alone stops hiragana-only Shift-JIS | never a default (F8 only) |
+| D39 | CP949 is the default's step 3, by (a)–(f), shown `(guessed)`, F8 overriding; routing unchanged; (f) (DEC 2026-11-25) only from 32 two-byte characters | the owner is Korean; over §7.2's corpus it picks every Korean CP949/EUC-KR sample up to 8 % hanja and nothing else; (e) alone among (a)–(e) stops hiragana-only Shift-JIS; (f) stops GBK Chinese whose characters CP949 reads as KS X 1001 Hangul | never a default (F8 only) |
 | D40 | HTML, HTM and styled XML: 1 Page · 2 Hex · 3 Text; other XML, RSS among it: 1 Text · 2 Hex · 3 Page (09 §5–§6); supersedes D7 for these | both engines show plain XML as run-on text (09 §5) | every XML a page (the draft's D9) |
 
 ## 11. Acceptance
@@ -598,7 +620,13 @@ Model units are ready to build; screen units wait for XR-T. Files are disjoint e
   66–68 % Hangul against the 3/4 bar, and hiragana-only Shift-JIS is stopped only by (e). Korean thick
   with hanja (47 % Hangul) is not picked: F8 picks it. VM-4's generated corpus agrees, but for one
   sample: a kana-and-kanji EUC-JP text decodes in CP949 with no error (its kanji as Hangul and hanja)
-  and is stopped by (d) alone, at 36 % Hangul — not the CP949 error §7.2's corpus found.
+  and is stopped by (d) alone among (a)–(e), at 36 % Hangul — not the CP949 error §7.2's corpus
+  found.
+- **Short heads are guessed Korean-first** (D39 (f), DEC 2026-11-25). Below 32 two-byte characters (f)
+  does not apply: GBK's `你好你好` (`C4E3 BAC3 C4E3 BAC3`, four KS X 1001 syllables to CP949) is
+  `CP949 (guessed)`. The owner is Korean, sopen has no GBK decoder to offer instead, and F8 is the way
+  out. The other side of (f): 32 or more syllables with no ASCII at all — Korean written without a
+  space for 8 KiB — is not guessed either; F8 picks it.
 - **SVG is text** (`kind.rs:62`) though it is a picture: its 1 is the highlighted source. 09 leaves
   `.svg` as 01 §3 makes it (09's scope), and the `image` crate's features in `Cargo.toml` decode no SVG.
 - **F9 and message 19.** A Mac's top row sends media keys unless fn is held; message 19's outcome decides

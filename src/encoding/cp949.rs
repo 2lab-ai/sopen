@@ -138,18 +138,26 @@ pub fn phase(bytes: &[u8]) -> Option<bool> {
     Some(pending(bytes))
 }
 
-/// §7.2 step 3: D39's (a)–(e) all hold ([`criteria`]).
+/// (f) asks a sample of at least this many two-byte characters…
+const F_FLOOR: usize = 32;
+/// …for one ASCII character (printable or whitespace) to this many of them: Korean puts spaces
+/// between words (0.35–0.40 of them in §7.2's Korean prose), Chinese prose next to none (0.012).
+const F_PER_ASCII: usize = 10;
+
+/// §7.2 step 3: D39's (a)–(f) all hold ([`criteria`]).
 pub fn guess(sample: &[u8], truncated: bool) -> bool {
     criteria(sample, truncated).iter().all(|&c| c)
 }
 
-/// D39's (a)–(e) over the sample (`truncated`: the file goes on past it): (a) it is not valid
+/// D39's (a)–(f) over the sample (`truncated`: the file goes on past it): (a) it is not valid
 /// UTF-8, with `kind.rs`'s allowance (a character cut by the sample's end is no error when the
 /// file goes on); (b) it decodes as CP949 with no error (a lead as its last byte is none either
 /// when the file goes on); (c) it holds at least 4 Hangul syllables (U+AC00–U+D7A3); (d) they
 /// are at least 3/4 of its decoded non-ASCII characters; (e) at least 3/4 of them are KS X
-/// 1001's 2,350 (both bytes ≥ 0xA1).
-pub(super) fn criteria(sample: &[u8], truncated: bool) -> [bool; 5] {
+/// 1001's 2,350 (both bytes ≥ 0xA1); (f) with at least 32 two-byte characters, its ASCII
+/// characters (printable and whitespace) are at least a tenth of them (DEC 2026-11-25: GBK's
+/// `你好吗啊` is all KS X 1001 Hangul; below 32 the guess stays Korean-first).
+pub(super) fn criteria(sample: &[u8], truncated: bool) -> [bool; 6] {
     let utf8 = match std::str::from_utf8(sample) {
         Ok(_) => true,
         Err(e) => truncated && e.error_len().is_none(),
@@ -157,12 +165,17 @@ pub(super) fn criteria(sample: &[u8], truncated: bool) -> [bool; 5] {
     let body = &sample[..sample.len() - usize::from(truncated && pending(sample))];
     let (cells, _) = decode(body, true);
     let (mut bad, mut other, mut hangul, mut ks) = (0usize, 0usize, 0usize, 0usize);
+    let (mut two, mut ascii) = (0usize, 0usize);
     let mut at = 0;
     for c in &cells {
         let bytes = &body[at..at + usize::from(c.len)];
         at += usize::from(c.len);
         bad += usize::from(c.ch == FFFD);
         other += usize::from(!c.ch.is_ascii());
+        two += usize::from(c.len == 2);
+        ascii += usize::from(
+            c.len == 1 && matches!(c.ch, ' '..='~' | '\t' | '\n' | '\r' | '\x0B' | '\x0C'),
+        );
         if ('\u{AC00}'..='\u{D7A3}').contains(&c.ch) {
             hangul += 1;
             ks += usize::from(bytes.iter().all(|&b| b >= 0xA1));
@@ -174,5 +187,6 @@ pub(super) fn criteria(sample: &[u8], truncated: bool) -> [bool; 5] {
         hangul >= 4,
         4 * hangul >= 3 * other,
         4 * ks >= 3 * hangul,
+        two < F_FLOOR || F_PER_ASCII * ascii >= two,
     ]
 }

@@ -207,8 +207,8 @@ fn ea3_ii_a_long_line_with_no_sync_byte_waits_for_its_checkpoints() {
     let (body, end) = long_line();
     let whole = Whole::of(&body, 0, end);
     let path = write(tmp.path(), "long.txt", &body);
-    let doc = TextDoc::open(&path).unwrap();
-    assert_eq!(doc.encoding_label().as_deref(), Some("CP949 (guessed)"));
+    let doc = TextDoc::open_encoded(&path, Cp949).unwrap();
+    assert_eq!(doc.encoding_label().as_deref(), Some("CP949"));
     let mut win = TextWindow::new(doc, "box:long".into(), "long.txt", vec![]);
     let go = held_phases(&mut win);
     let mut drv = Driver::new(500.0, 200.0);
@@ -293,7 +293,7 @@ fn ea7_cp949_rows_and_places_not_wrapped_are_character_starts() {
     for (name, body, end) in [("spaced", spaced, spaced_end), ("bare", bare, bare_end)] {
         let whole = Whole::of(&body, 0, end);
         let path = write(tmp.path(), &format!("{name}.txt"), &body);
-        let doc = TextDoc::open(&path).unwrap();
+        let doc = TextDoc::open_encoded(&path, Cp949).unwrap();
         assert_eq!(doc.encoding(), Cp949, "{name}");
         let mut win = TextWindow::new(doc, "box:k".into(), "k.txt", vec![]);
         let mut drv = Driver::new(500.0, 200.0);
@@ -339,5 +339,173 @@ fn ea7_cp949_rows_and_places_not_wrapped_are_character_starts() {
         drv.key(&mut win, Key::End, Modifiers::NONE);
         drv.until(&mut win, 10, |w| w.ready());
         assert_eq!(check_rows(&win, &whole, &format!("{name}: End")), 0);
+    }
+}
+
+/// MF-2 (review of VM-4): a checkpoint read under way when the document is made again (here a
+/// rebuild into another LF unit) is stopped at once — its cancel flag set, nothing installed
+/// into the new document — not left to end on its own.
+#[test]
+fn a_checkpoint_read_stops_when_the_document_is_made_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (body, _) = long_line();
+    let path = write(tmp.path(), "long.txt", &body);
+    let mut win = TextWindow::new(
+        TextDoc::open_encoded(&path, Cp949).unwrap(),
+        "box:l".into(),
+        "l.txt",
+        vec![],
+    );
+    let go = held_phases(&mut win);
+    let mut drv = Driver::new(500.0, 200.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    win.jump_to(Jump::Byte(100 * 1024));
+    drv.idle(&mut win, 3);
+    let cancel = win
+        .phase_read
+        .as_ref()
+        .expect("a checkpoint read")
+        .cancel
+        .clone();
+    win.enc_wanted = Some(Utf16Le);
+    drv.until(&mut win, 10, |w| w.doc.encoding() == Utf16Le);
+    drv.idle(&mut win, 1);
+    assert!(cancel.load(Ordering::Relaxed), "the read was told to stop");
+    assert!(win.phase_read.is_none());
+    let _ = go.send(());
+    drv.until(&mut win, 10, |w| w.ready());
+    assert!(win.doc.phases.lines.is_empty());
+}
+
+/// MF-2: a change of encoding in place starts the checkpoints afresh (they are CP949's: a new
+/// epoch, nothing kept, nothing asked); a read for another encoding's document never makes any.
+#[test]
+fn reencoding_drops_the_checkpoints_and_a_read_needs_cp949() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (body, _) = long_line();
+    let path = write(tmp.path(), "long.txt", &body);
+    let mut doc = TextDoc::open_encoded(&path, Cp949).unwrap();
+    assert_eq!(doc.encoding(), Cp949);
+    doc.phases.install(0, 0, vec![true; 4]);
+    doc.phases.wanted = Some((0, 6));
+    let epoch = doc.phases.epoch;
+    doc.reencode(Latin1);
+    assert!(doc.phases.lines.is_empty() && doc.phases.wanted.is_none());
+    assert_ne!(doc.phases.epoch, epoch);
+    let mut copy = doc.share().unwrap();
+    assert!(copy.phases_of(0, &[], 4, &AtomicBool::new(false)).is_err());
+}
+
+/// MF-2, end to end: a preview asks for a long line's checkpoints (100 KiB in, no sync byte)
+/// and reads none; it is set to Latin-1, handed over, then set to CP949 again: the rows are the
+/// whole-file decode — no checkpoint read under Latin-1 (all "no lead pending") is made, or
+/// trusted.
+#[test]
+fn a_latin1_round_trip_never_trusts_checkpoints_made_meanwhile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (body, end) = long_line();
+    let whole = Whole::of(&body, 0, end);
+    let path = write(tmp.path(), "long.txt", &body);
+    let mut win = TextWindow::new(
+        TextDoc::open_encoded(&path, Cp949).unwrap(),
+        "box:l".into(),
+        "l.txt",
+        vec![],
+    );
+    Window::set_preview(&mut win, true);
+    let mut drv = Driver::new(500.0, 200.0);
+    win.jump_to(Jump::Byte(100 * 1024));
+    drv.until(&mut win, 10, |w| w.ready() && w.page.is_some());
+    assert!(win.doc.phases.wanted.is_some() && win.phase_read.is_none());
+    win.enc_wanted = Some(Latin1);
+    drv.idle(&mut win, 2);
+    assert_eq!(win.doc.encoding(), Latin1);
+    Window::set_preview(&mut win, false);
+    drv.idle(&mut win, 2);
+    drv.until(&mut win, 10, |w| w.ready());
+    win.enc_wanted = Some(Cp949);
+    drv.idle(&mut win, 1);
+    drv.until(&mut win, 10, |w| w.ready() && w.doc.encoding() == Cp949);
+    assert_eq!(check_rows(&win, &whole, "back in CP949"), 0);
+}
+
+/// MF-3: while the checkpoints are read, a restart nothing proves is the point itself; the row
+/// before it never decodes the lead pending there as a U+FFFD the whole decode lacks.
+#[test]
+fn the_row_before_a_restart_nothing_proves_shows_no_wrong_character() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut body = vec![b'a'];
+    body.extend(syllables(64 * 1024));
+    // A sync byte 100 bytes before the fifth restart: the rows near it are proven, the restart
+    // (whose window starts 64 bytes before it) is not.
+    let space = 5 * wrap::RESTART as usize - 100;
+    body[space] = b' ';
+    let end = body.len() as u64;
+    body.push(b'\n');
+    let whole = Whole::of(&body, 0, end);
+    let path = write(tmp.path(), "r.txt", &body);
+    let mut win = TextWindow::new(
+        TextDoc::open_encoded(&path, Cp949).unwrap(),
+        "box:r".into(),
+        "r.txt",
+        vec![],
+    );
+    let go = held_phases(&mut win);
+    let mut drv = Driver::new(500.0, 200.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    win.jump_to(Jump::Byte(5 * wrap::RESTART - 50));
+    drv.idle(&mut win, 3);
+    assert!(win.phase_read.is_some(), "the checkpoints are on their way");
+    check_rows(&win, &whole, "held");
+    let _ = go.send(());
+    drv.until(&mut win, 10, |w| w.ready());
+    assert_eq!(check_rows(&win, &whole, "after"), 0);
+}
+
+/// MF-4: more long lines with no sync byte on one page than a document keeps checkpoints for
+/// (not wrapped, each 70 KiB in): every line on the page gets its checkpoints once — none the
+/// page asked for is forgotten to make room — so the reads end and the page is ready.
+#[test]
+fn more_long_lines_on_a_page_than_the_checkpoint_room_still_settle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut body = Vec::new();
+    let mut lines = Vec::new();
+    for _ in 0..100 {
+        let start = body.len() as u64;
+        body.push(b'a');
+        body.extend(syllables(40 * 1024));
+        lines.push((start, body.len() as u64));
+        body.push(b'\n');
+    }
+    let path = write(tmp.path(), "many.txt", &body);
+    let mut win = TextWindow::new(
+        TextDoc::open_encoded(&path, Cp949).unwrap(),
+        "box:m".into(),
+        "m.txt",
+        vec![],
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = reads.clone();
+    win.phase_hook = Some(Arc::new(move || {
+        counted.fetch_add(1, Ordering::Relaxed);
+    }));
+    let mut drv = Driver::new(500.0, 1500.0);
+    drv.until(&mut win, 10, |w| w.ready());
+    drv.key(&mut win, Key::W, Modifiers::NONE);
+    drv.idle(&mut win, 1);
+    win.left = 70 * 1024;
+    win.stale_page = true;
+    drv.idle(&mut win, 1);
+    drv.until(&mut win, 60, |w| w.ready());
+    let rows = win.page.as_ref().unwrap().rows.len();
+    assert!(rows > PHASE_LINES, "{rows} rows");
+    assert!(
+        reads.load(Ordering::Relaxed) <= rows + 2,
+        "{} reads",
+        reads.load(Ordering::Relaxed)
+    );
+    for &(s, e) in &lines[..rows] {
+        let whole = Whole::of(&body, s, e);
+        assert_eq!(check_rows(&win, &whole, &format!("line at {s}")), 0);
     }
 }

@@ -509,6 +509,9 @@ pub(super) struct Memo {
     width: f32,
     spans: HashMap<u64, Span>,
     restarts: HashMap<(u64, u64), u64>,
+    /// Restart points nothing proved a character start at (CP949, D28), by line start and
+    /// byte: the row that ends at one leaves a lead pending there to the row after it.
+    unproven: HashMap<(u64, u64), ()>,
     rows: HashMap<(u64, u64), Rc<Cut>>,
     segments: HashMap<(u64, u64), Rc<Vec<u64>>>,
     window: Window_,
@@ -642,6 +645,7 @@ impl Wrapper<'_> {
         let Some(lead) = lead else {
             let r = at.min(span.len);
             remember(&mut self.memo.restarts, (span.start, k), r);
+            remember(&mut self.memo.unproven, (span.start, r), ());
             return Ok(r);
         };
         let lead = ((lead - from) as usize).min(bytes.len());
@@ -722,10 +726,25 @@ impl Wrapper<'_> {
         if cr {
             bytes.truncate(bytes.len() - unit);
         }
+        // A row that ends at a restart nothing proves (CP949, D28) is not decoded whole: a lead
+        // pending there is left to the row after it, never a U+FFFD the whole decode lacks.
+        let open =
+            complete && limit < span.len && self.memo.unproven.contains_key(&(span.start, limit));
+        let whole = complete && !open;
         // A row starts where the row before it ended — a character start — but in an encoding
         // that needs its start proven (D28).
         let (cells, _, dim) = if enc.needs_phase() {
-            self.cells(span, s, &bytes, complete)?
+            match self.cells(span, s, &bytes, whole)? {
+                // Only that lead is left: one placeholder mark for it.
+                (cells, 0, _) if open && cells.is_empty() && !bytes.is_empty() => {
+                    let mark = Cell {
+                        ch: MARK,
+                        len: bytes.len() as u8,
+                    };
+                    (vec![mark], bytes.len(), 1)
+                }
+                found => found,
+            }
         } else {
             let (cells, used) = enc.decode(&bytes, complete);
             (cells, used, 0)
