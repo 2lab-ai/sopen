@@ -17,13 +17,21 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
 | ID | Status | What | Who |
 |---|---|---|---|
 | XW-help2 | 🟡 review | F1's help in cells in both backends: TS-1 with the help open; XW-term's interim status line removed; branch `feat/xw-help-cells` | coder |
-| XW-receipts | 🔴 open | 10 §14's receipts XW-term left out by decision: `SOPEN_CELLS=<path>` (the grid as text plus an attribute table, both backends) and TS-6 (a pty emulator advancing ambiguous glyphs by 2; every §10 glyph substituted) | coder |
+| X2-gui | 🔴 open | 10 §17's X2: `--gui`, forwarded when asked or when the kind the sender sees needs a window (a text file keeps the editor); an older HOST gets the run again without it (decided 2026-11-25) | coder |
+| X2-state | 🔴 open | 10 §17's X2: the switch's state, `"v": 1`, taken from one browser and given to another | coder |
+| X2-host | 🔴 open | 10 §17's X2: HOST's half, `--state-stdin`, the `sopen-xtools-state` and `sopen-xtools-kept` cues | coder |
+| X2-switch | 🔴 open | 10 §17's X2: the TUI's half over ssh, §7.3's outcomes, the question before switching; ships X2 | coder |
+| XW-receipts | 🔴 open | 10 §17's X3: `SOPEN_CELLS=<path>` in both backends and TS-6, which XW-term left out by decision; the receipt of every X3 screen | coder |
+| X3-text | 🔴 open | 10 §17's X3: the text viewer and its preview in cells, wrapped by cells | coder |
+| X3-hex | 🔴 open | 10 §17's X3: the hex viewer in cells. Carried from #108's review: point the hex tests' `drawn()` at `texts()` once hex paints cells (`galleys()` then holds one-character glyphs), and note that `rects()` will list cell backgrounds and the caret | coder |
+| X3-questions | 🔴 open | 10 §17's X3: the hex window's questions and rows, and Save As, in cells | coder |
+| X3-preview | 🔴 open | 10 §17's X3: the preview side's frame and progress line in cells | coder |
+| X3-binary | 🔴 open | 10 §17's X3: the binary dialog in cells | coder |
+| VM-8 | 🔴 open | 10 §17's X3 (08 §13's row): 08's slots kept in the terminal (T21), the view keys through the translator. Carried: `src/view_keys.rs`'s module doc names `term_input::RELEASES`, which `view_set.rs` already applies; VM-8 builds on that. Carried from the cut: VM-8 makes `Screen::TERMINAL` follow T21 (today it opens an image or a video on Hex, `views.rs:186-190, 481-496`) | coder |
 | VM-7b | 🔴 open | 08 §13's follow-up row: views of one remote file share its stream and a hidden view keeps no save connection (D13, D14; back within 06 §6's budget), D25's reload half, D10 for empty media and undecodable video, VA-5, VA-6 | coder |
-| VM-8 | 🔴 open | 08 §13: the terminal binding. Carried: `src/view_keys.rs`'s module doc now names `term_input::RELEASES` (the translator makes every release); VM-8 builds on that | coder |
 | VM-D0 | 🔴 open | 08 §13: 04 §2 and K-R1 brought to the shipped code | orchestrator |
 | WV-D | 🟡 running | 09 §12: the page view in the browser (`.html`/`.htm`/`.xml` as pages in the preview and the viewer, the fallback); branch `feat/wv-d-page-view` | coder |
 | WV-rest | 🔴 open | 09 §12's WV-C2, WV-B, WV-E2 and WV-F, in its order (X-W1, WV-0, WV-E1, WV-C and WV-A are closed) | coder |
-| X3-hex | 🔴 open | 10 §16's hex step. Carried from #108's review: point the hex tests' `drawn()` at `texts()` once hex paints cells (`galleys()` then holds one-character glyphs), and note that `rects()` will list cell backgrounds and the caret | coder |
 | ED-ops | 🟡 review | 12 §16: the editor's commands over the buffer (caret, block, clipboard, armings, find and replace, paste, the encoding question); branch `feat/ed-ops` | coder |
 | ED-units | 🔴 open | 12 §16's units: ED-save (no screen); then ED-screen, ED-dialogs, ED-layout (ships X5), ED-git, ED-route, after their 10 units (ED-buf and ED-enc are closed) | coder |
 
