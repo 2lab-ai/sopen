@@ -90,10 +90,15 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   hook (`screenshot_tick`, gui/mod.rs:1030) first takes every shown view's `takeSnapshot` (10–36 ms),
   then requests the read-back, and draws each snapshot at its view's frame before writing the PNG
   **[decision; 추정: the research composed outside the app]**.
-- **ATS**: App Transport Security may refuse plain `http` to a named host from WKWebView **[추정]**;
-  IP addresses and `localhost` are exempt by Apple's rules **[추정]**. WV-A measures `http://` to an
-  IP, to `localhost` and to a dotted name. sopen never weakens ATS (no Info.plist exception); a
-  refused load says so with a line naming `--browser` **[decision]**.
+- **ATS**: App Transport Security is not enforced for sopen's binary, an unbundled executable with no
+  Info.plist — measured by WV-A on macOS 26.7.1 (`wv_a_ats_and_plain_http` in
+  `src/gui/web/mac/tests.rs`, an executable of the same kind): plain `http` to `127.0.0.1`
+  loaded in 101–150 ms, to `localhost` in 57–63 ms, to `sopen.localhost` (a dotted name the system
+  resolves to loopback) in 57–64 ms, and `http://sopen-ats.invalid/` failed at the lookup
+  (`NSURLErrorDomain -1003`), not at ATS (`-1022`, which comes before any lookup); a one-off probe
+  outside the tests loaded `http://example.com/` in 485 ms. So no load is refused for being plain
+  `http`. sopen never adds an ATS exception; were it ever shipped in a bundle with an Info.plist, ATS
+  would apply and this is measured again **[decision]**.
 
 ### 2.3 Linux: WebKitGTK offscreen, loaded at runtime
 
@@ -384,10 +389,17 @@ the engine has one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it
   **[미측정]**; WV-S2 goes through the channels.
 - **Scripts off has non-URL channels too.** An XSLT can build host names from a file it read into
   `<link rel=dns-prefetch|preconnect>` or an `<a href>`: a DNS lookup, or a TCP connect with no
-  request, would carry them. The rule list is what contains them — a blocked load is never resolved
-  or connected **[추정]** — and WV-S2's logging resolver and TCP listener measure it (how, below). **If that scripts-off part of WV-S2 fails on a backend, file pages on that backend show
-  their source**, with §4's line (`the page view is not contained here (<channel>): showing the
-  source`), until a measurement shows containment.
+  request, would carry them. The rule list is what contains them, and WV-S2's logging resolver and
+  TCP listener measure it (how, below). On macOS WV-A measured the connects for what a page makes:
+  `<link rel=preconnect|dns-prefetch|prefetch>` to an outside server opened 0 connections with the
+  list and 1 without it (`wv_a_a_request_outside_the_scheme_is_blocked`); a lookup there is
+  **[미측정]**. A load sopen itself asks of the view (`loadRequest`) is not contained that way:
+  WebKit opened a TCP connection to an outside address before its navigation policy cancelled the
+  load (measured, WV-A), so the macOS engine refuses an address outside the view's scope before
+  WebKit sees it, with the refusal said as any navigation out (`Inner::load` in
+  `src/gui/web/mac.rs`) **[decision]**. **If that scripts-off part of WV-S2 fails on a backend, file
+  pages on that backend show their source**, with §4's line (`the page view is not contained here
+  (<channel>): showing the source`), until a measurement shows containment.
 - **Scripts are off by default**: `WKWebpagePreferences.allowsContentJavaScript = false`;
   `enable-javascript-markup = FALSE` (*web* §4.1-5).
 - **F2** turns scripts on for this view and off again, reloading the document on screen. Its label
@@ -550,8 +562,8 @@ within 2 s, else 1 with `… ended while ssh stayed for the browser's connection
   `cannot load <shown>: <reason> — Cmd/Ctrl+R tries again`; a TLS certificate the system does not
   trust → never accepted, `the certificate of <host> is not trusted — --browser opens it in the system
   browser`; HTTP auth or a client certificate → refused, naming `--browser`; the web process ends →
-  `the page's process ended — Cmd/Ctrl+R reloads`; ATS refusing plain http (§2.2) → naming
-  `--browser`.
+  `the page's process ended — Cmd/Ctrl+R reloads`. Plain `http` is not refused on macOS (§2.2: ATS
+  does not apply to sopen's binary), so there is no ATS line.
 - **`--browser`** (new, public): today's behaviour exactly, every route. With a file SOURCE a usage
   error (exit 2), as `--hold-until-eof` (main.rs:521-525). Passed to HOST on both forwarded routes
   (`tunnel_words`, forward.rs:361-364, and the run's words); an older HOST sopen does not know it and
@@ -702,7 +714,8 @@ page (*web* §1.1), so automated runs drive `makeFirstResponder` and `hitTest`; 
   refused with a line; a script writes into the page (scripts on by default).
 - **WV-A4 [owner]** From the Mac, `sopen --target <the Linux laptop> http://127.0.0.1:<dev server>/` →
   the page in xtools there; closing it → the Mac's sopen prints the line, exit 0; Ctrl-C on the Mac →
-  the window there closes. ATS: WV-A's three `http://` loads → recorded, and the spec's line holds.
+  the window there closes. ATS: WV-A recorded the Mac's plain `http://` loads (§2.2) — none refused,
+  so the address loads on the Mac too.
 
 ## 11. Test plan
 
@@ -735,7 +748,7 @@ handle; §3.1's ~4 and ~2 RTT. Its result goes into §3.1.
 |---|---|---|---|
 | WV-C | **Page server**: root, request steps (index included), turns, `reopen`, fingerprint, Range, type and charset tables, cancel, budget and its lift | `src/stream/page.rs`, `src/stream/page/tests.rs` (new); `src/stream/mod.rs` (the `mod` line) | X-W1; WV-0's `src/scheme.rs` (the trait) |
 | WV-0 | **Component core**: `Web`, `Engine`, the scheme trait, placement, the after-frame hide check, key states, scripts and F2's availability, `SOPEN_WEB`, `FakeEngine`, the compose call; the shell's part (§2.1) | `src/scheme.rs`, `src/gui/web/mod.rs`, `src/gui/web/fake.rs`, `src/gui/web/tests.rs` (new); `src/lib.rs` (the `mod` line); `src/gui/mod.rs` (`mod web`, `Shell`'s handle, after-frame check, teardown, monitor install, the compose call); AGENTS.md's `SOPEN_WEB` row | X-W1 (the trait first, so WV-C builds beside it) |
-| WV-A | **macOS engine**: WKWebView, process pool per view, monitor, shield, `takeSnapshot`, scheme glue, rule list in the temp store, ATS measurement | `src/gui/web/mac.rs`, `src/gui/web/mac/tests.rs` (new); `Cargo.toml`, `Cargo.lock` (objc2-web-kit; objc2-app-kit features); `.github/workflows/ci.yml` (one macOS-only line: `SOPEN_REQUIRE_WEBKIT=1`); AGENTS.md's `SOPEN_REQUIRE_WEBKIT` row | WV-0, X-W1 |
+| WV-A | **macOS engine**: WKWebView, a non-persistent data store per view (no per-view process pool: §2.5, R12), monitor, shield, `takeSnapshot`, scheme glue, rule list in the temp store, ATS measurement | `src/gui/web/mac.rs`, `src/gui/web/mac/tests.rs` (new); `src/gui/web/mod.rs` (the `mod mac` line and `platform()`); `Cargo.toml`, `Cargo.lock` (objc2-web-kit; objc2-app-kit features); `.github/workflows/ci.yml` (one macOS-only line: `SOPEN_REQUIRE_WEBKIT=1`); AGENTS.md's `SOPEN_REQUIRE_WEBKIT` row | WV-0, X-W1 |
 | WV-B | **Linux engine**: loader, GTK thread, context per view, offscreen copy, input, HiDPI, scheme glue, rules, settings | `src/gui/web/gtk.rs`, `src/gui/web/gtk/api.rs`, `src/gui/web/gtk/tests.rs` (new); `.github/workflows/ci.yml` (the Linux steps) | WV-0, X-W1 |
 | WV-D | **Page view in the browser**: `page_default`, `Prepared::Page`, preview, viewer, root, F2, the rows, fallback | `src/kind.rs`; `src/gui/web/page.rs` (new); `src/gui/web/mod.rs` (`mod` line); `src/gui/browser/prepare.rs`; `src/gui/browser/preview.rs`; `src/gui/browser.rs`; `src/gui/browser/keys.rs`; `src/gui/chrome.rs` (`PAGE_KEYS`); `src/gui/browser/tests/page.rs` (new); `.prd/02-architecture.md` §4.2–§4.3; `.prd/06-streaming.md` §6 | WV-C, WV-0; each platform's receipts after WV-A / WV-B |
 | WV-E1 | **The CLI half**: `--browser`, the three cues and their writes, the remote's lines, the closed-cue race, version skew — all on the fake ssh; HOST still opens the system browser | `src/main.rs`, `src/url.rs`, `src/forward.rs`, `tests/cli.rs`; AGENTS.md's `--browser` and `--hold-until-eof` rows | — (starts at once) |
@@ -746,7 +759,8 @@ handle; §3.1's ~4 and ~2 RTT. Its result goes into §3.1.
 start. **Only WV-F waits on 08's model** (VM-5 the view set, VM-6 the keys, VM-7 the binding) and on
 10: WV-D ships before them with the page as the default view and Esc back (§6 names the gap), and
 WV-F plugs it into the set and the GUI backend's pixel regions. **Shared files are sequenced**:
-`src/gui/web/mod.rs` gets one `mod` line each from WV-D and WV-E2; `src/lib.rs` one from WV-0 beside
+`src/gui/web/mod.rs` gets one `mod` line each from WV-A (with `platform()`), WV-D and WV-E2;
+`src/lib.rs` one from WV-0 beside
 08's VM-1/5/6 lines; `src/gui/mod.rs` (WV-0) is shared with 08's VM-2 and VM-7 and the browser
 workstream's input hook; `browser.rs`, `prepare.rs`, `keys.rs` with 08's VM-7 and the F4 editor, one
 at a time; `main.rs` WV-E1 → WV-E2; `ci.yml` by WV-A (the macOS line) and WV-B (the Linux steps),
@@ -767,3 +781,12 @@ looked at (06 §13).
   09 consumes it — one Esc returns the keyboard, a second leaves.
 - **01 A10a vs §7 route 1.** A10a: `sopen URL` opens the default browser and exits 0; from 09 it lasts
   until its window closes. WV-E2 rewrites A10a.
+- **libtest vs AppKit's main thread (WV-A).** AppKit and WebKit run only on a process's main thread,
+  and libtest runs every test on a thread of its own. The macOS window tests (§11) therefore run
+  each scenario in a child process — the test binary again — whose main thread a Mach-O initializer
+  (`CHILD_MAIN` in `src/gui/web/mac/tests.rs`, test builds only) takes over before libtest's `main`;
+  its window is borderless and off every screen, and the child never becomes the active app.
+- **R1 on macOS.** WKWebView has no setting that turns WebRTC off, so the macOS engine names it as
+  not contained with scripts on (`uncontained(true)` in `src/gui/web/mac.rs`) and F2 stays off in
+  file views there, whatever WV-S2 finds for the other channels; the address window keeps its
+  scripts (decision 10).
