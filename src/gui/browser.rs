@@ -1758,7 +1758,9 @@ impl Browser {
                 sha256: None,
             },
             undecodable: None,
-        };
+        }
+        // The stream and the save session the preview's views share from now on (08 §6).
+        .with(viewer.shared);
         let page = view_set::PageOpen {
             class: viewer.page.class,
             shown: viewer.page.shown,

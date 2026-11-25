@@ -12,6 +12,14 @@
 //! without claiming the cache — a remote file through a stream on that connection, a local one
 //! in place — and told they are previews; the hand-over ([`Preview::hand_over`]) makes the viewer
 //! a viewer again. Nothing a preview reads is written to disk.
+//!
+//! A remote file's views share what its opening kept ([`Shared`], 08 §6): a view made later
+//! reads through the opening's stream — no connection, no stat, no sniff of its own — and every
+//! `Origin` of them connects through one save session that a hidden view gives back (D13, D14).
+
+mod shared;
+
+pub use shared::{SaveSlot, Shared, Stream};
 
 use super::Connect;
 use crate::cache::{self, Claim};
@@ -215,16 +223,18 @@ impl Request<'_> {
     }
 
     /// The remote file as a stream on `fs`, the connection that resolved, stat'ed and sniffed
-    /// it (06 §2): nothing is fetched, and `fs` is the stream's from here on. Its `Origin` is a
-    /// placeholder that connects on its first use and until then takes the server as able to
-    /// replace a file. A failure is the error: never a quiet whole fetch instead.
+    /// it (06 §2): nothing is fetched, and `fs` is the stream's from here on — kept beside the
+    /// views ([`Stream`]). Its `Origin` connects on its first use, through the views' `save`
+    /// session (D14), and until then takes the server as able to replace a file. A failure is
+    /// the error: never a quiet whole fetch instead.
     fn stream(
         &self,
         label: &str,
         fs: Box<dyn RemoteFs + Send>,
         sniff: u64,
         wake: Waker,
-    ) -> Result<(Source, Origin)> {
+        save: &SaveSlot,
+    ) -> Result<(Source, Origin, Stream)> {
         let opening = Opening {
             label: self.show(),
             began: self.began,
@@ -233,14 +243,25 @@ impl Request<'_> {
         let dial = Some(self.connect.clone());
         let opened =
             streamed::open(fs, self.abs, opening, dial, wake, None).map_err(|not| not.error)?;
-        let origin = Origin::placeholder(
-            self.reconnect(),
-            label.to_string(),
+        let stream = Stream {
+            source: opened.source.clone(),
+            abs: self.abs.to_string(),
+            at: opened.at,
+        };
+        let origin = self.saving_origin(label, save, opened.at);
+        Ok((opened.source, origin, stream))
+    }
+
+    /// A remote view's `Origin`, at `at`: it connects on its first use through `save`, the
+    /// session its views share and a hidden one gives back (D14).
+    fn saving_origin(&self, label: &str, save: &SaveSlot, at: Stat) -> Origin {
+        Origin::new(
+            save.handle(),
+            Some(save.reconnect(self.connect.clone())),
+            Some(label.to_string()),
             self.abs.to_string(),
-            opened.at,
-            Placeholder::YES,
-        );
-        Ok((opened.source, origin))
+            at,
+        )
     }
 }
 
@@ -270,6 +291,10 @@ pub struct Opened {
     /// Where the page goes among its views (09 §5–§6), decided from the file opened — its
     /// resolved name and head, never the name the list shows (the opening's only).
     pub page: PageClass,
+    /// What a remote file's views share from now on (08 §6, D13, D14): the stream it was read
+    /// through — the opening's, or the one a view made later opened where there was none — and
+    /// the session its `Origin` saves on. Nothing for a local file.
+    pub shared: Shared,
 }
 
 /// [`prepare`] with what the view set keeps ([`Opened`]). `in_place`: a file at a revision or a
@@ -296,22 +321,119 @@ pub fn prepare_paged(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Opened> {
-    prepare_with(req, in_place, Want::Opening, pages, cancel, progress)
+    let none = Shared::default();
+    prepare_with(req, in_place, Want::Opening, pages, &none, cancel, progress)
+}
+
+/// What a view made later is made over (08 §6): what its views share, and whether the stream
+/// must be read again first.
+pub struct Over<'a> {
+    pub shared: &'a Shared,
+    /// The stream reads a version older than the file's — a Save landed that did not reload it
+    /// (the image's, the media window's: 06 §5) — so it is reloaded before the view reads it
+    /// (D25: the view shows the file as it is now).
+    pub reload: bool,
 }
 
 /// One view of a file already opened (08 §5: made the first time it is chosen), as `kind` would
 /// open it: `Other` its Hex view, `Text` its text (Text and Raw; view 3 of a binary), `Image`,
 /// `Video` or `Audio` its view 1 made again. A local file is read in place as the opening read it
-/// (a binary's text by the local whole-file pass, D23); a remote one through a stream of its own.
+/// (a binary's text by the local whole-file pass, D23). A remote one reads through the stream its
+/// views share (D13) — no connection of its own — and where they have none yet (a page file's
+/// first view after its Page, a handed-over image's first) opens one on a new connection, kept
+/// from then on ([`Opened::shared`]). Its `Origin` saves through their session (D14).
 pub fn prepare_view(
     req: &Request,
     in_place: bool,
     kind: Kind,
+    over: Over,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Opened> {
+    if let (Some(label), Some(stream)) = (req.label, &over.shared.stream) {
+        let save = over.shared.save.clone();
+        let save = save.unwrap_or_else(|| SaveSlot::new(Placeholder::YES));
+        return kept_prepared(req, label, kind, stream, save, over.reload, cancel);
+    }
     let source = Pages::Source(None);
-    prepare_with(req, in_place, Want::Kind(kind), &source, cancel, progress)
+    let want = Want::Kind(kind);
+    prepare_with(req, in_place, want, &source, over.shared, cancel, progress)
+}
+
+/// A view of a remote file made on the stream its views share (08 §6, D13): no connection, no
+/// stat and no sniff — the opening's are known — and nothing it shows is read again.
+/// `reload`: the stream is re-opened first ([`Over::reload`]). Its `Origin` saves through
+/// `save`, at the version the stream reads.
+fn kept_prepared(
+    req: &Request,
+    label: &str,
+    kind: Kind,
+    stream: &Stream,
+    save: SaveSlot,
+    reload: bool,
+    cancel: &AtomicBool,
+) -> Result<Opened> {
+    let stopped = || -> Result<()> {
+        if cancel.load(Ordering::Relaxed) {
+            bail!(crate::remote::Cancelled);
+        }
+        Ok(())
+    };
+    let req = &Request {
+        abs: &stream.abs,
+        ..*req
+    };
+    if reload {
+        stream.source.reload()?;
+        stopped()?;
+    }
+    let at = stream.at_now();
+    let source = stream.source.clone();
+    let origin = req.saving_origin(label, &save, at);
+    let prepared = match kind {
+        Kind::Text => {
+            text::warm();
+            Prepared::Text {
+                doc: TextDoc::streamed(source),
+                notices: Vec::new(),
+                claim: None,
+            }
+        }
+        // 06 §7.3: the window reads it whole through the stream — from its cache, what the
+        // opening's image read — and gives way to the hex window on the same stream.
+        Kind::Image => Prepared::ImageStream {
+            origin,
+            source,
+            repaint: hex::Repaint::default(),
+            notices: Vec::new(),
+        },
+        Kind::Video | Kind::Audio => {
+            let (_, name) = crate::remote::split_parent(req.abs);
+            let media = Media::stream_until(source, name, &req.show(), cancel);
+            // A probe Esc stopped fails as one: that is the cancel, not the file's fault.
+            stopped()?;
+            Prepared::MediaStream {
+                origin,
+                media: Box::new(media?),
+                notices: Vec::new(),
+            }
+        }
+        Kind::Other | Kind::Directory => Prepared::Hex {
+            file: HexFile::streamed(origin, source, hex::Repaint::default(), req.cache),
+            notices: Vec::new(),
+        },
+    };
+    Ok(Opened {
+        prepared,
+        kind,
+        stat: at,
+        undecodable: None,
+        page: PageClass::Plain,
+        shared: Shared {
+            stream: Some(stream.clone()),
+            save: Some(save),
+        },
+    })
 }
 
 /// The page view of a file already opened (09 §6: plain XML's view 3, or a page's view 1 made
@@ -325,14 +447,26 @@ pub fn prepare_page_view(
     let pages = Pages::Page {
         opened_on: opened_on.map(str::to_string),
     };
-    prepare_with(req, in_place, Want::Page, &pages, cancel, &mut |_, _| {})
+    let none = Shared::default();
+    prepare_with(
+        req,
+        in_place,
+        Want::Page,
+        &pages,
+        &none,
+        cancel,
+        &mut |_, _| {},
+    )
 }
 
+/// `shared`: what the views share already — the save session a remote view's `Origin` uses
+/// (a new one for an opening).
 fn prepare_with(
     req: &Request,
     in_place: bool,
     want: Want,
     pages: &Pages,
+    shared: &Shared,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Opened> {
@@ -371,11 +505,27 @@ fn prepare_with(
         Want::Kind(kind) => kind,
         Want::Opening | Want::Page => kind,
     };
+    // 08 D10: empty media has nothing to probe and its byte server no range to serve — it is
+    // shown as bytes, why said first, its views still a video's or a sound's.
+    let empty =
+        want == Want::Opening && matches!(kind, Kind::Video | Kind::Audio) && stat.size == 0;
+    // A remote file's `Origin`s save through one session (D14): the views' own, or a new one.
+    let save = req.label.map(|_| {
+        let save = shared.save.clone();
+        save.unwrap_or_else(|| SaveSlot::new(Placeholder::YES))
+    });
+    let mut stream = None;
     let mut undecodable = None;
-    let mut prepared = match (page, req.label) {
-        (Some(opened_on), _) => page_prepared(req, fs, opened_on.as_deref())?,
-        (None, Some(label)) => streamed_prepared(req, label, fs, kind, sniff, cancel)?,
-        (None, None) => local_prepared(
+    let mut prepared = match (page, req.label, &save) {
+        (Some(opened_on), _, _) => page_prepared(req, fs, opened_on.as_deref())?,
+        (None, Some(label), Some(save)) => {
+            let kind = if empty { Kind::Other } else { kind };
+            let (prepared, kept) = streamed_prepared(req, label, fs, kind, sniff, save, cancel)?;
+            stream = Some(kept);
+            prepared
+        }
+        (None, _, _) if empty => hex_of(req, fs, stat)?,
+        (None, _, _) => local_prepared(
             req,
             in_place,
             fs,
@@ -386,13 +536,16 @@ fn prepare_with(
             cancel,
         )?,
     };
+    if let (true, Prepared::Hex { notices, .. }) = (empty, &mut prepared) {
+        notices.insert(0, crate::views::Why::Empty.to_string());
+    }
     // §4: the source, saying why it is not the page.
     if let (Some(line), Prepared::Text { notices, .. }) = (source_line, &mut prepared) {
         notices.insert(0, line);
     }
     // The kind as the views see it (08 §3): what the preparation found the file to be.
     let kind = match &prepared {
-        Prepared::Hex { .. } if undecodable.is_none() => Kind::Other,
+        Prepared::Hex { .. } if undecodable.is_none() && !empty => Kind::Other,
         Prepared::Media { media, .. } | Prepared::MediaStream { media, .. } => {
             if media.video.is_some() {
                 Kind::Video
@@ -408,6 +561,7 @@ fn prepare_with(
         stat,
         undecodable,
         page: class,
+        shared: Shared { stream, save },
     })
 }
 
@@ -521,15 +675,17 @@ fn hex_waker(wake: &Waker, repaint: &hex::Repaint) -> Waker {
 /// block on (W5b's index for a file over 16 MiB); an image's window reads its header and then
 /// the file, on a worker of its own (06 §7.3); a video or a sound is probed here through its
 /// `play` URL (06 §7.4), and a `.ts` ffprobe cannot read as media is the hex window on the
-/// same stream.
+/// same stream. The stream is kept beside the views as well ([`Stream`]); its `Origin` saves
+/// through `save` (D14).
 fn streamed_prepared(
     req: &Request,
     label: &str,
     fs: Box<dyn RemoteFs + Send>,
     kind: Kind,
     sniff: u64,
+    save: &SaveSlot,
     cancel: &AtomicBool,
-) -> Result<Prepared> {
+) -> Result<(Prepared, Stream)> {
     // Esc is looked at between the steps, and while a probe runs (its ffprobe is killed then).
     let stop = || cancel.load(Ordering::Relaxed);
     let stopped = || -> Result<()> {
@@ -546,24 +702,28 @@ fn streamed_prepared(
     match kind {
         Kind::Text => {
             text::warm();
-            let (source, _origin) = req.stream(label, fs, sniff, req.wake.clone())?;
-            Ok(Prepared::Text {
+            let (source, _origin, kept) = req.stream(label, fs, sniff, req.wake.clone(), save)?;
+            let prepared = Prepared::Text {
                 doc: TextDoc::streamed(source),
                 notices: Vec::new(),
                 claim: None,
-            })
+            };
+            Ok((prepared, kept))
         }
         Kind::Image => {
-            let (source, origin) = req.stream(label, fs, sniff, hex_waker(req.wake, &repaint))?;
-            Ok(Prepared::ImageStream {
+            let wake = hex_waker(req.wake, &repaint);
+            let (source, origin, kept) = req.stream(label, fs, sniff, wake, save)?;
+            let prepared = Prepared::ImageStream {
                 origin,
                 source,
                 repaint,
                 notices: Vec::new(),
-            })
+            };
+            Ok((prepared, kept))
         }
         Kind::Video | Kind::Audio => {
-            let (source, origin) = req.stream(label, fs, sniff, hex_waker(req.wake, &repaint))?;
+            let wake = hex_waker(req.wake, &repaint);
+            let (source, origin, kept) = req.stream(label, fs, sniff, wake, save)?;
             let (_, name) = crate::remote::split_parent(req.abs);
             if kind::maybe_video(name) {
                 stopped()?;
@@ -578,7 +738,7 @@ fn streamed_prepared(
                 stopped()?;
                 if refined == Kind::Other {
                     drop(input);
-                    return Ok(hex_of_stream(origin, source, repaint));
+                    return Ok((hex_of_stream(origin, source, repaint), kept));
                 }
             }
             stopped()?;
@@ -586,16 +746,17 @@ fn streamed_prepared(
             // A probe Esc stopped fails as one: that is the cancel, not the file's fault.
             stopped()?;
             let media = media?;
-            Ok(Prepared::MediaStream {
+            let prepared = Prepared::MediaStream {
                 origin,
                 media: Box::new(media),
                 notices: Vec::new(),
-            })
+            };
+            Ok((prepared, kept))
         }
         // 06 §7.1: no fetch, whatever the size.
         Kind::Other | Kind::Directory => {
-            let (source, origin) = req.stream(label, fs, sniff, repaint.waker())?;
-            Ok(hex_of_stream(origin, source, repaint))
+            let (source, origin, kept) = req.stream(label, fs, sniff, repaint.waker(), save)?;
+            Ok((hex_of_stream(origin, source, repaint), kept))
         }
     }
 }
@@ -1010,6 +1171,8 @@ pub struct Previewed {
     cache: PathBuf,
     /// 09: see [`HandedOver::page`].
     page: PageSeen,
+    /// See [`HandedOver::shared`].
+    shared: Shared,
 }
 
 /// What a preview found of a page file (09 §5–§6), for the views of the viewer it becomes.
@@ -1085,6 +1248,7 @@ impl Previewed {
             lease: self.lease,
             kind,
             page: self.page,
+            shared: self.shared,
         }
     }
 }
@@ -1102,6 +1266,7 @@ pub struct Preview {
     /// The file's kind as its viewer has views for it (08 §3).
     kind: Kind,
     page: PageSeen,
+    shared: Shared,
 }
 
 /// A preview handed over (Enter or F3 on it): the viewer, a viewer again.
@@ -1118,6 +1283,11 @@ pub struct HandedOver {
     pub kind: Kind,
     /// What the preview found of a page file: whether its views have the page (09 §6).
     pub page: PageSeen,
+    /// What a remote file's views share from now on (08 §6, D13, D14): the stream the preview
+    /// read through and still does (none for an image, read whole), and the session its
+    /// `Origin` saves on — so a view made after the hand-over reads that stream, and the
+    /// handed-over view gives its save session back when it is hidden.
+    pub shared: Shared,
 }
 
 impl Preview {
@@ -1132,6 +1302,7 @@ impl Preview {
             lease: None,
             kind: Kind::Other,
             page: PageSeen::default(),
+            shared: Shared::default(),
         }
     }
 
@@ -1177,6 +1348,7 @@ impl Preview {
             notices: Vec::new(),
             kind: self.kind,
             page: self.page,
+            shared: self.shared,
         })
     }
 }
@@ -1191,6 +1363,8 @@ struct Known {
     link: Option<Link>,
     lease: Option<Lease>,
     page: PageSeen,
+    /// What the views of the viewer it may become share ([`HandedOver::shared`]).
+    shared: Shared,
 }
 
 /// Prepares the preview of the file at `req.abs` (02 §4.2–§4.4), on the window's preview
@@ -1232,6 +1406,7 @@ pub fn preview_paged(
         link: None,
         lease: None,
         page: PageSeen::default(),
+        shared: Shared::default(),
     };
     let host = req.label.unwrap_or(cache::LOCAL_HOST).to_string();
     let cache = req.cache.to_path_buf();
@@ -1241,6 +1416,7 @@ pub fn preview_paged(
             lease: known.lease,
             cache,
             page: known.page,
+            shared: known.shared,
         }),
         Err(e) if crate::remote::is_cancelled(&e) => Err(e),
         Err(e) => {
@@ -1258,6 +1434,7 @@ pub fn preview_paged(
                 lease: None,
                 cache,
                 page: PageSeen::default(),
+                shared: Shared::default(),
             })
         }
     }
@@ -1422,22 +1599,31 @@ fn preview_parts(
     };
     known.lease = Some(lease);
     let source = opened.source;
-    // A streamed viewer's `Origin` connects on its first use (06 §2); until then it answers what
-    // it has to: what the preview connection's server can do where that was asked of it.
+    // A streamed viewer's `Origin` connects on its first use (06 §2), through the save session
+    // the views of the viewer it may become share (D14); until then it answers what it has to:
+    // what the preview connection's server can do where that was asked of it.
     let origin = |answers: Placeholder, at: Stat| {
-        let connect = connect.clone();
-        Origin::placeholder(
-            Some(Box::new(move || connect()) as Reconnect),
-            label.to_string(),
+        let save = SaveSlot::new(answers);
+        let origin = Origin::new(
+            save.handle(),
+            Some(save.reconnect(connect.clone())),
+            Some(label.to_string()),
             real.clone(),
             at,
-            answers,
-        )
+        );
+        (origin, save)
+    };
+    // The stream the preview reads, which a viewer it becomes keeps beside its views (D13).
+    let kept = |source: &Source| Stream {
+        source: source.clone(),
+        abs: real.clone(),
+        at: opened.at,
     };
     let parts = match kind {
         Kind::Text => {
             budget.read_done();
             text::warm();
+            known.shared.stream = Some(kept(&source));
             Parts::TextStream {
                 source,
                 title: shown,
@@ -1459,8 +1645,11 @@ fn preview_parts(
                 ..opened.at
             };
             let (doc, shown) = decode_previewed(&bytes, budget, &check)?;
+            // Its stream is closed (read whole): the views share only its save session.
+            let (origin, save) = origin(answers, at);
+            known.shared.save = Some(save);
             Parts::Image {
-                file: ImageFile::new(origin(answers, at), bytes, cache),
+                file: ImageFile::new(origin, bytes, cache),
                 doc,
                 shown,
             }
@@ -1502,22 +1691,24 @@ fn preview_parts(
                         let rate = source.size() as f64 / made.media.duration.max(1e-3);
                         served.server().set_rate(rate as u64);
                     }
-                    Parts::Media {
-                        origin: origin(Placeholder::YES, opened.at),
-                        made,
-                    }
+                    let (origin, save) = origin(Placeholder::YES, opened.at);
+                    known.shared = Shared {
+                        stream: Some(kept(&source)),
+                        save: Some(save),
+                    };
+                    Parts::Media { origin, made }
                 }
                 // A `.ts` ffprobe cannot read as media: the hex view, as Enter shows it, on the
                 // same stream.
                 media::preview::Found::NotMedia => {
                     drop(input);
+                    let (origin, save) = origin(Placeholder::YES, opened.at);
+                    known.shared = Shared {
+                        stream: Some(kept(&source)),
+                        save: Some(save),
+                    };
                     Parts::Hex {
-                        file: HexFile::streamed(
-                            origin(Placeholder::YES, opened.at),
-                            source,
-                            repaint,
-                            cache,
-                        ),
+                        file: HexFile::streamed(origin, source, repaint, cache),
                     }
                 }
             };
@@ -1528,13 +1719,13 @@ fn preview_parts(
         }
         Kind::Other | Kind::Directory => {
             budget.read_done();
+            let (origin, save) = origin(Placeholder::YES, opened.at);
+            known.shared = Shared {
+                stream: Some(kept(&source)),
+                save: Some(save),
+            };
             Parts::Hex {
-                file: HexFile::streamed(
-                    origin(Placeholder::YES, opened.at),
-                    source,
-                    repaint,
-                    cache,
-                ),
+                file: HexFile::streamed(origin, source, repaint, cache),
             }
         }
     };
