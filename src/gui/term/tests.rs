@@ -694,6 +694,70 @@ fn fixture(more: usize) -> Fx {
 
 /// [`fixture`] with the files `named` besides.
 fn fixture_with(more: usize, named: &[&str]) -> Fx {
+    fixture_free(more, named, None)
+}
+
+/// The local file system, but for the free space it says: `free` (`None`: the host's), so a
+/// foot that shows it does not depend on the machine the test runs on.
+struct FreeAs {
+    inner: LocalFs,
+    free: Option<u64>,
+}
+
+impl RemoteFs for FreeAs {
+    fn stat_opt(&mut self, path: &str) -> anyhow::Result<Option<crate::remote::Stat>> {
+        self.inner.stat_opt(path)
+    }
+    fn lstat_opt(&mut self, path: &str) -> anyhow::Result<Option<crate::remote::Stat>> {
+        self.inner.lstat_opt(path)
+    }
+    fn realpath(&mut self, path: &str) -> anyhow::Result<String> {
+        self.inner.realpath(path)
+    }
+    fn read_head(&mut self, path: &str, max: usize) -> anyhow::Result<Vec<u8>> {
+        self.inner.read_head(path, max)
+    }
+    fn list_dir(&mut self, path: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_dir(path)
+    }
+    fn list_entries(&mut self, path: &str) -> anyhow::Result<Vec<crate::remote::Entry>> {
+        self.inner.list_entries(path)
+    }
+    fn free_space(&mut self, path: &str) -> Option<u64> {
+        self.free.or_else(|| self.inner.free_space(path))
+    }
+    fn read_to(
+        &mut self,
+        path: &str,
+        out: &mut dyn Write,
+        progress: &mut dyn FnMut(u64),
+    ) -> anyhow::Result<u64> {
+        self.inner.read_to(path, out, progress)
+    }
+    fn create_from(
+        &mut self,
+        local: &std::path::Path,
+        path: &str,
+        like: Option<crate::remote::Like>,
+    ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
+        self.inner.create_from(local, path, like)
+    }
+    fn set_mode(&mut self, path: &str, mode: u32) -> anyhow::Result<()> {
+        self.inner.set_mode(path, mode)
+    }
+    fn rename_over(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.inner.rename_over(from, to)
+    }
+    fn link_new(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.inner.link_new(from, to)
+    }
+    fn remove(&mut self, path: &str) -> anyhow::Result<()> {
+        self.inner.remove(path)
+    }
+}
+
+/// [`fixture_with`] whose file system says `free` bytes are free ([`FreeAs`]).
+fn fixture_free(more: usize, named: &[&str], free: Option<u64>) -> Fx {
     let tmp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(tmp.path()).unwrap().join("root");
     for dir in ["alpha", "beta", "한글 폴더"] {
@@ -707,10 +771,14 @@ fn fixture_with(more: usize, named: &[&str]) -> Fx {
         std::fs::write(root.join(format!("more{n:03}.txt")), "x\n").unwrap();
     }
     let root = root.to_str().unwrap().to_string();
-    let connect: Connect = Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>));
+    let fs = move || FreeAs {
+        inner: LocalFs::new(),
+        free,
+    };
+    let connect: Connect = Arc::new(move || Ok(Box::new(fs()) as Box<dyn RemoteFs + Send>));
     let launch: Launch = Arc::new(|abs: &str, _| Ok(format!("opened {abs}")));
     let b = Browser::new(Start {
-        fs: Box::new(LocalFs::new()),
+        fs: Box::new(fs()),
         connect,
         label: None,
         destination: None,
@@ -3186,8 +3254,16 @@ fn laid_wide(grid: &Buffer, x: u16, y: u16) -> bool {
 #[test]
 fn ts6_an_ambiguous_wide_terminal_gets_10s_table_and_no_row_breaks() {
     let long = "a long name the panel has to cut somewhere along the way.txt";
-    for ambiguous in [false, true] {
-        let fx = fixture_with(0, &["café.txt", long, "Café 한글 메모.txt"]);
+    // The foot's free space as CI's runner had it — one blank left before the frame — and too
+    // long to show (dropped: blanks to spare).
+    let cases = [
+        (false, 82_709_782_528),
+        (true, 82_709_782_528),
+        (true, 999_999_999_999_999),
+    ];
+    for (ambiguous, free) in cases {
+        let names = ["café.txt", long, "Café 한글 메모.txt"];
+        let fx = fixture_free(0, &names, Some(free));
         let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
         {
             let mut s = tape.0.borrow_mut();
@@ -3238,12 +3314,41 @@ fn ts6_an_ambiguous_wide_terminal_gets_10s_table_and_no_row_breaks() {
             .filter(|&y| (0..100).any(|x| laid_wide(&grid, x, y)))
             .collect();
         assert!(!wide_rows.is_empty(), "a row with é:\n{text}");
-        let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
-        for &y in &wide_rows {
-            let row: String = (0..100)
-                .map(|x| window.0[usize::from(y) * 100 + x].symbol.as_str())
+        // A row's content words: its frames' cells, which keep their columns, separate words as
+        // blanks do (a run may give up the blank before one).
+        let frame = |x: u16, y: u16| {
+            chrome(&grid, x, y) && grid[(x, y)].symbol().chars().any(cells::frame_glyph)
+        };
+        let words = |cell: &dyn Fn(u16) -> String, y: u16| {
+            let row: String = (0..100u16)
+                .map(|x| {
+                    if frame(x, y) {
+                        " ".to_string()
+                    } else {
+                        cell(x)
+                    }
+                })
                 .collect();
-            assert_eq!(words(&vt.row(y)), words(&row), "row {y} as text:\n{text}");
+            row.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        for &y in &wide_rows {
+            let shown = |x: u16| vt.cell(x, y).symbol.clone();
+            let laid = |x: u16| {
+                window.0[usize::from(y) * 100 + usize::from(x)]
+                    .symbol
+                    .clone()
+            };
+            let (sent, want) = (words(&shown, y), words(&laid, y));
+            assert_eq!(sent, want, "row {y} as text:\n{text}");
+            // The control: a space between two of its words eaten is a difference.
+            if let Some(k) = (1..want.len()).find(|&k| !want[k - 1].is_empty()) {
+                let mut eaten = want.clone();
+                let joined = format!("{}{}", eaten[k - 1], eaten[k]);
+                eaten.splice(k - 1..=k, [joined]);
+                assert_ne!(sent, eaten, "row {y}: an eaten space is seen");
+            }
             // Its frames where the window has them: the row is not broken.
             for x in 0..100u16 {
                 let p = &painted.0[usize::from(y) * 100 + usize::from(x)];
