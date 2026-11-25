@@ -3711,6 +3711,29 @@ mod stream {
         }
     }
 
+    /// 10 §10 at the source: in an ambiguous-wide terminal a byte on its way is `..` in the hex
+    /// column and `.` in the ASCII column (`·` is of width A, and a printer lays content of
+    /// width A in two cells, which would move the row); the window keeps `··` and `·`.
+    #[test]
+    fn bytes_on_their_way_stand_in_for_an_ambiguous_wide_terminal() {
+        let mut sx = sx(MODEL);
+        sx.frames(2);
+        let painted = sx.win.rows_painted as usize;
+        assert!(painted >= 2, "{painted} rows");
+        assert_eq!(sx.rows_reading(&pending_row()), painted, "the window's");
+        crate::gui::cells::set_ambiguous_wide(&sx.drv.ctx, true);
+        sx.frames(1);
+        let narrow = pending_row().replace('·', ".");
+        assert_eq!(sx.rows_reading(&narrow), painted, "{:?}", sx.grid_rows());
+        assert_eq!(
+            sx.rows_reading(&".".repeat(16)),
+            painted,
+            "the ASCII column"
+        );
+        let all: String = (sx.grid_rows().into_iter()).flatten().collect();
+        assert!(!all.contains('·'), "{all}");
+    }
+
     /// V1: the owner's 24 GB file. The window is there before any byte — its frame, its offsets,
     /// its rows as pending — and the first screen costs one 64 KiB block; then nothing more is
     /// sent, the `Origin`'s connection is never used and nothing is created in the cache.
@@ -8791,7 +8814,7 @@ mod x3 {
     use super::*;
     use crate::gui::cells::{self, Layer, Seen};
     use crate::gui::chrome::{CELL, PALETTE};
-    use crate::gui::term::{self, Backend, End, Receipt, Tty};
+    use crate::gui::term::{self, Backend, End, Probed, Receipt, Tty};
     use std::io;
 
     /// A terminal that sends nothing, `cols` × `rows`, that draws a glyph of ambiguous width in
@@ -8805,11 +8828,11 @@ mod x3 {
         fn size(&mut self) -> io::Result<(u16, u16)> {
             Ok(self.0)
         }
-        fn kitty(&mut self) -> bool {
-            false
-        }
-        fn ambiguous_wide(&mut self) -> bool {
-            self.1
+        fn probe(&mut self) -> Probed {
+            Probed {
+                kitty: false,
+                ambiguous: self.1,
+            }
         }
         fn drop_input(&mut self) {}
         fn next(&mut self, wait: Duration) -> io::Result<Option<crossterm::event::Event>> {

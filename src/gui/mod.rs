@@ -1289,8 +1289,6 @@ struct Dump {
     /// The pass the receipt is of, ended: it is written at the start of the next.
     taken: Option<term::WindowPass>,
     written: bool,
-    /// The watchdog's word.
-    done: Arc<AtomicBool>,
     result: Arc<Mutex<Option<Result<String, String>>>>,
 }
 
@@ -1314,9 +1312,6 @@ impl<W: Window> Window for Receipted<W> {
                 Err(e) => Err(format!("cannot write {}: {e}", dump.path.display())),
             });
             dump.written = true;
-            if !dump.shot {
-                dump.done.store(true, Ordering::SeqCst);
-            }
         }
         if dump.written {
             self.inner.ui(ui);
@@ -1940,6 +1935,17 @@ pub(crate) fn give_up(why: &str) -> ! {
     std::process::exit(1);
 }
 
+/// The receipt hooks' watchdog: `secs` from now sopen gives up (exit 1, [`give_up`]) unless
+/// `done` is set by then.
+pub(crate) fn arm_watchdog(secs: u64, hook: &'static str, done: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(secs));
+        if !done.load(Ordering::SeqCst) {
+            give_up(&format!("the {hook} hook stalled for {secs} s"));
+        }
+    });
+}
+
 /// Runs `window` until it closes. With the screenshot or the cells hook a watchdog ends a
 /// stalled run after `SOPEN_WATCHDOG` seconds (default 30, [`watchdog_secs`]).
 pub fn run_window<W: Window + 'static>(
@@ -1964,27 +1970,21 @@ pub fn run_window_sized<W: Window + 'static>(
     // face (`fonts::pin_symbols`).
     fonts::prefetch();
     let shot_done = Arc::new(AtomicBool::new(false));
-    // The watchdog's word: set once the window is gone too, however it went (a window that
-    // closed or did not start stalls nothing), so it never ends a process that goes on — the
-    // terminal backend's, which still holds its terminal.
-    let disarm = shot_done.clone();
+    // The watchdog's word: set once the window is gone, however it went (a window that closed
+    // or did not start stalls nothing), so it never ends a process that goes on — the terminal
+    // backend's, which still holds its terminal — and never before (a receipt written, then a
+    // window that does not close, is still a stall).
+    let disarm = Arc::new(AtomicBool::new(false));
     let shot_result: Arc<Mutex<Option<Result<String, String>>>> = Arc::default();
     let dump_result: Arc<Mutex<Option<Result<String, String>>>> = Arc::default();
     let closed = Arc::new(AtomicBool::new(false));
     if hooks.screenshot.is_some() || hooks.cells.is_some() {
-        let secs = watchdog_secs();
         let hook = if hooks.screenshot.is_some() {
             "screenshot"
         } else {
             "cells"
         };
-        let done = shot_done.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(secs));
-            if !done.load(Ordering::SeqCst) {
-                give_up(&format!("the {hook} hook stalled for {secs} s"));
-            }
-        });
+        arm_watchdog(watchdog_secs(), hook, disarm.clone());
     }
     let dump = hooks.cells.clone().map(|path| Dump {
         path,
@@ -1993,7 +1993,6 @@ pub fn run_window_sized<W: Window + 'static>(
         ready_frames: 0,
         taken: None,
         written: false,
-        done: shot_done.clone(),
         result: dump_result.clone(),
     });
     let shell = Shell {

@@ -36,6 +36,64 @@ impl LocalFs {
     }
 }
 
+/// What the exchange (or the rename that does not replace) answers where it is not offered (12 §9.1): an older kernel or a seccomp
+/// filter (`ENOSYS`), a filesystem without it (`EINVAL`, `ENOTSUP`, `EOPNOTSUPP`).
+const NOT_OFFERED: [i32; 4] = [libc::ENOSYS, libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP];
+
+/// What a rename with a flag does: swap the two names, or move without replacing.
+#[derive(Clone, Copy)]
+enum How {
+    Swap,
+    NoReplace,
+}
+
+#[cfg(target_os = "macos")]
+fn rename_how(a: &std::ffi::CStr, b: &std::ffi::CStr, how: How) -> std::io::Result<()> {
+    let flags = match how {
+        How::Swap => libc::RENAME_SWAP,
+        How::NoReplace => libc::RENAME_EXCL,
+    };
+    // SAFETY: two NUL-terminated paths that outlive the call.
+    match unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), flags) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_how(a: &std::ffi::CStr, b: &std::ffi::CStr, how: How) -> std::io::Result<()> {
+    let flags = match how {
+        How::Swap => libc::RENAME_EXCHANGE,
+        How::NoReplace => libc::RENAME_NOREPLACE,
+    };
+    // The system call itself, so a C library without its wrapper still renames; a kernel
+    // without it answers ENOSYS.
+    // SAFETY: two NUL-terminated paths that outlive the call, relative to the working folder.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            flags,
+        )
+    };
+    match rc {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_how(_: &std::ffi::CStr, _: &std::ffi::CStr, _: How) -> std::io::Result<()> {
+    Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
+}
+
+fn c_path(p: &str) -> Result<std::ffi::CString> {
+    std::ffi::CString::new(p).with_context(|| format!("{p}: a path with a NUL byte"))
+}
+
 pub(crate) fn stat_of(meta: &fs::Metadata) -> Stat {
     Stat {
         is_dir: meta.is_dir(),
@@ -235,6 +293,60 @@ impl RemoteFs for LocalFs {
 
     fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
         fs::hard_link(from, to).with_context(|| format!("cannot link {from} to {to}"))
+    }
+
+    /// 12 §9.1: one call that swaps the two names, so the target is never missing and the file
+    /// it displaced stays at hand to be checked.
+    fn exchange(&mut self, a: &str, b: &str) -> Result<()> {
+        match rename_how(&c_path(a)?, &c_path(b)?, How::Swap) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let what = format!("cannot exchange {a} and {b}");
+                match e.raw_os_error() {
+                    Some(n) if NOT_OFFERED.contains(&n) => {
+                        Err(anyhow::Error::new(super::NoExchange(n)).context(what))
+                    }
+                    _ => Err(e).context(what),
+                }
+            }
+        }
+    }
+
+    fn file_id(&mut self, path: &str) -> Result<Option<(super::FileId, u64)>> {
+        match fs::symlink_metadata(path) {
+            Ok(m) => Ok(Some((
+                super::FileId {
+                    dev: m.dev(),
+                    ino: m.ino(),
+                },
+                m.nlink(),
+            ))),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("cannot stat {path}")),
+        }
+    }
+
+    /// One call that refuses an existing `to` (`RENAME_EXCL`, `RENAME_NOREPLACE`); where the
+    /// filesystem has no such rename, a hard link (which refuses one too), then `from` removed.
+    fn move_new(&mut self, from: &str, to: &str) -> Result<()> {
+        let what = || format!("cannot move {from} to {to}");
+        match rename_how(&c_path(from)?, &c_path(to)?, How::NoReplace) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error().is_some_and(|n| NOT_OFFERED.contains(&n)) => {
+                fs::hard_link(from, to).with_context(what)?;
+                if let Err(e) = fs::remove_file(from) {
+                    crate::debug!("{from} stays beside {to}: {e}");
+                }
+                Ok(())
+            }
+            Err(e) => Err(e).with_context(what),
+        }
+    }
+
+    fn sync_dir(&mut self, dir: &str) -> Result<()> {
+        fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("cannot make the folder {dir} durable"))
     }
 
     fn remove(&mut self, path: &str) -> Result<()> {

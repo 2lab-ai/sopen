@@ -519,6 +519,8 @@ struct Script {
     /// The probe's answer (TS-6): `─` took two cells; and how many times it was asked.
     ambiguous: bool,
     probes: usize,
+    /// The terminal hangs up during the probe (its signal, `stop`, comes then).
+    hang_up_at_probe: bool,
     /// Raw mode now, and every switch of it.
     raw: bool,
     raws: Vec<bool>,
@@ -554,14 +556,16 @@ impl Tty for Tape {
         Ok(self.0.borrow().size)
     }
 
-    fn kitty(&mut self) -> bool {
-        self.0.borrow().kitty
-    }
-
-    fn ambiguous_wide(&mut self) -> bool {
+    fn probe(&mut self) -> Probed {
         let mut s = self.0.borrow_mut();
         s.probes += 1;
-        s.ambiguous
+        if s.hang_up_at_probe {
+            s.stopped = true;
+        }
+        Probed {
+            kitty: s.kitty,
+            ambiguous: s.ambiguous,
+        }
     }
 
     fn drop_input(&mut self) {
@@ -690,6 +694,70 @@ fn fixture(more: usize) -> Fx {
 
 /// [`fixture`] with the files `named` besides.
 fn fixture_with(more: usize, named: &[&str]) -> Fx {
+    fixture_free(more, named, None)
+}
+
+/// The local file system, but for the free space it says: `free` (`None`: the host's), so a
+/// foot that shows it does not depend on the machine the test runs on.
+struct FreeAs {
+    inner: LocalFs,
+    free: Option<u64>,
+}
+
+impl RemoteFs for FreeAs {
+    fn stat_opt(&mut self, path: &str) -> anyhow::Result<Option<crate::remote::Stat>> {
+        self.inner.stat_opt(path)
+    }
+    fn lstat_opt(&mut self, path: &str) -> anyhow::Result<Option<crate::remote::Stat>> {
+        self.inner.lstat_opt(path)
+    }
+    fn realpath(&mut self, path: &str) -> anyhow::Result<String> {
+        self.inner.realpath(path)
+    }
+    fn read_head(&mut self, path: &str, max: usize) -> anyhow::Result<Vec<u8>> {
+        self.inner.read_head(path, max)
+    }
+    fn list_dir(&mut self, path: &str) -> anyhow::Result<Vec<String>> {
+        self.inner.list_dir(path)
+    }
+    fn list_entries(&mut self, path: &str) -> anyhow::Result<Vec<crate::remote::Entry>> {
+        self.inner.list_entries(path)
+    }
+    fn free_space(&mut self, path: &str) -> Option<u64> {
+        self.free.or_else(|| self.inner.free_space(path))
+    }
+    fn read_to(
+        &mut self,
+        path: &str,
+        out: &mut dyn Write,
+        progress: &mut dyn FnMut(u64),
+    ) -> anyhow::Result<u64> {
+        self.inner.read_to(path, out, progress)
+    }
+    fn create_from(
+        &mut self,
+        local: &std::path::Path,
+        path: &str,
+        like: Option<crate::remote::Like>,
+    ) -> std::result::Result<crate::remote::Uploaded, crate::remote::CreateError> {
+        self.inner.create_from(local, path, like)
+    }
+    fn set_mode(&mut self, path: &str, mode: u32) -> anyhow::Result<()> {
+        self.inner.set_mode(path, mode)
+    }
+    fn rename_over(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.inner.rename_over(from, to)
+    }
+    fn link_new(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
+        self.inner.link_new(from, to)
+    }
+    fn remove(&mut self, path: &str) -> anyhow::Result<()> {
+        self.inner.remove(path)
+    }
+}
+
+/// [`fixture_with`] whose file system says `free` bytes are free ([`FreeAs`]).
+fn fixture_free(more: usize, named: &[&str], free: Option<u64>) -> Fx {
     let tmp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(tmp.path()).unwrap().join("root");
     for dir in ["alpha", "beta", "한글 폴더"] {
@@ -703,10 +771,14 @@ fn fixture_with(more: usize, named: &[&str]) -> Fx {
         std::fs::write(root.join(format!("more{n:03}.txt")), "x\n").unwrap();
     }
     let root = root.to_str().unwrap().to_string();
-    let connect: Connect = Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>));
+    let fs = move || FreeAs {
+        inner: LocalFs::new(),
+        free,
+    };
+    let connect: Connect = Arc::new(move || Ok(Box::new(fs()) as Box<dyn RemoteFs + Send>));
     let launch: Launch = Arc::new(|abs: &str, _| Ok(format!("opened {abs}")));
     let b = Browser::new(Start {
-        fs: Box::new(LocalFs::new()),
+        fs: Box::new(fs()),
         connect,
         label: None,
         destination: None,
@@ -3081,16 +3153,23 @@ fn ts6_the_probe_reads_where_the_cursor_stands_after_a_box_line() {
                 }
             }
             let text = String::from_utf8(got).unwrap();
-            assert!(text.ends_with("\x1b[6n\x1b[c"), "the probe: {text:?}");
+            assert!(
+                text.ends_with("\x1b[6n\x1b[?u\x1b[c"),
+                "the probe: {text:?}"
+            );
             let mut vt = if matches!(answer, Answer::Cursor { wide: true, .. }) {
                 Vt::wide(80, 24)
             } else {
                 Vt::new(80, 24)
             };
             vt.alt = true;
-            vt.feed(text.trim_end_matches("\x1b[6n\x1b[c").as_bytes());
+            vt.feed(text.trim_end_matches("\x1b[6n\x1b[?u\x1b[c").as_bytes());
             let reply = match answer {
                 Answer::Cursor { alone: true, .. } => format!("\x1b[{};{}R", vt.y + 1, vt.x + 1),
+                // A kitty terminal: its flags between the report and the attributes.
+                Answer::Cursor { wide, .. } if !wide => {
+                    format!("\x1b[{};{}R\x1b[?0u\x1b[?62;22c", vt.y + 1, vt.x + 1)
+                }
                 Answer::Cursor { .. } => format!("\x1b[{};{}R\x1b[?62;22c", vt.y + 1, vt.x + 1),
                 Answer::Attributes => "\x1b[?62;22c".to_string(),
                 Answer::Nothing => String::new(),
@@ -3103,7 +3182,7 @@ fn ts6_the_probe_reads_where_the_cursor_stands_after_a_box_line() {
         let silent = matches!(answer, Answer::Nothing | Answer::Cursor { alone: true, .. });
         let wait = Duration::from_millis(if silent { 400 } else { 10_000 });
         let at = Instant::now();
-        let probed = probe_width(slave, slave, wait).unwrap();
+        let probed = probe(slave, slave, wait).unwrap();
         let took = at.elapsed();
         let drawn = terminal.join().unwrap();
         // SAFETY: closes the two ends this test opened.
@@ -3112,7 +3191,15 @@ fn ts6_the_probe_reads_where_the_cursor_stands_after_a_box_line() {
             libc::close(master);
         }
         assert_eq!(drawn, "─", "{answer:?}: the probe's glyph at the corner");
-        assert_eq!(probed, wide, "{answer:?}");
+        assert_eq!(probed.ambiguous, wide, "{answer:?}");
+        let kitty = matches!(
+            answer,
+            Answer::Cursor {
+                wide: false,
+                alone: false
+            }
+        );
+        assert_eq!(probed.kitty, kitty, "{answer:?}: the kitty flags");
         if silent {
             assert!(
                 took >= wait && took < wait + Duration::from_secs(2),
@@ -3124,21 +3211,36 @@ fn ts6_the_probe_reads_where_the_cursor_stands_after_a_box_line() {
     }
 }
 
-/// The glyph `s` a window painted, as an ambiguous-wide terminal is sent it ([`narrow`]).
-fn through_the_table(window: &WindowCells) -> WindowCells {
-    let cells = (window.0.iter())
-        .map(|p| Painted {
-            symbol: narrow(&p.symbol).map_or_else(|| p.symbol.clone(), str::to_string),
-            ..p.clone()
+/// The stand-in an ambiguous-wide terminal is sent for the cell (`x`, `y`) of `grid`: §10's,
+/// where the cell is sopen's chrome ([`chrome`], [`narrow`]).
+fn stand_in(grid: &Buffer, x: u16, y: u16) -> Option<&'static str> {
+    narrow(grid[(x, y)].symbol()).filter(|_| chrome(grid, x, y))
+}
+
+/// The cells a window painted, as an ambiguous-wide terminal is sent them: chrome through §10's
+/// table, the grid (`grid`) saying which cell is chrome.
+fn through_the_table(window: &WindowCells, grid: &Buffer) -> WindowCells {
+    let cols = grid.area.width;
+    let cells = (window.0.iter().enumerate())
+        .map(|(i, p)| {
+            let (x, y) = (
+                (i % usize::from(cols)) as u16,
+                (i / usize::from(cols)) as u16,
+            );
+            Painted {
+                symbol: stand_in(grid, x, y).map_or_else(|| p.symbol.clone(), str::to_string),
+                ..p.clone()
+            }
         })
         .collect();
     (cells, window.1)
 }
 
-/// Whether `s` is a glyph an ambiguous-wide terminal draws in two cells and §10's table leaves:
-/// a name's (`é`).
-fn laid_wide(s: &str) -> bool {
-    narrow(s).is_none() && s.width() == 1 && s.chars().next().is_some_and(ambiguous)
+/// Whether the cell (`x`, `y`) of `grid` is one an ambiguous-wide terminal is sent in two cells,
+/// as written: content of ambiguous width (a name's `é`, the status row's `·`).
+fn laid_wide(grid: &Buffer, x: u16, y: u16) -> bool {
+    let s = grid[(x, y)].symbol();
+    s.width() == 1 && s.chars().next().is_some_and(ambiguous) && stand_in(grid, x, y).is_none()
 }
 
 /// TS-6 (10 §10, §14): the list — a name cut with "…", a name with `é`, Korean names and
@@ -3152,8 +3254,16 @@ fn laid_wide(s: &str) -> bool {
 #[test]
 fn ts6_an_ambiguous_wide_terminal_gets_10s_table_and_no_row_breaks() {
     let long = "a long name the panel has to cut somewhere along the way.txt";
-    for ambiguous in [false, true] {
-        let fx = fixture_with(0, &["café.txt", long]);
+    // The foot's free space as CI's runner had it — one blank left before the frame — and too
+    // long to show (dropped: blanks to spare).
+    let cases = [
+        (false, 82_709_782_528),
+        (true, 82_709_782_528),
+        (true, 999_999_999_999_999),
+    ];
+    for (ambiguous, free) in cases {
+        let names = ["café.txt", long, "Café 한글 메모.txt"];
+        let fx = fixture_free(0, &names, Some(free));
         let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
         {
             let mut s = tape.0.borrow_mut();
@@ -3174,6 +3284,7 @@ fn ts6_an_ambiguous_wide_terminal_gets_10s_table_and_no_row_breaks() {
         let all = bytes.text();
         vt.feed(&all.as_bytes()[..all.rfind(LEAVE).expect("left")]);
         let text = vt.text();
+        let grid = b.screen().buf;
         let mut sw = switched(&fx);
         b.offset = later();
         let painted = window_cells(&window_pass(&b.ctx, &mut sw, 100, 30), 100, 30);
@@ -3188,31 +3299,61 @@ fn ts6_an_ambiguous_wide_terminal_gets_10s_table_and_no_row_breaks() {
         for y in 0..vt.rows {
             for x in 0..vt.cols {
                 let s = &vt.cell(x, y).symbol;
+                let chrome_left = chrome(&grid, x, y) && narrow(grid[(x, y)].symbol()).is_some();
                 assert!(
-                    narrow(s).is_none(),
-                    "({x},{y}) {s:?} sent as it is:\n{text}"
+                    !(chrome_left && *s == grid[(x, y)].symbol()),
+                    "({x},{y}) chrome {s:?} sent as it is:\n{text}"
                 );
             }
         }
-        for shown in ["+---", "|", "=", "~", "café"] {
+        for shown in ["+---", "|", "=", "~", "café", "Café 한"] {
             assert!(text.contains(shown), "{shown:?} on screen:\n{text}");
         }
-        let window = through_the_table(&painted);
+        let window = through_the_table(&painted, &grid);
         let wide_rows: Vec<u16> = (0..30u16)
-            .filter(|&y| (0..100).any(|x| laid_wide(&window.0[usize::from(y) * 100 + x].symbol)))
+            .filter(|&y| (0..100).any(|x| laid_wide(&grid, x, y)))
             .collect();
         assert!(!wide_rows.is_empty(), "a row with é:\n{text}");
-        let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
-        for &y in &wide_rows {
-            let row: String = (0..100)
-                .map(|x| window.0[usize::from(y) * 100 + x].symbol.as_str())
+        // A row's content words: its frames' cells, which keep their columns, separate words as
+        // blanks do (a run may give up the blank before one).
+        let frame = |x: u16, y: u16| {
+            chrome(&grid, x, y) && grid[(x, y)].symbol().chars().any(cells::frame_glyph)
+        };
+        let words = |cell: &dyn Fn(u16) -> String, y: u16| {
+            let row: String = (0..100u16)
+                .map(|x| {
+                    if frame(x, y) {
+                        " ".to_string()
+                    } else {
+                        cell(x)
+                    }
+                })
                 .collect();
-            assert_eq!(words(&vt.row(y)), words(&row), "row {y} as text:\n{text}");
+            row.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        for &y in &wide_rows {
+            let shown = |x: u16| vt.cell(x, y).symbol.clone();
+            let laid = |x: u16| {
+                window.0[usize::from(y) * 100 + usize::from(x)]
+                    .symbol
+                    .clone()
+            };
+            let (sent, want) = (words(&shown, y), words(&laid, y));
+            assert_eq!(sent, want, "row {y} as text:\n{text}");
+            // The control: a space between two of its words eaten is a difference.
+            if let Some(k) = (1..want.len()).find(|&k| !want[k - 1].is_empty()) {
+                let mut eaten = want.clone();
+                let joined = format!("{}{}", eaten[k - 1], eaten[k]);
+                eaten.splice(k - 1..=k, [joined]);
+                assert_ne!(sent, eaten, "row {y}: an eaten space is seen");
+            }
             // Its frames where the window has them: the row is not broken.
             for x in 0..100u16 {
                 let p = &painted.0[usize::from(y) * 100 + usize::from(x)];
-                if p.symbol.chars().any(cells::frame_glyph) {
-                    let want = narrow(&p.symbol).unwrap_or(&p.symbol);
+                if p.symbol.chars().any(cells::frame_glyph) && chrome(&grid, x, y) {
+                    let want = stand_in(&grid, x, y).unwrap_or(&p.symbol);
                     assert_eq!(vt.cell(x, y).symbol, want, "({x},{y}):\n{text}");
                 }
             }
@@ -3232,8 +3373,8 @@ fn ts6_an_ambiguous_wide_terminal_gets_10s_table_and_no_row_breaks() {
                     assert_eq!(letters.cell(x, y).symbol, "é");
                     assert_eq!(letters.cell(x + 1, y).symbol, " ", "a blank after é");
                 }
-                if p.symbol.chars().any(cells::frame_glyph) {
-                    let want = narrow(&p.symbol).unwrap_or(&p.symbol);
+                if p.symbol.chars().any(cells::frame_glyph) && chrome(&grid, x, y) {
+                    let want = stand_in(&grid, x, y).unwrap_or(&p.symbol);
                     assert_eq!(letters.cell(x, y).symbol, want, "({x},{y})");
                 }
             }
@@ -3320,10 +3461,16 @@ fn ts6_the_hex_view_is_the_windows_cells_in_both_terminals() {
         let mut wide = Vt::wide(100, 30);
         wide.feed(&out.0.borrow());
         let text = wide.text();
+        // The grid the terminal printed from: which cell is chrome, which content.
+        let grid = b.screen().buf;
         for y in 0..wide.rows {
             for x in 0..wide.cols {
                 let s = &wide.cell(x, y).symbol;
-                assert!(narrow(s).is_none(), "{name}: ({x},{y}) {s:?} sent:\n{text}");
+                let chrome_left = chrome(&grid, x, y) && narrow(grid[(x, y)].symbol()).is_some();
+                assert!(
+                    !(chrome_left && *s == grid[(x, y)].symbol()),
+                    "{name}: ({x},{y}) chrome {s:?} sent as it is:\n{text}"
+                );
             }
         }
         // The CP437 column: cells 62–77 of the rows (the frame from row 2, the file's line, a
@@ -3337,20 +3484,28 @@ fn ts6_the_hex_view_is_the_windows_cells_in_both_terminals() {
         };
         let shown = column(&wide);
         assert!(!shown.chars().any(ambiguous), "{name}:\n{shown}");
-        let mut window = through_the_table(&painted);
+        // The window's cells through the table: chrome by the printer, and the CP437 column by
+        // the viewer at the source — §10's stand-in, `.` for a letter the table leaves.
+        let mut window = through_the_table(&painted, &grid);
         let mut letters = 0;
         for y in rows.clone() {
             for x in 62..78 {
                 let cell = &mut window.0[usize::from(y) * 100 + x];
-                if laid_wide(&cell.symbol) {
-                    cell.symbol = ".".into();
-                    letters += 1;
-                }
+                let Some(c) = cell.symbol.chars().next().filter(|&c| ambiguous(c)) else {
+                    continue;
+                };
+                cell.symbol = narrow(&cell.symbol).unwrap_or(".").to_string();
+                letters += usize::from(narrow(&c.to_string()).is_none());
             }
         }
         if name == "every.bin" {
-            let all = (0..=255u8).filter(|&b| laid_wide(&chrome::cp437(b).to_string()));
-            assert_eq!(letters, all.count(), "the CP437 column's letters, each");
+            let leaves = |b: &u8| {
+                let c = chrome::cp437(*b);
+                ambiguous(c) && narrow(&c.to_string()).is_none()
+            };
+            let all = (0..=255u8).filter(leaves).count();
+            assert!(all > 20, "the table leaves the letters: {all}");
+            assert_eq!(letters, all, "the CP437 column's letters, each");
             for stand_in in ['-', '=', '|', '+', '#', '^', 'v', '<', '>', '.'] {
                 assert!(
                     shown.contains(stand_in),
@@ -3358,14 +3513,20 @@ fn ts6_the_hex_view_is_the_windows_cells_in_both_terminals() {
                 );
             }
         }
-        // Prose of width A (the status row's `—`) is laid in two cells, as a name's `é` is: those
-        // rows equal as text — never a row of the hex frame (its left border in column 0), and
-        // each frame glyph in them where the window has it, so no moved border or arrow hides
-        // behind the words; every other cell is the window's through the table.
+        // Content of width A (the title row's and the status row's `·`, the status row's `—`) is
+        // laid in two cells, as a name's `é` is, its run giving up a blank for it (`Text ·2 Hex`
+        // where the run ends at the next entry's colours): those rows read the same glyphs in
+        // the same order, the mode button apart — never a row of the hex frame (its left border
+        // in column 0), and each chrome frame glyph in them where the window has it, so no moved
+        // border or arrow hides behind the glyphs; every other cell is the window's through the
+        // table.
         let wide_rows: Vec<u16> = (0..30u16)
-            .filter(|&y| (0..100).any(|x| laid_wide(&window.0[usize::from(y) * 100 + x].symbol)))
+            .filter(|&y| (0..100).any(|x| laid_wide(&grid, x, y)))
             .collect();
-        let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        let words = |s: &str| -> String {
+            let s = s.replace("[GUI]", "").replace("[TUI]", "");
+            s.chars().filter(|c| !c.is_whitespace()).collect()
+        };
         for &y in &wide_rows {
             let at = |x: u16| &painted.0[usize::from(y) * 100 + usize::from(x)];
             assert!(
@@ -3375,17 +3536,31 @@ fn ts6_the_hex_view_is_the_windows_cells_in_both_terminals() {
             let row: String = (0..100)
                 .map(|x| window.0[usize::from(y) * 100 + x].symbol.as_str())
                 .collect();
-            assert_eq!(words(&wide.row(y)), words(&row), "{name}: row {y}:\n{text}");
+            // The title row's views strip is the browser's (VM-7), not the hex view's: a `·`
+            // inside one entry's run (`1·2 Hex`, a binary's) has no blank to take and cuts the
+            // entry (`1·2 H~`), as the printer cuts any run (XW-receipts). Its frames still stand.
+            if y > 0 {
+                assert_eq!(words(&wide.row(y)), words(&row), "{name}: row {y}:\n{text}");
+            }
             for x in 0..100u16 {
-                let p = at(x);
-                if p.symbol.chars().any(cells::frame_glyph) {
-                    let want = narrow(&p.symbol).unwrap_or(&p.symbol);
+                if at(x).symbol.chars().any(cells::frame_glyph) && chrome(&grid, x, y) {
+                    let want = stand_in(&grid, x, y).unwrap_or(&at(x).symbol);
                     assert_eq!(wide.cell(x, y).symbol, want, "{name}: ({x},{y}):\n{text}");
                 }
             }
         }
         let d = differences_but(&window, &wide, Ink::Rgb, &wide_rows);
-        only_the_mode_button(&d, &wide, &format!("{name}, ambiguous-wide"));
+        if wide_rows.contains(&0) {
+            // The title row (the mode button's): its frames above, its place and button here.
+            let title = wide.row(0);
+            assert!(
+                title.contains("[GUI]") && title.contains("root"),
+                "{name}:\n{text}"
+            );
+            assert!(d.is_empty(), "{name}, ambiguous-wide:\n{}", d.join("\n"));
+        } else {
+            only_the_mode_button(&d, &wide, &format!("{name}, ambiguous-wide"));
+        }
     }
 }
 
@@ -3574,31 +3749,365 @@ fn ts6_a_click_after_a_letter_laid_in_two_cells_lands_on_the_cell_egui_drew() {
     assert_eq!(*clicked.borrow(), ["c", "é", "f"]);
 }
 
-/// In an ambiguous-wide terminal a click on a name's letter that the printer moved for `é`
-/// (`cafés`'s `s`, a cell to the right) moves the bar to that entry.
+// ---------------------------------------------------------------------------------------------
+// Review of XW-receipts: whole glyphs in the shift, the probe's one round trip, content kept.
+
+/// A screen of one row `width` cells wide: `parts` put one after the other, each in its pen.
+fn one_row(width: u16, parts: &[(&str, Pen)]) -> Screen {
+    let area = Cells::new(0, 0, width, 1);
+    let mut buf = Buffer::empty(area);
+    let p = chrome::PALETTE;
+    cells::fill(&mut buf, area, Pen::new(p.text, p.back));
+    let mut x = 0u16;
+    for &(text, pen) in parts {
+        x += cells::put(&mut buf, x, 0, text, usize::from(width - x), pen) as u16;
+    }
+    Screen {
+        buf,
+        caret: None,
+        hand_offs: vec![],
+    }
+}
+
+/// `screen` as an ambiguous-wide terminal shows it (the emulator fails a glyph past the row).
+fn shown_wide(screen: &Screen) -> Vt {
+    let bytes = Bytes::default();
+    let mut term = Term::new(bytes.clone(), true);
+    term.wide = true;
+    term.draw(screen).unwrap();
+    let a = screen.buf.area;
+    let mut vt = Vt::wide(a.width, a.height);
+    vt.alt = true;
+    vt.feed(&bytes.0.borrow());
+    vt
+}
+
+fn row_of(vt: &Vt) -> Vec<String> {
+    (0..vt.cols).map(|x| vt.cell(x, 0).symbol.clone()).collect()
+}
+
+/// A wide glyph after a letter laid in two cells moves whole: its second cell is never taken
+/// for room. At the screen's edge (`é한`) it is cut with `~`, never put in the last column; before
+/// a frame (`é한│`) the frame keeps its cell; before a word (`é한 x`) the space between stays —
+/// the room is the blanks after the words. A click maps through the whole glyph: on `한`'s second
+/// cell it lands on `한`'s own second column.
 #[test]
-fn ts6_a_click_on_a_name_moved_for_a_wide_letter_moves_the_bar_there() {
-    let fx = fixture_with(0, &["cafés.txt"]);
-    let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+fn ts6_a_wide_glyph_after_a_laid_letter_moves_whole() {
+    let p = chrome::PALETTE;
+    let text = Pen::new(p.text, p.back);
+    let line = Pen::new(p.frame_idle.color, p.back);
+    let edge = shown_wide(&one_row(3, &[("é한", text)]));
+    assert_eq!(row_of(&edge), ["é", "", "~"], "at the edge");
+    let framed = shown_wide(&one_row(4, &[("é한", text), ("│", line)]));
+    assert_eq!(row_of(&framed), ["é", "", "~", "|"], "before a frame");
+    let word = shown_wide(&one_row(7, &[("é한 x", text)]));
+    assert_eq!(
+        row_of(&word),
+        ["é", "", "한", "", " ", "x", " "],
+        "before a word"
+    );
+    let name = shown_wide(&one_row(20, &[("Café 한글 메모.txt", text)]));
+    let shown: String = row_of(&name).concat();
+    assert!(shown.starts_with("Café 한글 메모.txt"), "{shown:?}");
+    // [é, 한, its second cell, a blank, X]: 한 shown in the terminal's third and fourth cells.
+    let (_, columns) = for_ambiguous_wide(&one_row(6, &[("é한 X ", text)]));
+    assert_eq!(columns[0][..4], [0, 0, 1, 2], "{:?}", columns[0]);
+}
+
+/// Content is not substituted (10 §10): a name's `♥ • ○ →` and the `─` between two of its
+/// letters are sent as written, each laid in two cells; the frame around them gets §10's
+/// stand-ins. A run too short for a laid letter and the cell after it shows the cut, `~`.
+#[test]
+fn ts6_a_names_glyphs_stay_as_written_and_a_short_run_shows_the_cut() {
+    let p = chrome::PALETTE;
+    let text = Pen::new(p.text, p.back);
+    let line = Pen::new(p.frame_idle.color, p.back);
+    let parts = [
+        ("│", line),
+        ("a─b ♥•○→ x", text),
+        ("      ", text),
+        ("│", line),
+    ];
+    let vt = shown_wide(&one_row(18, &parts));
+    let shown: String = row_of(&vt).concat();
+    assert!(shown.starts_with("|a─b ♥•○→ x"), "{shown:?}");
+    assert_eq!(vt.cell(17, 0).symbol, "|", "{shown:?}");
+    let short = shown_wide(&one_row(3, &[("éa", text), ("│", line)]));
+    assert_eq!(row_of(&short), ["~", " ", "|"]);
+}
+
+/// The probe takes the last cursor report before the device attributes: a key typed ahead that
+/// reads as one (Alt+F3 is `CSI 1;3R` in the legacy encoding) is not the report; the kitty flags
+/// come in the same round trip.
+#[test]
+fn ts6_the_probe_takes_the_last_report_before_the_attributes() {
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: two out-pointers to live ints; no name, termios or size asked for.
+    let made = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(made, 0, "openpty");
+    // SAFETY: the slave this test opened; a zeroed termios is overwritten by tcgetattr.
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        assert_eq!(libc::tcgetattr(slave, &mut t), 0);
+        libc::cfmakeraw(&mut t);
+        assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &t), 0);
+    }
+    let reply = "\x1b[1;3R\x1b[1;2R\x1b[?1u\x1b[?62;22c";
+    // SAFETY: writes a live buffer to the master this test opened (read once the probe asks).
+    unsafe { libc::write(master, reply.as_ptr().cast(), reply.len()) };
+    let probed = probe(slave, slave, Duration::from_secs(5)).unwrap();
+    // SAFETY: closes the two ends this test opened.
+    unsafe {
+        libc::close(slave);
+        libc::close(master);
+    }
+    assert!(!probed.ambiguous, "the typed Alt+F3 taken for the report");
+    assert!(probed.kitty, "the kitty flags in the same round trip");
+}
+
+/// A terminal that hangs up during the probe at start is asked nothing more: no kitty query,
+/// no flag pushed, its input not read again — the run ends as a hang-up.
+#[test]
+fn a_terminal_that_hangs_up_during_the_probe_is_asked_nothing_more() {
+    let tape = Tape::default();
     {
         let mut s = tape.0.borrow_mut();
-        s.ambiguous = true;
-        s.stop = Some(libc::SIGTERM);
+        s.size = (40, 10);
+        s.kitty = true;
+        s.stop = Some(libc::SIGHUP);
+        s.hang_up_at_probe = true;
     }
-    // Title 0, frame 1, heads 2, `..` 3, three folders, then `cafés` (7): its `s` is in the
-    // left side's sixth cell on the grid, the seventh in the terminal.
+    let bytes = Bytes::default();
+    let mut b = Backend::new(tape.clone(), bytes.clone(), skin(), true);
+    let mut no_switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> { Ok(None) };
     assert_eq!(
-        play(&mut b, &tape, &fx, click(6, 7).to_vec()),
-        End::Signal(libc::SIGTERM)
+        b.run(&mut Unsettled, &mut no_switch).unwrap(),
+        End::Signal(libc::SIGHUP)
     );
+    let s = tape.0.borrow();
+    assert_eq!((s.probes, s.drops), (1, 0), "nothing read after the probe");
+    assert!(!bytes.text().contains(KITTY_PUSH), "no flag pushed");
+}
+
+/// Ctrl+C ends a receipt run whose screen never settles at once — the terminal restored, exit
+/// 130 — instead of holding the terminal until the watchdog.
+#[test]
+fn ctrl_c_ends_a_receipt_run() {
+    let tape = Tape::default();
+    {
+        let mut s = tape.0.borrow_mut();
+        s.size = (40, 10);
+        s.events
+            .push_back(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+    let bytes = Bytes::default();
+    let mut b = Backend::new(tape.clone(), bytes.clone(), skin(), true);
+    let dir = tempfile::tempdir().unwrap();
+    b.receipt = Some(Receipt::new(
+        dir.path().join("cells.txt"),
+        Duration::from_secs(2),
+    ));
+    let mut no_switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> { Ok(None) };
+    let at = Instant::now();
+    let end = b.run(&mut Unsettled, &mut no_switch);
+    assert_eq!(end.unwrap(), End::Signal(libc::SIGINT));
+    assert!(at.elapsed() < Duration::from_secs(1), "{:?}", at.elapsed());
+    left_as_found(&bytes, &tape);
+    assert_eq!(Signalled(libc::SIGINT).exit_code(), 130);
+}
+
+/// `SOPEN_STATE`'s `help=1` in the terminal as in the window: F1 is pressed once the screen is
+/// ready, and the receipt waits for the help — the window's receipt with the help open, byte for
+/// byte.
+#[test]
+fn help_1_opens_the_help_in_the_terminals_receipt_as_in_the_windows() {
+    let fx = fixture(0);
+    let (mut drv, mut win) = window(&fx, 100, 30);
+    drv.key(&mut win, Key::F1, Modifiers::NONE);
+    drv.idle(&mut win, 2);
+    let (in_window, _) = receipt_pass(&drv.ctx, &mut win, 100, 30);
+    drv.key(&mut win, Key::Escape, Modifiers::NONE);
+    drv.idle(&mut win, 2);
+    assert!(!crate::gui::help::is_open(&drv.ctx));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cells.txt");
+    let (mut b, tape, _bytes) = backend(&fx, 100, 30, false);
+    b.receipt = Some(Receipt::new(path.clone(), Duration::from_secs(30)));
+    b.help_first = true;
+    assert_eq!(play(&mut b, &tape, &fx, vec![]), End::Closed);
+    let terminal = std::fs::read_to_string(&path).unwrap();
+    assert!(terminal.contains("Keys in the file list"), "{terminal}");
+    assert_eq!(terminal, in_window);
+}
+
+/// A click where an ambiguous-wide terminal shows the title row's `[GUI]` — moved a cell to the
+/// right by an `é` in the folder's name — is the switch: on its `]`, which the grid has a cell
+/// to the left.
+#[test]
+fn ts6_a_click_on_the_mode_button_moved_for_a_wide_letter_is_the_switch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long = "a folder whose name is long enough for the title row to cut it, café";
+    let root = std::fs::canonicalize(tmp.path()).unwrap().join(long);
+    std::fs::create_dir_all(root.join("alpha")).unwrap();
+    let mut fx = fixture(0);
+    let root = root.to_str().unwrap().to_string();
+    let connect: Connect = Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>));
+    let launch: Launch = Arc::new(|abs: &str, _| Ok(format!("opened {abs}")));
+    fx.b = Rc::new(RefCell::new(Browser::new(Start {
+        fs: Box::new(LocalFs::new()),
+        connect,
+        label: None,
+        destination: None,
+        abs: root.clone(),
+        cache: tmp.path().join("cache"),
+        state_dir: tmp.path().join("state"),
+        launch,
+        git: None,
+    })));
+    let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+    tape.0.borrow_mut().ambiguous = true;
+    // `[GUI]` before the clock: at 85–89 of a 100-cell title row (checked below).
+    let at = Cells::new(85, 0, 5, 1);
+    let mut events = click(at.right(), 0).to_vec();
+    events.push(ctrl_q());
+    tape.0.borrow_mut().events.extend(events);
+    let asked = Rc::new(RefCell::new(0));
+    let count = asked.clone();
+    let mut switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
+        *count.borrow_mut() += 1;
+        Ok(Some("not now".into()))
+    };
+    let mut tui = Shared(fx.b.clone());
+    assert_eq!(b.run(&mut tui, &mut switch).unwrap(), End::Closed);
     let all = bytes.text();
     let mut vt = Vt::wide(100, 30);
     vt.feed(&all.as_bytes()[..all.rfind(LEAVE).expect("left")]);
-    assert_eq!(vt.cell(6, 7).symbol, "s", "{}", vt.text());
-    assert_eq!(
-        vt.cell(6, 7).bg,
-        Ink::Rgb(chrome::PALETTE.bar),
-        "the bar on cafés:\n{}",
-        vt.text()
-    );
+    assert_eq!(vt.cell(at.right(), 0).symbol, "]", "{}", vt.row(0));
+    let grid = b.screen();
+    let button: String = (85..90)
+        .map(|x| grid.buf[(x, 0)].symbol().to_string())
+        .collect();
+    assert_eq!(button, "[GUI]");
+    assert_eq!(*asked.borrow(), 1, "the click on the shown `]` switched");
+}
+
+/// Set in the child [`receipt_watchdog_child`] runs.
+const WATCHDOG_CHILD: &str = "SOPEN_TEST_RECEIPT_WATCHDOG_CHILD";
+
+/// Not a test of its own (it returns at once): the child of
+/// [`a_window_receipt_that_stalls_after_its_dump_ends_at_the_deadline`] — a window run with
+/// `SOPEN_CELLS` as the runner arms it (a 1 s watchdog), its receipt written, then the window
+/// stalls before it closes.
+#[test]
+fn receipt_watchdog_child() {
+    if std::env::var_os(WATCHDOG_CHILD).is_none() {
+        return;
+    }
+    let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    crate::gui::arm_watchdog(1, "cells", returned);
+    let dir = tempfile::tempdir().unwrap();
+    let fx = fixture(0);
+    let (mut drv, _) = window(&fx, 100, 30);
+    let mut win = crate::gui::Receipted {
+        inner: Shared(fx.b.clone()),
+        dump: Some(crate::gui::Dump {
+            path: dir.path().join("cells.txt"),
+            shot: false,
+            help: false,
+            ready_frames: 0,
+            taken: None,
+            written: false,
+            result: Arc::default(),
+        }),
+    };
+    drv.until(&mut win, 20, |w| w.dump.as_ref().is_some_and(|d| d.written));
+    // The stall: the window never closes.
+    std::thread::sleep(Duration::from_secs(20));
+}
+
+/// A window's receipt run whose window stalls after the receipt is written still ends at the
+/// watchdog's deadline (exit 1, its line): the watchdog stays armed until the window's runner
+/// returns, not until the receipt is written.
+#[test]
+fn a_window_receipt_that_stalls_after_its_dump_ends_at_the_deadline() {
+    let at = Instant::now();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "gui::term::tests::receipt_watchdog_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(WATCHDOG_CHILD, "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let took = at.elapsed();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("the cells hook stalled for 1 s"), "{err}");
+    assert!(took < Duration::from_secs(10), "{took:?}");
+}
+
+/// The probe reads every answer that came with the device attributes: a terminal that sends them
+/// first, then the report and the kitty flags, in one read, is still read whole.
+#[test]
+fn ts6_the_probe_reads_the_answers_after_the_attributes_in_the_same_read() {
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: two out-pointers to live ints; no name, termios or size asked for.
+    let made = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(made, 0, "openpty");
+    // SAFETY: the slave this test opened; a zeroed termios is overwritten by tcgetattr.
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        assert_eq!(libc::tcgetattr(slave, &mut t), 0);
+        libc::cfmakeraw(&mut t);
+        assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &t), 0);
+    }
+    let reply = "\x1b[?1;2c\x1b[1;3R\x1b[?0u";
+    // SAFETY: writes a live buffer to the master this test opened (read once the probe asks).
+    unsafe { libc::write(master, reply.as_ptr().cast(), reply.len()) };
+    let at = Instant::now();
+    let probed = probe(slave, slave, Duration::from_secs(5)).unwrap();
+    // SAFETY: closes the two ends this test opened.
+    unsafe {
+        libc::close(slave);
+        libc::close(master);
+    }
+    assert!(probed.ambiguous, "the report after the attributes");
+    assert!(probed.kitty, "the kitty flags after the attributes");
+    assert!(at.elapsed() < Duration::from_secs(2), "{:?}", at.elapsed());
+}
+
+/// A name's box line between a wide glyph and a letter (`한─b`, `b─한`) is content: the glyphs on
+/// either side are judged whole, a wide one's second cell no blank. Sent as written.
+#[test]
+fn ts6_a_box_line_beside_a_wide_glyph_in_a_name_stays_as_written() {
+    let p = chrome::PALETTE;
+    let text = Pen::new(p.text, p.back);
+    for name in ["한─b", "b─한"] {
+        let screen = one_row(10, &[(name, text)]);
+        let x = (0..10u16)
+            .find(|&x| screen.buf[(x, 0)].symbol() == "─")
+            .unwrap();
+        assert!(!chrome(&screen.buf, x, 0), "{name}: a name's");
+        let shown: String = row_of(&shown_wide(&screen)).concat();
+        assert!(shown.starts_with(name), "{name}: {shown:?}");
+    }
 }

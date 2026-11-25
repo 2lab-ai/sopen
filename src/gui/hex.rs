@@ -4404,6 +4404,9 @@ impl HexWindow {
                 };
                 let (digits, glyph) = match shown {
                     Cell::Byte(b) => (format!("{b:02X}"), column_glyph(Some(b), wide)),
+                    // `·` is of width A: in an ambiguous-wide terminal its stand-in, as the
+                    // ASCII column's (a printer lays content of width A in two cells).
+                    Cell::Pending if wide => ("..".to_string(), column_glyph(None, wide)),
                     Cell::Pending => ("··".to_string(), column_glyph(None, wide)),
                     Cell::Unreadable => ("??".to_string(), '?'),
                 };
