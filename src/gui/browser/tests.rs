@@ -16,6 +16,7 @@ mod s4;
 mod s5;
 mod s6;
 mod x1a;
+mod x1b;
 
 const RUST: &str = "// a comment\nfn main() {\n    let answer = 42;\n}\n";
 

@@ -180,6 +180,21 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
 | Timeline, waveform (design) | segments per pixel column | `▁▂▃▄▅▆▇█` per cell, two rows for L/R |
 | Progress, spinner | egui widgets | `█▓░` cells; a one-cell ASCII spinner |
 
+As the list's dialogs were built (XW-dialogs, 2026-11-25):
+
+- **The shadow is black cells** in the window, not the cells' glyphs in dark grey: outside the
+  tests the window keeps no record of the cells under a dialog (`cells.rs`'s recording is off),
+  so it cannot draw them again. The terminal owns its grid and could; it does not (§17, XW-term):
+  a per-cell 1:1 (§5, TS-1) needs both backends to draw the same shadow, so the dark-grey glyphs
+  come to both at once, when the window keeps the cells under a dialog.
+- **Buttons** are `[ X ]`, two blank cells between two of them (each its own text), the bar's
+  colours when focused; nothing changes under the pointer (egui's buttons were inverted there).
+- **The field's caret** shows while the field has the keyboard, also when the window is not in
+  front (a terminal shows its cursor so too); egui drew none then.
+- **A dialog's width** is its widest text's, its nominal width at least, at most 76 cells inside
+  (or its nominal width, if more) and the window less 8 cells; a longer text wraps by cells, a
+  path anywhere.
+
 ## 7. The switch (T4)
 
 ### 7.1 Where the window opens (T3, T11)
@@ -647,7 +662,7 @@ passes from one to the next in the order given. The gate is §15's.
 | XW-input | The translator (§4's rules) and its replays: the key-row table under legacy and kitty, the three test sequences and Hangul | `src/gui/term_input.rs` (new), `src/gui/term_input/tests.rs` (new) | 231 [M] + tests | XW-0; parallel to XW-cells–XW-list | no change: no caller yet |
 | XW-shell | Route B: `create_native`, one event loop per process, `run_app_on_demand` per window; `FKeyInput`'s F12, Alt+digits and Alt+G; the start-up failure path (T31). Then `src/gui/mod.rs` passes to 04's KL-W4 | `src/gui/mod.rs` | [추정] | XW-0 | the window as today, its run re-measured (TW-1's times) |
 | XW-dialogs | The list's dialogs in cells: the F2 field, F5–F8 modals, the group dialogs | `src/gui/browser/ops.rs`, `src/gui/browser/ops/`, `src/gui/browser/panel.rs` | [추정: where the spike puts X1's cost] | XW-list | the window's dialogs in cells |
-| XW-term | The terminal backend (from the spike's 272-line runner): loop, layer drawing, kitty flag 1 by default, mouse, OSC 52, the cursor at a field, resize, leaving and flushing, the in-process switch; `--tui`; README and AGENTS rows | `src/gui/term.rs` (new); `src/main.rs` (`--tui`); `README.md`, `AGENTS.md` | ≈300 [추정] | XW-list, XW-input, XW-shell, XW-dialogs | **X1b**: `sopen --tui` |
+| XW-term | The terminal backend (from the spike's 272-line runner): loop, layer drawing, kitty flag 1 by default, mouse, OSC 52, the cursor at a field, resize, leaving and flushing, the in-process switch; `--tui`; README and AGENTS rows. Carried from XW-dialogs: a dialog's shadow stays black cells here too, as the window draws it (§6, 1:1 for TS-1) — §6's dark-grey glyphs come to both backends together | `src/gui/term.rs` (new); `src/main.rs` (`--tui`); `README.md`, `AGENTS.md` | ≈300 [추정] | XW-list, XW-input, XW-shell, XW-dialogs | **X1b**: `sopen --tui` |
 
 - **Order**: XW-0 → XW-cells → XW-kit → XW-grid → XW-list, with XW-help, XW-input and XW-shell
   in parallel from XW-0; XW-dialogs after XW-list; XW-term last. X1a ships with XW-list (and

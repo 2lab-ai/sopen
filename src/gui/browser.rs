@@ -34,6 +34,8 @@ mod git_panel;
 pub(crate) mod keys;
 mod list_cells;
 mod ops;
+#[cfg(test)]
+pub(crate) use ops::shown_wrapped;
 mod panel;
 mod prepare;
 mod preview;

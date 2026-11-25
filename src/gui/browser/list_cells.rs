@@ -1,7 +1,8 @@
 //! A file panel on the cell grid (10 §4, X1a): the frame with the path in its top border, the
 //! column heads, the rows — the bar, a selected entry in the selection's colour, the entry being
-//! renamed as today's egui field at its row's cells — the scroll bar on the right border, the
-//! rule and the foot, written into a buffer of the side's cells and painted by [`cells::paint`],
+//! renamed as its field in its row's cells (`ops`' field: egui edits, the cells show it, its
+//! caret the buffer's) — the scroll bar on the right border, the rule and the foot, written into
+//! a buffer of the side's cells and painted by [`cells::paint`],
 //! a glyph per cell. Every width is a count of cells (unicode-width), so a Hangul name takes
 //! two cells a glyph and a cut never splits one (10 §10, 01 §3a). The pointer stays egui's: each
 //! row is an `interact` rect at its cells, the wheel is read over the side.
@@ -127,9 +128,9 @@ impl Browser {
             // Each cell fits its column at a glyph boundary, "…" where it is cut: never half a
             // wide glyph. A size too long for its column is said in a larger unit, never cut.
             if idx == panel.highlight && renaming.as_deref() == Some(entry.name.as_str()) {
-                // The name is a field over the Name and Ext columns, drawn after the cells.
+                // The name is a field over the Name and Ext columns, written after the rows.
                 let width = cols.ext + EXT - inner.x;
-                field = Some(grid.rect(Cells::new(inner.x, y, width, 1)));
+                field = Some(Cells::new(inner.x, y, width, 1));
             } else {
                 let (name, ext) = panel::split_name(entry);
                 let name = cells::fit_start(name, cols.name.into());
@@ -181,11 +182,15 @@ impl Browser {
         };
         let body = Pen::new(p.text, p.back);
         cells::put(&mut buf, inner.x + gap as u16, foot, &shown, room, body);
-        cells::paint(&painter, grid.origin, &buf, None);
-        // The field after the rows' interactions: on top of its row's, it takes its clicks.
-        if let Some(rect) = field {
-            self.ops.rename_field(ui, rect);
+        // A dialog over the list: the cells under it blank first (cells.rs, one buffer over
+        // another), so a wide glyph half under its edge goes as a terminal erases it.
+        for under in self.ops.covered(&ctx, grid) {
+            cells::fill(&mut buf, under, body);
         }
+        // The field after the rows' interactions — on top of its row's, it takes its clicks —
+        // written into these cells, its caret theirs.
+        let caret = field.and_then(|at| self.ops.rename_field(ui, grid, at, &mut buf));
+        cells::paint(&painter, grid.origin, &buf, caret);
         if let Some((idx, open)) = clicked {
             // While the tree is open the other side is a snapshot (02 §3.1 O4): a click there
             // moves nothing.
