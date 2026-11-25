@@ -3,9 +3,12 @@
 //! counting file layer on the route main takes ([`open_file`]) — plus Save to…'s file rules.
 
 use super::*;
+use crate::gui::browser::ops::dialog;
+use crate::gui::cells;
+use crate::gui::chrome::cga::{BLACK, WHITE};
 use crate::gui::testkit::{Driver, Meter as Metered};
 use crate::remote::{LocalFs, Stat};
-use eframe::egui::{Modifiers, Pos2};
+use eframe::egui::{Event, Modifiers, Pos2, Rect, Vec2};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::AtomicUsize;
 
@@ -196,10 +199,10 @@ impl Fx {
         names
     }
 
-    /// Focuses the path field (the row's room left of Browse…).
+    /// Focuses the path field (its row's cells, above Browse…).
     fn focus_path(&mut self) {
-        let browse = self.drv.find_text("Browse…").expect("Browse… shown");
-        let field = Pos2::new(browse.left() - 60.0, browse.center().y);
+        let browse = self.drv.find_text("[ Browse… ]").expect("Browse… shown");
+        let field = Pos2::new(browse.center().x, browse.center().y - CELL.y);
         self.drv.click(&mut self.win, field);
         assert_eq!(self.drv.ctx.memory(|m| m.focused()), Some(path_id()));
     }
@@ -214,10 +217,10 @@ fn enter_opens_the_hex_editor_and_only_then_fetches() {
     for text in [
         "blob.zip",
         describe.as_str(),
-        "Open in hex editor",
-        "Save to…",
-        "Cancel",
-        "Browse…",
+        "[ Open in hex editor ]",
+        "[ Save to… ]",
+        "[ Cancel ]",
+        "[ Browse… ]",
         hint(false),
     ] {
         assert!(fx.drv.find_text(text).is_some(), "{text:?} not shown");
@@ -269,7 +272,7 @@ fn esc_cancel_and_close_download_nothing() {
     fx.drv.key(&mut fx.win, Key::Escape, Modifiers::NONE);
     assert!(fx.win.close_ok);
     let mut fx2 = dialog();
-    fx2.drv.click_text(&mut fx2.win, "Cancel");
+    fx2.drv.click_text(&mut fx2.win, "[ Cancel ]");
     assert!(fx2.win.close_ok);
     let mut fx3 = dialog();
     assert!(fx3.win.close_requested());
@@ -296,17 +299,19 @@ fn the_hint_says_nothing_is_downloaded_only_when_something_would_be() {
     assert!(there.drv.find_text(hint(false)).is_some());
 }
 
-/// The window is as tall as its content: it asks for a height that holds the last line and
-/// leaves no large empty area below it.
+/// The window is as tall as its content: at the height it asks for, the last line is followed
+/// only by the box's margin and border, the shadow's row, one blank row and the F-key row.
 #[test]
 fn the_dialog_asks_for_its_contents_height() {
-    let fx = dialog();
+    let mut fx = dialog();
     let asked = fx.win.asked_height().expect("a height was asked for");
+    fx.drv.resize(WINDOW[0], asked);
+    fx.drv.idle(&mut fx.win, 3);
     let last = fx.drv.find_text(hint(false)).expect("the hint line");
-    assert!(asked >= last.bottom(), "{asked} < {}", last.bottom());
-    assert!(
-        asked <= last.bottom() + 30.0,
-        "{asked} leaves room below {}",
+    assert_eq!(
+        asked,
+        last.bottom() + 5.0 * CELL.y,
+        "{asked} below {}",
         last.bottom()
     );
     assert!(asked < 320.0, "{asked}");
@@ -322,7 +327,7 @@ fn save_to_a_free_path_writes_the_bytes_with_a_new_files_mode() {
         return;
     }
     let mut fx = dialog();
-    fx.drv.click_text(&mut fx.win, "Save to…");
+    fx.drv.click_text(&mut fx.win, "[ Save to… ]");
     fx.until_saved();
     let dest = fx.out.join("blob.zip");
     assert_eq!(std::fs::read(&dest).unwrap(), BODY);
@@ -337,7 +342,7 @@ fn save_to_a_free_path_writes_the_bytes_with_a_new_files_mode() {
     );
     let line = format!("saved {}", tilde(&dest));
     fx.drv.idle(&mut fx.win, 1);
-    assert!(fx.drv.find_text(&line).is_some(), "{line}");
+    assert!(said(&fx.drv, &line), "{line}");
     fx.drv.until(&mut fx.win, 5, |w| w.close_ok);
     assert_eq!(
         fx.out_files(),
@@ -353,16 +358,16 @@ fn save_to_an_existing_path_never_replaces_it_and_offers_the_next_name() {
     let mut fx = dialog();
     let taken = fx.out.join("blob.zip");
     std::fs::write(&taken, b"someone's file").unwrap();
-    fx.drv.click_text(&mut fx.win, "Save to…");
+    fx.drv.click_text(&mut fx.win, "[ Save to… ]");
     fx.until_asking();
     assert_eq!(std::fs::read(&taken).unwrap(), b"someone's file");
     let note = format!(
         "{} exists — not replaced. Save to… again saves as blob-1.zip",
         tilde(&taken)
     );
-    assert!(fx.drv.find_text(&note).is_some(), "said whole: {note}");
+    assert!(said(&fx.drv, &note), "said whole: {note}");
     assert_eq!(fx.win.path, tilde(&fx.out.join("blob-1.zip")));
-    fx.drv.click_text(&mut fx.win, "Save to…");
+    fx.drv.click_text(&mut fx.win, "[ Save to… ]");
     fx.until_saved();
     assert_eq!(std::fs::read(fx.out.join("blob-1.zip")).unwrap(), BODY);
     assert_eq!(std::fs::read(&taken).unwrap(), b"someone's file");
@@ -397,12 +402,12 @@ fn the_path_is_saved_exactly_as_typed() {
     let mut fx = dialog();
     let spaced = fx.out.join(" blob .zip ");
     fx.win.path = spaced.to_str().unwrap().to_string();
-    fx.drv.click_text(&mut fx.win, "Save to…");
+    fx.drv.click_text(&mut fx.win, "[ Save to… ]");
     fx.until_saved();
     assert_eq!(std::fs::read(&spaced).unwrap(), BODY);
     let mut fx = dialog();
     fx.win.path = "   ".to_string();
-    fx.drv.click_text(&mut fx.win, "Save to…");
+    fx.drv.click_text(&mut fx.win, "[ Save to… ]");
     fx.drv.idle(&mut fx.win, 2);
     assert!(fx.drv.find_text("type a path to save to").is_some());
     assert_eq!(fx.calls(), (0, 0));
@@ -417,7 +422,7 @@ fn browse_saves_where_the_system_dialog_says() {
         pick: Some(picked.clone()),
         ..Opts::default()
     });
-    fx.drv.click_text(&mut fx.win, "Browse…");
+    fx.drv.click_text(&mut fx.win, "[ Browse… ]");
     fx.until_saved();
     assert_eq!(fx.chooses.load(Ordering::SeqCst), 1);
     assert_eq!(std::fs::read(&picked).unwrap(), BODY);
@@ -429,9 +434,9 @@ fn browse_saves_where_the_system_dialog_says() {
 #[test]
 fn browse_without_an_answer_says_the_path_field_still_works() {
     let mut fx = dialog();
-    fx.drv.click_text(&mut fx.win, "Browse…");
+    fx.drv.click_text(&mut fx.win, "[ Browse… ]");
     fx.until_asking();
-    assert!(fx.drv.find_text(BROWSE_NONE).is_some());
+    assert!(said(&fx.drv, BROWSE_NONE));
     assert_eq!(fx.calls(), (0, 0));
     assert!(fx.out_files().is_empty());
 }
@@ -446,7 +451,7 @@ fn closing_during_a_download_cancels_it() {
         hold: Some(hold),
         ..Opts::default()
     });
-    fx.drv.click_text(&mut fx.win, "Save to…");
+    fx.drv.click_text(&mut fx.win, "[ Save to… ]");
     assert!(matches!(fx.win.stage, Stage::Moving { .. }));
     assert!(!fx.win.ready(), "no screenshot mid-transfer");
     fx.drv.key(&mut fx.win, Key::Enter, Modifiers::NONE);
@@ -467,7 +472,7 @@ fn a_dead_transfer_worker_is_a_visible_failure() {
         panics: true,
         ..Opts::default()
     });
-    fx.drv.click_text(&mut fx.win, "Save to…");
+    fx.drv.click_text(&mut fx.win, "[ Save to… ]");
     fx.drv
         .until(&mut fx.win, 20, |w| matches!(w.stage, Stage::Failed(_)));
     fx.drv.idle(&mut fx.win, 3);
@@ -476,9 +481,9 @@ fn a_dead_transfer_worker_is_a_visible_failure() {
     };
     let message = message.clone();
     assert!(message.contains("stopped without a result"), "{message}");
-    assert!(fx.drv.find_text(&message).is_some(), "shown whole");
+    assert!(said(&fx.drv, &message), "shown whole");
     assert!(fx.win.ready());
-    fx.drv.click_text(&mut fx.win, "Close");
+    fx.drv.click_text(&mut fx.win, "[ Close ]");
     assert!(fx.win.close_ok);
 
     let (release, hold) = mpsc::channel();
@@ -487,7 +492,7 @@ fn a_dead_transfer_worker_is_a_visible_failure() {
         hold: Some(hold),
         ..Opts::default()
     });
-    fx.drv.click_text(&mut fx.win, "Save to…");
+    fx.drv.click_text(&mut fx.win, "[ Save to… ]");
     assert!(!fx.win.close_requested(), "waits for the transfer");
     release.send(()).unwrap();
     fx.drv.until(&mut fx.win, 20, |w| w.close_ok);
@@ -1429,11 +1434,13 @@ fn w8a_the_dialog_does_not_say_saved_when_the_name_was_taken_at_the_last_moment(
     );
     let mut drv = Driver::new(WINDOW[0], 320.0);
     drv.idle(&mut win, 3);
-    drv.click_text(&mut win, "Save to…");
+    drv.click_text(&mut win, "[ Save to… ]");
     drv.until(&mut win, 20, |w| w.asking() && !w.notes.is_empty());
     drv.idle(&mut win, 3);
+    // The dialog's runs in order, joined: a note wrapped by cells reads as it was said.
     let shown: Vec<String> = drv.texts().into_iter().map(|(_, _, text)| text).collect();
-    let said = |what: &str| shown.iter().any(|text| text.contains(what));
+    let joined = shown.join(" ");
+    let said = |what: &str| joined.contains(what);
     assert!(said("exists — not replaced"), "{shown:?}");
     assert!(said("blob-1.zip"), "the next free name: {shown:?}");
     assert!(!said("saved "), "{shown:?}");
@@ -1745,7 +1752,7 @@ fn the_route_main_takes_downloads_nothing_before_the_choice() {
     let out = route.open(&route.hooks(), |drv, win| {
         drv.idle(win, 10);
         assert!(win.asking(), "the dialog asks");
-        assert!(drv.find_text("Open in hex editor").is_some());
+        assert!(drv.find_text("[ Open in hex editor ]").is_some());
         assert_eq!(route.reads(), 0, "read before the choice");
         assert!(
             walk(&route.cache()).is_empty(),
@@ -1957,7 +1964,10 @@ fn w8a_v10_a_refused_session_is_said_in_the_dialog_which_recovers() {
             "the dialog shows the line: {shown}"
         );
         assert!(!shown.contains("mux_client"), "not ssh's words: {shown}");
-        assert!(drv.find_text("Open in hex editor").is_some(), "as it was");
+        assert!(
+            drv.find_text("[ Open in hex editor ]").is_some(),
+            "as it was"
+        );
         assert_eq!(route.reads(), 0, "never a quiet whole fetch instead");
         assert_eq!(route.meter.totals(), (0, 0, 0, 0), "nothing crossed");
         // Sessions are free again: the same Enter opens it, on the connection it kept.
@@ -2093,7 +2103,7 @@ fn w8a_v21_esc_cancels_a_save_to_and_leaves_nothing() {
     );
     let mut drv = Driver::new(WINDOW[0], 320.0);
     drv.idle(&mut win, 3);
-    drv.click_text(&mut win, "Save to…");
+    drv.click_text(&mut win, "[ Save to… ]");
     assert!(matches!(win.stage, Stage::Moving { .. }));
     reached
         .recv_timeout(Duration::from_secs(10))
@@ -2111,7 +2121,7 @@ fn w8a_v21_esc_cancels_a_save_to_and_leaves_nothing() {
     assert!(win.ended.lock().unwrap().saved_to.is_none());
     assert_stopped_at_its_first_response(&route);
     // The source came back whole: the next Save to… downloads.
-    drv.click_text(&mut win, "Save to…");
+    drv.click_text(&mut win, "[ Save to… ]");
     drv.until(&mut win, 20, |w| matches!(w.stage, Stage::Saved { .. }));
     let saved = std::fs::read(route.tmp.path().join("out.zip")).unwrap();
     assert_eq!(saved.len(), 4 << 20);
@@ -2134,7 +2144,7 @@ fn w8a_v21_closing_cancels_a_save_to_and_leaves_nothing() {
         &mut |mut win| {
             let mut drv = Driver::new(WINDOW[0], 320.0);
             drv.idle(&mut win, 3);
-            drv.click_text(&mut win, "Save to…");
+            drv.click_text(&mut win, "[ Save to… ]");
             reached
                 .recv_timeout(Duration::from_secs(10))
                 .expect("the download began");
@@ -2163,7 +2173,7 @@ fn the_route_main_takes_downloads_once_on_save_to() {
     let route = Route::new();
     let out = route.open(&route.hooks(), |drv, win| {
         drv.idle(win, 3);
-        drv.click_text(win, "Save to…");
+        drv.click_text(win, "[ Save to… ]");
         drv.until(win, 20, |w| matches!(w.stage, Stage::Saved { .. }));
     });
     assert_eq!(route.reads(), 1, "one download");
@@ -2415,4 +2425,490 @@ fn the_dialog_is_a_pc_shell_box_and_f3_closes_it() {
     assert!(fx.drv.closed(), "F3 asks the window to close");
     assert!(fx.win.close_requested(), "and it may: nothing runs");
     assert_eq!(fx.calls(), (0, 0), "nothing was fetched or saved");
+}
+
+// ---------------------------------------------------------------------------------------------
+// X3-binary (10 §6, §17): the dialog in cells, through `ops::dialog`.
+
+const CELL: Vec2 = chrome::CELL;
+
+/// `text` stands on screen as cells: a whole text of its row, drawn by no galley.
+fn in_cells(drv: &Driver, text: &str) -> bool {
+    drv.find_text(text).is_some() && !drv.galleys().iter().any(|(_, g)| g.text() == text)
+}
+
+fn all_in_cells(drv: &Driver, texts: &[&str]) {
+    let missing: Vec<&&str> = texts.iter().filter(|t| !in_cells(drv, t)).collect();
+    assert!(missing.is_empty(), "not cells on screen: {missing:?}");
+}
+
+/// What the cell whose top-left corner is `at` shows on top.
+fn cell_at(drv: &Driver, at: Pos2) -> Option<String> {
+    drv.column(Rect::from_min_size(at, CELL))
+        .pop()
+        .map(|(_, t)| t)
+}
+
+/// The dialog's box in cells: `╔═ Binary File ═╗`, `║ … ║` rows and `╚═…═╝` — its rect.
+fn frame_of(drv: &Driver) -> Option<Rect> {
+    let screen = Rect::from_min_size(Pos2::ZERO, drv.ctx.content_rect().size());
+    for (top, text) in drv.column(screen) {
+        let line = text.trim();
+        if !(line.starts_with('╔') && line.ends_with('╗') && line.contains("═ Binary File ═"))
+        {
+            continue;
+        }
+        let lead = text.chars().take_while(|c| *c == ' ').count() as f32;
+        let left = top.left() + lead * CELL.x;
+        let right = left + cells::width(line) as f32 * CELL.x - CELL.x;
+        let mut y = top.top() + CELL.y;
+        while y + CELL.y <= screen.bottom() {
+            let ends = (
+                cell_at(drv, Pos2::new(left, y)),
+                cell_at(drv, Pos2::new(right, y)),
+            );
+            match (ends.0.as_deref(), ends.1.as_deref()) {
+                (Some("╚"), Some("╝")) => {
+                    let max = Pos2::new(right + CELL.x, y + CELL.y);
+                    return Some(Rect::from_min_max(Pos2::new(left, top.top()), max));
+                }
+                (Some("║"), Some("║")) => y += CELL.y,
+                _ => break,
+            }
+        }
+    }
+    None
+}
+
+fn framed(drv: &Driver) -> Rect {
+    frame_of(drv).unwrap_or_else(|| {
+        let screen = Rect::from_min_size(Pos2::ZERO, drv.ctx.content_rect().size());
+        let rows: Vec<String> = drv.column(screen).into_iter().map(|(_, t)| t).collect();
+        panic!("no frame titled \"Binary File\" in cells: {rows:#?}")
+    })
+}
+
+/// A run of cell backgrounds of `fill` covers `r`.
+fn filled(drv: &Driver, r: Rect, fill: egui::Color32) -> bool {
+    (drv.rects().iter()).any(|&(at, c, _)| c == fill && at.expand(0.25).contains_rect(r))
+}
+
+/// The DOS shadow of `frame`: black cells two wide at its right from its second row, and a
+/// row under it from its third column.
+fn shadowed(drv: &Driver, frame: Rect) -> bool {
+    let rows = |r: Rect| {
+        let n = (r.height() / CELL.y) as usize;
+        (0..n).all(|k| {
+            let row = Rect::from_min_size(
+                Pos2::new(r.left(), r.top() + k as f32 * CELL.y),
+                Vec2::new(r.width(), CELL.y),
+            );
+            filled(drv, row, BLACK)
+        })
+    };
+    let right = Rect::from_min_max(
+        Pos2::new(frame.right(), frame.top() + CELL.y),
+        Pos2::new(frame.right() + 2.0 * CELL.x, frame.bottom() + CELL.y),
+    );
+    let under = Rect::from_min_max(
+        Pos2::new(frame.left() + 2.0 * CELL.x, frame.bottom()),
+        Pos2::new(frame.right() + 2.0 * CELL.x, frame.bottom() + CELL.y),
+    );
+    rows(right) && rows(under)
+}
+
+/// The caret's two scan lines at the foot of the cell whose corner is `cell`.
+fn caret_at(drv: &Driver, cell: Pos2) -> bool {
+    let foot = Rect::from_min_size(cell + Vec2::new(0.0, CELL.y - 2.0), Vec2::new(CELL.x, 2.0));
+    (drv.rects().iter()).any(|&(r, _, _)| r == foot)
+}
+
+/// `text` said whole in the dialog's cells: each row the dialog wraps it into at its inside
+/// width a whole text of its row, one under the other.
+fn said(drv: &Driver, text: &str) -> bool {
+    let Some(frame) = frame_of(drv) else {
+        return false;
+    };
+    let inside = (frame.width() / CELL.x) as usize - 4;
+    let mut last: Option<Rect> = None;
+    for row in dialog::wrap(text, inside) {
+        let Some(at) = drv.find_text(&row) else {
+            return false;
+        };
+        if last.is_some_and(|l| at.top() != l.bottom() || at.left() != l.left()) {
+            return false;
+        }
+        last = Some(at);
+    }
+    last.is_some()
+}
+
+fn type_text(drv: &mut Driver, win: &mut BinaryWindow, text: &str) {
+    drv.frame(win, vec![Event::Text(text.to_string())], Modifiers::NONE);
+    drv.idle(win, 1);
+}
+
+mod x3 {
+    use super::*;
+
+    /// Every element of the dialog is cells on the window's grid: the box in box glyphs with
+    /// its title and its black shadow, the file's line, the buttons, the path field (white on
+    /// black), the hint — and none of them a galley (the egui dialog drew each as one). The
+    /// control: a part of a button's label is no whole text.
+    #[test]
+    fn x3_the_dialogs_texts_are_cells() {
+        let fx = dialog();
+        let frame = framed(&fx.drv);
+        assert!(shadowed(&fx.drv, frame), "the shadow");
+        let describe = format!("{} B ({} bytes) · ZIP archive", BODY.len(), BODY.len());
+        all_in_cells(
+            &fx.drv,
+            &[
+                "blob.zip",
+                &describe,
+                "[ Open in hex editor ]",
+                "[ Save to… ]",
+                "[ Cancel ]",
+                "[ Browse… ]",
+                hint(false),
+            ],
+        );
+        let path = fx.win.path.clone();
+        let field = fx.drv.find_text(&path).expect("the path field");
+        assert!(in_cells(&fx.drv, &path), "the field's text is cells");
+        assert!(filled(&fx.drv, field, BLACK), "on black");
+        assert_eq!(fx.drv.colors_of(&path).unwrap(), [WHITE], "in white");
+        for inside in [field, fx.drv.find_text("[ Save to… ]").unwrap()] {
+            assert!(
+                frame.contains_rect(inside),
+                "{inside:?} in the box {frame:?}"
+            );
+        }
+        assert!(!in_cells(&fx.drv, "Open in hex"), "the control");
+    }
+
+    /// The buttons take a click and the keyboard: a click on `[ Open in hex editor ]` opens the
+    /// hex window; Tab, Tab puts the focus on `[ Save to… ]` (the bar's colours), whose Enter
+    /// saves; `[ Cancel ]` focused takes Space and closes.
+    #[test]
+    fn x3_the_buttons_take_clicks_and_keys() {
+        let mut fx = dialog();
+        fx.drv.click_text(&mut fx.win, "[ Open in hex editor ]");
+        fx.drv
+            .until(&mut fx.win, 20, |w| matches!(w.stage, Stage::Hex(_)));
+        assert_eq!(fx.calls(), (1, 0));
+
+        let mut fx = dialog();
+        let bar = chrome::PALETTE.bar;
+        let save = fx.drv.find_text("[ Save to… ]").expect("Save to…");
+        assert!(!filled(&fx.drv, save, bar), "the control: nothing focused");
+        fx.drv.key(&mut fx.win, Key::Tab, Modifiers::NONE);
+        fx.drv.key(&mut fx.win, Key::Tab, Modifiers::NONE);
+        let save = fx.drv.find_text("[ Save to… ]").expect("Save to…");
+        assert!(filled(&fx.drv, save, bar), "focused: the bar's colours");
+        fx.drv.key(&mut fx.win, Key::Enter, Modifiers::NONE);
+        fx.until_saved();
+        assert_eq!(fx.calls(), (0, 1), "Enter on the focused button saved");
+
+        let mut fx = dialog();
+        for _ in 0..3 {
+            fx.drv.key(&mut fx.win, Key::Tab, Modifiers::NONE);
+        }
+        let cancel = fx.drv.find_text("[ Cancel ]").expect("Cancel");
+        assert!(filled(&fx.drv, cancel, bar), "Cancel focused");
+        fx.drv.key(&mut fx.win, Key::Space, Modifiers::NONE);
+        assert!(fx.win.close_ok, "Space on Cancel closes");
+        assert_eq!(fx.calls(), (0, 0));
+    }
+
+    /// The path field is a cell field: typed Hangul is two cells a syllable, the caret's cell
+    /// after it, and the arrow moves it by cells — two over a syllable; a paste replaces the
+    /// selection, and Enter saves to what it holds.
+    #[test]
+    fn x3_the_path_field_takes_hangul_and_its_caret_moves_by_cells() {
+        let mut fx = dialog();
+        fx.focus_path();
+        fx.drv
+            .key(&mut fx.win, Key::A, crate::gui::testkit::command(false));
+        type_text(&mut fx.drv, &mut fx.win, "새 파일.zip");
+        assert_eq!(fx.win.path, "새 파일.zip");
+        assert!(
+            in_cells(&fx.drv, "새 파일.zip"),
+            "the field's text is cells"
+        );
+        let typed = fx.drv.find_text("새 파일.zip").unwrap();
+        assert_eq!(
+            typed.width(),
+            11.0 * CELL.x,
+            "two syllables of two cells, seven of one"
+        );
+        assert!(caret_at(&fx.drv, typed.right_top()), "the caret after it");
+        for _ in 0..4 {
+            fx.drv.key(&mut fx.win, Key::ArrowLeft, Modifiers::NONE);
+        }
+        let at = |cells: f32| typed.left_top() + Vec2::new(cells * CELL.x, 0.0);
+        assert!(caret_at(&fx.drv, at(7.0)), "before .zip");
+        fx.drv.key(&mut fx.win, Key::ArrowLeft, Modifiers::NONE);
+        assert!(caret_at(&fx.drv, at(5.0)), "two cells back over 일");
+        assert!(
+            !caret_at(&fx.drv, at(6.0)),
+            "the control: never inside a syllable"
+        );
+
+        let dest = fx.out.join("붙여넣기.zip");
+        fx.drv
+            .key(&mut fx.win, Key::A, crate::gui::testkit::command(false));
+        fx.drv.paste_text(&mut fx.win, dest.to_str().unwrap());
+        assert_eq!(fx.win.path, dest.to_str().unwrap());
+        fx.drv.key(&mut fx.win, Key::Enter, Modifiers::NONE);
+        fx.until_saved();
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            BODY,
+            "saved where the field said"
+        );
+        assert_eq!(fx.calls(), (0, 1));
+    }
+
+    /// A save that has moved half of the file shows its progress row in cells: `█` for what is
+    /// done and `░` for the rest — as many of each, here — then the figures; the window asks
+    /// for the rows it gained, its line's and the bar's.
+    #[test]
+    fn x3_a_slow_save_shows_its_progress_row() {
+        struct Slow {
+            file: PathBuf,
+            go: Mutex<Receiver<()>>,
+        }
+        impl Source for Slow {
+            fn open_hex(&mut self, _: &mut dyn FnMut(u64, u64)) -> Result<Opened> {
+                bail!("not in this test")
+            }
+            fn save_to(
+                &mut self,
+                dest: &Path,
+                progress: &mut dyn FnMut(u64, u64),
+                cancel: &Decision,
+            ) -> std::result::Result<SavedTo, SaveError> {
+                progress(23, 46);
+                let _ = self.go.lock().unwrap().recv();
+                copy_to(&self.file, "blob.zip", dest, progress, cancel)
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("blob.zip");
+        std::fs::write(&file, BODY).unwrap();
+        let (go, wait) = mpsc::channel();
+        let dest = tmp.path().join("out.zip");
+        let hooks = Hooks {
+            save_to: Some(dest.clone()),
+            ..Hooks::default()
+        };
+        let info = Info {
+            title: "box:/srv/blob.zip".into(),
+            name: "blob.zip".into(),
+            size: 46,
+            local: false,
+        };
+        let source = Slow {
+            file,
+            go: Mutex::new(wait),
+        };
+        let mut win = BinaryWindow::new(
+            info,
+            Box::new(source),
+            Box::new(Picks(None, Arc::default())),
+            &hooks,
+        );
+        let mut drv = Driver::new(WINDOW[0], 320.0);
+        drv.idle(&mut win, 3);
+        let asking = win.asked_height().expect("a height asked for");
+        let figures = "50% · 23 B / 46 B";
+        assert!(
+            drv.find_text(figures).is_none(),
+            "the control: no progress yet"
+        );
+        drv.click_text(&mut win, "[ Save to… ]");
+        drv.until(&mut win, 20, |_| {
+            std::thread::sleep(Duration::from_millis(5));
+            true
+        });
+        for _ in 0..200 {
+            drv.idle(&mut win, 1);
+            if drv.find_text(figures).is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(in_cells(&drv, figures), "the figures in cells");
+        // The bar: the cells of the figures' row before them, in the box.
+        let at = drv.find_text(figures).unwrap();
+        let frame = framed(&drv);
+        let before = Rect::from_min_max(Pos2::new(frame.left(), at.top()), at.left_bottom());
+        let row: String = drv.column(before).into_iter().map(|(_, t)| t).collect();
+        let (done, rest) = (row.matches('█').count(), row.matches('░').count());
+        assert!(done > 0 && rest > 0, "{row:?}");
+        assert!(done.abs_diff(rest) <= 1, "half done: {row:?}");
+        assert!(
+            filled(&drv, at, chrome::PALETTE.dialog_back),
+            "on the box's cyan"
+        );
+        let line = format!("saving to {}… Esc cancels", tilde(&dest));
+        assert!(said(&drv, &line));
+        drv.idle(&mut win, 3);
+        // The rows it gained: the line (wrapped by cells at the box's width) and the bar's.
+        let inside = (framed(&drv).width() / CELL.x) as usize - 4;
+        let gained = dialog::wrap(&line, inside).len() + 1;
+        let saving = win.asked_height().unwrap();
+        assert_eq!(saving, asking + gained as f32 * CELL.y);
+        go.send(()).unwrap();
+        drv.until(&mut win, 20, |w| matches!(w.stage, Stage::Saved { .. }));
+        assert_eq!(std::fs::read(&dest).unwrap(), BODY);
+    }
+
+    /// A name that exists: the clash note is cells in the error colour, wrapped at the box's
+    /// width, and the field holds the next free name.
+    #[test]
+    fn x3_the_clash_note_is_cells() {
+        let mut fx = dialog();
+        let taken = fx.out.join("blob.zip");
+        std::fs::write(&taken, b"someone's file").unwrap();
+        let note = format!(
+            "{} exists — not replaced. Save to… again saves as blob-1.zip",
+            tilde(&taken)
+        );
+        assert!(!said(&fx.drv, &note), "the control: before the save");
+        fx.drv.click_text(&mut fx.win, "[ Save to… ]");
+        fx.until_asking();
+        assert!(said(&fx.drv, &note), "said whole in cells: {note}");
+        let inside = (framed(&fx.drv).width() / CELL.x) as usize - 4;
+        let last = dialog::wrap(&note, inside).pop().unwrap();
+        assert!(!fx
+            .drv
+            .galleys()
+            .iter()
+            .any(|(_, g)| g.text().contains(&last)));
+        assert!(fx
+            .drv
+            .colors_of(&last)
+            .unwrap()
+            .contains(&chrome::PALETTE.dialog_error));
+        let next = tilde(&fx.out.join("blob-1.zip"));
+        assert_eq!(fx.win.path, next);
+        assert!(in_cells(&fx.drv, &next), "the field holds the next name");
+    }
+
+    /// `fit`: the window asks for the box's rows, a blank row above it, its shadow's row and a
+    /// blank row under that, and the F-key row; at that height the box stands there exactly.
+    #[test]
+    fn x3_fit_sizes_the_window_to_the_dialogs_rows() {
+        let mut fx = dialog();
+        let rows = (framed(&fx.drv).height() / CELL.y) as usize;
+        let asked = fx.win.asked_height().expect("a height asked for");
+        assert_eq!(asked, (rows + 4) as f32 * CELL.y, "{rows} rows of the box");
+        fx.drv.resize(WINDOW[0], asked);
+        fx.drv.idle(&mut fx.win, 3);
+        let frame = framed(&fx.drv);
+        assert_eq!(frame.top(), CELL.y, "a blank row above the box");
+        assert_eq!(
+            frame.bottom() + 2.0 * CELL.y,
+            asked - CELL.y,
+            "shadow, blank, F-key row"
+        );
+        assert!(fx.drv.find_text("Exit   ").is_some(), "the F-key row");
+        assert!(shadowed(&fx.drv, frame));
+        assert_eq!(fx.win.asked_height(), Some(asked), "asked once: it fits");
+    }
+
+    /// The smallest window (`MIN_SIZE`'s width, 56 cells) still holds the row of buttons whole
+    /// and the box with its shadow; the hint wraps there, by cells.
+    #[test]
+    fn x3_the_smallest_window_holds_the_buttons() {
+        let mut fx = dialog();
+        fx.drv.resize(MIN_SIZE[0], WINDOW[1]);
+        fx.drv.idle(&mut fx.win, 3);
+        all_in_cells(
+            &fx.drv,
+            &["[ Open in hex editor ]", "[ Save to… ]", "[ Cancel ]"],
+        );
+        let frame = framed(&fx.drv);
+        let all = frame.union(frame.translate(Vec2::new(2.0 * CELL.x, CELL.y)));
+        let window = Rect::from_min_size(Pos2::ZERO, Vec2::new(MIN_SIZE[0], WINDOW[1]));
+        assert!(window.contains_rect(all), "{all:?} in {window:?}");
+        assert!(said(&fx.drv, hint(false)), "the hint, wrapped");
+        assert!(
+            !in_cells(&fx.drv, hint(false)),
+            "the control: not on one row"
+        );
+    }
+
+    /// A refusal of several lines (an error carrying ssh's) keeps them as rows of their own:
+    /// cells drop a line break, which would run the lines together. The control: the joined
+    /// text is not shown.
+    #[test]
+    fn x3_a_note_of_several_lines_keeps_its_lines() {
+        struct Refused;
+        impl Source for Refused {
+            fn open_hex(&mut self, _: &mut dyn FnMut(u64, u64)) -> Result<Opened> {
+                bail!("not in this test")
+            }
+            fn save_to(
+                &mut self,
+                _: &Path,
+                _: &mut dyn FnMut(u64, u64),
+                _: &Decision,
+            ) -> std::result::Result<SavedTo, SaveError> {
+                Err(SaveError::Failed(anyhow!(
+                    "cannot save on box\nssh said: no"
+                )))
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks = Hooks {
+            save_to: Some(tmp.path().join("out.zip")),
+            ..Hooks::default()
+        };
+        let info = Info {
+            title: "box:/srv/blob.zip".into(),
+            name: "blob.zip".into(),
+            size: 46,
+            local: false,
+        };
+        let mut win = BinaryWindow::new(
+            info,
+            Box::new(Refused),
+            Box::new(Picks(None, Arc::default())),
+            &hooks,
+        );
+        let mut drv = Driver::new(WINDOW[0], 320.0);
+        drv.idle(&mut win, 3);
+        drv.click_text(&mut win, "[ Save to… ]");
+        drv.until(&mut win, 20, |w| w.asking() && !w.notes.is_empty());
+        drv.idle(&mut win, 2);
+        all_in_cells(&drv, &["cannot save on box", "ssh said: no"]);
+        let (first, second) = (
+            drv.find_text("cannot save on box").unwrap(),
+            drv.find_text("ssh said: no").unwrap(),
+        );
+        assert_eq!(
+            second.top(),
+            first.bottom(),
+            "the second line under the first"
+        );
+        assert!(
+            drv.text_starting_with("cannot save on boxssh").is_none(),
+            "the control"
+        );
+    }
+
+    /// The F-key row stays clickable under the dialog: its Exit slot closes the window as F3
+    /// does (the dialog's modal takes the pointer from the row under it).
+    #[test]
+    fn x3_the_exit_slot_closes_it_under_the_dialog() {
+        let mut fx = dialog();
+        fx.drv.take_viewport_commands();
+        fx.drv.click_text(&mut fx.win, "Exit   ");
+        fx.drv.idle(&mut fx.win, 2);
+        assert!(fx.drv.closed(), "the Exit slot asks the window to close");
+        assert_eq!(fx.calls(), (0, 0));
+    }
 }
