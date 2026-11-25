@@ -5428,18 +5428,29 @@ impl TextWindow {
     /// hover): a long path never hides the stats, and nothing hides the encoding.
     fn bar_cells(&self, ui: &mut egui::Ui, grid: &Grid, buf: &mut Buffer, y: u16) {
         let p = chrome::PALETTE;
-        let (x0, end) = (1, grid.cols.saturating_sub(1));
-        if end <= x0 {
-            return;
-        }
+        let cols = grid.cols;
+        let (x0, end) = (1, cols.saturating_sub(1));
         let dim = Pen::new(p.dim, p.back);
         let (stats, encoding) = self.stats();
         let mut right = end;
         if let Some(encoding) = encoding {
-            // (A bar narrower than the encoding shows its start: there is no room to keep.)
-            let at = end.saturating_sub(cells::width(&encoding) as u16).max(x0);
-            cells::put(buf, at, y, &encoding, usize::from(end - at), dim);
-            right = at.saturating_sub(1).max(x0);
+            // The blank cells at the bar's ends give way before the encoding is cut: flush right
+            // when it fills the bar but a cell, from the first cell when it fills it all. (A bar
+            // narrower than the encoding shows its start: there is no room to keep.)
+            let w = cells::width(&encoding) as u16;
+            let (at, stop) = if w <= end.saturating_sub(x0) {
+                (end - w, end)
+            } else {
+                (cols.saturating_sub(w), cols)
+            };
+            cells::put(buf, at, y, &encoding, usize::from(stop - at), dim);
+            if at <= x0 {
+                return;
+            }
+            right = at - 1;
+        }
+        if right <= x0 {
+            return;
         }
         let shown = cells::fit_start(&stats, usize::from(right - x0));
         let at = right - cells::width(&shown) as u16;
@@ -5964,7 +5975,18 @@ impl TextWindow {
                     let line = page.colors.get(n.checked_sub(page.top_line?)? as usize)?;
                     Some((first, line.as_slice()))
                 });
-                lay_row(buf, text_x, y, end, &row_chars(row, colors, p.text, p.dim));
+                // As much of the row as its cells can show, never all a row not wrapped was read
+                // for (up to 16 bytes a column): its characters a few times the cells, more only
+                // while they all fit and the row goes on.
+                let mut most = 2 * usize::from(end - text_x) + 16;
+                loop {
+                    let chars = row_chars(row, colors, p.text, p.dim, most);
+                    let all = chars.len() < most;
+                    if lay_row(buf, text_x, y, end, &chars) || all {
+                        break;
+                    }
+                    most *= 2;
+                }
             }
             if !page.wrapped && self.doc.passing() {
                 // The rows below the last line indexed so far (a line that runs past
@@ -6067,12 +6089,21 @@ impl Laid {
         let rows = grid.rows;
         let bar = (rows >= 1).then_some(0);
         let status = (rows >= 2).then(|| rows - 1);
-        // As many rows of notes as leave the frame three (its border and a row).
+        // As many rows of notes as leave the frame three (its border and a row) — one at least
+        // on a grid of four rows: they are what must be read. Rows that do not fit are never
+        // dropped unsaid: the last row shown has the start of its own and how many are not.
         let room = usize::from(grid.cols.saturating_sub(2));
-        let wrapped: Vec<String> = (notices.iter())
+        let mut wrapped: Vec<String> = (notices.iter())
             .flat_map(|n| dialog::wrap(n, room))
             .collect();
-        let shown = wrapped.len().min(usize::from(rows.saturating_sub(5)));
+        let most = usize::from(rows.saturating_sub(5)).max(usize::from(rows >= 4));
+        let shown = wrapped.len().min(most);
+        if shown > 0 && shown < wrapped.len() {
+            let more = format!(" {} more", wrapped.len() - shown);
+            let head = cells::fit_start(&wrapped[shown - 1], room.saturating_sub(more.len() + 1));
+            let head = head.trim_end_matches('…').trim_end();
+            wrapped[shown - 1] = format!("{head}…{more}");
+        }
         let first = rows.saturating_sub(1 + shown as u16);
         let notes = (wrapped.into_iter().take(shown).enumerate())
             .map(|(k, text)| (first + k as u16, text))
@@ -6087,7 +6118,7 @@ impl Laid {
     }
 }
 
-/// A wrapped row's characters as painted (a tab as its spaces), each in its colour: by
+/// A row's first `most` characters as painted (a tab as its spaces), each in its colour: by
 /// `colors`, the line's colour per character with the row's first at index `first`, else plain;
 /// its placeholder marks and C1 controls' `·` `dim` (08 §7.4, D32).
 fn row_chars(
@@ -6095,9 +6126,14 @@ fn row_chars(
     colors: Option<(usize, &[Color32])>,
     plain: Color32,
     dim: Color32,
+    most: usize,
 ) -> Vec<(char, Color32)> {
-    let mut out = Vec::with_capacity(row.cut.shown.len());
+    let mut out = Vec::with_capacity(row.cut.shown.len().min(most));
     for (i, &(c, n)) in row.cut.shown.iter().enumerate() {
+        if out.len() >= most {
+            out.truncate(most);
+            break;
+        }
         let color = if i < row.cut.dim || row.cut.dots.binary_search(&i).is_ok() {
             dim
         } else {
@@ -6127,66 +6163,146 @@ fn direction(c: char) -> Option<bool> {
     }
 }
 
+/// What a character is to the order of a row's cells (UAX #9's bidi classes, as far as a row in a
+/// left-to-right paragraph with no embeddings needs them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bidi {
+    /// A left-to-right letter or digit.
+    L,
+    /// A right-to-left letter (Hebrew; Arabic, AL, laid as R).
+    R,
+    /// A digit (EN; Arabic-Indic, AN, laid as EN).
+    En,
+    /// `,` `.` `:` `/` (CS) and `+` `-` (ES): a number's own between two digits.
+    Sep,
+    /// `#` `$` `%` `°` … (ET): a number's own next to its digits.
+    Et,
+    /// Anything else: spaces, punctuation, symbols, marks.
+    N,
+}
+
+impl Bidi {
+    fn of(c: char) -> Bidi {
+        match c {
+            '0'..='9' | '\u{0660}'..='\u{0669}' | '\u{06F0}'..='\u{06F9}' => Bidi::En,
+            ',' | '.' | ':' | '/' | '+' | '-' => Bidi::Sep,
+            '#' | '$' | '%' | '°' | '±' | '¢' | '£' | '¤' | '¥' | '€' | '‰' | '′' | '″' => {
+                Bidi::Et
+            }
+            c => match direction(c) {
+                Some(true) => Bidi::R,
+                Some(false) => Bidi::L,
+                None => Bidi::N,
+            },
+        }
+    }
+}
+
 /// A row's characters (as [`row_chars`] gives them) as its cells show them, left to right: by
 /// grapheme cluster — a mark, a ZWJ or a variation selector with its base, in its base's colour —
-/// each run of right-to-left letters, with the spaces and marks between them, reversed into the
-/// cells' order, as it reads; everything else in its own order, and the runs in theirs, as in a
-/// left-to-right paragraph. Each cluster is a glyph of its own (10 §4): an Arabic letter in its
-/// isolated form, as a terminal shows it. The text is the row's own: only its order changes.
+/// ordered as UAX #9 orders a left-to-right row with no embeddings (W4, W5, W7, N1, N2, I1, I2,
+/// L2): a right-to-left run — its letters, the digits among them and the spaces and marks
+/// between — reversed into the cells' order, as it reads, its numbers kept in their own order
+/// as units (`שלום 123 עולם` shows `םלוע 123 םולש`); everything else in its own order. Each
+/// cluster is a glyph of its own (10 §4): an Arabic letter in its isolated form, as a terminal
+/// shows it. The text is the row's own: only its order changes.
 fn in_cell_order(chars: &[(char, Color32)]) -> Vec<(String, Color32)> {
     use unicode_segmentation::UnicodeSegmentation;
     let text: String = chars.iter().map(|&(c, _)| c).collect();
-    let mut clusters: Vec<(&str, Option<bool>, Color32)> = Vec::new();
+    let mut clusters: Vec<(&str, Color32)> = Vec::new();
+    let mut class: Vec<Bidi> = Vec::new();
     let mut at = 0;
     for g in text.graphemes(true) {
         let (base, color) = chars[at];
-        clusters.push((g, direction(base), color));
+        clusters.push((g, color));
+        class.push(Bidi::of(base));
         at += g.chars().count();
     }
-    // A neutral cluster goes right to left only between two right-to-left letters.
-    let mut next_rtl = vec![false; clusters.len()];
-    let mut next = None;
-    for i in (0..clusters.len()).rev() {
-        next_rtl[i] = next == Some(true);
-        if clusters[i].1.is_some() {
-            next = clusters[i].1;
+    let n = class.len();
+    // W4: one separator between two digits is the number's; W5: a number's signs next to it.
+    for i in 1..n.saturating_sub(1) {
+        if class[i] == Bidi::Sep && class[i - 1] == Bidi::En && class[i + 1] == Bidi::En {
+            class[i] = Bidi::En;
         }
     }
-    let mut rtl = Vec::with_capacity(clusters.len());
-    let mut prev = None;
-    for (i, &(_, class, _)) in clusters.iter().enumerate() {
-        rtl.push(class.unwrap_or(prev == Some(true) && next_rtl[i]));
-        if class.is_some() {
-            prev = class;
+    for i in 0..n {
+        if class[i] != Bidi::Et {
+            continue;
+        }
+        let end = i + class[i..].iter().take_while(|&&c| c == Bidi::Et).count();
+        let by_digit = (i > 0 && class[i - 1] == Bidi::En) || class.get(end) == Some(&Bidi::En);
+        if by_digit {
+            class[i..end].fill(Bidi::En);
         }
     }
-    let mut out = Vec::with_capacity(clusters.len());
+    // W6, W7: what is left of them is neutral; digits after a left-to-right letter (or at the
+    // row's start) are that word's.
+    let mut strong = Bidi::L;
+    for c in &mut class {
+        match *c {
+            Bidi::Sep | Bidi::Et => *c = Bidi::N,
+            Bidi::En if strong == Bidi::L => *c = Bidi::L,
+            Bidi::L | Bidi::R => strong = *c,
+            _ => {}
+        }
+    }
+    // N1, N2: neutrals take the direction on both sides of them (digits count as right to left
+    // there), else the row's, left to right; I1, I2: the levels.
+    let rtl = |c: Bidi| matches!(c, Bidi::R | Bidi::En);
+    let mut level = vec![0u8; n];
     let mut i = 0;
-    while i < clusters.len() {
-        let run = i + rtl[i..].iter().take_while(|&&r| r == rtl[i]).count();
-        let laid = clusters[i..run].iter().map(|&(g, _, c)| (g.to_string(), c));
-        if rtl[i] {
-            out.extend(laid.rev());
-        } else {
-            out.extend(laid);
+    while i < n {
+        if class[i] != Bidi::N {
+            level[i] = match class[i] {
+                Bidi::R => 1,
+                Bidi::En => 2,
+                _ => 0,
+            };
+            i += 1;
+            continue;
         }
-        i = run;
+        let end = i + class[i..].iter().take_while(|&&c| c == Bidi::N).count();
+        let before = i.checked_sub(1).is_some_and(|k| rtl(class[k]));
+        let after = class.get(end).is_some_and(|&c| rtl(c));
+        level[i..end].fill(u8::from(before && after));
+        i = end;
     }
-    out
+    // L2: from the highest level down to 1, each run at that level or above reversed.
+    let mut order: Vec<usize> = (0..n).collect();
+    for floor in (1..=2u8).rev() {
+        let mut i = 0;
+        while i < n {
+            if level[order[i]] < floor {
+                i += 1;
+                continue;
+            }
+            let end = i + order[i..]
+                .iter()
+                .take_while(|&&k| level[k] >= floor)
+                .count();
+            order[i..end].reverse();
+            i = end;
+        }
+    }
+    (order.into_iter())
+        .map(|k| (clusters[k].0.to_string(), clusters[k].1))
+        .collect()
 }
 
 /// `chars` (a row as painted, each in its colour) into row `y` of `buf` from cell `x` up to cell
 /// `end`: first as much of it as fits there, in its own order — a glyph that does not fit ends
 /// it, never cut in half (a row not wrapped is read wider than it shows) — then in the order its
-/// cells show it ([`in_cell_order`]), a glyph per cluster, as many cells as it takes.
-fn lay_row(buf: &mut Buffer, x: u16, y: u16, end: u16, chars: &[(char, Color32)]) {
+/// cells show it ([`in_cell_order`]), a glyph per cluster, as many cells as it takes. Whether a
+/// glyph did not fit: else more of the row could still show.
+fn lay_row(buf: &mut Buffer, x: u16, y: u16, end: u16, chars: &[(char, Color32)]) -> bool {
     use unicode_segmentation::UnicodeSegmentation;
     let room = usize::from(end.saturating_sub(x));
     let text: String = chars.iter().map(|&(c, _)| c).collect();
-    let (mut used, mut fits) = (0, 0);
+    let (mut used, mut fits, mut full) = (0, 0, false);
     for g in text.graphemes(true) {
         let w = cells::width(g);
         if used + w > room {
+            full = true;
             break;
         }
         used += w;
@@ -6198,6 +6314,7 @@ fn lay_row(buf: &mut Buffer, x: u16, y: u16, end: u16, chars: &[(char, Color32)]
         // (A cluster no cell shows — a lone mark, a zero-width space — takes none.)
         at += cells::put(buf, at, y, &g, cells::width(&g), Pen::new(color, back)) as u16;
     }
+    full
 }
 
 /// The cells of `grid` a dialog of cells over the viewer covers — F8's list of encodings, the

@@ -2,9 +2,9 @@
 //! frame and its scroll bar, the gutter, the rows, the notes, the status row and Go to's field, a
 //! preview's last row — is cells, a glyph per cell at the cell's corner, so the terminal shows it
 //! where a hand-off box stood. Widths are unicode-width's: Hangul and an emoji two cells, a
-//! combining mark in its base's cell. TS-4: the window's `SOPEN_CELLS` and the terminal's are the
-//! same bytes for a UTF-16 Hangul file in view 1, and with F8's list open; TK-3's `W` through the
-//! translator.
+//! combining mark in its base's cell. The window's `SOPEN_CELLS` and the terminal's are the same
+//! bytes for a UTF-16 Hangul file in view 1, and with F8's list open (TS-4 itself, through the
+//! terminal's bytes, is `term::tests::text`); TK-3's `W` through the translator.
 
 use super::*;
 use crate::gui::browser::{Browser, Connect, Launch, Start};
@@ -269,6 +269,31 @@ fn the_bar_keeps_the_encoding_and_cuts_the_title_from_the_left() {
     assert!(row.starts_with(&format!(" {title}  ")), "{row:?}");
 }
 
+/// The bar never cuts the encoding while the grid holds it (08 §7.5, VM-3): its blank cells at
+/// either end give way first — at a width of the label and of the label and a cell it is whole,
+/// flush right; with its two cells it has its margin back.
+#[test]
+fn a_bar_as_narrow_as_the_encoding_keeps_it_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "bom.txt", &encoded("one\ntwo\n", Utf16Le, true));
+    let mut win = TextWindow::new(TextDoc::open(&path).unwrap(), "box:b".into(), "b", vec![]);
+    let label = "UTF-16LE (BOM)";
+    let w = cells::width(label);
+    for (cols, row) in [
+        (w, label.to_string()),
+        (w + 1, format!(" {label}")),
+        (w + 2, format!(" {label} ")),
+    ] {
+        let mut drv = Driver::new(cols as f32 * CELL.x, 160.0);
+        drv.until(&mut win, 10, |w| w.ready());
+        drv.idle(&mut win, 1);
+        let layers = cells::layers(&drv.ctx);
+        let viewer = cells::find(&layers, "line");
+        let l = &layers[viewer.first().expect("the status row").layer];
+        assert_eq!(cells::row_text(&l.buf, 0).0, row, "{cols} cells");
+    }
+}
+
 /// Go to (Cmd/Ctrl+G) is a cell field on the status row: `Go to`, then black cells with what is
 /// typed in white and the caret after it; Enter goes there and the field goes.
 #[test]
@@ -431,6 +456,86 @@ fn the_notes_stand_above_the_status_row() {
     let red = chrome::PALETTE.error;
     for hit in [first, last] {
         assert_eq!(cells::colors(&layers[hit.layer], hit.cells), [red]);
+    }
+}
+
+/// Notes that do not all fit are never dropped unsaid: the last row they have shows the start of
+/// the next and how many rows are not shown — on a grid of six rows too, where the frame has no
+/// row to spare.
+#[test]
+fn notes_cut_short_say_how_many_rows_are_not_shown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(tmp.path(), "noted.txt", b"one\ntwo\n");
+    let notice = "first word, then a sentence long enough to wrap in a window of fifty cells \
+                  over and over again, ending with the last";
+    let mut win = TextWindow::new(
+        TextDoc::open(&path).unwrap(),
+        "box:noted".into(),
+        "noted.txt",
+        vec![notice.to_string()],
+    );
+    let rows = crate::gui::browser::ops::dialog::wrap(notice, 48);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    for (h, shown) in [(6u16, 1usize), (7, 2), (8, 3)] {
+        let mut drv = Driver::new(400.0, f32::from(h) * CELL.y);
+        drv.until(&mut win, 5, |w| w.ready());
+        drv.idle(&mut win, 1);
+        let layers = cells::layers(&drv.ctx);
+        let hit = cells::find(&layers, "first word");
+        let hit = hit.first().unwrap_or_else(|| panic!("{h} rows: the notes"));
+        let buf = &layers[hit.layer].buf;
+        let row = |y: u16| cells::row_text(buf, y).0.trim().to_string();
+        let first = h - 1 - shown as u16;
+        assert_eq!(hit.cells.y, first, "{h} rows: right above the status row");
+        for (k, want) in rows.iter().enumerate().take(shown - 1) {
+            assert_eq!(&row(first + k as u16), want, "{h} rows");
+        }
+        let last = row(h - 2);
+        let hidden = rows.len() - shown;
+        if hidden == 0 {
+            assert_eq!(last, rows[2], "{h} rows: all of them");
+        } else {
+            let start: String = rows[shown - 1].chars().take(8).collect();
+            assert!(last.starts_with(&start), "{h} rows: {last:?}");
+            assert!(
+                last.ends_with(&format!("… {hidden} more")),
+                "{h} rows: {last:?}"
+            );
+        }
+    }
+}
+
+/// A row full just before a tab: the tab is the space the row ends at — taken, not shown — and
+/// the next row starts with the next word, as with a space (a tab is a space to line breaking).
+#[test]
+fn a_row_full_before_a_tab_ends_there() {
+    let cols = columns(600.0, 400.0);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut win = viewer(
+        tmp.path(),
+        "tab.txt",
+        &format!("{}\tz end\n", "y".repeat(cols)),
+    );
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert_eq!(rows_of(&win)[..2], ["y".repeat(cols), "z end".to_string()]);
+}
+
+/// A right-to-left run with digits in it, as UAX #9 lays it in a left-to-right row: the run is
+/// reversed whole, its digits kept in their order as a unit — and digits after a Latin letter
+/// are that word's (`L`).
+#[test]
+fn digits_in_a_right_to_left_run_keep_their_order() {
+    for (s, laid) in [
+        ("שלום 123 עולם", "םלוע 123 םולש"),
+        ("abc 123 def", "abc 123 def"),
+        ("שלום 123 abc", "123 םולש abc"),
+        ("x שלום 1.5 עולם 50% y", "x 50% םלוע 1.5 םולש y"),
+        ("abc שלום, עולם. def", "abc םלוע ,םולש. def"),
+    ] {
+        let chars: Vec<(char, Color32)> = s.chars().map(|c| (c, Color32::WHITE)).collect();
+        let order: String = in_cell_order(&chars).into_iter().map(|(g, _)| g).collect();
+        assert_eq!(order, laid, "{s:?}");
     }
 }
 
@@ -627,12 +732,14 @@ fn steady(receipt: &str) -> String {
     lines.collect::<Vec<_>>().join("\n")
 }
 
-/// TS-4 (10 §14): a UTF-16 Hangul file in view 1 is the same cells in the window and the
-/// terminal — its rows there, no hand-off box — and so it is with F8's list of encodings open
-/// over it, and as the preview beside the list (its rows; its host's frame is X3-preview's). The
-/// window is one the switch opened (`[TUI]`): its title row is laid as the terminal's.
+/// `SOPEN_CELLS` (10 §15) of the text viewer: a UTF-16 Hangul file in view 1 is the same
+/// receipt from the window and from the terminal's run — its rows there, no hand-off box — and
+/// so it is with F8's list of encodings open over it, and as the preview beside the list (its
+/// rows; its host's frame is X3-preview's). The window is one the switch opened (`[TUI]`): its
+/// title row is laid as the terminal's. (TS-4 through the terminal's bytes:
+/// `term::tests::text`.)
 #[test]
-fn ts4_the_text_viewer_is_the_same_cells_in_both_backends() {
+fn the_cells_receipts_of_both_backends_agree_on_the_text_viewer() {
     let fx = hangul_folder();
     let (cols, rows) = (160, 30);
     for (what, keys, events) in [

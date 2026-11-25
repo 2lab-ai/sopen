@@ -3454,3 +3454,5 @@ fn ts6_a_click_on_a_name_moved_for_a_wide_letter_moves_the_bar_there() {
         vt.text()
     );
 }
+
+mod text;

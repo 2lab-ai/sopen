@@ -200,11 +200,8 @@ impl Kind {
 /// painted (a tab as spaces to the next stop counted in cells from the row's start; a control
 /// character as its code page 437 glyph) and the cells it takes.
 struct Clusters {
-    /// The text as painted.
-    text: String,
-    /// After each cluster: where it ends in `text`, its characters so far, the cells so far; and
-    /// what it is to line breaking.
-    ends: Vec<usize>,
+    /// After each cluster: its characters so far, the cells so far; and what it is to line
+    /// breaking.
     chars: Vec<usize>,
     x: Vec<usize>,
     kind: Vec<Kind>,
@@ -223,8 +220,6 @@ impl Clusters {
             .map(|c| if c.ch == '\t' { '\t' } else { face(c.ch) })
             .collect();
         let mut out = Clusters {
-            text: String::with_capacity(face.len()),
-            ends: Vec::new(),
             chars: Vec::new(),
             x: Vec::new(),
             kind: Vec::new(),
@@ -235,17 +230,14 @@ impl Clusters {
         for g in face.graphemes(true) {
             if g == "\t" {
                 let stop = TAB - x % TAB;
-                out.text.extend(std::iter::repeat_n(' ', stop));
                 out.shown.push((' ', stop as u8));
                 x += stop;
                 i += 1;
             } else {
-                out.text.push_str(g);
                 out.shown.extend(g.chars().map(|c| (c, 1)));
                 x += wide(g);
                 i += g.chars().count();
             }
-            out.ends.push(out.text.len());
             out.chars.push(i);
             out.x.push(x);
             out.kind.push(Kind::of(g));
@@ -265,17 +257,7 @@ impl Clusters {
     }
 
     fn len(&self) -> usize {
-        self.ends.len()
-    }
-
-    /// The first `k` clusters as painted.
-    fn prefix(&self, k: usize) -> &str {
-        &self.text[..if k == 0 { 0 } else { self.ends[k - 1] }]
-    }
-
-    /// Clusters `from..to` as painted.
-    fn part(&self, from: usize, to: usize) -> &str {
-        &self.text[self.prefix(from).len()..self.prefix(to).len()]
+        self.chars.len()
     }
 
     /// The cells the first `k` clusters take.
@@ -316,9 +298,9 @@ pub(super) fn cut_row(cells: &[Cell], complete: bool, width: usize) -> Cut {
         .unwrap_or(1);
     let (mut taken, mut shown) = (k, k);
     if k < n {
-        if c.part(k, k + 1) == " " {
-            // The space the row is full at is taken, not shown: the next row starts with the
-            // next word.
+        if c.kind[k] == Kind::Space {
+            // The space (or tab) the row is full at is taken, not shown: the next row starts
+            // with the next word.
             taken = k + 1;
         } else if !c.breaks_before(k) {
             // Inside a word (or before a closing mark): back to the last place a row may break,

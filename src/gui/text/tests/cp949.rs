@@ -200,8 +200,9 @@ fn long_line() -> (Vec<u8>, u64) {
 /// (longer than REACH + GRID). Go to 100 KiB past its start → placeholder marks and the status
 /// line, while the line's checkpoint read runs (`ready` waits for it); once it ends — having
 /// read the line's first six GRID points, less than 100 KiB of it — rows equal to the whole-file
-/// decode, the row holding the place at the top. A place past the seventh GRID point reads on
-/// from the sixth: no stretch twice.
+/// decode, the row the marks' top row started in at the top (the place on it or on the next
+/// row: a syllable's row may start before the marks' did). A place past the seventh GRID point
+/// reads on from the sixth: no stretch twice.
 #[test]
 fn ea3_ii_a_long_line_with_no_sync_byte_waits_for_its_checkpoints() {
     let tmp = tempfile::tempdir().unwrap();

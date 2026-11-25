@@ -4140,7 +4140,7 @@ fn a_mark_after_a_right_to_left_letter_stays_on_its_base() {
             .map(|c| (c, if c == '\u{0301}' { p.dim } else { p.text }))
             .collect();
         let mut buf = cells::Buffer::empty(cells::Cells::new(0, 0, 10, 1));
-        lay_row(&mut buf, 0, 0, 10, &chars);
+        assert!(!lay_row(&mut buf, 0, 0, 10, &chars), "{s:?} fits");
         let (text, at) = cells::row_text(&buf, 0);
         assert!(text.starts_with(s), "{text:?}");
         let base = text.chars().position(|c| c == '\u{0628}').unwrap();
