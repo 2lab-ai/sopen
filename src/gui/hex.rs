@@ -21,7 +21,8 @@
 //! written into buffers of whole cells ([`super::cells`]) and painted a glyph per cell, so the
 //! window and the terminal show the same cells (TS-4). In a terminal that draws a glyph of
 //! ambiguous width in two cells ([`cells::ambiguous_wide`], which the terminal backend sets) the
-//! ASCII column's CP437 glyphs of width A are `.` ([`column_glyph`], 10 §10). The rows below the
+//! ASCII column's CP437 glyphs of width A are 10 §10's stand-ins — `+ - = | # ^ v < >`, and `.`
+//! for the letters the table leaves ([`column_glyph`]). The rows below the
 //! grid (notices, the recovery and refusal rows, the read-only path) and the window's questions
 //! are still egui's.
 //!
@@ -170,17 +171,19 @@ pub fn ascii_char(b: Option<u8>) -> char {
 
 /// The ASCII column's glyph for a byte (`None`: on its way, `·`): its code page 437 glyph
 /// ([`ascii_char`]) — or, in a terminal that draws a glyph of ambiguous width in two cells
-/// (`wide`), `.` for one of width A (10 §10's last row: the Greek, maths and Latin-1 letters,
-/// `·`, the arrows and blocks among the control glyphs). Substituted here, where the cell is
-/// known to be a CP437 glyph: the terminal's printer lays a letter of width A in two cells, as
-/// it lays a name's, and would move the rest of the row.
+/// (`wide`), for one of width A 10 §10's stand-in: the table's (`+ - = |` for box lines, `#` for
+/// blocks, `^ v < >` for arrows, `.` for `·` and the other symbols, [`super::term::narrow`]),
+/// and `.` for what the table leaves — the Greek, maths and Latin-1 letters (its last row).
+/// Substituted here, where the cell is known to be a CP437 glyph: the terminal's printer lays a
+/// letter of width A in two cells, as it lays a name's, and would move the rest of the row.
 pub fn column_glyph(b: Option<u8>, wide: bool) -> char {
     let glyph = b.map_or('·', chrome::cp437);
-    if wide && super::term::ambiguous(glyph) {
-        '.'
-    } else {
-        glyph
+    if !wide || !super::term::ambiguous(glyph) {
+        return glyph;
     }
+    let mut utf8 = [0u8; 4];
+    let stand_in = super::term::narrow(glyph.encode_utf8(&mut utf8));
+    stand_in.and_then(|s| s.chars().next()).unwrap_or('.')
 }
 
 /// Where the hex column draws byte `i` of a row, in characters from the column's start.
@@ -4226,7 +4229,10 @@ impl HexWindow {
         let bar_cells = Cells::new(inner.right(), inner.y, 1, inner.height);
         let bar = grid.rect(bar_cells);
         let total = size.div_ceil(per);
-        let visible = u64::from(rows_cells.height).max(1);
+        // The whole rows of cells the frame has room for — none when notices took its height —
+        // and a page of them for the keys and the cursor's place, a row at least.
+        let room = u64::from(rows_cells.height);
+        let visible = room.max(1);
         // The grid got shorter (a warning or a notice took rows off its bottom, the window
         // shrank) and the cursor's row, on screen until now, would fall off: the grid scrolls
         // down by just the rows that keep it whole. A cursor already in view moves nothing, and
@@ -4346,7 +4352,7 @@ impl HexWindow {
         }
         self.top_row = self.top_row.min(max_top);
 
-        let rows = visible.min(total - self.top_row);
+        let rows = room.min(total - self.top_row);
         // The frame's one read, now that the rows on screen are known.
         let screen = self.top_row * per;
         let on_bar = bar_resp.is_pointer_button_down_on();

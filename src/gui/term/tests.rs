@@ -3241,6 +3241,144 @@ fn ts6_an_ambiguous_wide_terminal_gets_10s_table_and_no_row_breaks() {
     }
 }
 
+/// TS-4 and TS-6 on the hex view (08 §8: `2` in the viewer, X3-hex) of a file with a Hangul name
+/// and text, and of one holding every byte: in the terminal's bytes the window's cells, but the
+/// mode button; in an ambiguous-wide terminal every glyph of §10's table substituted, no row
+/// broken, the window's cells through the table — and the CP437 column's letters of width A,
+/// which the printer would lay in two cells, `.` (substituted at the source).
+#[test]
+fn ts6_the_hex_view_is_the_windows_cells_in_both_terminals() {
+    let hangul = "한글 메모\n안녕하세요, 세계\n".as_bytes().to_vec();
+    let every: Vec<u8> = (0..=255u8).collect();
+    for (name, bytes) in [("한글 문서 초안.txt", hangul), ("every.bin", every)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(name), &bytes).unwrap();
+        let connect: Connect =
+            Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>));
+        let launch: Launch = Arc::new(|abs: &str, _| Ok(format!("opened {abs}")));
+        let b = Browser::new(Start {
+            fs: Box::new(LocalFs::new()),
+            connect,
+            label: None,
+            destination: None,
+            abs: root.to_str().unwrap().to_string(),
+            cache: tmp.path().join("cache"),
+            state_dir: tmp.path().join("state"),
+            launch,
+            git: None,
+        });
+        let fx = Fx {
+            _tmp: tmp,
+            root: root.to_str().unwrap().to_string(),
+            b: Rc::new(RefCell::new(b)),
+        };
+        // `..`, then the file: Enter, then 2 (its hex view, viewing).
+        let (mut drv, mut win) = window(&fx, 100, 30);
+        drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
+        drv.until(&mut win, 20, |w| w.ready());
+        drv.key(&mut win, Key::Enter, Modifiers::NONE);
+        drv.until(&mut win, 20, |w| w.ready());
+        drv.press_typed(&mut win, Key::Num2, "2");
+        drv.until(&mut win, 20, |w| w.ready());
+        drv.idle(&mut win, 2);
+        let mut sw = switched(&fx);
+        let painted = window_cells(&window_pass(&drv.ctx, &mut sw, 100, 30), 100, 30);
+        assert!(
+            painted.0.iter().all(|c| c.covered),
+            "{name}: every cell is painted"
+        );
+        // Pass 1: a terminal that draws `─` in one cell.
+        let vt = terminal_of(&drv.ctx, &mut win, 100, 30, true);
+        let text = vt.text();
+        for shown in [
+            "File Edit",
+            "Go to",
+            "[ Save As… ]",
+            "0000(0000)",
+            "viewing",
+        ] {
+            assert!(text.contains(shown), "{name}: {shown:?} on screen:\n{text}");
+        }
+        assert!(!text.contains(HAND_OFF), "{name}: no hand-off box:\n{text}");
+        let d = differences(&painted, &vt, Ink::Rgb);
+        only_the_mode_button(&d, &vt, name);
+        // Pass 2: an ambiguous-wide terminal, the same context (its probe says so to the passes).
+        let tape = Tape::default();
+        {
+            let mut s = tape.0.borrow_mut();
+            s.size = (100, 30);
+            s.ambiguous = true;
+        }
+        let out = Bytes::default();
+        let mut b = Backend::new(tape, out.clone(), drv.ctx.clone(), true);
+        b.offset = later();
+        b.enter().unwrap();
+        b.pass(&mut win, vec![]).unwrap();
+        b.draw().unwrap();
+        let mut wide = Vt::wide(100, 30);
+        wide.feed(&out.0.borrow());
+        let text = wide.text();
+        for y in 0..wide.rows {
+            for x in 0..wide.cols {
+                let s = &wide.cell(x, y).symbol;
+                assert!(narrow(s).is_none(), "{name}: ({x},{y}) {s:?} sent:\n{text}");
+            }
+        }
+        // The CP437 column: cells 62–77 of the rows (the frame from row 2, the file's line, a
+        // blank, then the rows; the offsets `0000(0000)`, a blank, 16 bytes of hex, two blanks).
+        let rows = 5..5 + bytes.len().div_ceil(16) as u16;
+        let column = |vt: &Vt| -> String {
+            (rows.clone())
+                .map(|y| vt.part(y, 62, 78))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let shown = column(&wide);
+        assert!(!shown.chars().any(ambiguous), "{name}:\n{shown}");
+        let mut window = through_the_table(&painted);
+        let mut letters = 0;
+        for y in rows.clone() {
+            for x in 62..78 {
+                let cell = &mut window.0[usize::from(y) * 100 + x];
+                if laid_wide(&cell.symbol) {
+                    cell.symbol = ".".into();
+                    letters += 1;
+                }
+            }
+        }
+        if name == "every.bin" {
+            let all = (0..=255u8).filter(|&b| laid_wide(&chrome::cp437(b).to_string()));
+            assert_eq!(letters, all.count(), "the CP437 column's letters, each");
+            for stand_in in ['-', '=', '|', '+', '#', '^', 'v', '<', '>', '.'] {
+                assert!(
+                    shown.contains(stand_in),
+                    "{stand_in:?} in the column:\n{shown}"
+                );
+            }
+        }
+        // Prose of width A (the status row's `—`) is laid in two cells, as a name's `é` is: those
+        // rows equal as text; every other cell is the window's through the table.
+        let wide_rows: Vec<u16> = (0..30u16)
+            .filter(|&y| (0..100).any(|x| laid_wide(&window.0[usize::from(y) * 100 + x].symbol)))
+            .collect();
+        let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        for &y in &wide_rows {
+            assert!(
+                !rows.contains(&y),
+                "{name}: row {y} of the grid laid wide:\n{text}"
+            );
+            let row: String = (0..100)
+                .map(|x| window.0[usize::from(y) * 100 + x].symbol.as_str())
+                .collect();
+            assert_eq!(words(&wide.row(y)), words(&row), "{name}: row {y}:\n{text}");
+        }
+        let d = differences_but(&window, &wide, Ink::Rgb, &wide_rows);
+        only_the_mode_button(&d, &wide, &format!("{name}, ambiguous-wide"));
+    }
+}
+
 /// A letter laid in two cells for an ambiguous-wide terminal (`é`, its run moved a cell to the
 /// right) over a row that showed other glyphs: in a terminal that draws it in two cells it covers
 /// the second; in one whose table draws it in one, the blank sent there first shows — never the

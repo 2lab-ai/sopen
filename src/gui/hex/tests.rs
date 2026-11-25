@@ -9009,6 +9009,41 @@ mod x3 {
         on_grid(&fx, "a notice");
     }
 
+    /// No room for a row (notices took the grid's height): no row is read or painted — none
+    /// over the frame's border — while the keys still page by one row.
+    #[test]
+    fn a_grid_without_room_for_a_row_reads_and_paints_none() {
+        let mut fx = fetched("blob.bin", FIXTURE, 800.0, 192.0);
+        assert!(fx.win.rows_painted > 0, "the control: rows at first");
+        for n in 0..12 {
+            if fx.win.layout.is_some_and(|l| l.rows.height() == 0.0) {
+                break;
+            }
+            fx.win
+                .opened
+                .push(format!("notice {n}, which the owner reads whole"));
+            fx.drv.idle(&mut fx.win, 3);
+        }
+        let l = fx.win.layout.expect("drawn");
+        assert_eq!(l.rows.height(), 0.0, "the notices left no row");
+        assert_eq!(fx.win.rows_painted, 0, "no row painted");
+        assert_eq!(fx.win.visible, 1, "a page is still a row");
+        let grid = grid_layer(&fx.drv).expect("the frame is cells");
+        let a = grid.buf.area;
+        let text: Vec<String> = (a.top()..a.bottom())
+            .map(|y| cells::row_text(&grid.buf, y).0)
+            .collect();
+        assert!(
+            text.iter().all(|row| !row.contains("0000(0000)")),
+            "no row over the frame: {text:#?}"
+        );
+        let last = text.last().expect("a row");
+        assert!(
+            last.starts_with('╚') && last.ends_with('╝'),
+            "the border: {last}"
+        );
+    }
+
     /// The cursor in cells: where it types in the bar's colours, in the other column black, both
     /// digits of its byte; Tab swaps them; its neighbours are the body's.
     #[test]
@@ -9046,11 +9081,17 @@ mod x3 {
         let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
         fx.typed("7");
         let grid = grid_layer(&fx.drv).expect("the rows are cells");
-        let low = fx.pos(0, Pane::Hex);
+        // `pos` is the edge the byte's two digit cells share: their centres half a cell either
+        // side of it.
+        let half = egui::vec2(CELL.x / 2.0, 0.0);
+        let (high, low) = (fx.pos(0, Pane::Hex) - half, fx.pos(0, Pane::Hex) + half);
         let caret = grid
             .caret
             .map(|c| grid.rect(cells::Cells::new(c.x, c.y, 1, 1)));
-        assert!(caret.is_some_and(|r| r.contains(low)), "{caret:?}");
+        assert!(
+            caret.is_some_and(|r| r.contains(low) && !r.contains(high)),
+            "the low digit's cell, not the high one's: {caret:?}"
+        );
         fx.typed("A");
         assert_eq!(fx.at(), 1);
         let changed = (Some(PALETTE.changed), Some(PALETTE.changed_back));
@@ -9107,8 +9148,19 @@ mod x3 {
             Some(vec![PALETTE.dialog_weak]),
             "nothing to redo"
         );
-        fx.drv.click_text(&mut fx.win, "[ Redo ]");
-        assert_eq!(fx.win.status.text, "", "a button that is off does nothing");
+        // Save with nothing changed is off: its click starts nothing and says nothing (the
+        // save it would start says "no changes to save").
+        assert_eq!(
+            fx.drv.colors_of("[ Save ]"),
+            Some(vec![PALETTE.dialog_weak])
+        );
+        fx.drv.click_text(&mut fx.win, "[ Save ]");
+        fx.drv.idle(&mut fx.win, 1);
+        assert_eq!(
+            (fx.win.status.text.as_str(), fx.win.save_starts),
+            ("", 0),
+            "a button that is off does nothing"
+        );
         fx.typed("00");
         assert_eq!(
             fx.drv.colors_of("[ Undo ]"),
@@ -9179,6 +9231,16 @@ mod x3 {
     #[test]
     fn the_ascii_column_stands_in_for_ambiguous_glyphs_in_an_ambiguous_wide_terminal() {
         for b in 0..=255u8 {
+            // 10 §10's table where it has a stand-in (box lines `+ - = |`, blocks `#`, arrows
+            // `^ v < >`, `·` `.`); `.` exactly for the glyphs of width A it leaves (the letters).
+            let glyph = chrome::cp437(b);
+            let mut utf8 = [0u8; 4];
+            let want = match term::narrow(glyph.encode_utf8(&mut utf8)) {
+                Some(stand_in) => stand_in.chars().next().unwrap(),
+                None if term::ambiguous(glyph) => '.',
+                None => glyph,
+            };
+            assert_eq!(column_glyph(Some(b), true), want, "{b:#04x} {glyph:?}");
             let narrow = column_glyph(Some(b), true);
             assert!(!term::ambiguous(narrow), "{b:#04x}: {narrow:?}");
             assert_eq!(column_glyph(Some(b), false), chrome::cp437(b));
