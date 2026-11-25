@@ -193,10 +193,11 @@ fn x1b_the_copy_and_move_dialogs_are_cells() {
     );
     let shown = "me@box:/srv/다른 폴더";
     let target = field_text(&drv, shown, true);
-    let wide = cells::width(shown) as f32 * CELL.x;
+    // 17 characters, four of them Hangul syllables of two cells each: 21 cells.
+    assert_eq!(shown.chars().count(), 17);
     assert_eq!(
-        (target.width(), wide),
-        (21.0 * CELL.x, wide),
+        target.width(),
+        (17.0 + 4.0) * CELL.x,
         "two cells a syllable"
     );
     assert!(frame.contains_rect(target));
@@ -422,7 +423,7 @@ fn x1b_a_long_report_scrolls_in_its_frame_on_the_smallest_window() {
     struct One<'a>(&'a mut ReportView);
     impl Window for One<'_> {
         fn ui(&mut self, ui: &mut egui::Ui) {
-            self.0.ui(ui.ctx());
+            self.0.ui(ui.ctx(), dialog::grid(ui.ctx()));
         }
         fn ready(&self) -> bool {
             true
@@ -629,4 +630,159 @@ fn x1b_a_long_path_wraps_inside_76_cells_on_a_wide_window() {
     let question = format!("main.rs is already in {place}.");
     assert!(!in_cells(&drv, &question), "the control: not on one row");
     assert!(shown_wrapped(&drv, &question), "wrapped by cells");
+}
+
+/// A field holding wide glyphs: a click lands on the character its cell shows — a Hangul
+/// syllable's two cells its own, the left half before it, the right half after it — because the
+/// editing engine lays each glyph at its cells, as the cells show it.
+#[test]
+fn x1b_a_click_on_wide_glyphs_lands_on_the_character_its_cell_shows() {
+    let (mut h, _) = host(&[]);
+    let mut drv = Driver::new(900.0, 500.0);
+    h.ops.open_make_folder(&h.panel, None);
+    drv.idle(&mut h, 2);
+    type_text(&mut drv, &mut h, "새 폴더 2026");
+    let typed = field_text(&drv, "새 폴더 2026", false);
+    let cell = |k: f32| Pos2::new(typed.left() + k * CELL.x + 2.0, typed.center().y);
+    // `2` stands on the field's cell 8: 새 two cells, a blank, 폴 two, 더 two, a blank.
+    drv.click(&mut h, cell(8.0));
+    type_text(&mut drv, &mut h, "X");
+    assert_eq!(
+        h.ops.field_text(),
+        Some("새 폴더 X2026"),
+        "before the clicked `2`"
+    );
+    // Cell 4 is 폴's second half: the caret goes after it.
+    drv.click(&mut h, cell(4.0));
+    type_text(&mut drv, &mut h, "W");
+    assert_eq!(h.ops.field_text(), Some("새 폴W더 X2026"), "after 폴");
+}
+
+/// The field's IME rectangle — where the system puts its candidate window — is the caret's
+/// cell after each syllable typed, as the cells show the caret (10 §4: a terminal's cursor goes
+/// there too).
+#[test]
+fn x1b_the_ime_cursor_is_the_carets_cell() {
+    struct Ime(Host, Option<egui::output::IMEOutput>);
+    impl Window for Ime {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            Window::ui(&mut self.0, ui);
+            self.1 = ui.ctx().output(|o| o.ime);
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+    let (host, _) = host(&[]);
+    let mut w = Ime(host, None);
+    let mut drv = Driver::new(900.0, 500.0);
+    w.0.ops.open_make_folder(&w.0.panel, None);
+    drv.idle(&mut w, 2);
+    let mut typed = String::new();
+    for (k, syllable) in ["새", "폴", "더", "이", "름"].into_iter().enumerate() {
+        typed.push_str(syllable);
+        drv.frame(
+            &mut w,
+            vec![Event::Text(syllable.to_string())],
+            Modifiers::NONE,
+        );
+        drv.idle(&mut w, 1);
+        let field = drv.find_text(&typed).expect("the field's text");
+        let caret = Rect::from_min_size(field.right_top(), CELL);
+        let ime =
+            w.1.expect("the IME rectangle while the field has the keyboard");
+        let at = ime.cursor_rect;
+        assert_eq!(
+            field.width(),
+            2.0 * CELL.x * (k + 1) as f32,
+            "two cells a syllable"
+        );
+        // egui's cursor rectangle is the caret's line, 1.5 pt either side of it.
+        assert_eq!(
+            at.center().x,
+            caret.left(),
+            "after {typed}: {at:?} vs {caret:?}"
+        );
+        assert!(
+            caret.y_range().contains(at.center().y),
+            "{at:?} in {caret:?}"
+        );
+    }
+}
+
+/// A text wraps at its last blank that fits, the blank dropped — never leaving an empty last
+/// row; no text is one empty row; a word longer than the row is cut after its last whole glyph,
+/// never inside a wide one.
+#[test]
+fn x1b_texts_wrap_by_cells() {
+    use super::super::dialog::wrap;
+    assert_eq!(wrap("abc ", 3), ["abc"]);
+    assert_eq!(wrap("abc  ", 3), ["abc"]);
+    assert_eq!(wrap("", 3), [""]);
+    assert_eq!(wrap("ab cd", 3), ["ab", "cd"]);
+    assert_eq!(wrap("abcdef", 3), ["abc", "def"]);
+    assert_eq!(wrap("가나다", 5), ["가나", "다"]);
+    assert_eq!(wrap("a 가", 2), ["a", "가"]);
+}
+
+/// The report's scroll bar works as main's did: ↓ a row, ↑ back, a click on the track a page,
+/// the thumb dragged to the track's end shows the last row. The control: the last row before.
+#[test]
+fn x1b_the_reports_scroll_bar_takes_clicks_and_a_drag() {
+    let names: Vec<String> = (1..=20).map(|i| format!("file-{i:02}.txt")).collect();
+    let report = Report {
+        items: (names.iter()).map(|n| item(n, ItemOutcome::Done)).collect(),
+        notes: vec![],
+    };
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let Finished::Report(mut view) = finish(&copy_job(&refs), report) else {
+        panic!("a report");
+    };
+    struct One<'a>(&'a mut ReportView);
+    impl Window for One<'_> {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            self.0.ui(ui.ctx(), dialog::grid(ui.ctx()));
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+    let mut drv = Driver::new(900.0, 600.0);
+    let mut win = One(&mut view);
+    drv.idle(&mut win, 2);
+    let frame = framed(&drv, "Copy report");
+    let border = Rect::from_min_max(
+        Pos2::new(frame.right() - CELL.x, frame.top()),
+        Pos2::new(frame.right(), frame.bottom()),
+    );
+    let bar = |drv: &Driver, glyph: &str| -> Pos2 {
+        (drv.column(border).into_iter())
+            .find(|(_, t)| t == glyph)
+            .unwrap_or_else(|| panic!("{glyph:?} on the frame's right border"))
+            .0
+            .center()
+    };
+    let last = "done        file-20.txt";
+    assert!(!in_cells(&drv, last), "the control: below the rows shown");
+    let (up, down) = (bar(&drv, "↑"), bar(&drv, "↓"));
+    drv.click(&mut win, down);
+    assert_eq!(win.0.top, 1, "↓: a row");
+    drv.click(&mut win, up);
+    assert_eq!(win.0.top, 0, "↑: back");
+    drv.click(&mut win, down - Vec2::new(0.0, CELL.y));
+    assert_eq!(
+        win.0.top, 4,
+        "the track under the thumb: a page, as far as it goes"
+    );
+    drv.click(&mut win, up + Vec2::new(0.0, CELL.y * 4.0));
+    assert_eq!(win.0.top, 0, "the track over the thumb: a page back");
+    // The thumb, on the track's first cell, dragged to its last.
+    let thumb = up + Vec2::new(0.0, CELL.y);
+    drv.drag(
+        &mut win,
+        egui::PointerButton::Primary,
+        thumb,
+        down - Vec2::new(0.0, CELL.y),
+    );
+    assert!(in_cells(&drv, last), "the thumb dragged to the end");
 }

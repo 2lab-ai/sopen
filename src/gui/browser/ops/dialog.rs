@@ -120,7 +120,8 @@ pub struct Layout {
     placed: Vec<Placed>,
 }
 
-/// The window's grid: whole cells from its top-left corner, as the list's rows stand on it.
+/// The whole window's grid, for a dialog shown with no title or status row around it (the
+/// tests' hosts); the browser gives the area between them ([`super::Ops::dialogs`]).
 pub fn grid(ctx: &egui::Context) -> Grid {
     Grid::over(ctx.content_rect())
 }
@@ -156,7 +157,10 @@ pub fn wrap(text: &str, room: usize) -> Vec<String> {
         rows.push(row.to_string());
         rest = next;
     }
-    rows.push(rest.to_string());
+    // A break may leave only blanks — the text's own trailing ones: no row of nothing after it.
+    if !rest.trim().is_empty() || rows.is_empty() {
+        rows.push(rest.to_string());
+    }
     rows
 }
 
@@ -340,11 +344,11 @@ impl Layout {
         ]
     }
 
-    /// The box and its shadow in points.
-    pub fn covers(&self) -> Vec<egui::Rect> {
+    /// The box and its shadow, cut to the grid.
+    pub fn covers(&self) -> Vec<Cells> {
         let all = self.grid.all();
         (self.rects().into_iter())
-            .map(|r| self.grid.rect(r.intersection(all)))
+            .map(|r| r.intersection(all))
             .collect()
     }
 }
@@ -432,9 +436,62 @@ fn wheel_rows(ctx: &egui::Context) -> f32 {
     })
 }
 
+/// The scroll bar at cells `bar` (a column: ↑, the track, ↓) of rows that show from `first` of
+/// `max_top + 1` places, as egui's scroll area took the pointer: ↑ and ↓ a row, a click on the
+/// track a page towards it, the track dragged — the thumb, or anywhere on it — the place under
+/// the pointer. Never focusable: Tab's order is the dialog's controls'.
+fn scroll_bar_input(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    bar: Cells,
+    id: egui::Id,
+    first: usize,
+    max_top: usize,
+) -> usize {
+    let one = |y: u16| grid.rect(Cells::new(bar.x, y, 1, 1));
+    let (top_y, end_y) = (bar.y, bar.bottom() - 1);
+    let mut first = first;
+    if bar.height < 3 {
+        return first;
+    }
+    let up = ui.interact(one(top_y), id.with("scroll-up"), Sense::CLICK);
+    let down = ui.interact(one(end_y), id.with("scroll-down"), Sense::CLICK);
+    let track_cells = Cells::new(bar.x, top_y + 1, 1, bar.height - 2);
+    let track = grid.rect(track_cells);
+    let sense = Sense::CLICK | Sense::DRAG;
+    let on_track = ui.interact(track, id.with("scroll-track"), sense);
+    if up.clicked() {
+        first = first.saturating_sub(1);
+    }
+    if down.clicked() {
+        first = (first + 1).min(max_top);
+    }
+    // The thumb's cell on the track, as `cells::scroll_bar` draws it.
+    let room = f32::from(bar.height - 3);
+    let thumb = |first: usize| (room * first as f32 / max_top as f32).round();
+    let row_of = |p: egui::Pos2| ((p.y - track.top()) / CELL.y).floor().clamp(0.0, room);
+    let page = usize::from(bar.height);
+    if on_track.dragged() {
+        if let Some(p) = on_track.interact_pointer_pos() {
+            first = (row_of(p) / room.max(1.0) * max_top as f32).round() as usize;
+        }
+    } else if on_track.clicked() {
+        if let Some(p) = on_track.interact_pointer_pos() {
+            let (row, at) = (row_of(p), thumb(first));
+            if row < at {
+                first = first.saturating_sub(page);
+            } else if row > at {
+                first = (first + page).min(max_top);
+            }
+        }
+    }
+    first.min(max_top)
+}
+
 /// Shows `layout` as a modal `id` at its cells for one pass: one buffer of cells — the shadow,
 /// the frame, the texts — and each control an egui interaction at its cells, in the order of the
-/// parts (Tab's order); the field's engine at its cells; the wheel over the box scrolls its rows.
+/// parts (Tab's order); the field's engine at its cells; the wheel over the box and the scroll
+/// bar ([`scroll_bar_input`]) scroll its rows.
 /// Painted once every control has had its say, so the focus it shows is this pass's.
 pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) -> Shown {
     let Inputs {
@@ -443,7 +500,8 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
         mut top,
     } = inputs;
     let grid = layout.grid;
-    let body = grid.rect(layout.frame);
+    // The box, cut to the grid: on a grid too small for it, nothing of it stands outside.
+    let body = grid.rect(layout.frame.intersection(grid.all()));
     let at = body.min - ctx.content_rect().min;
     let area = egui::Modal::default_area(id)
         .anchor(egui::Align2::LEFT_TOP, at)
@@ -529,6 +587,11 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                             let moved = (first as f32 + wheel_rows(&ctx)).round();
                             first = moved.clamp(0.0, max_top as f32) as usize;
                         }
+                        if max_top > 0 {
+                            let x = frame_cells.right() - 1;
+                            let bar = Cells::new(x, cells.y, 1, cells.height);
+                            first = scroll_bar_input(ui, &grid, bar, id, first, max_top);
+                        }
                         if let Some(top) = top.as_deref_mut() {
                             *top = first;
                         }
@@ -566,11 +629,11 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
 
 /// The field's engine: egui's `TextEdit` for `text`, `tweak`ed, at cells `at` of `grid`, in a ui
 /// that paints nothing — each of its shapes a `Noop` — while it edits, selects, takes the
-/// clipboard and IME. Its text area is a cell narrower than the field, so the caret after the
-/// last character it shows is on the field's last cell, and the cells scroll a long text by its
-/// rule ([`first_shown`]): a click lands on the character its cell shows — exactly for the VGA
-/// font's one-cell glyphs; a wide glyph, which egui lays out narrower than its two cells, only
-/// near it.
+/// clipboard and IME. Its galley is laid on the cells ([`on_cells`]): every character at the x
+/// of its cell, a glyph as wide as its cells, so egui's click, drag, scroll and IME rectangle
+/// agree with what the cells show; its text area is a cell narrower than the field, so the caret
+/// after the last character it shows is on the field's last cell. How far egui scrolled its
+/// galley is what the cells then show ([`field_cells`]): the two views are one.
 pub fn field(
     ui: &mut egui::Ui,
     grid: &Grid,
@@ -578,21 +641,56 @@ pub fn field(
     id: egui::Id,
     text: &mut String,
     tweak: impl FnOnce(egui::TextEdit) -> egui::TextEdit,
-) -> egui::Response {
+) {
     let rect = grid.rect(at);
     let mut engine = ui.new_child(egui::UiBuilder::new().max_rect(rect));
     engine.set_opacity(0.0);
-    let margin = egui::Margin {
+    let inside = egui::Frame::NONE.inner_margin(egui::Margin {
         right: CELL.x as i8,
         ..egui::Margin::ZERO
+    });
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
+        let font = egui::FontSelection::Default.resolve(ui.style());
+        let mut job =
+            egui::text::LayoutJob::simple_singleline(buf.as_str().to_string(), font, cga::WHITE);
+        job.keep_trailing_whitespace = true;
+        on_cells(ui.fonts_mut(|f| f.layout_job(job)))
     };
     let edit = egui::TextEdit::singleline(text)
         .id(id)
-        .margin(margin)
-        .desired_width(rect.width());
-    let response = engine.put(rect, tweak(edit));
-    first_shown(ui.ctx(), id, text, at.width);
-    response
+        .frame(inside)
+        .desired_width(rect.width())
+        .layouter(&mut layouter);
+    let out = tweak(edit).show(&mut engine);
+    let scrolled = (out.text_clip_rect.left() - out.galley_pos.x) / CELL.x;
+    let first = scrolled.round().max(0.0) as usize;
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(first_shown_id(id), first));
+}
+
+/// `galley` (one row) with each character at its cell: a glyph at the x of the cells before it,
+/// as wide as its cells; a character after the first of a glyph (a combining mark) at the glyph's
+/// end and of no width. Only egui's interaction reads it — the field's engine paints nothing.
+fn on_cells(galley: std::sync::Arc<egui::Galley>) -> std::sync::Arc<egui::Galley> {
+    let mut laid = (*galley).clone();
+    let text = laid.job.text.clone();
+    let mut places = glyphs(&text).into_iter().flat_map(|(g, _, x, w)| {
+        (g.chars().enumerate()).map(move |(k, _)| if k == 0 { (x, w) } else { (x + w, 0) })
+    });
+    let mut right = 0.0f32;
+    for placed in &mut laid.rows {
+        let row = std::sync::Arc::make_mut(&mut placed.row);
+        for glyph in &mut row.glyphs {
+            if let Some((x, w)) = places.next() {
+                glyph.pos.x = x as f32 * CELL.x;
+                glyph.advance_width = w as f32 * CELL.x;
+            }
+        }
+        row.size.x = row.glyphs.last().map_or(0.0, |g| g.max_x());
+        right = right.max(placed.pos.x + row.size.x);
+    }
+    laid.rect.max.x = laid.rect.min.x + right;
+    std::sync::Arc::new(laid)
 }
 
 /// Each glyph of `text`: itself, the characters before it, the cells before it, its cells.
@@ -617,37 +715,13 @@ fn cells_before(text: &str, at: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// Where the field `id` keeps the first cell of its text it shows: how far its engine scrolled.
 fn first_shown_id(id: egui::Id) -> egui::Id {
     id.with("sopen-field-first-shown")
 }
 
-/// The first cell of `text` the field `id`, `width` cells wide, shows — moved as its engine moves
-/// its own view (egui's `TextEdit`, singleline): only when the caret leaves it, to keep the caret
-/// in its `width − 1` cells (or back to the start without the focus), and never past the end.
-fn first_shown(ctx: &egui::Context, id: egui::Id, text: &str, width: u16) -> usize {
-    let focused = ctx.memory(|m| m.has_focus(id));
-    let primary = (egui::text_edit::TextEditState::load(ctx, id))
-        .and_then(|s| s.cursor.char_range())
-        .map(|r| r.primary.index.0);
-    let caret = match primary {
-        Some(at) if focused => cells_before(text, at),
-        _ => 0,
-    };
-    let view = usize::from(width.saturating_sub(1));
-    let key = first_shown_id(id);
-    let mut first = ctx.data(|d| d.get_temp::<usize>(key)).unwrap_or(0);
-    if caret < first {
-        first = caret;
-    } else if caret > first + view {
-        first = caret - view;
-    }
-    first = first.min(cells::width(text).saturating_sub(view));
-    ctx.data_mut(|d| d.insert_temp(key, first));
-    first
-}
-
 /// The field at cells `at` of `buf`, as its engine `id` holds `text`: black cells, the text in
-/// white from the first cell the engine shows ([`first_shown`]), the selection in the bar's
+/// white from the first cell its engine shows ([`field`]), the selection in the bar's
 /// colours, a wide glyph never cut in half; while `focused`, the selection shows and the caret's
 /// cell is returned.
 pub fn field_cells(

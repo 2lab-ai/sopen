@@ -43,3 +43,52 @@ fn a_wide_glyph_half_under_a_dialog_goes_from_the_list() {
     fx.key(Key::Escape);
     assert_eq!(cell(&fx, 4, row), ["한"], "back with the dialog gone");
 }
+
+/// The title row's cells and the status and F-key rows' on a `w`×`h` window, as the column
+/// query reads them.
+fn edges(fx: &Fx, w: f32, h: f32) -> Vec<(Rect, String)> {
+    let top = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, 16.0));
+    let bottom = Rect::from_min_max(Pos2::new(0.0, h - 32.0), Pos2::new(w, h));
+    let mut out = fx.drv.column(top);
+    out.extend(fx.drv.column(bottom));
+    out
+}
+
+/// A dialog stands between the title row and the status row: F7's refusal of a 1,000-character
+/// name on the smallest window is cut to fit there, its shadow too — the title, status and
+/// F-key rows read as they did before it opened.
+#[test]
+fn a_dialog_stays_between_the_title_row_and_the_status_row() {
+    let mut fx = fixture();
+    let (w, h) = (480.0, 320.0);
+    fx.drv.resize(w, h);
+    fx.drv.idle(&mut fx.b, 3);
+    let before = edges(&fx, w, h);
+    fx.key(Key::F7);
+    fx.typed(&"a".repeat(1000));
+    fx.key(Key::Enter);
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(fx.b.ops.holds_keyboard(), "refused: still open");
+    assert!(
+        fx.drv.text_starting_with("aaaaaaaa").is_some(),
+        "the refusal shows"
+    );
+    assert_eq!(edges(&fx, w, h), before, "nothing of the dialog over them");
+}
+
+/// A window whose middle is four cells by four: F7's dialog is cut to those cells — nothing of
+/// it over the title, status or F-key rows — and nothing panics.
+#[test]
+fn a_dialog_on_a_tiny_grid_stays_inside_it() {
+    let mut fx = fixture();
+    let (w, h) = (32.0, 112.0);
+    fx.drv.resize(w, h);
+    fx.drv.idle(&mut fx.b, 3);
+    let before = edges(&fx, w, h);
+    fx.key(Key::F7);
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(fx.b.ops.holds_keyboard(), "the dialog is up");
+    assert_eq!(edges(&fx, w, h), before, "nothing of the dialog over them");
+    fx.key(Key::Escape);
+    assert!(!fx.b.ops.holds_keyboard());
+}

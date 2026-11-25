@@ -2648,10 +2648,12 @@ mod tests {
         fx.drv.click(&mut fx.b, at_seven);
         fx.settle();
         assert!(fx.viewer(), "an empty slot: still the viewer");
-        assert!(!shown(&fx), "and no dialog");
         fx.drv.click_text(&mut fx.b, "Exit   ");
         fx.settle();
         assert!(!fx.viewer(), "the Exit slot left it");
+        // Over a viewer the list's dialogs are not drawn; back in the list, one the empty slot
+        // had opened would be.
+        assert!(!shown(&fx), "and no dialog");
         fx.drv.click_text(&mut fx.b, "Edit   ");
         assert_eq!(fx.edited(), [format!("{}/main.rs", fx.root)]);
     }

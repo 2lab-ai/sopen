@@ -210,10 +210,7 @@ fn k_r3_f8_asks_for_the_trash_and_shift_f8_is_permanent() {
         wait(&mut fx, |b| !b.ops.checking_trash());
         let asked = fx.drv.find_text("Delete zeta.md?").is_some();
         assert_eq!(asked, opens.is_some(), "{key:?} {mods:?}");
-        assert!(
-            fx.drv.find_text("Make a folder in").is_none(),
-            "{key:?} {mods:?}"
-        );
+        assert!(fx.drv.find_text("[ Make ]").is_none(), "{key:?} {mods:?}");
         if let Some(line) = opens {
             assert!(fx.drv.find_text(line).is_some(), "{key:?} {mods:?}: {line}");
             assert_eq!(in_error_colour(&fx, line), line == "permanent", "{line}");

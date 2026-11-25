@@ -1407,7 +1407,15 @@ fn k_c2_a_name_in_the_way_asks_skip_rename_or_cancel() {
         fx.key(Key::Enter);
         fx.wait(|b| b.ops.holds_keyboard());
         assert!(fx.drv.find_text("Name exists").is_some());
-        assert!(fx.drv.find_text("Overwrite").is_none(), "never offered");
+        assert!(fx.drv.find_text("[ Overwrite ]").is_none(), "never offered");
+        assert!(
+            ops::nowhere(&fx.drv, "Overwrite"),
+            "not even in a longer text"
+        );
+        assert!(
+            !ops::nowhere(&fx.drv, "Skip"),
+            "the control: a button's word"
+        );
     };
     ask(&mut fx);
     fx.drv.click_text(&mut fx.b, "[ Skip ]");

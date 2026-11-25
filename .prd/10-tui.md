@@ -193,7 +193,10 @@ As the list's dialogs were built (XW-dialogs, 2026-11-25):
   front (a terminal shows its cursor so too); egui drew none then.
 - **A dialog's width** is its widest text's, its nominal width at least, at most 76 cells inside
   (or its nominal width, if more) and the window less 8 cells; a longer text wraps by cells, a
-  path anywhere.
+  path anywhere. It stands between the title row and the status row; where they leave too little
+  room, its texts lose their last rows, and what still does not fit is cut there, never drawn
+  over them.
+- **Dialog and list text cannot be selected** (egui's labels could) until cell selection lands.
 
 ## 7. The switch (T4)
 
