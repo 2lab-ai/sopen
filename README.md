@@ -249,12 +249,16 @@ keys that work there are labelled), cyan dialogs with a shadow.
 | `⌘R` · `⌘U` · `⌘←` / `⌘→` | re-read · swap the panels · this folder in the left / right panel |
 | `⌘1`…`⌘0`, or a click on the bottom row | `F1`…`F10` (Ctrl on Linux) |
 | `Esc` / `F3` in a viewer | back to the list, the bar where it was |
+| `1` / `2` / `3` in a viewer | the file's own view / its bytes in the hex editor (any file) / the other view: Raw (text unhighlighted) for text, the text of a binary; the title row names them (`1 Text · 2 Hex · 3 Raw`). Where digits are typed (the hex editor being edited, a field), `F9` then the digit |
+| `F8` / `E` in a text or Raw view | the list of encodings (ASCII, UTF-8, UTF-16LE/BE, UCS-2LE/BE, UTF-32LE/BE, Latin-1, CP437, CP949): `↑` `↓` and `Enter` read the file again in the one chosen, `Esc` keeps it |
 | `F3` in a window of its own | close it, as `⌘W` (asks first when there are unsaved changes) |
 
 Text shows read-only with syntax highlighting and line numbers, a page at a time (a file of any
 size opens alike); images open in the image window, video and audio in the media window, anything
-else in the hex editor — each with its own edits and Save, as below. Leaving a viewer with unsaved
-changes asks first, as its own window does. A remote file is not downloaded: it shows as soon as
+else in the hex editor — each with its own edits and Save, as below. `2` shows any file's bytes in
+the hex editor, `1` its own view again, as it was; there the hex editor opens viewing: digits and
+letters are not typed until `Enter` (or `Insert`) starts editing, and `Esc` ends it. Leaving a
+viewer, or switching from a view, with unsaved changes asks first, as its own window does. A remote file is not downloaded: it shows as soon as
 its first part arrives and the rest is read as you move (an image is read whole into memory first,
 with its progress; `Esc` stops that).
 
@@ -327,7 +331,8 @@ changes: a folder still opens in a window.
 ## Images
 
 The window shows the image fitted; the mouse wheel or a pinch zooms, a trackpad scroll or a
-right-drag pans (`F` fits again, `1` is 100 %). Drag a rectangle (handles adjust it, dragging
+right-drag pans (`F` fits again, `A` is 100 % — `1` too in a window of its own; in the browser's
+viewer `1` is view 1). Drag a rectangle (handles adjust it, dragging
 inside moves it), then:
 
 | Key | |
@@ -356,7 +361,8 @@ image's copy is 8-bit.
 A remote image shows its size (and its Exif thumbnail) at once, then fills in as it is read —
 JPEG and PNG as a partial picture. An image whose decoding needs more than 512 MiB of memory (or
 a file over 512 MiB) first says how much it needs and what this machine has, and waits:
-**Continue** or **Close** — and for a large decode **Hex view** too, its bytes in the hex editor.
+**Continue** or **Close** — and for a large decode **Hex view** too (`2` in the browser, `H`), its
+bytes in the hex editor.
 A file that does not decode opens in the hex editor, saying why.
 
 Animated GIF/PNG/WebP and multi-page TIFF open read-only (first frame / page; `⌘C` still copies).

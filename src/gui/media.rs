@@ -1739,6 +1739,15 @@ struct MediaWindow {
     close_ok: bool,
     /// The unsaved-changes prompt is up.
     prompt: bool,
+    /// Saves that wrote the file (a Save, or a cut-off one found landed):
+    /// [`super::Window::saves_landed`].
+    saves_landed: u64,
+    /// Hidden as a view of the file browser's viewer (08 §5): its playback stopped where it
+    /// was; the frame there is sought again when it is shown.
+    reseek: bool,
+    /// Hidden as a view, its waveform's decode was stopped ([`MediaWindow::peaks`] holds what
+    /// it had read): it goes on when the window is shown.
+    rewave: bool,
     /// `SOPEN_STATE` `close=ask`: closing is asked for on the first pass.
     ask_close: bool,
     /// A Save landed but its file could not be read back: no more edits.
@@ -1996,6 +2005,9 @@ impl MediaWindow {
             close_when_saved: false,
             close_ok: false,
             prompt: false,
+            saves_landed: 0,
+            reseek: false,
+            rewave: false,
             ask_close: false,
             stale: false,
             leftover: Arc::default(),
@@ -3801,6 +3813,13 @@ impl MediaWindow {
             self.pass = file.pass();
             self.baseline = file.origin.at.fingerprint();
         }
+        if matches!(
+            result,
+            Ok(Saved::Written { .. } | Saved::FoundLanded { .. })
+        ) {
+            // The view set's receipt (08 D25), whatever the window does next.
+            self.saves_landed += 1;
+        }
         match result {
             Ok(Saved::Written { media, notes, .. }) => {
                 self.unknown = false;
@@ -4620,6 +4639,13 @@ impl MediaWindow {
     fn start_decoders(&mut self, ctx: &egui::Context) {
         let kept = self.first.take().map(|rgba| (0, rgba));
         self.scrub = Scrubber::start_seeded(&self.media, ctx.clone(), SCRUB_BUDGET, kept);
+        self.rewave = false;
+        self.start_wave(ctx);
+    }
+
+    /// A sound's waveform: from the peaks a preview (or the window, hidden) left, on from where
+    /// they end, else from the start.
+    fn start_wave(&mut self, ctx: &egui::Context) {
         if self.audio_only() {
             let waker = ctx.clone();
             let wake = move || waker.request_repaint();
@@ -4786,6 +4812,14 @@ impl super::Window for MediaWindow {
             self.start_planning(&ctx);
             self.start_decoders(&ctx);
             self.seek(&ctx, self.marks.t);
+        }
+        if std::mem::take(&mut self.reseek) {
+            // Shown again: the frame where playback stopped when it was hidden.
+            self.seek(&ctx, self.marks.t);
+        }
+        if std::mem::take(&mut self.rewave) {
+            // Shown again: the waveform's decode goes on from where it stopped.
+            self.start_wave(&ctx);
         }
         self.start_recovery(&ctx);
         self.poll_recovery();
@@ -4988,6 +5022,69 @@ impl super::Window for MediaWindow {
 
     fn keys(&self) -> &'static [super::chrome::FKey] {
         super::chrome::MEDIA_KEYS
+    }
+
+    /// Hidden as a view of the browser's viewer, nothing plays (08 §5, D1): playback stops at
+    /// its place, which is kept, as In/Out and the selection are.
+    ///
+    /// Hidden, it reads nothing either: its stream does not poll (06 §5, as the hex, text and
+    /// image windows' do not), and the waveform's decode stops, its peaks so far parked with
+    /// how far they reach; shown again, the decode goes on from there, as after a preview's
+    /// hand-over (02 §4.4).
+    fn set_shown(&mut self, shown: bool) {
+        if let Some(stream) = self.stream() {
+            stream.set_visible(shown);
+        }
+        if shown {
+            return;
+        }
+        if self.audio_only() {
+            // As a pause (`pause`): a stopped sound waits for nothing new at its place.
+            self.unasked();
+        }
+        if let Some(player) = self.player.take() {
+            self.marks.t = player.clock(Instant::now()).min(self.length());
+            self.reseek = true;
+        }
+        // (A preview's peaks are its preparation's, decoded nowhere: they stay.)
+        if let Some(decode) = self.wave.take_if(|_| !self.preview) {
+            let peaks = decode
+                .peaks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            // Dropped, the decode's ffmpeg is stopped.
+            drop(decode);
+            self.peaks = peaks.map(|p| {
+                let upto = (!p.complete && p.error.is_none()).then_some(p.read);
+                (p, upto)
+            });
+            self.rewave = true;
+        }
+    }
+
+    /// Its close prompt or Save As is the view keys' Question (08 §4).
+    fn view_state(&mut self) -> crate::view_keys::State {
+        if self.prompt || self.save_as.is_some() {
+            crate::view_keys::State::Question
+        } else {
+            crate::view_keys::State::Free
+        }
+    }
+
+    fn saves_landed(&self) -> u64 {
+        self.saves_landed
+    }
+
+    /// What a switch of views asks or waits for (08 §5).
+    fn hold(&mut self) -> crate::views::Hold {
+        if self.save.is_some() {
+            crate::views::Hold::Saving
+        } else if self.unsaved() {
+            crate::views::Hold::Unsaved
+        } else {
+            crate::views::Hold::Clean
+        }
     }
 
     /// A preview (02 §4.2) shows what its preparation made, without bars, takes no input and

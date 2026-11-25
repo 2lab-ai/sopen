@@ -946,6 +946,11 @@ impl TextDoc {
         self.enc
     }
 
+    /// §7.2's default, once the first bytes were read: what F8's list names the default.
+    pub fn pick(&self) -> Option<crate::encoding::Pick> {
+        self.pick
+    }
+
     /// The encoding as the bar says it (§7.5): `UTF-16LE (BOM)`, `UTF-8 (guessed)`; `None`
     /// before the first bytes were read (a stream's first block on its way), when nothing has
     /// picked it yet — unless it was chosen.
@@ -3922,9 +3927,12 @@ struct TextWindow {
     reask: bool,
     /// This pass has a key, a click or a scroll in it (06 §5: what retries a failed stream).
     input: bool,
-    /// `SOPEN_STATE` `enc=` (08 D34): the encoding chosen for this opening, applied on the
-    /// first pass ([`TextWindow::choose`]).
+    /// `SOPEN_STATE` `enc=` (08 D34), or F8's list (08 §7.5): the encoding chosen for this
+    /// opening, applied on the next pass ([`TextWindow::choose`]).
     enc_wanted: Option<Encoding>,
+    /// Raw (08 D8): the text view with highlighting off — one document, index, encoding and
+    /// place with Text.
+    raw: bool,
     /// CP949's checkpoint read under way, if one is (08 §7.4).
     phase_read: Option<PhaseRead>,
     /// Called as a checkpoint read's worker starts (tests: hold it).
@@ -4061,6 +4069,7 @@ impl TextWindow {
             preview: false,
             preview_index: None,
             enc_wanted: None,
+            raw: false,
             phase_read: None,
             #[cfg(test)]
             phase_hook: None,
@@ -5758,7 +5767,9 @@ impl TextWindow {
             // much, 06 §7.2.)
             if !self.frozen() {
                 let stop = self.doc.first_long.unwrap_or(u64::MAX);
-                let hl = self.syntax.and_then(|s| Highlight::new(s, p.text, stop));
+                // Raw is not highlighted (D8).
+                let syntax = self.syntax.filter(|_| !self.raw);
+                let hl = syntax.and_then(|s| Highlight::new(s, p.text, stop));
                 #[cfg(test)]
                 let hl = hl.map(|mut h| {
                     h.hook = self.hook.clone();
@@ -6185,6 +6196,35 @@ impl Window for TextWindow {
         if let Some(source) = self.doc.source() {
             source.set_visible(shown);
         }
+    }
+
+    /// Text or Raw (D8): the highlighter goes or starts again, the page read again either way.
+    fn set_raw(&mut self, raw: bool) {
+        if std::mem::replace(&mut self.raw, raw) != raw {
+            self.worker = None;
+            (self.hl_tried, self.hl_retry) = (false, false);
+            self.stale_page = true;
+        }
+    }
+
+    /// The first byte of the top row (08 §2's place).
+    fn byte_place(&self) -> Option<u64> {
+        Some(self.top + if self.wrap { self.top_off } else { 0 })
+    }
+
+    /// The row byte `at` is in at the top, as `at=` opens it (08 D11, §7.3's jump rule).
+    fn go_to_byte(&mut self, at: u64) {
+        self.jump_to(Jump::Byte(at));
+    }
+
+    fn encoding(&self) -> Option<(Encoding, Option<crate::encoding::Pick>)> {
+        Some((self.doc.encoding(), self.doc.pick()))
+    }
+
+    /// F8's choice (08 §7.5): read in it from the next pass — in place, or indexed again when
+    /// the LF unit changes (D22: [`TextWindow::choose`]).
+    fn set_encoding(&mut self, enc: Encoding) {
+        self.enc_wanted = Some(enc);
     }
 
     /// F2 switches wrapping: the row says what it does now.

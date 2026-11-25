@@ -707,6 +707,10 @@ fn is_low(u: u16) -> bool {
 /// ([`cp949::guess`]), on encoding_rs's `EUC_KR`.
 mod cp949;
 
+/// The encode side (12 §7.2, ED-enc): [`Encoding::encode`], and [`encode::Refused`] for a
+/// character the encoding cannot hold.
+pub mod encode;
+
 #[cfg(test)]
 mod tests;
 

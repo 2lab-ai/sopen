@@ -801,6 +801,53 @@ fn on_the_real_clock_a_stalled_ffprobe_is_stopped_in_time() {
     });
 }
 
+/// 08 §5 (VM-7): a view of the browser's viewer hidden while its waveform decodes reads
+/// nothing — the decode is stopped, the peaks so far parked with how far they reach — and shown
+/// again decodes on from there, as after a hand-over: nothing before it is read twice.
+#[test]
+fn a_hidden_sound_parks_its_waveform_and_decodes_on_when_shown() {
+    bounded(180, |t| {
+        let Some(tools) = tools_or_skip() else { return };
+        let tmp = t.tmp();
+        let path = tmp.path().join("tone.wav");
+        quiet_then_loud(&tools, &path, 6, 2);
+        let held = Held {
+            sound: Some(2.0),
+            ..Held::budget(&t.hand())
+        };
+        let mut fx = previewed(tmp, path, &tools, &held);
+        let (before, _) = fx.win.peaks.clone().expect("the preview's peaks");
+        fx.win.set_preview(false);
+        fx.drv.until(&mut fx.win, 20, |w| w.ready());
+        // As a decode that had read the first 2 s when the view was hidden.
+        let mut partial = before.clone();
+        (partial.complete, partial.read, partial.error) = (false, 2.0, None);
+        fx.win.wave = Some(wave::Decode::done(partial.clone()));
+        let starts = wave::starts(&fx.path).len();
+        crate::gui::Window::set_shown(&mut fx.win, false);
+        assert!(fx.win.wave.is_none(), "the decode stopped");
+        assert_eq!(
+            fx.win.peaks,
+            Some((partial, Some(2.0))),
+            "parked: how far it read"
+        );
+        crate::gui::Window::set_shown(&mut fx.win, true);
+        fx.drv.until(&mut fx.win, 60, |w| {
+            let peaks = w
+                .wave
+                .as_ref()
+                .and_then(|d| d.peaks.lock().unwrap().clone());
+            peaks.is_some_and(|p| p.complete)
+        });
+        assert_eq!(
+            wave::starts(&fx.path)[starts..],
+            [(2.0, None)],
+            "decoded on from 2 s, once"
+        );
+        assert_none_left(fx.tmp.path());
+    });
+}
+
 /// P3, on the real clock: a two-hour sound shows the waveform of its first 10 minutes — said,
 /// with the whole duration — its probe within ffprobe's 5 s and its waveform within the
 /// waveform's 10 s, each measured by itself; nothing is left running.
