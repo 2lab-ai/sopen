@@ -8,15 +8,17 @@
 //! - **A path checked once is not checked again** (change 1): a later range on it is served from
 //!   the open handle, or from a `reopen` (2 RTT) whose fingerprint must match; a whole file asked
 //!   again (a reload) is always reopened. A file whose size or mtime moved fails a request already
-//!   under way — never padded — and is checked afresh for a new one. A range inside one aligned
+//!   under way — never padded — and is checked afresh for a new one; so is one that will not open
+//!   or whose read fails, its kept blocks forgotten. A range inside one aligned
 //!   [`CACHE_BLOCK`] reads the whole block, and later ranges inside it come from memory.
 //! - **Turns** (§3.1, change 2): requests take turns of one piece each (≤ [`PIECE`], pipelined
 //!   reads of 64 KiB, at most what the engine's window lets the request send), a new request's
 //!   first turn being its steps and its first piece; while another request waits a piece is what
 //!   the link carries in [`LINK_TIME`] (change 5).
 //! - **Range** (RFC 9110, one range) → 206, past the end → 416, anything else → 200. **Type** by
-//!   extension; a text type's charset from the file's first 8 KiB as the text view picks it, so
-//!   its head waits for that read.
+//!   extension; a text type's charset from the file's first 8 KiB as the text view picks it —
+//!   none when the text names its own by its type's rule (HTML's prescan) — so its head waits for
+//!   that read.
 //! - **Cancel**: a stopped request ends after the read in flight or the step in progress; what
 //!   was asked of the handle is drained, never left for the next request.
 //! - **Budget**: a preview reads at most [`PREVIEW_BUDGET`]; a request that would read past it
@@ -32,7 +34,7 @@ use crate::scheme::{self, Body, Head, Reply, Request, RequestId, WINDOW};
 use anyhow::{anyhow, bail, Context};
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
-use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -335,17 +337,17 @@ pub fn mime(name: &str) -> &'static str {
     type_of(name).0
 }
 
-/// The charset a text type's head names for a file whose first bytes are `sample` (its first
-/// [`kind::SNIFF_BYTES`]; more is not looked at), `truncated` when the file goes on past them:
-/// the text view's default (08 §7.2, `crate::encoding::pick`), so the page and its source agree —
-/// `utf-8` by its BOM or when the sample is UTF-8 (`kind::utf8_text`: a character cut at the
-/// edge accepted, never `looks_like_text`), `utf-16le`/`be` and `utf-32le`/`be` by BOM or the NUL
-/// pattern, anything else none. None too when the text names its own: a `<meta>` with a charset
-/// (`charset=`, or `http-equiv`'s content), the XML declaration's `encoding`, CSS's `@charset`.
-pub fn charset(sample: &[u8], truncated: bool) -> Option<&'static str> {
+/// The charset a text type `mime`'s head names for a file whose first bytes are `sample` (its
+/// first [`kind::SNIFF_BYTES`]; more is not looked at), `truncated` when the file goes on past
+/// them: the text view's default (08 §7.2, `crate::encoding::pick`), so the page and its source
+/// agree — `utf-8` by its BOM or when the sample is UTF-8 (`kind::utf8_text`: a character cut at
+/// the edge accepted, never `looks_like_text`), `utf-16le`/`be` and `utf-32le`/`be` by BOM or the
+/// NUL pattern, anything else none. None too when the text names its own, by its type's own rule
+/// ([`names_charset`]): a header's charset would override it.
+pub fn charset(mime: &str, sample: &[u8], truncated: bool) -> Option<&'static str> {
     let truncated = truncated || sample.len() > kind::SNIFF_BYTES;
     let sample = &sample[..sample.len().min(kind::SNIFF_BYTES)];
-    if names_charset(sample) {
+    if names_charset(mime, sample) {
         return None;
     }
     match crate::encoding::pick(sample, truncated).encoding {
@@ -359,33 +361,289 @@ pub fn charset(sample: &[u8], truncated: bool) -> Option<&'static str> {
     }
 }
 
-/// The sample names its own charset, in ASCII: a header's would override it (HTML and CSS take
-/// the transport's first).
-fn names_charset(sample: &[u8]) -> bool {
-    let lower = sample.to_ascii_lowercase();
-    let text = lower
-        .strip_prefix(Encoding::Utf8.bom())
-        .unwrap_or(&lower[..]);
-    if text.starts_with(b"@charset \"") {
-        return true;
-    }
-    if text.starts_with(b"<?xml") {
-        let decl = &text[..find(text, b"?>").unwrap_or(text.len())];
-        if find(decl, b"encoding").is_some() {
-            return true;
+/// The bytes HTML's prescan reads (WHATWG HTML, "prescan a byte stream to determine its
+/// encoding"), and those CSS's `@charset` must sit in (CSS Syntax, "determine the fallback
+/// encoding").
+const PRESCAN_BYTES: usize = 1024;
+
+/// A text that names its own encoding, by the rule its engine reads it by — only a label of an
+/// encoding of the Encoding Standard ([`label`]) counts: HTML by the prescan of its first 1024 bytes
+/// ([`prescan`]); XML (`application/xml`, XSLT, SVG) by its declaration's `encoding`, only at the
+/// very start of the file, after a UTF-8 BOM if any; CSS by `@charset "LABEL";` as the file's
+/// first bytes. A script or JSON names none.
+fn names_charset(mime: &str, sample: &[u8]) -> bool {
+    match mime {
+        "text/html" => prescan(&sample[..sample.len().min(PRESCAN_BYTES)]).is_some(),
+        "application/xml" | "text/xsl" | "image/svg+xml" => {
+            let text = sample.strip_prefix(Encoding::Utf8.bom()).unwrap_or(sample);
+            xml_encoding(text).is_some()
         }
-    }
-    let mut rest = text;
-    while let Some(at) = find(rest, b"<meta") {
-        rest = &rest[at + 5..];
-        let tag = &rest[..rest.iter().position(|&b| b == b'>').unwrap_or(rest.len())];
-        let spaced = tag.first().is_some_and(|b| b" \t\n\x0c\r/".contains(b));
-        if spaced && find(tag, b"charset").is_some() {
-            return true;
+        "text/css" => {
+            let text = &sample[..sample.len().min(PRESCAN_BYTES)];
+            let Some(rest) = text.strip_prefix(b"@charset \"") else {
+                return false;
+            };
+            let end = rest.iter().position(|&b| b == b'"');
+            end.is_some_and(|e| rest.get(e + 1) == Some(&b';') && label(&rest[..e]).is_some())
         }
+        _ => false,
     }
-    false
 }
+
+/// HTML whitespace (tab, LF, FF, CR, space).
+fn space(b: u8) -> bool {
+    matches!(b, 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
+}
+
+/// WHATWG HTML's prescan over `b`: the encoding the first `<meta>` naming one names (as the
+/// prescan returns it), skipping
+/// comments, other tags (their attributes read, so a `>` inside a quoted value ends nothing) and
+/// `<!`, `</`, `<?` constructs; `None` when none does before the bytes end — a tag cut at their
+/// end names nothing.
+fn prescan(b: &[u8]) -> Option<Enc> {
+    let mut i = 0;
+    while i < b.len() {
+        let rest = &b[i..];
+        if rest.starts_with(b"<!--") {
+            // To the `>` of the first `-->`; the dashes of `<!--` count.
+            i += 2 + find(&rest[2..], b"-->")? + 2;
+        } else if rest.len() > 5
+            && rest[..5].eq_ignore_ascii_case(b"<meta")
+            && (space(rest[5]) || rest[5] == b'/')
+        {
+            i += 5;
+            if let Some(found) = meta(b, &mut i)? {
+                // As the prescan returns it: a UTF-16 label is UTF-8 (the bytes it was read in are
+                // ASCII), x-user-defined is windows-1252; anything else, `replacement` included.
+                return Some(match found {
+                    f if f == encoding_rs::UTF_16LE || f == encoding_rs::UTF_16BE => {
+                        encoding_rs::UTF_8
+                    }
+                    f if f == encoding_rs::X_USER_DEFINED => encoding_rs::WINDOWS_1252,
+                    f => f,
+                });
+            }
+        } else if rest.len() > 1
+            && rest[0] == b'<'
+            && (rest[1].is_ascii_alphabetic()
+                || (rest[1] == b'/' && rest.get(2).is_some_and(u8::is_ascii_alphabetic)))
+        {
+            i += b[i..].iter().position(|&c| space(c) || c == b'>')?;
+            while let Attribute::Got(..) = attribute(b, &mut i) {}
+            // The attributes ran to the end of the bytes: the tag is cut.
+            b.get(i)?;
+        } else if rest.starts_with(b"<!") || rest.starts_with(b"</") || rest.starts_with(b"<?") {
+            i += rest.iter().position(|&c| c == b'>')?;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A `<meta>`'s attributes from `i` (after `<meta`): the encoding it names (`charset`, or
+/// `http-equiv=content-type` with a `content` naming one), `Some(None)` for none, `None` when the
+/// bytes end inside it.
+fn meta(b: &[u8], i: &mut usize) -> Option<Option<Enc>> {
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut pragma = false;
+    // `None`: no charset yet; `Some(true)`: from `content`, which needs the pragma.
+    let mut need_pragma = None;
+    let mut found: Option<Option<Enc>> = None;
+    loop {
+        match attribute(b, i) {
+            Attribute::Out => return None,
+            Attribute::End => break,
+            Attribute::Got(name, value) => {
+                if seen.contains(&name) {
+                    continue;
+                }
+                match name.as_slice() {
+                    b"http-equiv" => pragma |= value == b"content-type",
+                    b"content" if found.is_none() => {
+                        if let Some(e) = from_content(&value) {
+                            found = Some(Some(e));
+                            need_pragma = Some(true);
+                        }
+                    }
+                    b"charset" => {
+                        found = Some(label(&value));
+                        need_pragma = Some(false);
+                    }
+                    _ => {}
+                }
+                seen.push(name);
+            }
+        }
+    }
+    Some(match need_pragma {
+        None => None,
+        Some(true) if !pragma => None,
+        _ => found.flatten(),
+    })
+}
+
+/// What WHATWG's "get an attribute" found at `i`.
+enum Attribute {
+    Got(Vec<u8>, Vec<u8>),
+    /// `>`: there is none.
+    End,
+    /// The bytes ended.
+    Out,
+}
+
+/// WHATWG HTML's "get an attribute": its name and value, lowercased; `i` left after it.
+fn attribute(b: &[u8], i: &mut usize) -> Attribute {
+    let at = |i: usize| b.get(i).copied();
+    while at(*i).is_some_and(|c| space(c) || c == b'/') {
+        *i += 1;
+    }
+    match at(*i) {
+        None => return Attribute::Out,
+        Some(b'>') => return Attribute::End,
+        Some(_) => {}
+    }
+    let (mut name, mut value) = (Vec::new(), Vec::new());
+    loop {
+        let Some(c) = at(*i) else {
+            return Attribute::Out;
+        };
+        if c == b'=' && !name.is_empty() {
+            *i += 1;
+            break;
+        }
+        if space(c) {
+            while at(*i).is_some_and(space) {
+                *i += 1;
+            }
+            match at(*i) {
+                None => return Attribute::Out,
+                Some(b'=') => {
+                    *i += 1;
+                    break;
+                }
+                Some(_) => return Attribute::Got(name, value),
+            }
+        }
+        if c == b'/' || c == b'>' {
+            return Attribute::Got(name, value);
+        }
+        name.push(c.to_ascii_lowercase());
+        *i += 1;
+    }
+    while at(*i).is_some_and(space) {
+        *i += 1;
+    }
+    match at(*i) {
+        None => return Attribute::Out,
+        Some(q @ (b'"' | b'\'')) => {
+            *i += 1;
+            loop {
+                let Some(c) = at(*i) else {
+                    return Attribute::Out;
+                };
+                *i += 1;
+                if c == q {
+                    return Attribute::Got(name, value);
+                }
+                value.push(c.to_ascii_lowercase());
+            }
+        }
+        Some(b'>') => return Attribute::Got(name, value),
+        Some(c) => {
+            value.push(c.to_ascii_lowercase());
+            *i += 1;
+        }
+    }
+    loop {
+        match at(*i) {
+            None => return Attribute::Out,
+            Some(c) if space(c) || c == b'>' => return Attribute::Got(name, value),
+            Some(c) => {
+                value.push(c.to_ascii_lowercase());
+                *i += 1;
+            }
+        }
+    }
+}
+
+/// WHATWG HTML's "extracting a character encoding from a meta element" (a `content` value).
+fn from_content(s: &[u8]) -> Option<Enc> {
+    let mut pos = 0;
+    loop {
+        let mut j = pos + find_ignoring_case(&s[pos..], b"charset")? + 7;
+        while s.get(j).copied().is_some_and(space) {
+            j += 1;
+        }
+        if s.get(j) != Some(&b'=') {
+            pos = j;
+            continue;
+        }
+        j += 1;
+        while s.get(j).copied().is_some_and(space) {
+            j += 1;
+        }
+        let c = *s.get(j)?;
+        if c == b'"' || c == b'\'' {
+            let rest = &s[j + 1..];
+            let end = rest.iter().position(|&d| d == c)?;
+            return label(&rest[..end]);
+        }
+        let end = s[j..]
+            .iter()
+            .position(|&d| space(d) || d == b';')
+            .map_or(s.len(), |e| j + e);
+        return label(&s[j..end]);
+    }
+}
+
+/// The XML declaration's `encoding` when `text` starts with one (`<?xml` and whitespace).
+fn xml_encoding(text: &[u8]) -> Option<Enc> {
+    let rest = text.strip_prefix(b"<?xml")?;
+    if !rest.first().copied().is_some_and(space) {
+        return None;
+    }
+    let decl = &rest[..find(rest, b"?>")?];
+    let mut pos = 0;
+    while let Some(k) = find(&decl[pos..], b"encoding") {
+        let at = pos + k;
+        pos = at + 8;
+        if !space(decl[at - 1]) {
+            continue;
+        }
+        let mut j = pos;
+        while decl.get(j).copied().is_some_and(space) {
+            j += 1;
+        }
+        if decl.get(j) != Some(&b'=') {
+            continue;
+        }
+        j += 1;
+        while decl.get(j).copied().is_some_and(space) {
+            j += 1;
+        }
+        let q = *decl.get(j)?;
+        if q != b'"' && q != b'\'' {
+            return None;
+        }
+        let name = &decl[j + 1..];
+        return label(&name[..name.iter().position(|&c| c == q)?]);
+    }
+    None
+}
+
+fn find_ignoring_case(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+}
+
+/// The Encoding Standard's "get an encoding" (`encoding_rs::Encoding::for_label`: whitespace
+/// around the label and ASCII case ignored); `None` for a label of no encoding.
+fn label(label: &[u8]) -> Option<Enc> {
+    encoding_rs::Encoding::for_label(label)
+}
+
+/// An encoding of the Encoding Standard.
+type Enc = &'static encoding_rs::Encoding;
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
@@ -407,42 +665,85 @@ enum Span {
 }
 
 fn span(range: Option<&str>, size: u64) -> Span {
+    // The field's own leading and trailing whitespace is not its value; inside the grammar
+    // (`bytes=a-b`, `1#range-spec`) whitespace is only around a list's commas.
     let Some((unit, set)) = range.and_then(|r| r.trim().split_once('=')) else {
         return Span::Whole;
     };
-    if !unit.trim().eq_ignore_ascii_case("bytes") {
+    if !unit.eq_ignore_ascii_case("bytes") {
         return Span::Whole;
     }
     // A list's empty elements are nothing (RFC 9110 §5.6.1).
-    let mut specs = set.split(',').map(str::trim).filter(|s| !s.is_empty());
+    let parts: Vec<&str> = set.split(',').collect();
+    let last = parts.len() - 1;
+    let mut specs = parts.iter().enumerate().filter_map(|(i, part)| {
+        let part = if i > 0 { part.trim_start() } else { part };
+        let part = if i < last { part.trim_end() } else { part };
+        (!part.is_empty()).then_some(part)
+    });
     let (Some(spec), None) = (specs.next(), specs.next()) else {
         return Span::Whole;
     };
     let Some((a, b)) = spec.split_once('-') else {
         return Span::Whole;
     };
-    match (number(a), number(b)) {
-        (None, Some(n)) if a.is_empty() => match (n, size) {
-            (0, _) => Span::Unsatisfiable,
+    let (digits_a, digits_b) = (digits(a), digits(b));
+    match (a.is_empty(), digits_a, b.is_empty(), digits_b) {
+        // `-N`: the last N bytes.
+        (true, _, false, Some(n)) => match (n.is_zero(), size) {
+            (true, _) => Span::Unsatisfiable,
             (_, 0) => Span::Whole,
-            _ => Span::Part(size.saturating_sub(n), size - 1),
+            _ => Span::Part(size.saturating_sub(n.value()), size - 1),
         },
-        (Some(first), last) if b.is_empty() || last.is_some() => match last {
-            Some(last) if last < first => Span::Whole,
-            _ if first >= size => Span::Unsatisfiable,
-            last => Span::Part(first, last.unwrap_or(u64::MAX).min(size - 1)),
-        },
+        // `A-` and `A-B`: the order is the numbers', whatever their size.
+        (false, Some(first), true, _) => from(first, None, size),
+        (false, Some(first), false, Some(last)) if last >= first => from(first, Some(last), size),
         _ => Span::Whole,
     }
 }
 
-/// Digits, saturating: a first byte past any file is still past its end.
-fn number(s: &str) -> Option<u64> {
+/// `A-` or `A-B` (B ≥ A) of a `size`-byte file.
+fn from(first: Digits, last: Option<Digits>, size: u64) -> Span {
+    let first = first.value();
+    if first >= size {
+        return Span::Unsatisfiable;
+    }
+    let last = last.map_or(u64::MAX, Digits::value);
+    Span::Part(first, last.min(size - 1))
+}
+
+/// A run of decimal digits, compared as numbers of any size (leading zeros dropped).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Digits<'a>(&'a str);
+
+fn digits(s: &str) -> Option<Digits<'_>> {
     (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| {
-        s.bytes().fold(0u64, |n, d| {
-            n.saturating_mul(10).saturating_add(u64::from(d - b'0'))
-        })
+        let trimmed = s.trim_start_matches('0');
+        Digits(if trimmed.is_empty() { "0" } else { trimmed })
     })
+}
+
+impl Digits<'_> {
+    fn is_zero(self) -> bool {
+        self.0 == "0"
+    }
+
+    /// The number, `u64::MAX` past it: a first byte past any file is still past its end.
+    fn value(self) -> u64 {
+        self.0.parse().unwrap_or(u64::MAX)
+    }
+}
+
+impl PartialOrd for Digits<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Digits<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.0.len(), self.0).cmp(&(other.0.len(), other.0))
+    }
 }
 
 /// A piece while another request waits: what the link carries in [`LINK_TIME`] at `rate`
@@ -625,12 +926,12 @@ impl Out {
     ) -> Result<Option<Option<&'static str>>, Halt> {
         match self {
             Out::Body(body) => send(body, bytes.to_vec()).map(|()| None),
-            Out::Waiting { held, .. } => {
+            Out::Waiting { held, plan, .. } => {
                 held.extend_from_slice(bytes);
                 if held.len() < sample {
                     return Ok(None);
                 }
-                let found = charset(&held[..sample], truncated);
+                let found = charset(plan.mime, &held[..sample], truncated);
                 self.resolve(found).map(|()| Some(found))
             }
             Out::Spent => Err(Halt::Stopped),
@@ -757,6 +1058,8 @@ struct Worker {
 
 impl Worker {
     fn run(mut self) {
+        // The request whose turn just ended: it goes back behind what arrived during its turn.
+        let mut back = None;
         loop {
             loop {
                 match self.rx.try_recv() {
@@ -765,12 +1068,13 @@ impl Worker {
                     Err(TryRecvError::Disconnected) => return self.end(),
                 }
             }
+            if let Some(req) = back.take() {
+                self.queue.push_back(req);
+            }
             match self.queue.iter().position(Req::ready) {
                 Some(i) => {
                     let req = self.queue.remove(i).expect("a ready request");
-                    if let Some(req) = self.turn(req) {
-                        self.queue.push_back(req);
-                    }
+                    back = self.turn(req);
                 }
                 None => match self.rx.recv() {
                     Ok(msg) => self.take(msg),
@@ -920,6 +1224,14 @@ impl Worker {
             self.stopped(&req);
             return None;
         }
+        // A whole file asked again (a reload) is opened again before anything is answered from
+        // its check — its size, an empty file's empty answer — its fingerprint compared; runs of
+        // ranges keep the handle (change 1).
+        if was_checked && span(req.range.as_deref(), file.size) == Span::Whole {
+            if let Err(no) = self.open(&file, true) {
+                return self.not_open(req, reply, no, recheck);
+            }
+        }
         let size = file.size;
         let (first, end, part) = match span(req.range.as_deref(), size) {
             Span::Whole => (0, size, false),
@@ -953,14 +1265,14 @@ impl Worker {
         };
         if found.is_none() {
             if let Some(b0) = self.blocks.get(&file, 0) {
-                let f = charset(&b0[..sample as usize], truncated);
+                let f = charset(mime, &b0[..sample as usize], truncated);
                 self.charsets.insert(file.version(), f);
                 found = Some(f);
             }
         }
         // An empty file: its head (an empty sample is UTF-8) and its end.
         if end == first {
-            match out.resolve(found.unwrap_or_else(|| charset(&[], false))) {
+            match out.resolve(found.unwrap_or_else(|| charset(mime, &[], false))) {
                 Ok(()) => self.close(&req, out, code),
                 Err(halt) => {
                     self.halt(&req, out, halt);
@@ -992,25 +1304,23 @@ impl Worker {
         if kept.is_none() || sniff {
             // A new whole-file request opens the file again (2 RTT, its fingerprint compared):
             // the kept handle is for runs of ranges.
-            match self.open(&file, was_checked && !part) {
+            match self.open(&file, false) {
                 Ok(()) => {}
-                Err(NotOpen::Moved(_)) if was_checked && recheck => {
-                    self.ledger.give(std::mem::take(&mut req.owed));
-                    let Out::Waiting { reply, .. } = out else {
+                Err(no) => match out {
+                    Out::Waiting { reply, .. } if was_checked => {
+                        return self.not_open(req, reply, no, recheck);
+                    }
+                    out => {
+                        self.failed(&req, out, no.why());
                         return None;
-                    };
-                    return self.first(req, reply, false);
-                }
-                Err(no) => {
-                    self.failed(&req, out, no.why());
-                    return None;
-                }
+                    }
+                },
             }
         }
         if sniff {
             match self.read_all(&mut req.owed, 0, sample) {
                 Ok(head) => {
-                    let f = charset(&head, truncated);
+                    let f = charset(mime, &head, truncated);
                     self.charsets.insert(file.version(), f);
                     found = Some(f);
                 }
@@ -1050,7 +1360,7 @@ impl Worker {
         };
         // Block 0 holds the sample (a block is longer than it).
         if let Out::Waiting { .. } = out {
-            let f = charset(&data[..sample as usize], truncated);
+            let f = charset(mime, &data[..sample as usize], truncated);
             self.charsets.insert(file.version(), f);
             if let Err(halt) = out.resolve(f) {
                 return self.halt(&req, out, halt);
@@ -1064,6 +1374,20 @@ impl Worker {
             }
         }
         None
+    }
+
+    /// A checked file that would not open again — it moved or is gone, and [`Worker::open`]
+    /// forgot it: the request has sent nothing, so it runs its steps afresh, once (a 404 for a
+    /// file that is gone, not a network error on every reload).
+    fn not_open(&mut self, mut req: Req, reply: Reply, no: NotOpen, recheck: bool) -> Option<Req> {
+        self.ledger.give(std::mem::take(&mut req.owed));
+        match recheck {
+            true => self.first(req, reply, false),
+            false => {
+                self.fail_reply(&req, reply, no.why());
+                None
+            }
+        }
     }
 
     /// One piece of an open response.
@@ -1248,7 +1572,8 @@ impl Worker {
     /// The handle on `file`: kept when it is on it already, else a `reopen` (or an open from the
     /// connection) — its fingerprint compared either way. A file that moved is forgotten, so the
     /// next request checks it afresh.
-    /// `fresh`: opened again even when the handle is on it (a new whole-file request).
+    /// `fresh`: opened again even when the handle is on it (a new whole-file request). A file that
+    /// would not open is forgotten too.
     fn open(&mut self, file: &Checked, fresh: bool) -> Result<(), NotOpen> {
         let opened = match std::mem::replace(&mut self.link, Link::Lost(String::new())) {
             Link::File(handle) if handle.path() == file.resolved && !fresh => Ok(handle),
@@ -1274,6 +1599,7 @@ impl Worker {
             }
             Err(remote::Refused { conn, error }) => {
                 self.link = Link::Conn(conn);
+                self.forget(&file.resolved);
                 let why = format!("cannot open {}: {error:#}", file.resolved);
                 Err(NotOpen::Failed(why))
             }
@@ -1329,6 +1655,8 @@ impl Worker {
         }
         *owed = owed.saturating_sub(len);
         let mut halt = None;
+        // A reply that failed, ended early or did not fit: the file is not what was checked.
+        let mut fault = false;
         let (mut t0, mut last, mut after) = (None, None, 0u64);
         let mut silent = 0;
         while slots.iter().any(|s| matches!(s.state, Fill::Sent(_))) {
@@ -1372,6 +1700,7 @@ impl Worker {
             };
             match (failure, reply) {
                 (Some(why), _) => {
+                    fault = true;
                     halt.get_or_insert(Halt::Failed(why));
                     slots[i].state = Fill::Dead;
                 }
@@ -1408,6 +1737,11 @@ impl Worker {
             }
         }
         self.link = Link::File(file);
+        // Its check, its charset and its kept blocks are forgotten: the next request runs the
+        // steps again, and no kept block of it is served.
+        if fault {
+            self.forget(&path);
+        }
         if let (Some(t0), Some(last)) = (t0, last) {
             let took = last.saturating_duration_since(t0).as_secs_f64();
             if took > 0.0 && after > 0 {
@@ -1528,7 +1862,13 @@ struct InPlace {
 
 impl InPlace {
     fn open(path: &str) -> anyhow::Result<Box<dyn Ranged>> {
-        let file = std::fs::File::open(path).with_context(|| format!("cannot open {path}"))?;
+        // Without blocking: a FIFO opened for reading waits for a writer. Nothing else changes —
+        // a regular file's reads are positioned and never wait.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .with_context(|| format!("cannot open {path}"))?;
         let opened = stat_of(&file.metadata()?);
         if !opened.is_file {
             bail!("{path} is not a regular file");

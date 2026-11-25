@@ -589,6 +589,19 @@ impl View {
     }
 }
 
+/// Options whose request log lines are kept in the vector returned.
+fn logged(options: Options) -> (Options, Arc<Mutex<Vec<String>>>) {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = lines.clone();
+    let options = Options {
+        log: Some(Arc::new(move |l: &str| {
+            sink.lock().unwrap().push(l.to_string())
+        })),
+        ..options
+    };
+    (options, lines)
+}
+
 /// `GET path` on a fresh view, its answer.
 fn fetch(view: &mut View, path: &str, range: Option<&str>) -> Got {
     let id = view.get(path, range);
@@ -813,6 +826,26 @@ fn step_missing_and_not_regular_are_404() {
     assert_eq!(v.ops.count("open "), 0);
 }
 
+/// A checked file that is gone: its reopen fails, so the view forgets it and runs the steps
+/// again — 404, not a network error on every reload — whether the handle was on it (a whole
+/// file asked again) or on another file (a range).
+#[test]
+fn step_a_checked_file_deleted_is_404() {
+    let s = site();
+    s.put("a.css", b"p{}");
+    s.put("b.css", b"q{}");
+    let mut v = view(&s, Options::viewer());
+    assert!(fetch(&mut v, "a.css", None).ok());
+    std::fs::remove_file(s.at("a.css")).unwrap();
+    assert_eq!(fetch(&mut v, "a.css", None).code(), 404);
+    assert!(fetch(&mut v, "b.css", None).ok());
+    s.put("a.css", b"p{}");
+    assert!(fetch(&mut v, "a.css", None).ok());
+    assert!(fetch(&mut v, "b.css", None).ok());
+    std::fs::remove_file(s.at("a.css")).unwrap();
+    assert_eq!(fetch(&mut v, "a.css", Some("bytes=0-0")).code(), 404);
+}
+
 // ---------------------------------------------------------------------------------------------
 // X-W1 change 1: a path checked once is not checked again; small ranges from a block cache.
 
@@ -946,6 +979,47 @@ fn fingerprint_a_small_file_changed_between_requests_is_served_new() {
     assert_eq!(v.ops.count(&format!("realpath {a}")), 3);
 }
 
+/// A whole file asked again is opened again before anything is answered, its empty answer
+/// included (it needs no read): an empty file given content is served with it.
+#[test]
+fn fingerprint_an_empty_file_given_content_is_served_new() {
+    let s = site();
+    s.put("a.css", b"");
+    let mut v = view(&s, Options::viewer());
+    let empty = fetch(&mut v, "a.css", None);
+    assert!(empty.ok(), "{:?}", empty.end);
+    assert!(empty.body.is_empty());
+    std::fs::write(s.at("a.css"), b"p{color:red}").unwrap();
+    let got = fetch(&mut v, "a.css", None);
+    assert!(got.ok(), "{:?}", got.end);
+    assert_eq!(got.body, b"p{color:red}");
+}
+
+/// A read that ends early — the file cut under the kept handle — fails its request and forgets
+/// the file, its charset and its kept blocks: the next request runs the steps again, and a kept
+/// block's old bytes are never served.
+#[test]
+fn fingerprint_an_early_end_forgets_the_file_and_its_blocks() {
+    let s = site();
+    let old = binary(MIB);
+    s.put("v.bin", &old);
+    let mut v = view(&s, Options::viewer());
+    assert_eq!(
+        fetch(&mut v, "v.bin", Some("bytes=10-20")).body,
+        &old[10..=20]
+    );
+    // Rewritten in place, shorter: the handle kept on it finds nothing past the new end.
+    let new = text(300 * KIB);
+    std::fs::write(s.at("v.bin"), &new).unwrap();
+    let cut = fetch(&mut v, "v.bin", Some("bytes=600000-600010"));
+    assert!(cut.failed(), "{:?}", cut.end);
+    let checks = v.ops.count("realpath ");
+    let again = fetch(&mut v, "v.bin", Some("bytes=10-20"));
+    assert!(again.ok(), "{:?}", again.end);
+    assert_eq!(again.body, &new[10..=20]);
+    assert_eq!(v.ops.count("realpath "), checks + 1, "checked again");
+}
+
 /// Two paths to one file (a folder and its `index.html`) checked at two fingerprints: the view
 /// keeps one version — the older is forgotten with its blocks — so no range is ever cut from a
 /// block of another version.
@@ -1071,8 +1145,35 @@ fn range_parses_as_rfc_9110_says() {
         (Some("bytes=0-1,5-6"), 100, Whole),
         (Some("bytes=0-10,5-20"), 100, Whole),
         (Some("bytes=0-1, "), 100, Part(0, 1)),
+        (Some("bytes=0-1 , "), 100, Part(0, 1)),
+        (Some("bytes=, 0-1"), 100, Part(0, 1)),
         (Some("BYTES=0-1"), 100, Part(0, 1)),
-        (Some("bytes= 3-4"), 100, Part(3, 4)),
+        (Some(" bytes=0-1 "), 100, Part(0, 1)),
+        // No whitespace inside the grammar: around `=`, or before the first range.
+        (Some("bytes =0-1"), 100, Whole),
+        (Some("bytes= 3-4"), 100, Whole),
+        (Some("bytes=3- 4"), 100, Whole),
+        // Numbers past u64 keep their order: a last before its first is malformed (200).
+        (
+            Some("bytes=18446744073709551617-18446744073709551616"),
+            100,
+            Whole,
+        ),
+        (
+            Some("bytes=18446744073709551616-18446744073709551617"),
+            100,
+            Unsatisfiable,
+        ),
+        (Some("bytes=18446744073709551616-"), 100, Unsatisfiable),
+        (Some("bytes=0-18446744073709551616"), 100, Part(0, 99)),
+        (Some("bytes=-18446744073709551616"), 100, Part(0, 99)),
+        (Some("bytes=0005-0009"), 100, Part(5, 9)),
+        (Some("bytes=5-00004"), 100, Whole),
+        (
+            Some("bytes=000000000000000000000000000001-2"),
+            100,
+            Part(1, 2),
+        ),
         (Some("items=0-1"), 100, Whole),
         (Some("bytes=a-b"), 100, Whole),
         (Some("bytes=1 -2"), 100, Whole),
@@ -1173,77 +1274,205 @@ fn type_by_extension_from_the_fixed_table() {
 #[test]
 fn charset_follows_the_text_views_default() {
     let korean = "한국어 페이지\n".repeat(400);
-    assert_eq!(charset(korean.as_bytes(), false), Some("utf-8"));
+    assert_eq!(charset(HTML, korean.as_bytes(), false), Some("utf-8"));
     // A Hangul syllable (3 bytes) cut at byte 8192, the sample's edge: accepted when the file
     // goes on (WV-S4), not when it ends there.
     let mut cut = vec![b'a'; 8190];
     cut.extend_from_slice("한".as_bytes());
     let sample = &cut[..8192];
-    assert_eq!(charset(sample, true), Some("utf-8"));
-    assert_eq!(charset(sample, false), None);
+    assert_eq!(charset(HTML, sample, true), Some("utf-8"));
+    assert_eq!(charset(HTML, sample, false), None);
     // A UTF-8 BOM decides, whatever follows.
-    assert_eq!(charset(b"\xEF\xBB\xBF<p>\xFF</p>", false), Some("utf-8"));
-    // UTF-16 by its BOM, or by the NUL pattern.
-    let wide = |s: &str, be: bool| -> Vec<u8> {
-        s.encode_utf16()
-            .flat_map(|u| if be { u.to_be_bytes() } else { u.to_le_bytes() })
-            .collect()
-    };
-    let mut le = vec![0xFF, 0xFE];
-    le.extend(wide("<p>안녕</p>", false));
-    assert_eq!(charset(&le, false), Some("utf-16le"));
-    let mut be = vec![0xFE, 0xFF];
-    be.extend(wide("<p>안녕</p>", true));
-    assert_eq!(charset(&be, false), Some("utf-16be"));
     assert_eq!(
-        charset(&wide("<html><p>hello</p></html>", false), false),
-        Some("utf-16le")
-    );
-    assert_eq!(
-        charset(&wide("<html><p>hello</p></html>", true), false),
-        Some("utf-16be")
-    );
-    assert_eq!(
-        charset(b"\xFF\xFE\x00\x00<\x00\x00\x00", false),
-        Some("utf-32le")
-    );
-    assert_eq!(
-        charset(b"\x00\x00\xFE\xFF\x00\x00\x00<", false),
-        Some("utf-32be")
-    );
-    // CP949 / EUC-KR bytes ("한국어"): step 3 is VM-4's, so step 4 — and they are not UTF-8.
-    let euc_kr = b"<p>\xC7\xD1\xB1\xB9\xBE\xEE</p>".repeat(20);
-    assert_eq!(charset(&euc_kr, false), None);
-    // Binary: none.
-    assert_eq!(
-        charset(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\x80\x81", false),
-        None
-    );
-    // The text names its own: none, the document's own rule decides.
-    for named in [
-        &b"<!doctype html><meta charset=\"euc-kr\"><p>a</p>"[..],
-        b"<HTML><HEAD><META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=euc-kr\">",
-        b"<meta\tname=x charset=euc-kr>",
-        b"<?xml version=\"1.0\" encoding=\"EUC-KR\"?><rss/>",
-        b"\xEF\xBB\xBF<?xml version='1.0' encoding='utf-8'?><a/>",
-        b"@charset \"euc-kr\";\np { color: red }",
-    ] {
-        assert_eq!(
-            charset(named, false),
-            None,
-            "{}",
-            String::from_utf8_lossy(named)
-        );
-    }
-    // A meta tag that names no charset names nothing.
-    assert_eq!(
-        charset(
-            b"<meta name=\"viewport\" content=\"width=device-width\">",
-            false
-        ),
+        charset(HTML, b"\xEF\xBB\xBF<p>\xFF</p>", false),
         Some("utf-8")
     );
-    assert_eq!(charset(b"", false), Some("utf-8"));
+    // UTF-16 by its BOM, or by the NUL pattern.
+    let mut le = vec![0xFF, 0xFE];
+    le.extend(wide("<p>안녕</p>", false));
+    assert_eq!(charset(HTML, &le, false), Some("utf-16le"));
+    let mut be = vec![0xFE, 0xFF];
+    be.extend(wide("<p>안녕</p>", true));
+    assert_eq!(charset(HTML, &be, false), Some("utf-16be"));
+    let page = "<html><p>hello</p></html>";
+    assert_eq!(charset(HTML, &wide(page, false), false), Some("utf-16le"));
+    assert_eq!(charset(HTML, &wide(page, true), false), Some("utf-16be"));
+    let utf32 = b"\xFF\xFE\x00\x00<\x00\x00\x00";
+    assert_eq!(charset(HTML, utf32, false), Some("utf-32le"));
+    let utf32 = b"\x00\x00\xFE\xFF\x00\x00\x00<";
+    assert_eq!(charset(HTML, utf32, false), Some("utf-32be"));
+    // CP949 / EUC-KR bytes ("한국어"): step 3 guesses CP949, which no header names.
+    let euc_kr = b"<p>\xC7\xD1\xB1\xB9\xBE\xEE</p>".repeat(20);
+    assert_eq!(charset(HTML, &euc_kr, false), None);
+    // Binary: none.
+    let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\x80\x81";
+    assert_eq!(charset(HTML, png, false), None);
+    assert_eq!(charset(HTML, b"", false), Some("utf-8"));
+    // Every text type takes the same default.
+    for mime in [
+        "text/css",
+        "text/javascript",
+        "application/json",
+        "application/xml",
+    ] {
+        assert_eq!(
+            charset(mime, korean.as_bytes(), false),
+            Some("utf-8"),
+            "{mime}"
+        );
+        assert_eq!(charset(mime, &euc_kr, false), None, "{mime}");
+    }
+}
+
+/// UTF-16 code units of `s`, either order.
+fn wide(s: &str, be: bool) -> Vec<u8> {
+    s.encode_utf16()
+        .flat_map(|u| if be { u.to_be_bytes() } else { u.to_le_bytes() })
+        .collect()
+}
+
+const HTML: &str = "text/html";
+
+/// A text that names its own charset gets none from the header, so the engine reads it by its
+/// own rule — decided as that rule decides, never by a substring: HTML by WHATWG's prescan of
+/// its first 1024 bytes (comments and other markup skipped, a `<meta>`'s `charset`, or
+/// `http-equiv=content-type` with a `content` naming one; only a label of a real encoding
+/// counts); XML by its declaration, only at the very start (after a BOM); CSS by `@charset "…";`
+/// as its first bytes.
+#[test]
+fn charset_a_text_naming_its_own_by_the_rule_of_its_type() {
+    let named = |mime: &str, text: &[u8]| charset(mime, text, false).is_none();
+    for html in [
+        &b"<!doctype html><meta charset=\"euc-kr\"><p>a</p>"[..],
+        b"<HTML><HEAD><META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=euc-kr\">",
+        b"<meta content='text/html;charset = \"shift_jis\"' http-equiv=CONTENT-TYPE>",
+        b"<meta\tname=x charset=euc-kr>",
+        b"<meta charset=' KS_C_5601-1987 '>",
+        b"<!-- a comment --><meta charset=utf-8>",
+        b"<title>x</title><meta/charset=gbk>",
+        b"<meta charset=utf-16>",
+        // The dashes of `<!--` close it too.
+        b"<!--><meta charset=euc-kr>",
+    ] {
+        assert!(named(HTML, html), "{}", String::from_utf8_lossy(html));
+    }
+    for html in [
+        // A meta in a comment, or a comment that is not closed.
+        &b"<!-- <meta charset=\"euc-kr\"> --><p>a</p>"[..],
+        b"<!-- not closed <meta charset=euc-kr>",
+        // `charset` that is no meta's charset.
+        b"<meta name=\"charset-example\" content=\"x\">",
+        b"<meta name=charset content=euc-kr>",
+        b"<p data-charset=euc-kr>charset=euc-kr</p>",
+        b"<script>if (document.charset) {}</script><p>charset=euc-kr</p>",
+        b"<a title='<meta charset=euc-kr>'>x</a>",
+        // A `content` naming one with no `http-equiv=content-type`; a label of no encoding.
+        b"<meta content=\"text/html; charset=euc-kr\">",
+        b"<meta http-equiv=refresh content=\"0; charset=euc-kr\">",
+        b"<meta charset=\"bogus\">",
+        b"<meta charset>",
+        // An XML declaration or `@charset` is not HTML's rule.
+        b"<?xml version=\"1.0\" encoding=\"euc-kr\"?><p>a</p>",
+    ] {
+        assert!(!named(HTML, html), "{}", String::from_utf8_lossy(html));
+    }
+    // The prescan reads 1024 bytes: a meta cut at the 1024th byte, or after it, names nothing.
+    for at in [1010, 1024, 2000] {
+        let mut html = vec![b' '; at];
+        html.extend_from_slice(b"<meta charset=\"euc-kr\">");
+        assert!(!named(HTML, &html), "a meta at {at}");
+    }
+    let mut html = vec![b' '; 1000];
+    html.extend_from_slice(b"<meta charset=euc-kr>");
+    assert!(named(HTML, &html), "a meta ending at byte 1021");
+    let xml = "application/xml";
+    for mime in [xml, "text/xsl", "image/svg+xml"] {
+        assert!(named(
+            mime,
+            b"<?xml version=\"1.0\" encoding=\"EUC-KR\"?><rss/>"
+        ));
+        assert!(named(
+            mime,
+            b"\xEF\xBB\xBF<?xml version='1.0' encoding = 'utf-8'?><a/>"
+        ));
+    }
+    for text in [
+        &b"\n<?xml version=\"1.0\" encoding=\"EUC-KR\"?><rss/>"[..],
+        b"<!-- x --><?xml version=\"1.0\" encoding=\"EUC-KR\"?>",
+        b"<?xml version=\"1.0\"?><a encoding=\"euc-kr\"/>",
+        b"<?xml version=\"1.0\" xencoding=\"euc-kr\"?>",
+        b"<?xml version=\"1.0\" encoding=\"no-such\"?>",
+        b"<?xml-stylesheet href=\"a.xsl\" encoding=\"euc-kr\"?>",
+        b"<meta charset=euc-kr>",
+    ] {
+        assert!(!named(xml, text), "{}", String::from_utf8_lossy(text));
+    }
+    let css = "text/css";
+    assert!(named(css, b"@charset \"euc-kr\";\np { color: red }"));
+    for text in [
+        &b"/* x */ @charset \"euc-kr\";"[..],
+        b" @charset \"euc-kr\";",
+        b"@CHARSET \"euc-kr\";",
+        b"@charset 'euc-kr';",
+        b"@charset \"euc-kr\"",
+        b"@charset \"bogus\";",
+        b"p { content: \"@charset \\\"euc-kr\\\";\" }",
+    ] {
+        assert!(!named(css, text), "{}", String::from_utf8_lossy(text));
+    }
+    // Scripts and JSON name none in band.
+    assert!(!named(
+        "text/javascript",
+        b"// <meta charset=euc-kr>\n@charset \"euc-kr\";"
+    ));
+}
+
+/// The prescan returns what WHATWG's says: a label is the Encoding Standard's ("get an
+/// encoding": whitespace and case ignored), an unknown one is skipped (the next `<meta>` may
+/// name one); a UTF-16 label is taken as UTF-8 and x-user-defined as windows-1252; any other
+/// encoding as it is — `replacement` (the ISO-2022-KR family's) included: the prescan has no
+/// step that drops it.
+#[test]
+fn charset_the_prescan_returns_what_the_standard_says() {
+    use encoding_rs::{EUC_KR, REPLACEMENT, SHIFT_JIS, UTF_8, WINDOWS_1252};
+    let cases: &[(&[u8], Option<&'static encoding_rs::Encoding>)] = &[
+        (b"<meta charset=euc-kr>", Some(EUC_KR)),
+        (b"<meta charset=' KS_C_5601-1987\t'>", Some(EUC_KR)),
+        (b"<meta charset=windows-949>", Some(EUC_KR)),
+        (
+            b"<meta http-equiv=content-type content='text/html; charset=sjis'>",
+            Some(SHIFT_JIS),
+        ),
+        (b"<meta charset=utf-16le>", Some(UTF_8)),
+        (b"<meta charset=UTF-16BE>", Some(UTF_8)),
+        (b"<meta charset=utf-16>", Some(UTF_8)),
+        (b"<meta charset=x-user-defined>", Some(WINDOWS_1252)),
+        (b"<meta charset=iso-2022-kr>", Some(REPLACEMENT)),
+        (b"<meta charset=replacement>", Some(REPLACEMENT)),
+        (b"<meta charset=bogus>", None),
+        (b"<meta charset=utf-7>", None),
+        (
+            b"<meta charset=bogus><meta charset=gbk>",
+            Some(encoding_rs::GBK),
+        ),
+    ];
+    for (html, want) in cases {
+        let got = prescan(html);
+        assert_eq!(got, *want, "{}", String::from_utf8_lossy(html));
+    }
+    // Through the head: whatever the prescan takes, the header leaves to the page.
+    for html in [
+        &b"<meta charset=x-user-defined>"[..],
+        b"<meta charset=iso-2022-kr>",
+    ] {
+        assert_eq!(
+            charset(HTML, html, false),
+            None,
+            "{}",
+            String::from_utf8_lossy(html)
+        );
+    }
+    assert_eq!(charset(HTML, b"<meta charset=utf-7>", false), Some("utf-8"));
 }
 
 /// A text type's head waits for the read that brings its first 8 KiB; any other type's head
@@ -1363,6 +1592,37 @@ fn stop_mid_body_reads_stop_within_one_window() {
     assert!(v.got[&id].end.is_none());
     let read = v.ops.read_bytes(&s.at("big.bin"));
     assert!(read <= taken + WINDOW as u64, "{read} read, {taken} taken");
+}
+
+/// A request parked between its turns — no room, the worker held in another request's steps —
+/// and stopped there ends at the turn boundary: no read of it after the stop, one `stopped`
+/// line, though the room it got back (a credit queued before the stop) makes it ready.
+#[test]
+fn stop_a_parked_request_reads_nothing_more() {
+    let s = site();
+    s.put("big.bin", &binary(8 * MIB));
+    s.put("a.css", b"p{}");
+    let (options, lines) = logged(Options::viewer());
+    let mut v = view(&s, options);
+    let (big, css) = (s.at("big.bin"), s.at("a.css"));
+    let id = v.get("big.bin", None);
+    v.ops.hold(&format!("stat {css}"));
+    let css_id = v.get("a.css", None);
+    v.ops.wait_for(&format!("stat {css}"));
+    v.body_at_least(id, MIB);
+    let before = v.ops.read_bytes(&big);
+    v.stop(id);
+    v.ops.release(&format!("stat {css}"));
+    assert!(v.answer(css_id).ok());
+    v.settle();
+    assert_eq!(v.ops.read_bytes(&big), before, "read after its stop");
+    let stopped = format!("page {} /big.bin stopped", id.get());
+    let lines = lines.lock().unwrap().clone();
+    assert_eq!(
+        lines.iter().filter(|l| **l == stopped).count(),
+        1,
+        "{lines:?}"
+    );
 }
 
 /// A stop after the last byte but before the end (Mac `<video>`): the end is never called, and
@@ -1539,9 +1799,13 @@ fn change5_pieces_shrink_to_link_time_while_another_request_waits() {
     assert_eq!(piece_for(Some(1e12), true), PIECE);
 }
 
-/// Change 5 on a simulated link (X-W1's: 50 ms, 2 MB/s): once the link's rate is measured, the
-/// piece of a long response planned while another request waits is what 100 ms carries (three
-/// reads), not the whole window — the request behind it waits that long, not 0.52 s.
+/// Change 5 on a simulated link (X-W1's: 50 ms, 2 MB/s), and what a turn's end does with what
+/// arrived during it. The worker is held on purpose at three places, so the order is the
+/// server's, not the threads': a long `bytes=0-` (big) is parked after its first piece, planned
+/// alone (the whole window); the worker is held in a small range's block read (s1) while big gets
+/// its room back and another small range (s2) is asked; then big's second turn, with s2 waiting,
+/// is what 100 ms carries — exactly three reads — and a third small range (s3) asked during that
+/// turn goes before big's next, as a turn's end takes what arrived before the request goes back.
 #[test]
 fn change5_on_a_simulated_link_a_waiting_request_holds_back_only_a_short_piece() {
     let size = 20 * MIB as u64;
@@ -1555,35 +1819,51 @@ fn change5_on_a_simulated_link_a_waiting_request_holds_back_only_a_short_piece()
     let ops = Ops::default();
     let conn = Spy::boxed(file.into_connection(), &ops);
     let mut v = view_on(conn, "/site", Options::viewer(), Mode::Push, ops);
+    let block = |k: u64| {
+        (
+            k * CACHE_BLOCK,
+            format!("bytes={}-{}", k * CACHE_BLOCK, k * CACHE_BLOCK + 10),
+        )
+    };
+    let (a1, r1) = block(38);
+    let (a2, r2) = block(50);
+    let (a3, r3) = block(60);
     let big = v.get("v.bin", Some("bytes=0-"));
     v.head(big);
-    let at = 38 * CACHE_BLOCK;
-    let small = v.get("v.bin", Some(&format!("bytes={at}-{}", at + 10)));
-    let got = v.answer(small);
-    assert!(got.ok(), "{:?}", got.end);
-    assert_eq!(got.body, crate::remote::pattern(at, 11));
-    let reads: Vec<(u64, u64)> = control
+    let held = format!("read /site/v.bin {a1} ");
+    v.ops.hold(&held);
+    let s1 = v.get("v.bin", Some(&r1));
+    v.ops.wait_for(&held);
+    v.body_at_least(big, MIB);
+    let second = format!("read /site/v.bin {} ", PIECE + READ);
+    v.ops.hold(&second);
+    let s2 = v.get("v.bin", Some(&r2));
+    v.ops.release(&held);
+    v.ops.wait_for(&second);
+    let s3 = v.get("v.bin", Some(&r3));
+    v.ops.release(&second);
+    for (id, at) in [(s1, a1), (s2, a2), (s3, a3)] {
+        let got = v.answer(id);
+        assert!(got.ok(), "{:?}", got.end);
+        assert_eq!(got.body, crate::remote::pattern(at, 11));
+    }
+    v.stop(big);
+    let reads: Vec<u64> = control
         .sent()
         .iter()
         .filter_map(|r| match r.asked {
-            Asked::Read { off, len } => Some((off, u64::from(len))),
+            Asked::Read { off, .. } => Some(off),
             _ => None,
         })
         .collect();
-    let block = reads
-        .iter()
-        .position(|(off, _)| (at..at + CACHE_BLOCK).contains(off))
-        .expect("the small request's block was read");
-    // The big one's first piece was planned alone (the whole window); what it read after that,
-    // before the small one's block, is at most one short piece.
-    let before: u64 = reads[..block].iter().map(|(_, len)| len).sum();
-    assert!(before >= PIECE, "{before}");
-    assert!(
-        before - PIECE <= 3 * READ,
-        "{} read in between",
-        before - PIECE
-    );
-    v.stop(big);
+    let first: Vec<u64> = (0..PIECE / READ).map(|i| i * READ).collect();
+    let blocks = |at: u64| (0..CACHE_BLOCK / READ).map(move |i| at + i * READ);
+    let mut want = first;
+    want.extend(blocks(a1));
+    want.extend([PIECE, PIECE + READ, PIECE + 2 * READ]);
+    want.extend(blocks(a2));
+    want.extend(blocks(a3));
+    assert_eq!(reads[..want.len()], want[..]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1676,4 +1956,20 @@ fn a_local_page_is_served_in_place() {
         &page[700_000..]
     );
     assert_eq!(fetch(&mut v, "out.txt", None).code(), 403);
+}
+
+/// A local page: a FIFO where a checked file was is opened without blocking, found not to be a
+/// regular file, and the steps run again (404) — the worker never waits on it.
+#[test]
+fn a_local_fifo_at_a_checked_path_is_404_not_a_hang() {
+    let s = site();
+    s.put("a.css", b"p{}");
+    let (page_server, control) = serve_local(&s.root, Options::viewer());
+    let mut v = table_view(Box::new(page_server), control, Mode::Push, Ops::default());
+    assert!(fetch(&mut v, "a.css", None).ok());
+    std::fs::remove_file(s.at("a.css")).unwrap();
+    let fifo = std::ffi::CString::new(s.at("a.css")).unwrap();
+    // SAFETY: a NUL-terminated path; mkfifo only makes the node.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    assert_eq!(fetch(&mut v, "a.css", None).code(), 404);
 }

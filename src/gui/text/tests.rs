@@ -4650,15 +4650,16 @@ fn a_long_title_is_cut_before_the_bar_s_stats() {
     assert!(drv.find_text("UTF-16LE (guessed)").is_some());
 }
 
-/// `SOPEN_STATE` `enc=NAME` (08 D34) names an encoding the text views decode, in any case;
-/// anything else — CP949 too, until VM-4 decodes it — is refused before a window opens.
+/// `SOPEN_STATE` `enc=NAME` (08 D34) names an encoding the text views decode, in any case
+/// (CP949 too since VM-4: `cp949::sopen_state_enc_names_cp949`); anything else is refused
+/// before a window opens.
 #[test]
 fn sopen_state_enc_names_an_encoding() {
     use crate::gui::State;
     assert_eq!(State::parse("enc=utf-16le").unwrap().enc, Some(Utf16Le));
     let s = State::parse("open=a.txt;enc=Latin-1").unwrap();
     assert_eq!((s.open.as_deref(), s.enc), (Some("a.txt"), Some(Latin1)));
-    for bad in ["enc=", "enc=EBCDIC", "enc=CP949"] {
+    for bad in ["enc=", "enc=EBCDIC", "enc=EUC-JP"] {
         assert!(State::parse(bad).is_err(), "{bad}");
     }
 }
@@ -4881,26 +4882,38 @@ fn rows_start_at_character_starts_of_the_whole_file_decode() {
     check(&win, "End");
 }
 
-/// D28 through CP949's slot (VM-4 fills it; today it proves no character start): a row that
-/// starts where nothing proves a character start shows placeholder marks, dim, never
-/// characters, and the status row says why. The line's own start is proven.
+/// D28 in CP949 (VM-4): a row that starts where nothing proves a character start — past REACH
+/// in a line with no sync byte, its checkpoint read not ended (held here) — shows placeholder
+/// marks, dim, never characters, and the status row says why. The line's own start is proven.
 #[test]
 fn where_no_character_start_is_proven_the_row_shows_marks() {
     let tmp = tempfile::tempdir().unwrap();
-    let path = write(tmp.path(), "k.txt", "가나 다라 ".repeat(4000).as_bytes());
+    let mut body = b"a ".to_vec();
+    body.extend(cp949::syllables(100 * 1024));
+    let path = write(tmp.path(), "k.txt", &body);
     let doc = TextDoc::open_encoded(&path, Cp949).unwrap();
     let mut win = TextWindow::new(doc, "box:k".into(), "k.txt", vec![]);
+    let (go, wait) = mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    win.phase_hook = Some(Arc::new(move || {
+        let _ = wait.lock().unwrap().recv();
+    }));
     let mut drv = Driver::new(700.0, 300.0);
     drv.until(&mut win, 10, |w| w.ready());
-    // (The status row is drawn before the page is read: the next pass says why.)
-    drv.idle(&mut win, 1);
-    let page = win.page.as_ref().unwrap();
-    let (first, rest) = page.rows.split_first().unwrap();
+    let first = win.page.as_ref().unwrap().rows[0].clone();
     assert_eq!(
         (first.start, first.cut.dim),
         (0, 0),
         "the line's start is proven"
     );
+    let plain = drv.colors_of(&first.cut.text()).unwrap();
+    win.jump_to(Jump::Byte(150 * 1024));
+    drv.idle(&mut win, 2);
+    // (The status row is drawn before the page is read: the next pass says why.)
+    drv.idle(&mut win, 1);
+    assert!(win.phase_read.is_some());
+    let page = win.page.as_ref().unwrap();
+    let rest = &page.rows[..];
     assert!(!rest.is_empty());
     for row in rest {
         assert!(
@@ -4911,10 +4924,7 @@ fn where_no_character_start_is_proven_the_row_shows_marks() {
         assert_eq!(row.cut.dim, row.cut.shown.len());
     }
     let marks = rest[0].cut.text();
-    let (dim, plain) = (
-        drv.colors_of(&marks).unwrap(),
-        drv.colors_of(&first.cut.text()).unwrap(),
-    );
+    let dim = drv.colors_of(&marks).unwrap();
     assert_ne!(dim[0], plain[0], "marks are dim");
     assert!(
         drv.texts()
@@ -4923,6 +4933,7 @@ fn where_no_character_start_is_proven_the_row_shows_marks() {
         "{:?}",
         drv.texts()
     );
+    let _ = go.send(());
 }
 
 /// D32: a C1 control (U+0080–U+009F, which Latin-1 makes of 0x80–0x9F) is drawn as a dim `·`,
@@ -5237,3 +5248,5 @@ fn a_rebuild_overtaken_by_a_change_comes_back_to_its_place_by_byte() {
     );
     assert!(from <= place && place < to, "{place} on top: {from}..{to}");
 }
+
+pub(super) mod cp949;

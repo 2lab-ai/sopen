@@ -7,9 +7,9 @@
 //! does: every start a rule gives is a character start of the whole-file decode, and decoding
 //! from it gives the whole-file decode's characters (`tests.rs` holds every encoding to that).
 //!
-//! CP949 / EUC-KR is listed but is VM-4's (§13): its decoder, its rules, its phase and the
-//! default's step 3 are the `cp949` slot at the end of this file, which decodes nothing yet
-//! ([`Encoding::supported`]).
+//! CP949 / EUC-KR is VM-4's (§13): its decoder (encoding_rs's `EUC_KR`), its rules, its phase
+//! and the default's step 3 are `cp949.rs`, held to the whole decode by `cp949_tests.rs`. Where
+//! nothing proves a character start, its rules give `None` (D28).
 
 use crate::gui::chrome;
 use crate::kind::SNIFF_BYTES;
@@ -148,7 +148,7 @@ impl Pick {
 /// 1. A BOM, the longest first, whatever the file's size (D37).
 /// 2. Else the NUL pattern: in the order UTF-32LE, UTF-32BE, UTF-16LE, UTF-16BE, the first whose
 ///    sample holds at least 4 whole units, at least 3/4 of them ASCII units (D17).
-/// 3. Else CP949 by D39's (a)–(e) — the `cp949` slot, VM-4's; never today.
+/// 3. Else CP949 by D39's (a)–(e) ([`cp949::guess`]), shown `(guessed)`.
 /// 4. Else UTF-8, valid or not. ASCII, UCS-2, Latin-1 and CP437 are never defaults.
 pub fn pick(head: &[u8], truncated: bool) -> Pick {
     use Encoding::*;
@@ -234,7 +234,7 @@ impl Encoding {
             .find(|e| e.supported() && e.label().eq_ignore_ascii_case(name))
     }
 
-    /// Whether it is decoded today: every entry but CP949, until VM-4 fills its slot.
+    /// Whether it is decoded: every entry (CP949 since VM-4 filled its slot).
     pub fn supported(self) -> bool {
         self != Encoding::Cp949 || cp949::SUPPORTED
     }
@@ -536,8 +536,7 @@ impl Encoding {
     /// GRID point of a line longer than REACH (§7.4). A checkpoint at G that says `true` proves a
     /// character start at G − 1, `false` one at G: pass it to the rules as [`Around::anchored`],
     /// and the next checkpoint is the phase of the bytes from there. `None` for every encoding
-    /// but CP949 — a no-op, their starts are found from [`Self::look_back`] bytes — and for CP949
-    /// until VM-4.
+    /// but CP949 — a no-op, their starts are found from [`Self::look_back`] bytes.
     pub fn phase(self, bytes: &[u8]) -> Option<bool> {
         match self {
             Encoding::Cp949 => cp949::phase(bytes),
@@ -704,87 +703,12 @@ fn is_low(u: u16) -> bool {
     (0xDC00..=0xDFFF).contains(&u)
 }
 
-/// CP949's slot (§7.4, VM-4). VM-4 replaces this module with `mod cp949;` — its
-/// `src/encoding/cp949.rs`, giving these same items — and nothing else in this file changes: the
-/// entry dispatches here already, and step 3 of [`pick`] is [`cp949::guess`]. Until then CP949
-/// is listed but not [`Encoding::supported`]: it decodes every byte as one U+FFFD (never text,
-/// always progress), proves no character start (each rule gives `None`), keeps no phase and is
-/// never the default. Its tests go with it.
-mod cp949 {
-    use super::{Around, Cell};
-
-    /// Whether CP949 is decoded.
-    pub const SUPPORTED: bool = false;
-
-    /// The decoder: encoding_rs's `EUC_KR` (= windows-949) from a character start.
-    pub fn decode(bytes: &[u8], _whole: bool) -> (Vec<Cell>, usize) {
-        let cells = bytes.iter().map(|_| Cell {
-            ch: char::REPLACEMENT_CHARACTER,
-            len: 1,
-        });
-        (cells.collect(), bytes.len())
-    }
-
-    /// Rule 1: decode forward from the line start within REACH, else the checkpoint at `g`,
-    /// else the last sync byte in [g − W, g); g − 1 when a lead is pending there, else `g`.
-    pub fn grid_cut(_near: Around, _g: u64) -> Option<u64> {
-        None
-    }
-
-    /// Rule 2: the window's first sync byte, or the exact start a known phase gives.
-    pub fn restart_start(_near: Around, _x: u64) -> Option<u64> {
-        None
-    }
-
-    /// Rule 4: decode forward from the proof before `left` to the first start at or after it.
-    pub fn left_start(_near: Around, _left: u64) -> Option<u64> {
-        None
-    }
-
-    /// The phase checkpoint's bit: a lead pending at the end of `bytes`.
-    pub fn phase(_bytes: &[u8]) -> Option<bool> {
-        None
-    }
-
-    /// §7.2 step 3, D39's (a)–(e).
-    pub fn guess(_sample: &[u8], _truncated: bool) -> bool {
-        false
-    }
-
-    /// The empty slot: listed, never offered, never picked, decoding nothing as text, proving no
-    /// character start.
-    #[cfg(test)]
-    mod tests {
-        use crate::encoding::{pick, Around, Cell, Encoding, Pick};
-
-        #[test]
-        fn the_cp949_slot_is_empty() {
-            let e = Encoding::Cp949;
-            assert!(!e.supported());
-            assert_eq!(Encoding::from_label("CP949"), None);
-            let bytes = [0xB0, 0xA1, b'A', 0x0A];
-            let (got, used) = e.decode(&bytes, true);
-            assert_eq!(used, 4);
-            let fffd = Cell {
-                ch: char::REPLACEMENT_CHARACTER,
-                len: 1,
-            };
-            assert!(got.iter().all(|c| c == &fffd));
-            let near = Around::anchored(0, &bytes);
-            assert_eq!(e.grid_cut(near, 2), None);
-            assert_eq!(e.restart_start(near, 1), None);
-            assert_eq!(e.left_start(near, 1), None);
-            assert_eq!(e.phase(&bytes), None);
-            // Korean in CP949 by its bytes (한글) is UTF-8 by step 4 until step 3 is filled.
-            let korean = [0xC7, 0xD1, 0xB1, 0xDB, b' '].repeat(400);
-            let utf8 = Pick {
-                encoding: Encoding::Utf8,
-                guessed: false,
-            };
-            assert_eq!(pick(&korean, false), utf8);
-        }
-    }
-}
+/// CP949 / EUC-KR (§7.4, VM-4): its decoder, sync bytes, rules and phase, and step 3 of [`pick`]
+/// ([`cp949::guess`]), on encoding_rs's `EUC_KR`.
+mod cp949;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cp949_tests;
