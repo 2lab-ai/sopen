@@ -1026,7 +1026,7 @@ fn ea5_the_nul_pattern_over_the_corpus() {
         ("Korean UTF-32LE", encode(Utf32Le, &korean), none),
         ("English UTF-8", english.clone().into_bytes(), none),
         ("Korean UTF-8", korean.clone().into_bytes(), none),
-        // No pattern; step 3's, CP949 once VM-4 fills it.
+        // No pattern; step 3's (VM-4's corpus is `cp949_tests.rs`).
         ("CP949 (KS X 1001 pairs)", cp949, found(Cp949)),
         ("Latin-1", latin1, none),
         ("random bytes", random, none),
@@ -1048,13 +1048,7 @@ fn ea5_the_nul_pattern_over_the_corpus() {
         // The answer is the first 8 KiB's (D27).
         let head = &bytes[..bytes.len().min(SNIFF_BYTES)];
         for got in [pick(&bytes, false), pick(head, bytes.len() > SNIFF_BYTES)] {
-            if want == found(Cp949) {
-                // Steps 1–2 find nothing; step 4 answers until step 3 is filled. Every other
-                // sample without a pattern stays UTF-8 then too, so a wrong CP949 pick shows.
-                assert!([none, want].contains(&got), "{name}: {got:?}");
-            } else {
-                assert_eq!(got, want, "{name}");
-            }
+            assert_eq!(got, want, "{name}");
         }
     }
     // The log is the corpus's 79 %: ASCII units are ≥ 3/4 of it, not much more.
@@ -1251,7 +1245,7 @@ fn a_place_past_the_bytes_read_has_nothing_before_it() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The list, the look-back, the CP949 slot.
+// The list, the look-back, CP949's entry.
 
 #[test]
 fn the_list_and_its_labels() {
@@ -1311,8 +1305,8 @@ fn the_phase_is_a_no_op_but_for_cp949() {
     assert!(Cp949.needs_phase());
 }
 
-/// CP949's entry, whatever its slot holds (the empty slot's own test is in the slot): one-byte
-/// units, the byte 0x0A, no BOM, a jump's place kept as it is.
+/// CP949's entry (its decoder and rules are `cp949_tests.rs`'s): one-byte units, the byte 0x0A,
+/// no BOM, a jump's place kept as it is.
 #[test]
 fn cp949s_entry() {
     assert_eq!(
