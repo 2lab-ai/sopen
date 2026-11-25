@@ -562,10 +562,20 @@ too, where F3 closes it as ⌘W does.
 ## 4a. Where it opens
 
 `sopen SOURCE` opens SOURCE on the machine it was typed on. `sopen --target HOST SOURCE` opens it on HOST's screen
-instead: sopen starts HOST's own sopen as `sopen --here [--app APP] [--hex] -- SOURCE` over the system `ssh`, with the same
+instead: sopen starts HOST's own sopen as `sopen --here [--app APP] [--gui] [--hex] -- SOURCE` over the system `ssh`, with the same
 multiplexed master and connection options as §4, waits for it, and exits with its exit code (0, 1 and 3 mean what
 they mean here; 127 is no sopen on HOST; 2 is a usage error from a sopen on HOST too old to know `--here`, passed on
-as it is). When ssh itself fails (its exit code 255) sopen exits 1 with `could not
+as it is). `--gui` (the window on HOST, [10](10-tui.md) §11 row 2, T35) goes when the owner gave it or, for a window
+run, with `--hex` or when the kind this machine sees opens in a window — a folder, an image, video or audio, a binary;
+a local SOURCE is seen by its stat and first bytes, a remote one by its name alone. Text, a name that does not decide
+the kind (HOST then picks by kind), `--app` and an address go without it, and so does a run the hooks keep without a
+window (`SOPEN_LIST`, `SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`, a binary's `SOPEN_CHOICE=save` or `cancel`) unless the
+owner gave it. HOST's exit 2 with clap's line for an unknown `--gui` (`error: unexpected argument '--gui' found`, a
+sopen older than it; clap refuses before anything runs) makes sopen run the same forward once more without it, after
+`sopen on HOST is older and does not know --gui; running it there again without it` on stderr; any other exit 2 is
+passed on as it is. `--gui` without a HOST opens here as before, and with no display here (Linux without `DISPLAY` /
+`WAYLAND_DISPLAY`) exits 1 with `no display here — sopen config target <host>, or --target, opens the window on
+another machine`. When ssh itself fails (its exit code 255) sopen exits 1 with `could not
 reach HOST`; any other status above 128 (sopen itself exits only 0, 1 or 3 — 2 for a usage error — so most likely a
 signal, 128 + n)
 exits 1 with `sopen on HOST ended with status N (signal n?)`. HOST needs sopen installed; the machine holding the file still needs only sshd. Because HOST is always

@@ -282,8 +282,8 @@ pub fn quote(word: &str) -> String {
 }
 
 /// The `sh` script HOST runs, on one line (no shell reads it differently for a newline). Its
-/// arguments are `[--app APP] [--hex] [--hold-until-eof] [--browser] -- SOURCE`; it always adds
-/// `--here`.
+/// arguments are `[--app APP] [--gui] [--hex] [--hold-until-eof] [--browser] -- SOURCE`; it
+/// always adds `--here`.
 fn script(host: &str, install_paths: &str) -> String {
     let missing = quote(&format!(
         "sopen is not installed on {host} (brew install 2lab-ai/tap/sopen-preview)"
@@ -335,8 +335,23 @@ fn script(host: &str, install_paths: &str) -> String {
     .join(" ")
 }
 
-/// The command for HOST's sshd: `exec [env K=V…] sh -c <script> sopen [--app APP] [--hex]
-/// [--browser] -- SOURCE`,
+/// What a forward passes on to HOST's sopen besides `--here`, in this order before `--`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Flags<'a> {
+    /// `--app APP` (10 §11 row 1).
+    pub app: Option<&'a str>,
+    /// `--gui` (10 §11 row 2, T35): the owner gave it, or the kind this side sees needs a
+    /// window; never with `app` nor for an address. An older sopen on HOST that does not know it
+    /// gets the run again without it ([`run`]).
+    pub gui: bool,
+    /// `--hex`.
+    pub hex: bool,
+    /// An address's `--browser` (09 §7).
+    pub browser: bool,
+}
+
+/// The command for HOST's sshd: `exec [env K=V…] sh -c <script> sopen [--app APP] [--gui]
+/// [--hex] [--browser] -- SOURCE`,
 /// every word but `exec` quoted. The hooks go in front of `sh`, so the script sees
 /// `SOPEN_TARGET_BIN` and the sopen it starts sees them all. The bare `exec` (a constant, never
 /// data) replaces the login shell that parses the line — dash and fish would otherwise stay as
@@ -345,23 +360,24 @@ fn script(host: &str, install_paths: &str) -> String {
 pub fn remote_words(
     host: &str,
     source: &str,
-    app: Option<&str>,
-    hex: bool,
-    browser: bool,
+    flags: Flags,
     env: &[String],
     install_paths: &str,
 ) -> Vec<String> {
-    let mut flags: Vec<String> = Vec::new();
-    if let Some(app) = app {
-        flags.extend(["--app".to_string(), app.to_string()]);
+    let mut args: Vec<String> = Vec::new();
+    if let Some(app) = flags.app {
+        args.extend(["--app".to_string(), app.to_string()]);
     }
-    if hex {
-        flags.push("--hex".to_string());
+    if flags.gui {
+        args.push(GUI_FLAG.to_string());
     }
-    if browser {
-        flags.push(BROWSER_FLAG.to_string());
+    if flags.hex {
+        args.push("--hex".to_string());
     }
-    words(host, &flags, source, env, install_paths)
+    if flags.browser {
+        args.push(BROWSER_FLAG.to_string());
+    }
+    words(host, &args, source, env, install_paths)
 }
 
 /// [`remote_words`] for an address held open through a tunnel ([`tunnel`]): HOST's sopen gets
@@ -387,6 +403,9 @@ pub const HOLD_FLAG: &str = "--hold-until-eof";
 /// `sopen URL`'s flag for the system browser (09 §7), passed on to HOST's sopen as given: an
 /// older one does not know it and exits 2 with its own line.
 pub const BROWSER_FLAG: &str = "--browser";
+
+/// The window on the machine SOURCE opens on (10 §11 row 2).
+pub const GUI_FLAG: &str = "--gui";
 
 /// `exec [env K=V…] sh -c <script> sopen <flags…> -- SOURCE`, every word but `exec` quoted.
 fn words(
@@ -447,41 +466,178 @@ pub fn ssh_args(
     args
 }
 
-/// Runs sopen on HOST for `source` (already as HOST sees it) and waits; returns the exit code to
-/// leave with. `browser`: an address's `--browser`, passed on.
-pub fn run(
-    host: &str,
-    source: &str,
-    app: Option<&str>,
-    hex: bool,
-    browser: bool,
-    state_dir: &Path,
-) -> Result<u8> {
+/// Runs sopen on HOST for `source` (already as HOST sees it) with `flags` and waits; returns the
+/// exit code to leave with. A run with `--gui` that HOST's sopen refuses as an argument it does
+/// not know (exit 2 and clap's line, [`older`]) is run once more without it, after one line
+/// saying so: clap refuses before anything runs there, so nothing is done twice.
+pub fn run(host: &str, source: &str, flags: Flags, state_dir: &Path) -> Result<u8> {
     let env = forwarded_env(|key| std::env::var_os(key))?;
-    let words = remote_words(host, source, app, hex, browser, &env, INSTALL_PATHS);
     let connection = crate::remote::connection_args(host, state_dir)?;
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    // An address is logged as sopen prints it, never whole (`url::redacted`).
-    let logged = match crate::url::parse(source) {
-        Some(_) => {
-            let shown = crate::url::redacted(source);
-            remote_words(host, &shown, app, hex, browser, &env, "")
-        }
-        None => words.clone(),
+    let ssh = |flags: Flags| -> Command {
+        let words = remote_words(host, source, flags, &env, INSTALL_PATHS);
+        // An address is logged as sopen prints it, never whole (`url::redacted`).
+        let logged = match crate::url::parse(source) {
+            Some(_) => remote_words(host, &crate::url::redacted(source), flags, &env, ""),
+            None => words.clone(),
+        };
+        let app = flags.app.is_some();
+        crate::debug!(
+            "{}",
+            crate::render_command(
+                std::ffi::OsStr::new("ssh"),
+                &ssh_args(connection.clone(), tty, app, host, logged)
+            )
+        );
+        let mut ssh = Command::new("ssh");
+        ssh.args(ssh_args(connection.clone(), tty, app, host, words));
+        ssh
     };
-    crate::debug!(
-        "{}",
-        crate::render_command(
-            std::ffi::OsStr::new("ssh"),
-            &ssh_args(connection.clone(), tty, app.is_some(), host, logged)
-        )
-    );
-    let args = ssh_args(connection, tty, app.is_some(), host, words);
-    let status = Command::new("ssh")
-        .args(&args)
+    if flags.gui {
+        let (status, said) = watched(ssh(flags), tty)?;
+        if !older(status.code(), said) {
+            return exit_code(host, status);
+        }
+        eprintln!(
+            "sopen: sopen on {host} is older and does not know {GUI_FLAG}; running it there \
+             again without it"
+        );
+    }
+    let without = Flags {
+        gui: false,
+        ..flags
+    };
+    let status = ssh(without)
         .status()
         .context("cannot run ssh (is OpenSSH installed?)")?;
     exit_code(host, status)
+}
+
+/// clap's first line for an argument it does not know, as a sopen on HOST older than `--gui`
+/// says it (clap 4; coloured when its stderr is a terminal, as under `ssh -t`).
+const UNKNOWN_GUI: &str = "error: unexpected argument '--gui' found";
+
+/// HOST's answer to a run with `--gui` says its sopen is older: exit 2 *and* clap's line for an
+/// unknown `--gui` ([`UNKNOWN_GUI`]). Any other exit 2 — a usage error of its own, a sopen older
+/// still that does not know `--here` — is HOST's answer as it is.
+fn older(code: Option<i32>, said: bool) -> bool {
+    code == Some(2) && said
+}
+
+/// Runs `ssh` with the stream that carries HOST's stderr — ssh's stdout under `-t` (`tty`: the
+/// terminal there takes both), else its stderr — piped through this side and passed on as it
+/// comes, watched for [`UNKNOWN_GUI`]; the other stream is this side's as it is. Returns ssh's
+/// status and whether that line came.
+fn watched(mut ssh: Command, tty: bool) -> Result<(ExitStatus, bool)> {
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    match tty {
+        true => ssh.stdout(Stdio::piped()),
+        false => ssh.stderr(Stdio::piped()),
+    };
+    let mut child = ssh
+        .spawn()
+        .context("cannot run ssh (is OpenSSH installed?)")?;
+    let said = std::sync::Arc::new(AtomicBool::new(false));
+    let done = match tty {
+        true => watch(child.stdout.take(), std::io::stdout, said.clone()),
+        false => watch(child.stderr.take(), std::io::stderr, said.clone()),
+    };
+    let status = child.wait().context("ssh did not run to its end")?;
+    // Its end, unless a descendant of ssh still holds it (a ProxyCommand keeps ssh's stderr).
+    ended(None, done);
+    Ok((status, said.load(Ordering::SeqCst)))
+}
+
+/// Copies `pipe` to `sink()` as it comes and sets `said` once a line of it is [`UNKNOWN_GUI`]
+/// ([`Scan`]); the receiver gets `()` at the pipe's end.
+fn watch<W: std::io::Write + 'static>(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+    sink: fn() -> W,
+    said: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Some(mut pipe) = pipe {
+            let mut scan = Scan::default();
+            let mut bytes = [0u8; 8192];
+            loop {
+                let n = match pipe.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                let mut sink = sink();
+                let _ = sink.write_all(&bytes[..n]);
+                let _ = sink.flush();
+                scan.take(&bytes[..n]);
+                if scan.seen {
+                    said.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            scan.end();
+            if scan.seen {
+                said.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _ = tx.send(());
+    });
+    rx
+}
+
+/// Looks for [`UNKNOWN_GUI`] at the start of a line of one stream — a line ending at `\n` or
+/// `\r` (a terminal's `\r\n`), its ANSI escape sequences (clap's colours) taken off.
+#[derive(Default)]
+struct Scan {
+    /// The current line so far, kept up to [`Scan::KEPT`] bytes: past that, and coloured, it is
+    /// still longer than clap's line.
+    line: Vec<u8>,
+    seen: bool,
+}
+
+impl Scan {
+    const KEPT: usize = 512;
+
+    fn take(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if b == b'\n' || b == b'\r' {
+                self.end();
+            } else if self.line.len() < Self::KEPT {
+                self.line.push(b);
+            }
+        }
+    }
+
+    /// The current line has ended (or the stream has).
+    fn end(&mut self) {
+        self.seen |= without_escapes(&self.line).starts_with(UNKNOWN_GUI);
+        self.line.clear();
+    }
+}
+
+/// `bytes` as text without its ANSI escape sequences: a CSI (`ESC [`, parameters, one final
+/// byte in `@`–`~`) whole, any other `ESC` with the byte after it.
+fn without_escapes(bytes: &[u8]) -> String {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if bytes.get(i) == Some(&b'[') {
+            i += 1;
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+        }
+        // The final byte, or the one after a lone ESC.
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1127,7 +1283,8 @@ mod signals {
 }
 
 /// HOST's exit code is ours: 0, 1 and 3 from sopen, 2 from an older sopen that does not know
-/// `--here` (a usage error), 127 for no sopen there. ssh's own failure (255) is "could not
+/// `--here` (a usage error; one that does not know `--gui` gets the run again without it first,
+/// [`run`]), 127 for no sopen there. ssh's own failure (255) is "could not
 /// reach". sopen itself exits with nothing above 3, so a status above 128 is most likely a
 /// signal (128 + n) — said as a guess, with the status as it came.
 fn exit_code(host: &str, status: ExitStatus) -> Result<u8> {
@@ -1421,15 +1578,11 @@ mod tests {
         let connection = ["-S", "/s/cm-x", "-o", "ControlMaster=auto"]
             .map(OsString::from)
             .to_vec();
-        let words = remote_words(
-            "box",
-            "/tmp/a b.png",
-            Some("ImHex"),
-            false,
-            false,
-            &[],
-            INSTALL_PATHS,
-        );
+        let app = |name| Flags {
+            app: Some(name),
+            ..Flags::default()
+        };
+        let words = remote_words("box", "/tmp/a b.png", app("ImHex"), &[], INSTALL_PATHS);
         // No terminal here, `--app` waiting for Enter: no terminal there, but this side's input.
         let args = ssh_args(connection.clone(), false, true, "box", words.clone());
         let mut want = connection.clone();
@@ -1465,22 +1618,49 @@ mod tests {
         assert_eq!(flags(false, false), ["-T", "-n"]);
 
         let env = ["SOPEN_LOG=debug".to_string()];
-        let words = remote_words("box", "/x", None, false, false, &env, INSTALL_PATHS);
+        let words = remote_words("box", "/x", Flags::default(), &env, INSTALL_PATHS);
         assert_eq!(words[..4], ["exec", "'env'", "'SOPEN_LOG=debug'", "'sh'"]);
         assert_eq!(words[words.len() - 3..], ["'sopen'", "'--'", "'/x'"]);
         // `--hex` travels after `--app`, before `--`.
-        let words = remote_words("box", "/x", None, true, false, &[], INSTALL_PATHS);
+        let hex = Flags {
+            hex: true,
+            ..Flags::default()
+        };
+        let words = remote_words("box", "/x", hex, &[], INSTALL_PATHS);
         assert_eq!(
             words[words.len() - 4..],
             ["'sopen'", "'--hex'", "'--'", "'/x'"]
         );
-        let words = remote_words("box", "/x", Some("ImHex"), true, false, &[], INSTALL_PATHS);
+        let app_hex = Flags {
+            hex: true,
+            ..app("ImHex")
+        };
+        let words = remote_words("box", "/x", app_hex, &[], "");
         assert_eq!(
             words[words.len() - 6..],
             ["'sopen'", "'--app'", "'ImHex'", "'--hex'", "'--'", "'/x'"]
         );
+        // `--gui` (10 §11 row 2) right after `--here`, before `--hex`: `--here --gui -- DIR`.
+        let gui = Flags {
+            gui: true,
+            ..Flags::default()
+        };
+        let words = remote_words("box", "/srv/dir", gui, &[], INSTALL_PATHS);
+        assert_eq!(
+            words[words.len() - 4..],
+            ["'sopen'", "'--gui'", "'--'", "'/srv/dir'"]
+        );
+        let words = remote_words("box", "/x", Flags { hex: true, ..gui }, &[], "");
+        assert_eq!(
+            words[words.len() - 5..],
+            ["'sopen'", "'--gui'", "'--hex'", "'--'", "'/x'"]
+        );
         // An address's `--browser` (09 §7) travels as given, before `--`.
-        let words = remote_words("box", "https://x/", None, false, true, &[], INSTALL_PATHS);
+        let browser = Flags {
+            browser: true,
+            ..Flags::default()
+        };
+        let words = remote_words("box", "https://x/", browser, &[], INSTALL_PATHS);
         assert_eq!(
             words[words.len() - 4..],
             ["'sopen'", "'--browser'", "'--'", "'https://x/'"]
@@ -1523,6 +1703,87 @@ mod tests {
             "sopen on box ended with status 143 (signal 15?)"
         );
         assert!(exit_code("box", ExitStatus::from_raw(9)).is_err());
+    }
+
+    /// X2-gui: a sopen on HOST older than `--gui` refuses it as clap refuses any argument it does
+    /// not know. The line is the locked clap's own, rendered from a command without `--gui` —
+    /// plain, as `ssh -T` passes HOST's stderr, and coloured with `\r\n`, as a terminal there
+    /// (`ssh -t`) gets it — and is found at a line's start, in chunks of any size, after other
+    /// lines. The same line for another flag, or not at a line's start, is not it; and the
+    /// answer is an older sopen only with exit 2 as well.
+    #[test]
+    fn hosts_unknown_gui_line_is_found_plain_or_coloured() {
+        let before = clap::Command::new("sopen")
+            .arg(
+                clap::Arg::new("here")
+                    .long("here")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(clap::Arg::new("source"));
+        let refused = |args: &[&str]| before.clone().try_get_matches_from(args).unwrap_err();
+        let e = refused(&["sopen", "--here", "--gui", "--", "/srv/dir"]);
+        assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert_eq!(e.exit_code(), 2);
+        let plain = e.render().to_string();
+        let coloured = e.render().ansi().to_string().replace('\n', "\r\n");
+        assert!(coloured.contains('\x1b'), "{coloured:?}");
+        let seen = |bytes: &[u8], chunk: usize| {
+            let mut scan = Scan::default();
+            for part in bytes.chunks(chunk) {
+                scan.take(part);
+            }
+            scan.end();
+            scan.seen
+        };
+        for text in [&plain, &coloured] {
+            for chunk in [1, 7, 4096] {
+                assert!(
+                    seen(text.as_bytes(), chunk),
+                    "{text:?} in chunks of {chunk}"
+                );
+                let after = format!("a line\nprogress 10%\r{text}");
+                assert!(
+                    seen(after.as_bytes(), chunk),
+                    "{after:?} in chunks of {chunk}"
+                );
+            }
+        }
+        let other = refused(&["sopen", "--here", "--state-stdin", "--", "/x"]);
+        let other = other.render().to_string();
+        assert!(!seen(other.as_bytes(), 4096), "{other}");
+        assert!(!seen(
+            b"note: error: unexpected argument '--gui' found\n",
+            4096
+        ));
+        assert!(!seen(b"error: unexpected argument '--guide' found\n", 4096));
+        assert!(!seen(b"", 1));
+        assert!(older(Some(2), true));
+        for (code, said) in [
+            (Some(2), false),
+            (Some(1), true),
+            (Some(0), true),
+            (None, true),
+        ] {
+            assert!(!older(code, said), "{code:?} {said}");
+        }
+    }
+
+    /// The watch on HOST's stream sets its flag once the line has come, and only then.
+    #[test]
+    fn the_watch_says_whether_hosts_line_came() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let watched = |bytes: &[u8]| {
+            let said = std::sync::Arc::new(AtomicBool::new(false));
+            let pipe = std::io::Cursor::new(bytes.to_vec());
+            let done = watch(Some(pipe), std::io::sink, said.clone());
+            done.recv_timeout(Duration::from_secs(10)).unwrap();
+            said.load(Ordering::SeqCst)
+        };
+        assert!(watched(
+            b"x\nerror: unexpected argument '--gui' found\n\nUsage: sopen\n"
+        ));
+        assert!(!watched(b"error: unexpected argument '--here' found\n"));
+        assert!(!watched(b"opened\n"));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2526,15 +2787,11 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
         for sh in login_shells() {
             let h = host("Darwin", "");
             executable(&h.bin.join("sopen"), &fake_sopen());
-            let words = remote_words(
-                "box",
-                source,
-                Some("Hex Fiend"),
-                false,
-                false,
-                &env,
-                INSTALL_PATHS,
-            );
+            let app = Flags {
+                app: Some("Hex Fiend"),
+                ..Flags::default()
+            };
+            let words = remote_words("box", source, app, &env, INSTALL_PATHS);
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert_eq!(err, "", "{sh:?}");
@@ -2560,14 +2817,26 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
                 "{sh:?}"
             );
             assert_eq!(value(&out, "SOPEN_LOG"), "debug", "{sh:?}");
-            // `--hex` reaches HOST's sopen after `--here`, before `--`.
-            let words = remote_words("box", source, None, true, false, &env, INSTALL_PATHS);
+            // `--gui` and `--hex` (as a forward with `--hex` passes them, X2-gui) reach HOST's
+            // sopen after `--here`, before `--`.
+            let hex = Flags {
+                gui: true,
+                hex: true,
+                ..Flags::default()
+            };
+            let words = remote_words("box", source, hex, &env, INSTALL_PATHS);
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             let args: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("arg ")).collect();
             assert_eq!(
                 args,
-                ["[--here]", "[--hex]", "[--]", &format!("[{source}]")],
+                [
+                    "[--here]",
+                    "[--gui]",
+                    "[--hex]",
+                    "[--]",
+                    &format!("[{source}]")
+                ],
                 "{sh:?}"
             );
             // Not Linux: no display variables are made up, and systemd is not asked.
@@ -2585,7 +2854,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
             let elsewhere = h.root.join("build/sopen-dev");
             executable(&elsewhere, &fake_sopen());
             let env = [format!("SOPEN_TARGET_BIN={}", elsewhere.display())];
-            let words = remote_words("box", "/x", None, false, false, &env, &h.not_installed());
+            let words = remote_words("box", "/x", Flags::default(), &env, &h.not_installed());
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert!(has_line(&out, "arg [--here]"), "{sh:?}: {out}");
@@ -2599,7 +2868,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
             // production list: a sopen installed on the test machine would be found first.)
             executable(&h.home.join(".cargo/bin/sopen"), &fake_sopen());
             let paths = format!(r#"{} "$HOME/.cargo/bin/sopen""#, h.not_installed());
-            let words = remote_words("box", "/x", None, false, false, &[], &paths);
+            let words = remote_words("box", "/x", Flags::default(), &[], &paths);
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert!(has_line(&out, "arg [/x]"), "{sh:?}: {out}");
@@ -2689,7 +2958,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
         executable(&brew.join("sopen"), &fake_sopen());
         executable(&brew.join("ffmpeg"), "#!/bin/sh\n");
         let paths = quote(brew.join("sopen").to_str().unwrap());
-        let words = remote_words("box", "/x", None, false, false, &[], &paths);
+        let words = remote_words("box", "/x", Flags::default(), &[], &paths);
         let (code, out, err) = h.run(sh, &words, &base);
         assert_eq!(code, 0, "{sh:?}: {err}");
         let path = value(&out, "PATH");
@@ -2711,7 +2980,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
         let elsewhere = h.root.join("build/sopen-dev");
         executable(&elsewhere, &fake_sopen());
         let env = [format!("SOPEN_TARGET_BIN={}", elsewhere.display())];
-        let words = remote_words("box", "/x", None, false, false, &env, &h.not_installed());
+        let words = remote_words("box", "/x", Flags::default(), &env, &h.not_installed());
         let (code, out, err) = h.run(sh, &words, &base);
         assert_eq!(code, 0, "{sh:?}: {err}");
         let path = value(&out, "PATH");
@@ -2749,7 +3018,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
     fn the_script_says_when_sopen_is_missing() {
         for sh in login_shells() {
             let h = host("Darwin", "");
-            let words = remote_words("me@box", "/x", None, false, false, &[], &h.not_installed());
+            let words = remote_words("me@box", "/x", Flags::default(), &[], &h.not_installed());
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 127, "{sh:?}: {out} {err}");
             assert_eq!(
@@ -2770,7 +3039,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
         // show here as no exit code (-1) — and to ssh as a lost connection (255).
         for sh in login_shells() {
             let h = host("Darwin", "");
-            let words = remote_words("box", "/x", None, false, false, &[], INSTALL_PATHS);
+            let words = remote_words("box", "/x", Flags::default(), &[], INSTALL_PATHS);
             for (signal, code) in [("INT", 130), ("TERM", 143), ("HUP", 129)] {
                 executable(
                     &h.bin.join("sopen"),
@@ -2825,7 +3094,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
             }
             std::fs::write(h.root.join("session-env"), session).unwrap();
             executable(&h.bin.join("sopen"), &fake_sopen());
-            let words = remote_words("box", "/x", None, false, false, &[], INSTALL_PATHS);
+            let words = remote_words("box", "/x", Flags::default(), &[], INSTALL_PATHS);
             let (code, out, err) = h.run(&sh, &words, &[]);
             assert_eq!(code, 0, "{sh:?}: {err}");
             assert!(!pwned.exists(), "{sh:?}: a session value was evaluated");
@@ -2855,7 +3124,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
             std::fs::create_dir_all(&run).unwrap();
             std::fs::write(run.join("wayland-0.lock"), "").unwrap();
             let _socket = std::os::unix::net::UnixListener::bind(run.join("wayland-3")).unwrap();
-            let words = remote_words("box", "/x", None, false, false, &[], INSTALL_PATHS);
+            let words = remote_words("box", "/x", Flags::default(), &[], INSTALL_PATHS);
             let runtime = [("XDG_RUNTIME_DIR", run.to_str().unwrap())];
             let (code, out, err) = h.run(&sh, &words, &runtime);
             assert_eq!(code, 0, "{sh:?}: {err}");

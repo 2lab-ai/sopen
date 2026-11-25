@@ -52,7 +52,7 @@ brew install 2lab-ai/tap/sopen-preview    # macOS (arm64, x86_64), Linux (x86_64
   remote. The file browser, the image and media windows, the binary-file dialog and the hex window
   need a desktop session (X11 or Wayland); without one a folder opens in the editor and a binary,
   image or media file is fetched and its path printed — or, with `--tui`, the file browser runs in
-  the terminal.
+  the terminal; with `--gui`, which asks for the window, sopen says so and exits 1.
 
 ## What the remote needs
 
@@ -73,6 +73,7 @@ sopen --target <host> <host>:/tmp/a.html      # a file on <host> itself opens th
 sopen --target <host> ./notes.txt             # a local file: <host> fetches it from this machine
 sopen config target <host>                    # from now on `sopen SOURCE` opens on <host>
 sopen --here myserver:/tmp/a.html             # …but this one here
+sopen --gui --target <host> <host>:/srv/app   # in a window on <host>, whatever sopen sees of it from here
 sopen config                                  # where the config file is, the target (and fkeys, if set)
 sopen config target --unset                   # back to this machine
 sopen config fkeys system                     # macOS: sopen never touches what the top row sends
@@ -104,6 +105,19 @@ alias. It needs sopen installed; sopen there gets `--here`, so it never sends th
 A local file (or a `localhost:` one) is fetched by `<host>` from this machine by its short host
 name, so that name must work for `ssh` on `<host>`.
 
+For what opens in a window, sopen there also gets `--gui`: a folder, an image, video or audio, a
+binary (a local file as sopen finds it here, a remote one by its name alone), and anything with
+`--hex` or your own `--gui`. A text file goes without it and keeps the editor;
+so does a remote one whose name does not say what it is (`<host>:/srv/app`, `<host>:/srv/data`):
+`<host>` then picks by what it finds. `--app` and addresses never get it, and a scripted run that
+opens no window (`SOPEN_LIST`, `SOPEN_AUTOSAVE`, …) gets it only from you. A `<host>` whose sopen
+is older than `--gui` refuses it (its own usage error); sopen then runs the same thing there once
+more without it, and says `sopen on <host> is older and does not know --gui; running it there
+again without it`. `--gui` without a target opens here as before, and on a machine without a
+display (Linux without `DISPLAY` or `WAYLAND_DISPLAY`) it exits 1 with `no display here — sopen
+config target <host>, or --target, opens the window on another machine` — as does `<host>`'s
+sopen, given `--gui`, when it finds no desktop session there.
+
 The window opens on `<host>`'s desktop session (on Linux sopen finds it through
 `systemctl --user`). On macOS an app started over ssh cannot take focus: the xtools window
 floats above the other windows until you click, type or scroll in it (or it gets focus), but the editor
@@ -111,8 +125,9 @@ floats above the other windows until you click, type or scroll in it (or it gets
 there; a sopen stopped without a terminal leaves the window on `<host>` open.
 
 The exit code is `<host>`'s; `could not reach <host>` means ssh did not get there, `sopen is not
-installed on <host>` (exit 127) means it has no sopen, and `sopen on <host> ended with status
-N (signal n?)` means it most likely was interrupted there.
+installed on <host>` (exit 127) means it has no sopen, `sopen on <host> ended with status
+N (signal n?)` means it most likely was interrupted there, and exit 2 with `<host>`'s own usage
+line (other than the one for `--gui`) means its sopen is too old for the run, or the run is wrong.
 
 ## Web addresses: `sopen URL`
 
