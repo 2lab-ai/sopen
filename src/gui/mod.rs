@@ -867,23 +867,23 @@ pub fn hosted(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<Hosted>(hosted_id()).is_some())
 }
 
-/// A window's F-key row at the bottom of `ui` — F1 (its key help, [`help`]), F3 (closes it, as
-/// Cmd/Ctrl+W does) and its own `keys` — and F1 and F3 themselves, without modifiers (04 §3
-/// rule 1); above the row, while the F-key switch did not take effect, a status row saying so
-/// ([`fkeys_status`], 04 §6.3: the row's slots and Cmd/Ctrl+digits still work). Nothing while
-/// it is hosted: the host's row lists the window's keys with its own, its F1 and F3 are the
-/// host's, and so is its status row. Call it before the window's other bottom panels (the row
-/// is the window's last).
+/// A window's F-key row at the bottom of `ui`, in cells (10 §4, §6) — F1 (its key help,
+/// [`help`]), F3 (closes it, as Cmd/Ctrl+W does) and its own `keys` — and F1 and F3 themselves,
+/// without modifiers (04 §3 rule 1); above the row, while the F-key switch did not take effect,
+/// a status row in cells saying so ([`fkeys_status`], 04 §6.3: the row's slots and
+/// Cmd/Ctrl+digits still work). Each is one row tall, so what is above them stays on the grid.
+/// Nothing while it is hosted: the host's row lists the window's keys with its own, its F1 and
+/// F3 are the host's, and so is its status row. Call it before the window's other bottom panels
+/// (the row is the window's last).
 pub fn own_keys(ui: &mut egui::Ui, keys: &[chrome::FKey]) {
     let ctx = ui.ctx().clone();
     if hosted(&ctx) {
         return;
     }
     let row = chrome::merged(&[chrome::HELP_KEY, chrome::EXIT_KEY], keys);
-    chrome::key_panel(ui, "sopen-own-keys", &row);
+    chrome::key_panel_cells(ui, "sopen-own-keys", &row);
     if let Some(line) = fkeys_status(&ctx) {
-        chrome::bar_panel(egui::Panel::bottom("sopen-own-fkeys"))
-            .show(ui, |ui| chrome::status_row(ui, &Status::error(line)));
+        chrome::status_panel_cells(ui, "sopen-own-fkeys", &Status::error(line));
     }
     // Not while a text field has the keyboard (F-keys are not text, but the field is the
     // owner's).

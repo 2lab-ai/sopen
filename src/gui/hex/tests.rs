@@ -96,15 +96,7 @@ impl Fx {
 
     /// Where byte `at` is drawn in `pane` (it must be on screen).
     fn pos(&self, at: u64, pane: Pane) -> Pos2 {
-        let l = self.win.layout.expect("drawn");
-        let row = at / ROW - self.win.top_row;
-        let i = at % ROW;
-        let y = l.rows.top() + l.row_h * (row as f32 + 0.5);
-        let x = match pane {
-            Pane::Hex => l.hex_x + l.cw * (hex_col(i) as f32 + 1.0),
-            Pane::Ascii => l.ascii_x + l.cw * (i as f32 + 0.5),
-        };
-        Pos2::new(x, y)
+        byte_pos(&self.win, at, pane)
     }
 
     /// Passes until the grid's place on screen stops moving.
@@ -139,6 +131,34 @@ impl Fx {
         self.drv.until(&mut self.win, 20, |w| w.job.is_none());
         self.drv.idle(&mut self.win, 2);
     }
+}
+
+/// Where `win` drew byte `at` in `pane` (it must be on screen): in the hex column its low digit's
+/// cell (the first's right edge), in the ASCII column its cell.
+fn byte_pos(win: &HexWindow, at: u64, pane: Pane) -> Pos2 {
+    let l = win.layout.expect("drawn");
+    let row = at / ROW - win.top_row;
+    let i = at % ROW;
+    let y = l.rows.top() + l.row_h * (row as f32 + 0.5);
+    let x = match pane {
+        Pane::Hex => l.hex_x + l.cw * (hex_col(i) as f32 + 1.0),
+        Pane::Ascii => l.ascii_x + l.cw * (i as f32 + 0.5),
+    };
+    Pos2::new(x, y)
+}
+
+/// The cell the last pass of `drv` shows at `p` (points), from the last cell layer painted there
+/// (10 §4: what the window painted, a glyph and two colours per cell).
+fn cell_at(drv: &Driver, p: Pos2) -> Option<crate::gui::cells::Seen> {
+    let cell = crate::gui::chrome::CELL;
+    let layers = crate::gui::cells::layers(&drv.ctx);
+    layers.iter().rev().find_map(|l| {
+        let a = l.buf.area;
+        let x = ((p.x - l.origin.x) / cell.x).floor() as i32 - i32::from(a.x);
+        let y = ((p.y - l.origin.y) / cell.y).floor() as i32 - i32::from(a.y);
+        let inside = x >= 0 && y >= 0 && x < i32::from(a.width) && y < i32::from(a.height);
+        (inside && l.clip.contains(p)).then(|| l.seen()[y as usize][x as usize].clone())
+    })
 }
 
 /// Files under `dir`, recursively; an absent `dir` has none, any other error fails the test.
@@ -989,7 +1009,19 @@ fn the_bars_stay_one_line_and_the_grid_stays_put() {
     fx.typed("ff");
     fx.settle();
     assert_eq!(fx.win.layout, quiet, "the grid moved");
-    assert_eq!(fx.drv.rows_of(&long), Some(1), "the status is one line");
+    // The status row is one row of cells, the one above the F-key row, whatever it says: here
+    // the cursor's place, and of the long line what room is left (none at this width).
+    let cell = crate::gui::chrome::CELL;
+    let status = egui::Rect::from_min_size(
+        Pos2::new(0.0, 320.0 - 2.0 * cell.y),
+        egui::vec2(480.0, cell.y),
+    );
+    let shown = fx.drv.column(status);
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert!(
+        shown[0].1.starts_with(" 0x1 (1) · 0x6F 111 'o' │"),
+        "{shown:?}"
+    );
     let row = |fx: &Fx, label: &str| {
         fx.drv
             .find_text(label)
@@ -997,7 +1029,7 @@ fn the_bars_stay_one_line_and_the_grid_stays_put() {
             .center()
             .y
     };
-    assert!((row(&fx, "Go to") - row(&fx, "Save copy")).abs() < 0.5);
+    assert!((row(&fx, "Go to") - row(&fx, "[ Save copy ]")).abs() < 0.5);
     // A running save's spinner does not make the status bar taller either.
     let (_tx, rx) = mpsc::channel();
     fx.win.job = Some(Job {
@@ -1019,9 +1051,12 @@ fn closing_with_unsaved_edits_asks() {
     assert!(!fx.win.close_requested());
     assert!(fx.win.prompt);
     fx.drv.idle(&mut fx.win, 2);
-    for label in ["Save", "Discard", "Cancel"] {
+    for label in ["Discard", "Cancel"] {
         assert!(fx.drv.find_text(label).is_some(), "{label}");
     }
+    // The prompt's Save, besides the F-key row's 5Save (the toolbar's is `[ Save ]`).
+    let saves = fx.drv.texts().into_iter().filter(|(_, _, t)| t == "Save");
+    assert_eq!(saves.count(), 2, "the prompt's Save");
     fx.drv.click_text(&mut fx.win, "Cancel");
     assert!(!fx.win.prompt && !fx.win.close_ok);
     assert!(!fx.win.close_requested());
@@ -1085,8 +1120,8 @@ fn files_under(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     out
 }
 
-/// Hovers the control labelled `label` highest in the window (the toolbar's, not the F-key
-/// row's) until `tip` shows; the pointer is taken to `away` first, so no earlier tip is up.
+/// Hovers the control labelled `label` highest in the window (the toolbar's `[ Save ]`, not the
+/// F-key row's) until `tip` shows; the pointer is taken to `away` first, so no earlier tip is up.
 fn hover_says<W: Window>(drv: &mut Driver, win: &mut W, label: &str, tip: &str, away: Pos2) {
     drv.move_to(win, away);
     for _ in 0..90 {
@@ -1196,11 +1231,11 @@ fn a_file_at_a_revision_moves_and_goes_to_but_edits_and_saves_nothing() {
         );
     }
     let away = Pos2::new(500.0, 400.0);
-    for label in ["Save", "Save copy", "Save As…"] {
+    for label in ["[ Save ]", "[ Save copy ]", "[ Save As… ]"] {
         hover_says(&mut fx.drv, &mut fx.win, label, NO_PLACE, away);
     }
-    fx.drv.click_text(&mut fx.win, "Save copy");
-    fx.drv.click_text(&mut fx.win, "Save As…");
+    fx.drv.click_text(&mut fx.win, "[ Save copy ]");
+    fx.drv.click_text(&mut fx.win, "[ Save As… ]");
     assert!(fx.win.job.is_none() && fx.win.save_as.is_none() && fx.win.save_starts == 0);
     fx.drv.idle(&mut fx.win, 30);
     assert!(fx.win.journal_dir.is_none(), "nothing kept");
@@ -2112,29 +2147,23 @@ fn a_report_never_moves_the_rows() {
     assert!(fx.win.visible < visible, "{} vs {visible}", fx.win.visible);
 }
 
-/// The cursor is painted in both columns — filled where it types, outlined in the other — and
-/// follows navigation, Tab and undo.
+/// The cursor is painted in both columns — in the bar's colours where it types, white on black in
+/// the other (cells have no outline: 10 §4) — and follows navigation, Tab and undo.
 #[test]
 fn the_cursor_is_painted_in_both_columns() {
     let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
-    let fill = fx.drv.ctx.global_style().visuals.selection.bg_fill;
+    let p = crate::gui::chrome::PALETTE;
     let painted = |fx: &Fx, at: u64| {
-        let rects = fx.drv.rects();
-        let filled = |pane| {
-            let p = fx.pos(at, pane);
-            rects.iter().any(|(r, f, _)| *f == fill && r.contains(p))
+        let back = |pane| {
+            let s = cell_at(&fx.drv, fx.pos(at, pane)).expect("a cell there");
+            (s.fg == Some(p.bar_text)).then_some(s.bg).flatten()
         };
-        let outlined = |pane| {
-            let p = fx.pos(at, pane);
-            rects
-                .iter()
-                .any(|(r, f, w)| *f != fill && *w > 0.0 && r.contains(p))
-        };
+        let (hex, ascii) = (back(Pane::Hex), back(Pane::Ascii));
         (
-            filled(Pane::Hex),
-            outlined(Pane::Hex),
-            filled(Pane::Ascii),
-            outlined(Pane::Ascii),
+            hex == Some(p.bar),
+            hex == Some(p.bar_idle),
+            ascii == Some(p.bar),
+            ascii == Some(p.bar_idle),
         )
     };
     fx.key(Key::ArrowDown, Modifiers::NONE);
@@ -3100,6 +3129,8 @@ fn close_ask_brings_up_the_prompt_in_the_dialog_look() {
         Some(vec![p.dialog_text])
     );
     let discard = fx.drv.find_text("Discard").expect("the prompt's buttons");
+    // `rects` lists the cells' background runs and the caret too (the rows are cells); the
+    // prompt's are painted over them, so the last one under a point is the prompt's.
     let cyan = fx.drv.rects().iter().any(|(r, f, _)| {
         *f == p.dialog_back && r.contains(discard.left_top() - egui::vec2(4.0, 4.0))
     });
@@ -3608,15 +3639,47 @@ mod stream {
             self.drv.find_text(text).is_some()
         }
 
-        /// How many texts the last pass drew that read exactly `text`, cut by a clip or not.
+        /// How many texts the last pass drew that read exactly `text`, cut by a clip or not: egui's
+        /// and the cells' runs (`Driver::texts`; the rows are cells, so `galleys` holds their
+        /// one-character glyphs, #108's review).
         fn drawn(&self, text: &str) -> usize {
-            let all = self.drv.galleys();
-            all.iter().filter(|(_, g)| g.text() == text).count()
+            let all = self.drv.texts();
+            all.iter().filter(|(_, _, t)| t == text).count()
+        }
+
+        /// The grid's rows on screen as their columns read in cells — the offset, the hex and the
+        /// ASCII column, their blanks at the end cut — whatever colours their cells are in (the
+        /// cursor's, a changed byte's, one on its way): a column is not one run.
+        fn grid_rows(&self) -> Vec<[String; 3]> {
+            let l = self.win.layout.expect("drawn");
+            let r = l.rows;
+            let column = |from: f32, to: f32| -> Vec<String> {
+                let area = Rect::from_min_max(Pos2::new(from, r.top()), Pos2::new(to, r.bottom()));
+                let rows = self.drv.column(area).into_iter();
+                rows.map(|(_, t)| t.trim_end().to_string()).collect()
+            };
+            let offsets = column(r.left(), l.hex_x - l.cw);
+            let hex = column(l.hex_x, l.ascii_x - 2.0 * l.cw);
+            let ascii = column(l.ascii_x, l.ascii_x + ROW as f32 * l.cw);
+            (offsets.into_iter().zip(hex).zip(ascii))
+                .map(|((o, h), a)| [o, h, a])
+                .collect()
+        }
+
+        /// How many rows of the grid have a column that reads exactly `text`.
+        fn rows_reading(&self, text: &str) -> usize {
+            let rows = self.grid_rows();
+            rows.iter().filter(|r| r.iter().any(|c| c == text)).count()
         }
 
         /// Bytes of reads asked and not yet answered (status requests left out).
         fn reads_out(&self) -> u64 {
             self.in_flight() / BLOCK * BLOCK
+        }
+
+        /// Where byte `at` is drawn in `pane` (it must be on screen).
+        fn pos(&self, at: u64, pane: Pane) -> Pos2 {
+            byte_pos(&self.win, at, pane)
         }
 
         /// The offset column's text for the row at `off`.
@@ -3661,29 +3724,30 @@ mod stream {
             assert!(sx.shows(&off), "row {row}'s offset is drawn");
         }
         assert!(sx.shows(&pending_row()), "the rows show as pending");
-        // The second row (the cursor is in the first): every cell in the skin's dim colour.
-        let rows = sx.drv.galleys();
-        let row: Vec<_> = rows
-            .iter()
-            .filter(|(_, g)| g.text() == pending_row())
-            .collect();
-        assert!(row.len() >= 2, "{} pending rows", row.len());
-        let cells: Vec<_> = row[1]
-            .1
-            .job
-            .sections
-            .iter()
-            .step_by(2)
-            .map(|s| s.format.color)
-            .collect();
-        assert_eq!(cells, vec![cga::CYAN; 16], "pending cells are dim");
+        // The second row (the cursor is in the first): every byte's cells, both digits and the
+        // ASCII column's, `·` in the skin's dim colour.
+        for at in 16..32 {
+            for (pane, back) in [(Pane::Hex, 0.0), (Pane::Hex, 8.0), (Pane::Ascii, 0.0)] {
+                let p = sx.pos(at, pane) - egui::vec2(back, 0.0);
+                let cell = cell_at(&sx.drv, p).expect("a cell of the row");
+                assert_eq!(
+                    (cell.symbol.as_str(), cell.fg),
+                    ("·", Some(cga::CYAN)),
+                    "pending cells are dim: {at} {pane:?}"
+                );
+            }
+        }
         assert_eq!(sx.status(), "loading 0x0");
         assert!(!sx.win.ready(), "not shot before the screen's bytes came");
-        // Every row painted — the last, cut by the frame, included — has its offset and is
-        // pending; none is blank.
+        // Every row on screen — whole rows of cells — has its offset and is pending; none is
+        // blank.
         let painted = sx.win.rows_painted;
         assert!(painted >= 20, "{painted} rows");
-        assert_eq!(sx.drawn(&pending_row()), painted as usize, "pending rows");
+        assert_eq!(
+            sx.rows_reading(&pending_row()),
+            painted as usize,
+            "pending rows"
+        );
         for row in 0..painted {
             assert_eq!(sx.drawn(&sx.offset(row * ROW)), 1, "row {row}'s offset");
         }
@@ -3692,14 +3756,18 @@ mod stream {
         assert_eq!(sx.win.rows_painted, painted);
         for row in 0..painted {
             assert_eq!(sx.drawn(&sx.offset(row * ROW)), 1, "row {row}'s offset");
-            assert_eq!(sx.drawn(&pattern_row(row * ROW)), 1, "row {row}'s bytes");
+            let bytes = pattern_row(row * ROW);
+            assert_eq!(sx.rows_reading(&bytes), 1, "row {row}'s bytes");
             let ascii: String = pattern(row * ROW, 16)
                 .into_iter()
                 .map(|b| ascii_char(Some(b)))
                 .collect();
-            assert!(sx.drawn(&ascii) >= 1, "row {row}'s ASCII column");
+            assert!(
+                sx.rows_reading(ascii.trim_end()) >= 1,
+                "row {row}'s ASCII column"
+            );
         }
-        assert_eq!(sx.drawn(&pending_row()), 0);
+        assert_eq!(sx.rows_reading(&pending_row()), 0);
         for row in 0..3 {
             assert!(sx.shows(&pattern_row(row * ROW)), "row {row}'s bytes");
         }
@@ -4241,10 +4309,10 @@ mod stream {
         // Ready means the screen too: the cursor's rows are there, with the patch in them.
         let mut row: Vec<Option<u8>> = pattern(FAR, 16).into_iter().map(Some).collect();
         (row[0], row[1]) = (Some(0xDE), Some(0xAD));
-        // (Drawn under the close prompt, which the kit's `find_text` does not look through.)
-        let drawn = sx.drv.galleys();
-        assert!(
-            drawn.iter().any(|(_, g)| g.text() == hex_cells(&row)),
+        // (Drawn under the close prompt: its cells are read where they stand.)
+        assert_eq!(
+            sx.rows_reading(&hex_cells(&row)),
+            1,
             "the patched row is drawn"
         );
         let line = sx.win.cursor_line();
@@ -6260,12 +6328,14 @@ mod stream {
     /// what §10 says; Save copy stands in for Save where Save is off.
     #[test]
     fn e16_the_close_prompt_saves_saves_as_discards_or_cancels() {
+        // The prompt's buttons: a label it shows besides the F-key row's (`5Save`; the
+        // toolbar's are `[ Save ]`, `[ Save copy ]`, `[ Save As… ]`).
         let buttons = |ed: &Ed| -> Vec<&str> {
             ["Save", "Save copy", "Save As…", "Discard", "Cancel"]
                 .into_iter()
                 .filter(|b| {
                     ed.drv.texts().iter().filter(|(_, _, t)| t == b).count()
-                        > usize::from(*b == "Save" || *b == "Save copy" || *b == "Save As…")
+                        > usize::from(*b == "Save")
                 })
                 .collect()
         };
@@ -8711,5 +8781,428 @@ mod stream {
             ),
             "{offer}"
         );
+    }
+}
+
+/// X3-hex (10 §17): the hex window on the cell grid — its toolbar, Go to field, rows, cursor,
+/// changed and loading bytes, the rows the file does not reach, the status row and the F-key row
+/// of a window on its own are cells, the same in the window and in the terminal (TS-4).
+mod x3 {
+    use super::*;
+    use crate::gui::cells::{self, Layer, Seen};
+    use crate::gui::chrome::{CELL, PALETTE};
+    use crate::gui::term::{self, Backend, End, Receipt, Tty};
+    use std::io;
+
+    /// A terminal that sends nothing, `cols` × `rows`, that draws a glyph of ambiguous width in
+    /// two cells or not (its probe's answer, TS-6): a receipt run's (10 §15).
+    struct Still((u16, u16), bool);
+
+    impl Tty for Still {
+        fn raw(&mut self, _on: bool) -> io::Result<()> {
+            Ok(())
+        }
+        fn size(&mut self) -> io::Result<(u16, u16)> {
+            Ok(self.0)
+        }
+        fn kitty(&mut self) -> bool {
+            false
+        }
+        fn ambiguous_wide(&mut self) -> bool {
+            self.1
+        }
+        fn drop_input(&mut self) {}
+        fn next(&mut self, wait: Duration) -> io::Result<Option<crossterm::event::Event>> {
+            std::thread::sleep(wait.min(Duration::from_millis(1)));
+            Ok(None)
+        }
+        fn pending(&mut self) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn stopped(&self) -> Option<i32> {
+            None
+        }
+    }
+
+    /// The terminal's `SOPEN_CELLS` receipt of `win` on a `cols` × `rows` terminal, its passes in
+    /// `ctx` (the window's, for what its memory holds: F1's help), or a context of their own: the
+    /// run ends by itself once `win` has settled.
+    fn terminal_receipt<W: Window>(
+        win: &mut W,
+        ctx: Option<egui::Context>,
+        cols: u16,
+        rows: u16,
+    ) -> String {
+        terminal_receipt_in(win, ctx, cols, rows, false)
+    }
+
+    /// [`terminal_receipt`] in a terminal that draws a glyph of ambiguous width in two cells
+    /// (`wide`) or not.
+    fn terminal_receipt_in<W: Window>(
+        win: &mut W,
+        ctx: Option<egui::Context>,
+        cols: u16,
+        rows: u16,
+        wide: bool,
+    ) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cells.txt");
+        let ctx = ctx.unwrap_or_else(|| {
+            let ctx = egui::Context::default();
+            chrome::install(&ctx);
+            ctx
+        });
+        let mut b = Backend::new(Still((cols, rows), wide), io::sink(), ctx, true);
+        b.offset = 20_000.0;
+        b.receipt = Some(Receipt::new(path.clone(), Duration::from_secs(30)));
+        let mut no_switch = |_: &mut Backend<Still, io::Sink>| -> io::Result<Option<String>> {
+            panic!("no switch in this test")
+        };
+        assert_eq!(b.run(win, &mut no_switch).unwrap(), End::Closed);
+        std::fs::read_to_string(&path).expect("the receipt written")
+    }
+
+    /// The window's `SOPEN_CELLS` receipt of one more pass of `win` in `drv`'s context, as the
+    /// shell writes it (`term::window_receipt`).
+    fn window_receipt<W: Window>(drv: &Driver, win: &mut W, cols: u16, rows: u16) -> String {
+        let size = egui::vec2(f32::from(cols) * CELL.x, f32::from(rows) * CELL.y);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
+            time: Some(10_000.0),
+            max_texture_side: Some(8192),
+            focused: true,
+            ..Default::default()
+        };
+        let mut pass = None;
+        let mut out = drv.ctx.run_ui(raw, |ui| {
+            cells::clear(ui.ctx());
+            win.ui(ui);
+            pass = Some(term::keep_window_pass(ui.ctx()));
+        });
+        out.textures_delta.clear();
+        term::window_receipt(&drv.ctx, &pass.expect("the pass ran"))
+    }
+
+    /// The layer the grid is painted in: the one whose frame is titled `File Edit`.
+    fn grid_layer(drv: &Driver) -> Option<std::sync::Arc<Layer>> {
+        cells::layers(&drv.ctx)
+            .into_iter()
+            .find(|l| (0..l.buf.area.height).any(|y| cells::row_text(&l.buf, y).0.contains(TITLE)))
+    }
+
+    /// The pen a cell is written in.
+    fn pen(s: &Seen) -> (Option<Color32>, Option<Color32>) {
+        (s.fg, s.bg)
+    }
+
+    fn body() -> (Option<Color32>, Option<Color32>) {
+        (Some(PALETTE.text), Some(PALETTE.back))
+    }
+
+    /// The bytes of a short Korean text file (UTF-8).
+    const HANGUL: &str = "한글 메모\n안녕하세요, 세계\n";
+
+    /// TS-4 (10 §14) on the hex window on its own (`sopen --hex`): the terminal's receipt of a
+    /// Hangul file and the window's are the same bytes, no hand-off box in them — the toolbar, the
+    /// rows, the status row and the F-key row (`1Help 3Exit 5Save 6Goto 7SaveAs 8Asc/hx`) all
+    /// cells.
+    #[test]
+    fn ts4_the_hex_window_on_its_own_is_the_same_cells_in_both_backends() {
+        let mut fx = fetched("한글 메모.txt", HANGUL.as_bytes(), 800.0, 480.0);
+        fx.drv.until(&mut fx.win, 20, |w| w.ready());
+        let in_window = window_receipt(&fx.drv, &mut fx.win, 100, 30);
+        let terminal = terminal_receipt(&mut fx.win, None, 100, 30);
+        assert!(!terminal.contains(term::HAND_OFF), "{terminal}");
+        for shown in [
+            "Go to",
+            "[ Save copy ]",
+            TITLE,
+            "한글 메모.txt",
+            "ED 95 9C EA B8 80 20 EB",
+            "0x0 (0) · 0xED 237",
+            "Exit",
+            "Goto",
+            "Asc/hx",
+        ] {
+            assert!(terminal.contains(shown), "{shown:?} in:\n{terminal}");
+        }
+        assert_eq!(terminal, in_window, "the same bytes");
+    }
+
+    /// TS-4 on the hex view (08 §8: `2` in the browser's viewer) of a Hangul file: where the
+    /// terminal showed a hand-off box it shows the hex view, the same cells as the window's.
+    #[test]
+    fn ts4_the_hex_view_of_a_hangul_file_is_the_same_cells_in_both_backends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("한글 메모.txt"), HANGUL).unwrap();
+        let mut b = crate::gui::browser::Browser::new(crate::gui::browser::Start {
+            fs: Box::new(LocalFs::new()),
+            connect: Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)),
+            label: None,
+            destination: None,
+            abs: root.to_str().unwrap().to_string(),
+            cache: tmp.path().join("cache"),
+            state_dir: tmp.path().join("state"),
+            launch: Arc::new(|abs: &str, _| Ok(format!("opened {abs}"))),
+            git: None,
+        });
+        // A grid wide enough that neither title row cuts the folder's path: the terminal's has
+        // `[GUI]` (blank in its receipt), the window's none (10 §5's one difference).
+        let mut drv = Driver::new(1120.0, 480.0);
+        drv.until(&mut b, 20, |b| b.ready());
+        drv.key(&mut b, Key::ArrowDown, Modifiers::NONE);
+        drv.until(&mut b, 20, |b| b.ready());
+        drv.key(&mut b, Key::Enter, Modifiers::NONE);
+        drv.until(&mut b, 20, |b| b.ready());
+        drv.idle(&mut b, 2);
+        drv.press_typed(&mut b, Key::Num2, "2");
+        drv.until(&mut b, 20, |b| b.ready());
+        drv.idle(&mut b, 2);
+        assert!(drv.find_text(VIEWING).is_some(), "the hex view, viewing");
+        let in_window = window_receipt(&drv, &mut b, 140, 30);
+        let terminal = terminal_receipt(&mut b, None, 140, 30);
+        assert!(!terminal.contains(term::HAND_OFF), "{terminal}");
+        for shown in [TITLE, "ED 95 9C EA B8 80 20 EB", "[ Save As… ]", VIEWING] {
+            assert!(terminal.contains(shown), "{shown:?} in:\n{terminal}");
+        }
+        // The title row too: its views strip at the same cells in both, the mode button's cells
+        // kept in a window started directly (blank), as in the terminal (`[GUI]`, blank in its
+        // receipt: 10 §5's one difference).
+        let title = terminal.lines().nth(1).unwrap_or_default();
+        assert!(title.contains("1 Text · 2 Hex · 3 Raw"), "{title}");
+        assert_eq!(terminal, in_window, "the same bytes");
+    }
+
+    /// Every cell layer of the window lies on the grid (whole cells from the window's corner),
+    /// with a notice below the rows and with F1's help open: no hex row is cut by the help's box
+    /// (the half row above it is gone); with the help open both backends show the same cells.
+    #[test]
+    fn the_window_lies_on_the_grid_with_a_notice_and_with_f1_open() {
+        let mut fx = fetched("blob.bin", FIXTURE, 800.0, 480.0);
+        let on_grid = |fx: &Fx, what: &str| {
+            assert!(grid_layer(&fx.drv).is_some(), "{what}: the rows are cells");
+            for l in cells::layers(&fx.drv.ctx) {
+                let o = l.origin;
+                assert!(
+                    o.x % CELL.x == 0.0 && o.y % CELL.y == 0.0,
+                    "{what}: a layer at {o:?}"
+                );
+            }
+        };
+        on_grid(&fx, "plain");
+        fx.key(Key::F1, Modifiers::NONE);
+        fx.drv.idle(&mut fx.win, 2);
+        assert!(crate::gui::help::is_open(&fx.drv.ctx));
+        on_grid(&fx, "F1");
+        let in_window = window_receipt(&fx.drv, &mut fx.win, 100, 30);
+        let terminal = terminal_receipt(&mut fx.win, Some(fx.drv.ctx.clone()), 100, 30);
+        assert!(!terminal.contains(term::HAND_OFF), "{terminal}");
+        assert!(terminal.contains("Keys"), "the help:\n{terminal}");
+        assert_eq!(terminal, in_window, "the same bytes with the help open");
+        fx.key(Key::Escape, Modifiers::NONE);
+        fx.win
+            .opened
+            .push("a notice the owner reads whole".to_string());
+        fx.drv.idle(&mut fx.win, 3);
+        on_grid(&fx, "a notice");
+    }
+
+    /// The cursor in cells: where it types in the bar's colours, in the other column black, both
+    /// digits of its byte; Tab swaps them; its neighbours are the body's.
+    #[test]
+    fn the_cursor_is_in_its_pane_in_cells() {
+        let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+        fx.key(Key::ArrowDown, Modifiers::NONE);
+        fx.key(Key::ArrowRight, Modifiers::NONE);
+        fx.key(Key::ArrowRight, Modifiers::NONE);
+        assert_eq!(fx.at(), 18);
+        let typing = (Some(PALETTE.bar_text), Some(PALETTE.bar));
+        let other = (Some(PALETTE.bar_text), Some(PALETTE.bar_idle));
+        let at = |fx: &Fx, at: u64, pane: Pane| {
+            let s = cell_at(&fx.drv, fx.pos(at, pane)).expect("a cell there");
+            (s.symbol.clone(), pen(&s))
+        };
+        let high = |fx: &Fx, at: u64| {
+            let p = fx.pos(at, Pane::Hex) - egui::vec2(CELL.x, 0.0);
+            pen(&cell_at(&fx.drv, p).unwrap())
+        };
+        // Byte 18 is `C`, 0x43: the low digit's cell, the high one's, the ASCII column's.
+        assert_eq!(at(&fx, 18, Pane::Hex), ("3".to_string(), typing));
+        assert_eq!(high(&fx, 18), typing, "both digits");
+        assert_eq!(at(&fx, 18, Pane::Ascii), ("C".to_string(), other));
+        assert_eq!(at(&fx, 19, Pane::Hex).1, body());
+        fx.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(at(&fx, 18, Pane::Hex).1, other);
+        assert_eq!(at(&fx, 18, Pane::Ascii).1, typing);
+    }
+
+    /// Typing in cells: the first digit puts the caret on the low nibble's cell; the byte typed
+    /// is yellow on black in both columns; the rows the file does not reach are blank cells of the
+    /// frame's body.
+    #[test]
+    fn typed_bytes_show_changed_and_the_rows_past_the_end_are_blank_cells() {
+        let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+        fx.typed("7");
+        let grid = grid_layer(&fx.drv).expect("the rows are cells");
+        let low = fx.pos(0, Pane::Hex);
+        let caret = grid
+            .caret
+            .map(|c| grid.rect(cells::Cells::new(c.x, c.y, 1, 1)));
+        assert!(caret.is_some_and(|r| r.contains(low)), "{caret:?}");
+        fx.typed("A");
+        assert_eq!(fx.at(), 1);
+        let changed = (Some(PALETTE.changed), Some(PALETTE.changed_back));
+        let hex = cell_at(&fx.drv, fx.pos(0, Pane::Hex)).unwrap();
+        assert_eq!((hex.symbol.as_str(), pen(&hex)), ("A", changed));
+        let ascii = cell_at(&fx.drv, fx.pos(0, Pane::Ascii)).unwrap();
+        assert_eq!((ascii.symbol.as_str(), pen(&ascii)), ("z", changed));
+        // FIXTURE is 22 bytes: the second row ends at its sixth byte, and no third row is there.
+        for p in [
+            fx.pos(16 + 6, Pane::Hex),
+            fx.pos(16 + 6, Pane::Ascii),
+            fx.pos(32, Pane::Hex),
+            fx.pos(32 + 7, Pane::Ascii),
+            fx.pos(16 * 10, Pane::Hex),
+        ] {
+            let s = cell_at(&fx.drv, p).expect("a cell of the grid");
+            assert_eq!((s.symbol.as_str(), pen(&s)), (" ", body()), "at {p:?}");
+        }
+    }
+
+    /// Go to is a field in cells: what is typed shows white on black, the caret after it, its
+    /// hint dim while it is empty; Enter goes there.
+    #[test]
+    fn go_to_is_a_field_in_cells() {
+        let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+        assert_eq!(
+            fx.drv.colors_of("0x… or decimal"),
+            Some(vec![PALETTE.dim]),
+            "the hint"
+        );
+        fx.key(Key::G, command(false));
+        fx.typed("0x10");
+        assert_eq!(fx.drv.colors_of("0x10"), Some(vec![PALETTE.field_text]));
+        let field = fx.drv.find_text("0x10").unwrap();
+        let after = cell_at(
+            &fx.drv,
+            field.right_center() + egui::vec2(CELL.x / 2.0, 0.0),
+        );
+        assert_eq!(
+            after.map(|s| (s.caret, s.bg)),
+            Some((true, Some(cga::BLACK)))
+        );
+        fx.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(fx.at(), 16);
+    }
+
+    /// The toolbar's buttons are cells, each clicked at its cells: Undo undoes, Save copy saves a
+    /// copy; one that does nothing now is in the dialog's weak colour and its click does nothing.
+    #[test]
+    fn the_toolbar_buttons_are_cells_clicked_by_their_cells() {
+        let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
+        assert_eq!(
+            fx.drv.colors_of("[ Redo ]"),
+            Some(vec![PALETTE.dialog_weak]),
+            "nothing to redo"
+        );
+        fx.drv.click_text(&mut fx.win, "[ Redo ]");
+        assert_eq!(fx.win.status.text, "", "a button that is off does nothing");
+        fx.typed("00");
+        assert_eq!(
+            fx.drv.colors_of("[ Undo ]"),
+            Some(vec![PALETTE.dialog_text])
+        );
+        fx.drv.click_text(&mut fx.win, "[ Undo ]");
+        fx.drv.idle(&mut fx.win, 1);
+        assert_eq!(fx.win.doc.changed_count(), 0, "undone");
+        fx.drv.click_text(&mut fx.win, "[ Redo ]");
+        fx.drv.idle(&mut fx.win, 1);
+        assert_eq!(fx.win.doc.changed_count(), 1, "redone");
+        fx.drv.click_text(&mut fx.win, "[ Save copy ]");
+        fx.wait_for_save();
+        let copy = fx.remote.with_file_name("blob.edited.bin");
+        assert_eq!(std::fs::read(copy).unwrap()[0], 0x00);
+        assert_eq!(std::fs::read(&fx.remote).unwrap(), FIXTURE, "the original");
+    }
+
+    /// TS-6 at the source (10 §10's last row): the terminal backend says its probe's answer to
+    /// the passes, so in an ambiguous-wide terminal the ASCII column's glyphs of width A are `.`
+    /// in the terminal's cells, while the window shows their CP437 glyphs.
+    #[test]
+    fn an_ambiguous_wide_terminal_shows_the_stand_ins_and_the_window_cp437() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        let mut fx = fetched("all.bin", &all, 800.0, 560.0);
+        fx.drv.until(&mut fx.win, 20, |w| w.ready());
+        let in_window = window_receipt(&fx.drv, &mut fx.win, 100, 35);
+        let wide = terminal_receipt_in(&mut fx.win, None, 100, 35, true);
+        let narrow = terminal_receipt_in(&mut fx.win, None, 100, 35, false);
+        // As the screens lay it: 0xFF's no-break space is a blank cell there.
+        let ascii = |row: u8, wide: bool| -> String {
+            (row * 16..=row * 16 + 15)
+                .map(|b| column_glyph(Some(b), wide))
+                .map(|c| if c == '\u{A0}' { ' ' } else { c })
+                .collect()
+        };
+        for row in [0x8u8, 0xA, 0xE, 0xF] {
+            let line = |receipt: &str| {
+                let offset = format!("{:04}({:04X})", u32::from(row) * 16, u32::from(row) * 16);
+                (receipt.lines())
+                    .find(|l| l.contains(&offset))
+                    .unwrap_or_else(|| panic!("row {row:X}:\n{receipt}"))
+                    .to_string()
+            };
+            let stand_ins = ascii(row, true);
+            assert_ne!(
+                stand_ins,
+                ascii(row, false),
+                "row {row:X} has glyphs of width A"
+            );
+            assert!(line(&wide).contains(&stand_ins), "{}", line(&wide));
+            assert!(
+                line(&in_window).contains(&ascii(row, false)),
+                "{}",
+                line(&in_window)
+            );
+            assert!(
+                line(&narrow).contains(&ascii(row, false)),
+                "{}",
+                line(&narrow)
+            );
+        }
+    }
+
+    /// 10 §10's last row at the source: in an ambiguous-wide terminal no glyph of the ASCII column
+    /// is of ambiguous width (`.` stands in), elsewhere every one is its CP437 glyph — all 256
+    /// bytes.
+    #[test]
+    fn the_ascii_column_stands_in_for_ambiguous_glyphs_in_an_ambiguous_wide_terminal() {
+        for b in 0..=255u8 {
+            let narrow = column_glyph(Some(b), true);
+            assert!(!term::ambiguous(narrow), "{b:#04x}: {narrow:?}");
+            assert_eq!(column_glyph(Some(b), false), chrome::cp437(b));
+            let kept = !term::ambiguous(chrome::cp437(b));
+            assert_eq!(narrow == chrome::cp437(b), kept, "{b:#04x}");
+        }
+        let all: Vec<u8> = (0..=255u8).collect();
+        let mut fx = fetched("all.bin", &all, 1000.0, 600.0);
+        let column = |fx: &Fx| -> String {
+            (0..16u64)
+                .flat_map(|row| (0..16).map(move |i| row * 16 + i))
+                .map(|at| cell_at(&fx.drv, fx.pos(at, Pane::Ascii)).unwrap().symbol)
+                .collect()
+        };
+        let shown: String = column(&fx);
+        let cp437: String = (0..=255u8).map(chrome::cp437).collect();
+        assert_eq!(
+            shown.chars().skip(1).collect::<String>(),
+            cp437.chars().skip(1).collect::<String>()
+        );
+        cells::set_ambiguous_wide(&fx.drv.ctx, true);
+        fx.drv.idle(&mut fx.win, 2);
+        let shown = column(&fx);
+        assert!(shown.chars().all(|c| !term::ambiguous(c)), "{shown}");
+        assert!(shown.contains('.') && shown.contains('░'), "{shown}");
     }
 }

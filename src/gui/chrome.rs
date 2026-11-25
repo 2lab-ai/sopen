@@ -844,8 +844,8 @@ pub fn title_row_with(ui: &mut egui::Ui, place: &str, strip: Option<&Strip>) {
     cells::put(&mut buf, clock_x as u16, 0, &clock, cols, pen);
     let x = block + 1;
     let (room, mode) = mode_button(ui.ctx(), &mut buf, x, clock_x, pen);
-    // The strip stands right before the mode button (or the clock), a blank either side; the
-    // place has what is left.
+    // The strip stands right before the mode button's cells (or the clock), a blank either side;
+    // the place has what is left.
     let mut end = room;
     let mut clicks = vec![];
     if let Some(strip) = strip {
@@ -926,8 +926,14 @@ pub fn mode_button_rect(ctx: &egui::Context) -> Option<Rect> {
         .and_then(|r| r.0)
 }
 
+/// The mode button's cells: `[GUI]` and `[TUI]` alike.
+const MODE_CELLS: usize = 5;
+
 /// The mode button in `buf` right before the clock at `clock_x`, a blank either side, when the
 /// row has room for it after the place's start `x`: where the place's room ends, and its cells.
+/// A backend that shows no button (a window started directly) keeps its cells blank all the
+/// same, so what stands before it — the place, a viewer's views — is at the same cells in both
+/// backends (10 §5: the button is their one difference, TS-1).
 fn mode_button(
     ctx: &egui::Context,
     buf: &mut cells::Buffer,
@@ -935,12 +941,13 @@ fn mode_button(
     clock_x: usize,
     pen: cells::Pen,
 ) -> (usize, Option<cells::Cells>) {
-    let Some(ModeButton(label)) = ctx.data(|d| d.get_temp(mode_button_id())) else {
-        return (clock_x, None);
-    };
-    let w = cells::width(label);
+    let label = ctx.data(|d| d.get_temp::<ModeButton>(mode_button_id()));
+    let w = label.map_or(MODE_CELLS, |ModeButton(label)| cells::width(label));
     let Some(at) = clock_x.checked_sub(w + 1).filter(|&at| at > x) else {
         return (clock_x, None);
+    };
+    let Some(ModeButton(label)) = label else {
+        return (at, None);
     };
     cells::put(buf, at as u16, 0, label, w, pen);
     (at, Some(cells::Cells::new(at as u16, 0, w as u16, 1)))
