@@ -82,10 +82,15 @@ impl Ops {
 
     /// Waits until a call whose line starts with `prefix` was asked (it may be held there).
     fn wait_for(&self, prefix: &str) {
+        self.wait_for_nth(prefix, 1);
+    }
+
+    /// Waits until `n` calls whose lines start with `prefix` were asked.
+    fn wait_for_nth(&self, prefix: &str, n: usize) {
         let (lock, cv) = &*self.0;
         let deadline = Instant::now() + HANG;
         let mut s = lock.lock().unwrap();
-        while !s.lines.iter().any(|l| l.starts_with(prefix)) {
+        while s.lines.iter().filter(|l| l.starts_with(prefix)).count() < n {
             let left = deadline.saturating_duration_since(Instant::now());
             assert!(!left.is_zero(), "`{prefix}` never asked: {:?}", s.lines);
             s = cv.wait_timeout(s, left).unwrap().0;
@@ -1018,6 +1023,35 @@ fn fingerprint_an_early_end_forgets_the_file_and_its_blocks() {
     assert!(again.ok(), "{:?}", again.end);
     assert_eq!(again.body, &new[10..=20]);
     assert_eq!(v.ops.count("realpath "), checks + 1, "checked again");
+}
+
+/// A read that fails in a text file's first piece — after that piece's first read found its
+/// charset and sent the head — forgets the charset too: the file asked again (unchanged) waits
+/// for its first read before its head, as a file never read does.
+#[test]
+fn fingerprint_a_read_fault_forgets_the_charset_found_in_its_piece() {
+    let s = site();
+    let page = text(2 * MIB);
+    s.put("big.html", &page);
+    let mut v = view(&s, Options::viewer());
+    let html = s.at("big.html");
+    v.ops.fault(&format!("read {html} 65536 "));
+    let bad = fetch(&mut v, "big.html", None);
+    assert_eq!(bad.mime(), "text/html; charset=utf-8");
+    assert!(bad.failed(), "{:?}", bad.end);
+    v.ops.hold(&format!("read {html} "));
+    let id = v.get("big.html", None);
+    // Its first read is asked (the first request's was the first such line) and held.
+    v.ops.wait_for_nth(&format!("read {html} 0 "), 2);
+    assert!(
+        v.table().next_call().is_none(),
+        "a head before the first read"
+    );
+    v.ops.release(&format!("read {html} "));
+    let got = v.answer(id);
+    assert!(got.ok(), "{:?}", got.end);
+    assert_eq!(got.mime(), "text/html; charset=utf-8");
+    assert_eq!(got.body, page);
 }
 
 /// Two paths to one file (a folder and its `index.html`) checked at two fingerprints: the view

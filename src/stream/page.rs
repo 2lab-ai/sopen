@@ -1414,11 +1414,12 @@ impl Worker {
             }
             Ok(())
         });
-        if let Some(f) = found {
-            self.charsets.insert(open.file.version(), f);
-        }
         if let Err(halt) = read {
             return self.halt(&req, open.out, halt);
+        }
+        // Kept only once the piece is whole: a fault forgot the file, its charset with it.
+        if let Some(f) = found {
+            self.charsets.insert(open.file.version(), f);
         }
         open.at += len;
         if open.at < open.end {
