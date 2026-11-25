@@ -473,7 +473,7 @@ fn g_t1_enter_on_a_commit_then_on_a_file_shows_its_diff_read_only() {
     );
     assert!(g.painted("+more"), "the diff's added line");
     let viewer = g.b().viewer.as_ref().unwrap();
-    assert!(viewer.read_only);
+    assert!(viewer.views.read_only());
     assert_eq!(
         viewer.abs,
         format!("{}/a.txt", g.top()),
@@ -514,7 +514,7 @@ fn g_t2_shift_f3_on_an_image_shows_that_version_read_only() {
     g.with(Key::F3, Modifiers::SHIFT);
     g.until("the image's viewer", |b| b.viewer.is_some());
     g.settle();
-    assert!(g.b().viewer.as_ref().unwrap().read_only);
+    assert!(g.b().viewer.as_ref().unwrap().views.read_only());
     assert!(
         g.painted("read-only: a file at a revision has no place to be saved"),
         "the reason on the image window's row"
@@ -1098,7 +1098,7 @@ fn an_undecodable_image_at_a_revision_is_a_read_only_hex_window() {
     g.with(Key::F3, Modifiers::SHIFT);
     g.until("the viewer", |b| b.viewer.is_some());
     g.settle();
-    assert!(g.b().viewer.as_ref().unwrap().read_only);
+    assert!(g.b().viewer.as_ref().unwrap().views.read_only());
     let slot = |l: &str| g.fx.drv.find_text(&format!("{l:<7}")).is_some();
     assert!(slot("Goto") && slot("Asc/hx"), "the hex window's row");
     let file = walk(&crate::cache::revisions_root(&g.fx.cache))

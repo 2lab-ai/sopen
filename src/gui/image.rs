@@ -1976,6 +1976,8 @@ struct ImageWindow {
     /// How many saves have ended — a result taken, a refusal, a stop: what a wait for a save's
     /// end counts (a queued Save has no `job` yet, so an empty `job` is not an end).
     saves_ended: u64,
+    /// Saves that wrote the file (a Save, or a cut-off one found landed): [`super::Window::saves_landed`].
+    saves_landed: u64,
     outcome: Arc<Mutex<Outcome>>,
     prompt: bool,
     close_ok: bool,
@@ -2149,6 +2151,7 @@ impl ImageWindow {
             status: Status::default(),
             job: None,
             saves_ended: 0,
+            saves_landed: 0,
             outcome: Arc::default(),
             prompt: false,
             close_ok: false,
@@ -3123,6 +3126,8 @@ impl ImageWindow {
     /// A Save landed: the file is another now — what the journal's edits are against, and what
     /// the rows' Restore is checked against again.
     fn landed(&mut self) {
+        // The view set's receipt (08 D25): the file is another, whatever the window does next.
+        self.saves_landed += 1;
         self.basis = self.file.lock().unwrap().basis();
         self.keeper.retired();
         for row in &mut self.rows {
@@ -3264,7 +3269,9 @@ impl ImageWindow {
         if plain_key(ctx, Key::F) {
             self.view = View::default();
         }
-        if plain_key(ctx, Key::Num1) {
+        // 100 %: A (actual pixels) — in the file browser's viewer 1 is view 1 (08 D12) — and
+        // 1 in a window of its own, which has no views (D24).
+        if plain_key(ctx, Key::A) || plain_key(ctx, Key::Num1) {
             self.view.scale = Some(1.0 / ctx.pixels_per_point());
         }
     }
@@ -3446,6 +3453,19 @@ impl ImageWindow {
                         modifiers,
                     });
                 }
+            }
+            // A key that types, as the keyboard sends it (`typed:`): the key, its text, its
+            // release.
+            super::browser::Play::Typed(key, text) => {
+                let event = |pressed| egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                i.events
+                    .extend([event(true), egui::Event::Text(text), event(false)]);
             }
         });
         ctx.request_repaint();
@@ -3796,6 +3816,30 @@ impl super::Window for ImageWindow {
 
     fn keys(&self) -> &'static [super::chrome::FKey] {
         super::chrome::IMAGE_KEYS
+    }
+
+    /// Its close prompt or Save As is the view keys' Question (08 §4).
+    fn view_state(&mut self) -> crate::view_keys::State {
+        if self.prompt || self.saving_as.is_some() {
+            crate::view_keys::State::Question
+        } else {
+            crate::view_keys::State::Free
+        }
+    }
+
+    fn saves_landed(&self) -> u64 {
+        self.saves_landed
+    }
+
+    /// What a switch of views asks or waits for (08 §5): a Save in its queue is one under way.
+    fn hold(&mut self) -> crate::views::Hold {
+        if self.job.is_some() || self.queued.is_some() {
+            crate::views::Hold::Saving
+        } else if self.doc.unsaved() {
+            crate::views::Hold::Unsaved
+        } else {
+            crate::views::Hold::Clean
+        }
     }
 
     /// A preview (02 §4.2) shows the picture fitted, without bars, and takes no input; `false`
@@ -4418,9 +4462,10 @@ pub struct HexSwitch {
     before_open: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-/// What an image window that gave way leaves its host: the hex window's file and the notices
-/// its rows open with.
-type GivenWay = (super::hex::HexFile, Vec<String>);
+/// What an image window that gave way leaves its host: the hex window's file, the notices its
+/// rows open with, and whether it gave way because the file does not decode (else: Hex view was
+/// asked for).
+type GivenWay = (super::hex::HexFile, Vec<String>, bool);
 
 impl HexSwitch {
     /// For a stream opened to wake `repaint`.
@@ -4476,6 +4521,8 @@ struct Streaming {
     /// A window of its own ([`open_stream`]): what Save will not keep is said on the terminal
     /// too, and the window takes the image's size once it is known.
     standalone: bool,
+    /// A view of the file browser's viewer (08 §8): the memory line names Hex view's key 2.
+    in_viewer: bool,
     image: Option<Box<ImageWindow>>,
     outcome: Arc<Mutex<Outcome>>,
     leftover: Arc<Mutex<Option<Job>>>,
@@ -4509,6 +4556,8 @@ struct Streaming {
 struct HexOpening {
     switch: HexSwitch,
     notices: Vec<String>,
+    /// The file does not decode ([`GivenWay`]'s flag).
+    failed: bool,
     opened: Receiver<std::result::Result<super::hex::HexFile, String>>,
 }
 
@@ -4549,6 +4598,7 @@ impl Streaming {
             load,
             hooks: hooks.clone(),
             standalone: false,
+            in_viewer: false,
             image: None,
             outcome: Arc::default(),
             leftover: Arc::default(),
@@ -4615,6 +4665,7 @@ impl Streaming {
         let Some((origin, cache_root, mut notices)) = self.parts.take() else {
             return;
         };
+        let failed = why.is_some();
         if let Some(why) = why {
             notices.insert(0, format!("{why}; the file is shown as bytes"));
         }
@@ -4624,11 +4675,11 @@ impl Streaming {
             }
             (None, Some(path)) => {
                 let path = path.clone();
-                return self.open_hex(ctx, switch, (path, origin, cache_root), notices);
+                return self.open_hex(ctx, switch, (path, origin, cache_root), notices, failed);
             }
             (None, None) => return,
         };
-        *switch.wanted.lock().unwrap_or_else(|p| p.into_inner()) = Some((file, notices));
+        *switch.wanted.lock().unwrap_or_else(|p| p.into_inner()) = Some((file, notices, failed));
         ctx.request_repaint();
     }
 
@@ -4641,6 +4692,7 @@ impl Streaming {
         switch: HexSwitch,
         (path, origin, cache_root): (PathBuf, Origin, PathBuf),
         notices: Vec<String>,
+        failed: bool,
     ) {
         let (tx, opened) = mpsc::channel();
         let (woken, wake) = (ctx.clone(), ctx.clone());
@@ -4664,6 +4716,7 @@ impl Streaming {
                 self.hex_opening = Some(HexOpening {
                     switch,
                     notices,
+                    failed,
                     opened,
                 });
                 wake.request_repaint();
@@ -4686,11 +4739,15 @@ impl Streaming {
             }
         };
         let HexOpening {
-            switch, notices, ..
+            switch,
+            notices,
+            failed,
+            ..
         } = self.hex_opening.take().expect("looked at above");
         match made {
             Ok(file) => {
-                *switch.wanted.lock().unwrap_or_else(|p| p.into_inner()) = Some((file, notices));
+                *switch.wanted.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some((file, notices, failed));
                 ctx.request_repaint();
             }
             Err(why) => self.fail(ctx, why),
@@ -4811,10 +4868,11 @@ impl Streaming {
             } else {
                 ui.visuals().warn_fg_color
             };
-            let keys = if hex_view {
-                "Continue (Enter) · Hex view (H) · Close (Esc)"
-            } else {
-                "Continue (Enter) · Close (Esc)"
+            // In the browser's viewer Hex view is view 2, H its alias (08 §8).
+            let keys = match (hex_view, self.in_viewer) {
+                (true, true) => "Continue (Enter) · Hex view (2) · Close (Esc)",
+                (true, false) => "Continue (Enter) · Hex view (H) · Close (Esc)",
+                (false, _) => "Continue (Enter) · Close (Esc)",
             };
             lines.push((format!("{} — {keys}", ask.line(physical)), color));
         }
@@ -4985,6 +5043,28 @@ impl super::Window for Streaming {
         }
     }
 
+    fn set_in_viewer(&mut self, in_viewer: bool) {
+        self.in_viewer = in_viewer;
+    }
+
+    fn view_state(&mut self) -> crate::view_keys::State {
+        match &mut self.image {
+            Some(image) => image.view_state(),
+            None => crate::view_keys::State::Free,
+        }
+    }
+
+    fn hold(&mut self) -> crate::views::Hold {
+        match &mut self.image {
+            Some(image) => image.hold(),
+            None => crate::views::Hold::Clean,
+        }
+    }
+
+    fn saves_landed(&self) -> u64 {
+        self.image.as_ref().map_or(0, |image| image.saves_landed())
+    }
+
     fn close_requested(&mut self) -> bool {
         match &mut self.image {
             Some(image) => image.close_requested(),
@@ -5085,7 +5165,7 @@ struct Switching {
 impl Switching {
     /// The image window gave way: the hex window from now on.
     fn swap(&mut self, ctx: &egui::Context) {
-        let Some((file, notices)) = self.switch.as_ref().and_then(HexSwitch::take) else {
+        let Some((file, notices, _)) = self.switch.as_ref().and_then(HexSwitch::take) else {
             return;
         };
         // A file at a revision stays one in the hex window.

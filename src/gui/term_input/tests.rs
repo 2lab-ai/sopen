@@ -740,8 +740,9 @@ fn plays(enc: Enc) -> Vec<Play> {
             window: window_text(typed),
         });
     }
-    // The spike's counts (macOS): 101 rows — the ⌘⌫ row is a Mac's — 26 ⌘ variants of them and
-    // 20 aliases under kitty (10 in the legacy encoding, which cannot send ⌘), 7 typed.
+    // The spike's counts (macOS): 101 rows — the ⌘⌫ row is a Mac's — and the viewer's 1, 2, 3
+    // and F9 since VM-7 (08 §8), 26 ⌘ variants of them and 20 aliases under kitty (10 in the
+    // legacy encoding, which cannot send ⌘), 7 typed.
     let count = |pick: fn(&Play) -> bool| plays.iter().filter(|p| pick(p)).count();
     let cmd_rows = count(|p| p.label.ends_with("(⌘)"));
     let aliases = count(|p| p.label.starts_with("List Ctrl+") || p.label.starts_with("List ⌘+"));
@@ -754,7 +755,7 @@ fn plays(enc: Enc) -> Vec<Play> {
             count(|p| p.label.contains("typed"))
         ),
         (
-            if HERE { 101 } else { 100 },
+            if HERE { 105 } else { 104 },
             if kitty { 26 } else { 0 },
             if kitty { 20 } else { 10 },
             7

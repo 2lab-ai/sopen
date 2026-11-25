@@ -800,6 +800,7 @@ size rule. Image and media upload their output, as today.
 | Write in place… | Only in §4.1's refusal rows, behind §4.4's dialog. |
 | Closing with unsaved edits (closing the window, Esc out of a browser viewer, F3) | `Save the changes to host:/abs before closing?` → **Save** · **Save As…** · **Discard** · **Cancel**. Save copy stands in for Save where Save is off, as today. Save As… opens the modal, and the window closes only after a save that landed. Discard's hover says it deletes the kept edits at <path>. Today's rules stay: closing during a save waits; a save that did not land keeps the window. |
 | Recovery | §3's rows on open, and §5.1's undo-file rows in the hex window: the newest three, the rest counted in a line. A row's buttons are disabled while a Save runs. |
+| The hex view in the browser's viewer | Opens viewing: typed text is not read, so a view key (08 §4) is never a byte. Enter or Insert starts editing (`editing — Esc ends`), Esc or F9 ends it (08 D35); its edits stay unsaved until saved in either mode. `--hex` and the binary dialog type at once, as before. §2's hex model is unchanged. |
 
 ## 11. Robustness and bounds
 

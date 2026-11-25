@@ -1024,7 +1024,7 @@ fn enter_on_an_info_card_opens_the_file() {
         .drv
         .text_starting_with("decoding this image needs")
         .unwrap();
-    assert!(line.contains("Hex view (H)"), "{line}");
+    assert!(line.contains("Hex view (2)"), "{line}");
     let seen = seen.lock().unwrap();
     assert_eq!(
         seen.connects, 2,

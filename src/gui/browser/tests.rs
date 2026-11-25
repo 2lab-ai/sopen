@@ -15,6 +15,7 @@ mod s3;
 mod s4;
 mod s5;
 mod s6;
+mod vm7;
 mod x1a;
 mod x1b;
 
@@ -391,9 +392,13 @@ fn an_edited_image_is_asked_before_it_goes() {
 fn keys_in_a_viewer_never_move_the_list() {
     let mut fx = fixture();
     fx.open("data.bin");
+    // The hex view opens viewing (08 D35): Enter edits.
+    fx.key(Key::Enter);
     fx.key(Key::Tab);
     fx.typed("n");
     fx.key(Key::ArrowDown);
+    // Esc ends editing; the next one leaves.
+    fx.key(Key::Escape);
     fx.key(Key::Escape);
     // The byte typed is an edit: the hex window asks.
     assert!(fx.drv.find_text("Unsaved changes").is_some());
@@ -412,8 +417,10 @@ fn a_viewers_f_keys_join_the_browsers_row() {
     for label in ["Exit   ", "Edit   ", "Save   ", "Goto   ", "Asc/hx "] {
         assert!(fx.drv.find_text(label).is_some(), "{label:?} in the row");
     }
-    // The first row is 00 01 02 …: F8 moves the typing to the ASCII column, where Z is a byte.
+    // The first row is 00 01 02 …: F8 moves the typing to the ASCII column, where Z is a byte
+    // once Enter has started editing (08 D35).
     fx.key(Key::F8);
+    fx.key(Key::Enter);
     fx.typed("Z");
     assert!(
         fx.drv.text_starting_with("5A 01 02").is_some(),
@@ -441,7 +448,8 @@ fn a_hosted_hex_viewers_f5_and_f6_work_and_respect_its_prompt() {
     let mut fx = fixture();
     let file = format!("{}/data.bin", fx.root);
     fx.open("data.bin");
-    // The first row is 00 01 02 …: 7A over the first byte, then F5.
+    // The first row is 00 01 02 …: 7A over the first byte (Enter edits, 08 D35), then F5.
+    fx.key(Key::Enter);
     fx.typed("7A");
     fx.key(Key::F5);
     fx.drv
@@ -459,7 +467,8 @@ fn a_hosted_hex_viewers_f5_and_f6_work_and_respect_its_prompt() {
         fx.drv.text_starting_with("FF 11 12").is_some(),
         "FF went to offset 16"
     );
-    // Esc with that edit: the prompt; F5 under it saves nothing.
+    // Esc ends editing; the next one, with that edit: the prompt; F5 under it saves nothing.
+    fx.key(Key::Escape);
     fx.key(Key::Escape);
     assert!(fx.drv.find_text("Unsaved changes").is_some());
     fx.key(Key::F5);
@@ -496,7 +505,8 @@ fn a_hosted_hex_viewers_go_to_takes_played_keys_in_a_window_without_focus() {
     let mut fx = fixture();
     fx.open("data.bin");
     fx.drv.focused = false;
-    fx.b.script = parse_keys("F6,text:0x10,Enter").unwrap().into();
+    // Editing first (Enter, 08 D35): a digit that missed the field would be a byte.
+    fx.b.script = parse_keys("Enter,F6,text:0x10,Enter").unwrap().into();
     fx.settle();
     fx.drv.idle(&mut fx.b, 2);
     fx.drv.focused = true;
@@ -509,6 +519,8 @@ fn a_hosted_hex_viewers_go_to_takes_played_keys_in_a_window_without_focus() {
 fn a_hosted_hex_viewers_go_to_is_still_open_after_the_window_lost_focus() {
     let mut fx = fixture();
     fx.open("data.bin");
+    // Editing first (Enter, 08 D35): a digit that missed the field would be a byte.
+    fx.key(Key::Enter);
     fx.key(Key::F6);
     fx.drv.focused = false;
     fx.drv.idle(&mut fx.b, 1);
@@ -660,7 +672,26 @@ fn the_viewer_is_given_the_grid_and_clipped_to_it() {
         settle: Box::new(|_| Some(Outcome::default())),
     };
     let (ctx, abs) = (fx.drv.ctx.clone(), format!("{}/notes.txt", fx.root));
-    fx.b.view(&ctx, probe, None, abs, None, false);
+    let means = view_set::Means {
+        path: abs.clone(),
+        name: "notes.txt".to_string(),
+        title: abs.clone(),
+        connect: local_connect(),
+        label: None,
+        in_place: false,
+    };
+    let opened = view_set::OpenedAs {
+        kind: crate::kind::Kind::Text,
+        stat: LocalFs::new().stat(&abs).unwrap(),
+        undecodable: None,
+    };
+    let views = view_set::open(&ctx, &opened, means, None);
+    let made = view_set::Made {
+        embedded: probe,
+        hold: None,
+        switch: None,
+    };
+    fx.b.view(&ctx, made, abs, false, views);
     fx.drv.idle(&mut fx.b, 2);
     let all = grid_columns(0, 125);
     assert_eq!(
@@ -1311,7 +1342,7 @@ fn w8b_esc_in_the_pass_an_image_gives_way_leaves_it() {
         b.viewer.is_some() && b.ready()
     });
     fx.drv.idle(&mut fx.b, 1);
-    assert!(shows(&fx, "Hex view (H)"), "the memory line");
+    assert!(shows(&fx, "Hex view (2)"), "the memory line");
     pressed_together(&mut fx, &[Key::H, Key::Escape]);
     fx.drv.idle(&mut fx.b, 3);
     assert!(fx.b.viewer.is_none(), "the owner left");
@@ -1349,7 +1380,7 @@ fn w8b_hex_view_on_the_memory_line_switches_to_the_hex_window() {
     fx.select("huge.png");
     fx.key(Key::Enter);
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while !shows(&fx, "Hex view (H)") {
+    while !shows(&fx, "Hex view (2)") {
         assert!(
             std::time::Instant::now() < deadline,
             "no memory line with Hex view ({:?})",
@@ -1424,7 +1455,7 @@ fn w8b_a_local_image_too_large_to_decode_asks_and_offers_hex_view() {
     fx.select("huge.png");
     fx.key(Key::Enter);
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while !shows(&fx, "Hex view (H)") {
+    while !shows(&fx, "Hex view (2)") {
         assert!(
             std::time::Instant::now() < deadline,
             "no memory line with Hex view ({:?})",
@@ -1763,6 +1794,8 @@ fn a_link_is_saved_through_to_its_file() {
     fx.b.list(Some(0), root, None, None);
     fx.settle();
     fx.open("link.bin");
+    // The hex view opens viewing (08 D35): Enter edits.
+    fx.key(Key::Enter);
     fx.typed("41");
     fx.drv
         .key(&mut fx.b, Key::S, crate::gui::testkit::command(false));

@@ -20,6 +20,8 @@ pub struct Meter {
     pub opened: Mutex<Vec<(usize, String)>>,
     /// Every read a stream asked: `(transport id, offset, length)`.
     pub asked: Mutex<Vec<(usize, u64, u32)>>,
+    /// Every poll a stream sent (an `fstat` or a stat of its path, 06 §5): by transport id.
+    pub polls: Mutex<Vec<usize>>,
     /// Bytes and read responses that came back to streams.
     pub stream_bytes: AtomicU64,
     pub stream_responses: AtomicUsize,
@@ -49,6 +51,7 @@ impl Meter {
             connects: AtomicUsize::new(0),
             opened: Mutex::default(),
             asked: Mutex::default(),
+            polls: Mutex::default(),
             stream_bytes: AtomicU64::new(0),
             stream_responses: AtomicUsize::new(0),
             whole_reads: AtomicUsize::new(0),
@@ -341,9 +344,11 @@ impl Ranged for MeteredRanged {
         self.inner_mut().read(off, len)
     }
     fn fstat(&mut self) -> Ticket {
+        self.meter.polls.lock().unwrap().push(self.id);
         self.inner_mut().fstat()
     }
     fn stat_path(&mut self) -> Ticket {
+        self.meter.polls.lock().unwrap().push(self.id);
         self.inner_mut().stat_path()
     }
     fn pending(&self) -> usize {

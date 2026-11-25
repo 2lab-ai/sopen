@@ -1876,6 +1876,16 @@ pub(super) struct HexWindow {
     /// edited or saved, no journal is written and none of an earlier session's is looked for
     /// (that look may reconcile a cut-off Save on the file).
     at_revision: bool,
+    /// The Hex view of the file browser's viewer (08 D35, [`super::Window::set_in_viewer`]): it
+    /// opens viewing — typed text is not read, so a view key is never a byte — and `editing`
+    /// from Enter or Insert until Esc or F9 (the view keys' commands). A window on its own types
+    /// at once, as ever.
+    in_viewer: bool,
+    editing: bool,
+    /// Saves that wrote the file so far (a Save, Write in place, a cut-off Save found landed):
+    /// the browser's view set tells its hidden views they are stale by it (08 D25), whatever
+    /// the window does after.
+    saves_landed: u64,
     /// Saves started so far (tests: a key starts exactly one).
     #[cfg(test)]
     pub(super) save_starts: usize,
@@ -1921,6 +1931,10 @@ pub(super) fn bare_key(ctx: &egui::Context, key: Key) -> bool {
 fn grid_id() -> egui::Id {
     egui::Id::unique("sopen-hex-grid")
 }
+
+/// The Hex view's status row while it is viewing and while it is edited (08 §8, D35).
+pub(super) const VIEWING: &str = "viewing — Enter edits";
+pub(super) const EDITING: &str = "editing — Esc ends";
 
 fn goto_id() -> egui::Id {
     egui::Id::unique("sopen-hex-goto")
@@ -2006,6 +2020,9 @@ impl HexWindow {
             #[cfg(test)]
             crashed: false,
             cursor,
+            in_viewer: false,
+            editing: false,
+            saves_landed: 0,
             top_row: 0,
             visible: 1,
             follow: true,
@@ -2570,6 +2587,17 @@ impl HexWindow {
                 self.opened.push(CANNOT_REPLACE.to_string());
             }
             self.can_replace = can;
+        }
+        // What wrote the file itself (not a copy beside it): the view set's receipt (D25).
+        if matches!(
+            &result,
+            Ok(JobDone::Saved(Saved::Written { .. })
+                | JobDone::Streamed {
+                    done: Streamed::Saved { .. } | Streamed::FoundLanded { .. },
+                    ..
+                })
+        ) {
+            self.saves_landed += 1;
         }
         let landed = match &result {
             Ok(JobDone::Saved(Saved::Written { .. })) => {
@@ -3647,6 +3675,8 @@ impl HexWindow {
             };
             self.place(self.cursor.at, pane);
         }
+        // Viewing (D35): typed text is not read — no byte changes until Enter or Insert.
+        let viewing = self.in_viewer && !self.editing;
         let typed: Vec<char> = ctx.input(|i| {
             i.events
                 .iter()
@@ -3657,7 +3687,7 @@ impl HexWindow {
                 .flatten()
                 .collect()
         });
-        for c in typed {
+        for c in typed.into_iter().filter(|_| !viewing) {
             if self.no_edit_here() {
                 break;
             }
@@ -3838,6 +3868,9 @@ impl HexWindow {
         }
         match self.loading_line(ctx) {
             Some(line) => Status::info(line),
+            None if self.in_viewer && self.status.text.is_empty() => {
+                Status::info(if self.editing { EDITING } else { VIEWING })
+            }
             None => self.status.clone(),
         }
     }
@@ -4667,6 +4700,76 @@ impl super::Window for HexWindow {
         if let Some(stream) = &self.stream {
             stream.set_visible(shown);
         }
+    }
+
+    /// The Hex view of the browser's viewer (D35): viewing from now on, also each time it is
+    /// shown again; its typing column kept.
+    fn set_in_viewer(&mut self, in_viewer: bool) {
+        self.in_viewer = in_viewer;
+        self.editing = false;
+    }
+
+    /// A question up (the close prompt, Save As, a confirmation, Write in place) is the view
+    /// keys' Question; else the hex view's viewing or editing (D35), read-only for a revision or
+    /// a file turned read-only, saving while a Save Esc stops runs.
+    fn view_state(&mut self) -> crate::view_keys::State {
+        if self.prompt || self.dialog_up() {
+            return crate::view_keys::State::Question;
+        }
+        crate::view_keys::State::Hex(crate::view_keys::Hex {
+            editing: self.editing,
+            read_only: self.at_revision || self.read_only.is_some(),
+            saving: self.job.is_some() && self.stream.is_some(),
+        })
+    }
+
+    fn hold(&mut self) -> crate::views::Hold {
+        if self.job.is_some() {
+            crate::views::Hold::Saving
+        } else if self.doc.unsaved() {
+            crate::views::Hold::Unsaved
+        } else {
+            crate::views::Hold::Clean
+        }
+    }
+
+    fn view_key(&mut self, command: crate::view_keys::Command) {
+        use crate::view_keys::{Command, Ending};
+        match command {
+            Command::StartEditing => {
+                self.editing = true;
+                self.status = Status::default();
+            }
+            Command::EndEditing | Command::Arm(Ending::Editing) => {
+                self.editing = false;
+                self.status = Status::default();
+            }
+            Command::ReadOnly => {
+                let why = match &self.read_only {
+                    Some(_) if !self.at_revision => self.read_only_why.as_str(),
+                    _ => AT_A_REVISION,
+                };
+                self.status = Status::error(format!("cannot edit: {why}"));
+            }
+            _ => {}
+        }
+    }
+
+    fn byte_place(&self) -> Option<u64> {
+        Some(self.cursor.at)
+    }
+
+    fn saves_landed(&self) -> u64 {
+        self.saves_landed
+    }
+
+    /// The cursor on `at`, its row at the top (08 D11).
+    fn go_to_byte(&mut self, at: u64) {
+        let at = self.last().map_or(at, |last| at.min(last));
+        self.cursor.at = at;
+        self.cursor.low = false;
+        self.top_row = at / ROW;
+        self.follow = true;
     }
 
     fn close_requested(&mut self) -> bool {

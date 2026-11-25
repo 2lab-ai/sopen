@@ -414,12 +414,18 @@ window on that host shares that one budget.
     waited 3.1 s (*edit* §2.4). The viewer's reads, on its `Ranged`, are not held up by it.
 - **The media window holds one Source.** All of ffmpeg's HTTP connections read through its single
   `Ranged`.
+- **A browser viewer's views each hold their own** (08 §8, VM-7, until VM-7b's D13/D14): a view
+  made on a remote file (2 Hex, 3 Text, a view 1 made again) opens one session for its own stream,
+  as the opening did, and keeps it while it is hidden; one that saves adds its `Origin` from its
+  first Save. A file has at most two documents among its views (§3 of 08: Raw is Text's), so a
+  viewer holds 2 sessions after its second view, and at worst 4 — an image and its Hex view both
+  saved. A view the image gives way to by `H` reads the image's stream (no session more).
 
 | Holder | Channels while it lives |
 |---|---|
 | a standalone viewer (hex, image, media) | 1; 2 from its first Save, Save copy, Save As or Export (hex: or from an open that recovers a journal) |
 | the browser's listing | 1 |
-| a browser viewer | 1; 2 from its first Save, Save copy, Save As or Export (hex: or from an open that recovers a journal) |
+| a browser viewer | 1 per view made (at most 2), each +1 from its first Save, Save copy, Save As or Export (hex: or from an open that recovers a journal): 1–4 (08 §8; VM-7b brings it back to 1–2) |
 | the browser's preview session (02 §4.4, one per window) | 1 |
 | the directory tree (browser 05) | 1 |
 | a file operation (browser 04) | 1 each |
@@ -427,7 +433,13 @@ window on that host shares that one budget.
 
 These are 02 §4.4's counts: listing 1, viewer 1, preview 1, tree 1, file operation 1, git ≤ 3, which
 is 8, and 9 while a git stop runs. Streaming adds one only while a viewer has saved or exported.
-One more sopen window on the same host can therefore reach the limit.
+One more sopen window on the same host can therefore reach the limit. With VM-7's views a viewer
+that showed a second view is 2 (9, and 10 while a git stop runs), and one whose two views both
+saved is 4: with every other holder busy at once that is 11, past sshd's 10 — the next session
+asked for is refused and said in words, as below. A view whose make is refused is not made: the
+view on screen stays, the status row says the refusal, and nothing is lost (a view 1 made again
+after its prompt was answered: its edits were saved or discarded first, and the viewer goes back
+to the list).
 
 **When sshd refuses a session**, the refusal can come at two moments. Each is said in words, and
 nothing else is affected:
@@ -867,7 +879,11 @@ the page and drop the queued keys.
     - `Doc::decode` and `Doc::decode_checked` ask nothing and keep the crate's limit.
 - **Hex view, and the hex view for a file that does not decode.** The memory line offers Hex view
   (H), which shows the file's bytes in the hex window — in the browser, and in a window of its
-  own, which becomes the hex window in place (as the binary dialog does). A file that does not
+  own, which becomes the hex window in place (as the binary dialog does). In the browser's viewer
+  Hex view is view 2 (08 §8, VM-7): the line reads `Hex view (2)`, `H` its alias. Only `H` (and a
+  file that does not decode) gives the hex window this stream; `2` makes the Hex view as every view
+  of the viewer is made today — on a connection and a stream of its own, reading again what it
+  shows (08 D13 is VM-7b's) — and the image window stays, hidden, on its own. A file that does not
   decode opens in the hex window the same way, its reason the first of the window's rows.
   - A remote file's hex window reads the same stream: nothing is read again, and the stats line
     has one `first` for the open.

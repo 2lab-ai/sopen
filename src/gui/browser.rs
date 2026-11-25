@@ -41,6 +41,7 @@ mod prepare;
 mod preview;
 mod tree;
 pub(crate) mod view;
+mod view_set;
 
 use super::cells::{self, Grid};
 use super::chrome::{self, FKey};
@@ -70,7 +71,7 @@ use git_panel::{
 };
 use keys::{Command, Context, Step};
 pub use panel::Panel;
-use prepare::Prepared;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -481,17 +482,32 @@ fn no_engine() -> ops::Run {
 pub(crate) enum Play {
     Key(Key, Modifiers),
     Text(String),
+    /// A key that types, as the keyboard sends it: the key with its physical key, then its typed
+    /// text, in one pass (`typed:1`, 08 §12).
+    Typed(Key, String),
 }
 
 /// `SOPEN_KEYS`, read: steps separated by commas — a key by egui's name (`F5`, `Enter`, `Esc`,
-/// `Down`, `Space`, `Tab`, a letter), with `Shift+`, `Alt+` or `Cmd+` / `Ctrl+` before it, or
-/// `text:…` for typed text. The browser plays them, one per settled window, as the owner's
-/// keys (a receipt of a dialog, a selection, a rename).
+/// `Down`, `Space`, `Tab`, a letter), with `Shift+`, `Alt+` or `Cmd+` / `Ctrl+` before it,
+/// `text:…` for typed text, or `typed:1` for a key that types one character as the keyboard
+/// sends it — the key and its text together (08 §12: a viewer's `1` chooses view 1 and is not
+/// typed). The browser plays them, one per settled window, as the owner's keys (a receipt of a
+/// dialog, a selection, a rename, a view).
 pub(crate) fn parse_keys(text: &str) -> std::result::Result<Vec<Play>, String> {
     let mut out = Vec::new();
     for step in text.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if let Some(typed) = step.strip_prefix("text:") {
             out.push(Play::Text(typed.to_string()));
+            continue;
+        }
+        if let Some(typed) = step.strip_prefix("typed:") {
+            let mut chars = typed.chars();
+            let key = match (chars.next(), chars.next()) {
+                (Some(c), None) => Key::from_name(&c.to_string()),
+                _ => None,
+            };
+            let key = key.ok_or_else(|| format!("'{step}': typed: takes one key's character"))?;
+            out.push(Play::Typed(key, typed.to_string()));
             continue;
         }
         let mut modifiers = Modifiers::NONE;
@@ -536,13 +552,16 @@ struct Opening {
     source: Source,
     /// A diff or a file at a revision (03 §6.2–§6.3): its viewer is read-only.
     read_only: Option<ReadOnly>,
+    /// How its file is reached: what its views are made over later (08 §6).
+    connect: Connect,
+    label: Option<String>,
 }
 
 /// Where an opening's file comes from.
 enum Source {
     /// Enter on it in the list: [`prepare::prepare`] on a worker.
     Fresh {
-        rx: Receiver<Result<Prepared>>,
+        rx: Receiver<Result<prepare::Opened>>,
         worker: Option<JoinHandle<()>>,
     },
     /// Enter on a file whose preview was still being prepared (02 §4.4): that preparation,
@@ -559,9 +578,10 @@ struct Viewer {
     abs: String,
     /// An image read through a stream: where it gives way to the hex window (06 §7.3).
     switch: Option<super::image::HexSwitch>,
-    /// A diff or a file at a revision (03 §6.3): the viewer was told before its first pass, and
-    /// so is the hex window it gives way to.
-    read_only: bool,
+    /// The file's views (08 §8): `embedded` is the one on screen. A diff or a file at a revision
+    /// (03 §6.3): the viewer was told before its first pass, and so is every view made later —
+    /// the hex window an image gives way to among them.
+    views: view_set::Views,
 }
 
 /// The directory tree on the side that had the keyboard when F10 was pressed (05; 02 §3.1
@@ -774,6 +794,9 @@ pub(crate) struct Browser {
     /// `SOPEN_STATE` `loading=1` (06 §11): handed to the text viewers this browser opens, as
     /// `at=` is. A viewer on a stream is then shot at its first frame with rows.
     open_loading: bool,
+    /// `SOPEN_STATE` `view=N` (08 §8): the first viewer opened in this browser switches to view
+    /// N once it is on screen — taken by it, as `at=` is.
+    open_view: Option<u8>,
     /// `SOPEN_KEYS`: the keys still to play, one per settled window, and the passes to let go
     /// by before the next (a field opened by one takes the typing on the pass after).
     script: VecDeque<Play>,
@@ -801,6 +824,10 @@ impl Drop for Browser {
                 settle: viewer.embedded.settle,
                 hold: viewer.hold,
             });
+            let Leftover {
+                closing, workers, ..
+            } = &mut *leftover;
+            viewer.views.close(closing, workers);
         }
         if let Some(opening) = self.opening.take() {
             opening.cancel.store(true, Ordering::Relaxed);
@@ -921,6 +948,7 @@ impl Browser {
             open_at: None,
             open_enc: None,
             open_loading: false,
+            open_view: None,
             script: VecDeque::new(),
             script_gap: 0,
             tree: None,
@@ -1042,6 +1070,7 @@ impl Browser {
         let remote = label.is_some();
         let in_place = read_only.is_some();
         let cache = self.cache.clone();
+        let (kept_connect, kept_label) = (connect.clone(), label.clone());
         let (d, t, stop, waker, path) = (
             done.clone(),
             total.clone(),
@@ -1066,11 +1095,7 @@ impl Browser {
                 t.store(all, Ordering::Relaxed);
                 waker.request_repaint();
             };
-            let result = if in_place {
-                prepare::prepare_in_place(&req, &stop, &mut progress)
-            } else {
-                prepare::prepare(&req, &stop, &mut progress)
-            };
+            let result = prepare::prepare_opening(&req, in_place, &stop, &mut progress);
             let _ = tx.send(result);
             waker.request_repaint();
         });
@@ -1087,6 +1112,8 @@ impl Browser {
                 worker: Some(worker),
             },
             read_only,
+            connect: kept_connect,
+            label: kept_label,
         });
     }
 
@@ -1527,6 +1554,7 @@ impl Browser {
         };
         let cancelled = opening.cancel.load(Ordering::Relaxed);
         let (abs, name, read_only) = (opening.abs, opening.name, opening.read_only);
+        let (connect, label) = (opening.connect, opening.label);
         if let Source::Fresh {
             worker: Some(worker),
             ..
@@ -1549,13 +1577,23 @@ impl Browser {
                 drop(result);
                 self.status = not_opened(&name, self.label.is_some());
             }
-            Ok(result) => self.opened(ctx, result, abs, name, read_only),
+            Ok(result) => {
+                let means = view_set::Means {
+                    path: abs.clone(),
+                    name: name.clone(),
+                    title: String::new(),
+                    connect,
+                    label,
+                    in_place: read_only.is_some(),
+                };
+                self.opened(ctx, result, means, read_only)
+            }
             // The preview's preparation, taken over, came to its end: the live preview becomes
             // the viewer — or it is an info card (an error), and the file opens as from the
             // list.
             Err(preview::Ended::Ready(_)) if cancelled => self.status = not_opened(&name, false),
             Err(preview::Ended::Ready(previewed)) => match previewed.show().hand_over() {
-                Ok(viewer) => self.handed_over(ctx, viewer, abs),
+                Ok(viewer) => self.handed_over(ctx, viewer, abs, name),
                 Err(_card) => self.start_open(ctx, abs, name),
             },
             Err(preview::Ended::Cancelled) => {
@@ -1567,18 +1605,18 @@ impl Browser {
         }
     }
 
-    /// The file at `abs` came back ready: its viewer shows, in this window — read-only, titled
-    /// and edited as `read_only` says, for a diff or a file at a revision (03 §6.2–§6.3).
+    /// The file came back ready: its viewer shows, in this window — read-only, titled and edited
+    /// as `read_only` says, for a diff or a file at a revision (03 §6.2–§6.3). `means`: where its
+    /// bytes are and how they are reached, for the views made later (08 §6).
     fn opened(
         &mut self,
         ctx: &egui::Context,
-        result: Result<Prepared>,
-        abs: String,
-        name: String,
+        result: Result<prepare::Opened>,
+        mut means: view_set::Means,
         read_only: Option<ReadOnly>,
     ) {
-        let prepared = match result {
-            Ok(prepared) => prepared,
+        let opened = match result {
+            Ok(opened) => opened,
             Err(e) if crate::remote::is_cancelled(&e) => {
                 self.status = Status::info("cancelled; nothing was kept");
                 return;
@@ -1589,97 +1627,32 @@ impl Browser {
                 return;
             }
         };
+        let abs = means.path.clone();
         let title = match &read_only {
             Some(r) => r.title.clone(),
             None => show(self.label.as_deref(), &abs),
         };
-        let mut switch = None;
-        let (embedded, hold) = match prepared {
-            Prepared::Image {
-                file,
-                doc,
-                notices,
-                claim,
-            } => (super::image::embed(file, doc, notices), claim),
-            Prepared::ImageAsking {
-                file,
-                path,
-                notices,
-                claim,
-            } => {
-                // 06 §7.3: the memory line, with Hex view on the file read in place.
-                let gives_way = super::image::HexSwitch::local(path);
-                match super::image::embed_asking(file, notices, Some(gives_way.clone())) {
-                    Ok(embedded) => {
-                        switch = Some(gives_way);
-                        (embedded, claim)
-                    }
-                    Err(e) => {
-                        self.status = Status::error(format!("{e:#}"));
-                        return;
-                    }
-                }
-            }
-            Prepared::ImageStream {
-                origin,
-                source,
-                repaint,
-                notices,
-            } => {
-                // 06 §7.3: the window reads on a worker of its own, and gives way to the hex
-                // window on the same stream (Hex view, a file that does not decode).
-                let gives_way = super::image::HexSwitch::new(repaint);
-                let made = super::image::embed_stream(
-                    origin,
-                    source,
-                    &self.cache,
-                    notices,
-                    Some(gives_way.clone()),
-                );
-                match made {
-                    Ok(embedded) => {
-                        switch = Some(gives_way);
-                        (embedded, None)
-                    }
-                    Err(e) => {
-                        self.status = Status::error(format!("{e:#}"));
-                        return;
-                    }
-                }
-            }
-            Prepared::Media {
-                origin,
-                media,
-                notices,
-                claim,
-            } => (
-                super::media::embed(origin, *media, &self.cache, notices),
-                claim,
-            ),
-            // Probed on the worker: nothing slow is left for this frame (06 §7.4).
-            Prepared::MediaStream {
-                origin,
-                media,
-                notices,
-            } => (
-                super::media::embed_streamed(origin, *media, &self.cache, notices),
-                None,
-            ),
-            Prepared::Hex { file, notices } => (super::hex::embed(file, notices), None),
-            Prepared::Text {
-                doc,
-                notices,
-                claim,
-            } => {
-                // A file read in place (no fetched copy, no stream) is followed at its end.
-                let live = claim.is_none() && !doc.is_stream();
-                let at = self.open_at.take();
-                let loading = self.open_loading;
-                let enc = self.open_enc.take();
-                (
-                    super::text::embed_scripted(doc, title, &name, notices, live, at, loading, enc),
-                    claim,
-                )
+        means.title = title.clone();
+        let opened_as = view_set::OpenedAs::of(&opened);
+        // `at=` and `enc=` are the first text file's: taken by a text viewer, kept past any
+        // other.
+        let text = match opened.prepared {
+            prepare::Prepared::Text { .. } => view_set::TextOpen {
+                at: self.open_at.take(),
+                loading: self.open_loading,
+                enc: self.open_enc.take(),
+            },
+            _ => view_set::TextOpen {
+                loading: self.open_loading,
+                ..Default::default()
+            },
+        };
+        let made = view_set::embed(opened.prepared, &self.cache, title, &means.name, text, None);
+        let made = match made {
+            Ok(made) => made,
+            Err(e) => {
+                self.status = Status::error(format!("{e:#}"));
+                return;
             }
         };
         self.status = Status::default();
@@ -1688,7 +1661,8 @@ impl Browser {
             Some(r) => (r.edit, true),
             None => (abs, false),
         };
-        self.view(ctx, embedded, hold, abs, switch, read_only);
+        let views = view_set::open(ctx, &opened_as, means, self.open_view.take());
+        self.view(ctx, made, abs, read_only, views);
     }
 
     /// What `SOPEN_STATE` asks of the browser (a scripted run): the entry to open or to put
@@ -1698,6 +1672,7 @@ impl Browser {
         self.open_at = state.at;
         self.open_enc = state.enc;
         self.open_loading = state.loading;
+        self.open_view = state.view;
         self.mode = state.mode;
         self.bar_first = state.bar.clone();
         self.git.script = GitScript {
@@ -1710,29 +1685,69 @@ impl Browser {
     }
 
     /// A preview handed over (02 §4.4): the live window is the viewer.
-    fn handed_over(&mut self, ctx: &egui::Context, viewer: prepare::HandedOver, abs: String) {
+    fn handed_over(
+        &mut self,
+        ctx: &egui::Context,
+        viewer: prepare::HandedOver,
+        abs: String,
+        name: String,
+    ) {
         self.status = match viewer.notices.as_slice() {
             [] => Status::default(),
             said => Status::info(said.join(" · ")),
         };
-        self.view(ctx, viewer.embedded, viewer.hold, abs, None, false);
+        let means = view_set::Means {
+            path: abs.clone(),
+            title: show(self.label.as_deref(), &abs),
+            name,
+            connect: self.connect.clone(),
+            label: self.label.clone(),
+            in_place: false,
+        };
+        let opened_as = view_set::OpenedAs {
+            kind: viewer.kind,
+            // The hand-over keeps no stat: the set reads only whether media is empty (D10),
+            // and a preview of empty media is a card, never handed over.
+            stat: crate::remote::Stat {
+                is_dir: false,
+                is_file: true,
+                is_symlink: false,
+                size: 1,
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                mode: 0,
+                uid: None,
+                gid: None,
+                missing: Some("size"),
+                sha256: None,
+            },
+            undecodable: None,
+        };
+        let views = view_set::open(ctx, &opened_as, means, self.open_view.take());
+        let made = view_set::Made {
+            embedded: viewer.embedded,
+            hold: viewer.hold,
+            switch: None,
+        };
+        self.view(ctx, made, abs, false, views);
     }
 
-    /// `embedded` is the viewer on screen from now on; `read_only` (a diff, a file at a
-    /// revision) is told to it here, before its first pass (03 §6.3; S2-E: a flag set later
-    /// could let a recovery of an earlier session start).
+    /// `made` is the viewer on screen from now on, the first of `views`; `read_only` (a diff, a
+    /// file at a revision) is told to it here, before its first pass (03 §6.3; S2-E: a flag set
+    /// later could let a recovery of an earlier session start), and so is that it is a view of
+    /// the viewer (D35: the hex view opens viewing).
     fn view(
         &mut self,
         ctx: &egui::Context,
-        mut embedded: Embedded,
-        hold: Option<crate::cache::Claim>,
+        made: view_set::Made,
         abs: String,
-        switch: Option<super::image::HexSwitch>,
         read_only: bool,
+        views: view_set::Views,
     ) {
+        let mut embedded = made.embedded;
         if read_only {
             embedded.window.set_read_only(true);
         }
+        embedded.window.set_in_viewer(true);
         // The list gave up the keyboard: the viewer's keys are its own now.
         ctx.memory_mut(|m| m.surrender_focus(list_id()));
         self.exit = Exit::List;
@@ -1741,10 +1756,10 @@ impl Browser {
         debug_assert!(self.viewer.is_none(), "a viewer was replaced unasked");
         self.viewer = Some(Viewer {
             embedded,
-            hold,
+            hold: made.hold,
             abs,
-            switch,
-            read_only,
+            switch: made.switch,
+            views,
         });
         self.moved_at = None;
     }
@@ -1766,10 +1781,15 @@ impl Browser {
     /// The viewer is gone: what it may still be writing is kept until it settles.
     fn drop_viewer(&mut self) {
         if let Some(viewer) = self.viewer.take() {
-            self.leftover.borrow_mut().closing.push(Closing {
+            let mut leftover = self.leftover.borrow_mut();
+            leftover.closing.push(Closing {
                 settle: viewer.embedded.settle,
                 hold: viewer.hold,
             });
+            let Leftover {
+                closing, workers, ..
+            } = &mut *leftover;
+            viewer.views.close(closing, workers);
         }
         // A viewer closing commits at once (02 §3.1).
         self.moved_at = None;
@@ -1777,6 +1797,8 @@ impl Browser {
 
     /// Where the closed viewer's exit leads: the list as it was, or the window closing.
     fn after_viewer(&mut self, ctx: &egui::Context) {
+        // The list's digits and letters are its own again from the next pass (08 §8).
+        super::set_view_keys(ctx, None);
         self.status = self.told_later.take().unwrap_or_default();
         if std::mem::replace(&mut self.exit, Exit::List) == Exit::Quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1831,7 +1853,9 @@ impl Browser {
                     None => self.preview.take(&path),
                 };
                 match taken {
-                    preview::Taken::Viewer(viewer) => self.handed_over(ctx, viewer, path),
+                    preview::Taken::Viewer(viewer) => {
+                        self.handed_over(ctx, viewer, path, entry.name)
+                    }
                     preview::Taken::Card => self.start_open(ctx, path, entry.name),
                     preview::Taken::Running(prep) => {
                         self.status = Status::default();
@@ -1844,6 +1868,8 @@ impl Browser {
                             cancel: prep.cancel.clone(),
                             source: Source::Preview(prep),
                             read_only: None,
+                            connect: self.connect.clone(),
+                            label: self.label.clone(),
                         });
                     }
                     preview::Taken::Nothing => self.start_open(ctx, path, entry.name),
@@ -2192,20 +2218,28 @@ impl Browser {
             return;
         };
         self.script_gap = 2;
-        ctx.input_mut(|i| match step {
-            Play::Text(text) => i.events.push(egui::Event::Text(text)),
-            Play::Key(key, modifiers) => {
-                for pressed in [true, false] {
-                    i.events.push(egui::Event::Key {
-                        key,
-                        physical_key: None,
-                        pressed,
-                        repeat: false,
-                        modifiers,
-                    });
-                }
-            }
-        });
+        let key = |key, physical_key, pressed, modifiers| egui::Event::Key {
+            key,
+            physical_key,
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let mut events = match step {
+            Play::Text(text) => vec![egui::Event::Text(text)],
+            Play::Key(k, modifiers) => [true, false]
+                .map(|pressed| key(k, None, pressed, modifiers))
+                .to_vec(),
+            Play::Typed(k, text) => vec![
+                key(k, Some(k), true, Modifiers::NONE),
+                egui::Event::Text(text),
+                key(k, Some(k), false, Modifiers::NONE),
+            ],
+        };
+        // Played after the shell's input hook: the viewer's view keys are taken here as the
+        // hook takes the keyboard's (08 §8).
+        super::route_view_keys(ctx, &mut events);
+        ctx.input_mut(|i| i.events.extend(events));
         ctx.request_repaint();
     }
 
@@ -2345,24 +2379,31 @@ impl Browser {
     /// not leave.
     fn viewer_ui(&mut self, ui: &mut egui::Ui, esc_was_a_fields: bool) {
         let ctx = ui.ctx().clone();
+        // F8's list of encodings, over the view (08 §7.5).
+        self.picker_ui(&ctx, ui.max_rect());
         let Some(viewer) = self.viewer.as_mut() else {
             return;
         };
         let ((), asked) = super::host_pass(&ctx, || viewer.embedded.window.ui(ui));
         // 06 §7.3: the image gave way to the hex window (Hex view, a file that does not
-        // decode) — on the same stream, in its place, nothing read again. Unless the owner left
-        // in the same pass (its Esc asked the image window to close): then the hex window is
-        // not made, and its file — the stream with it — goes; the viewer closes below.
+        // decode) — on the same stream, in its place, nothing read again: it is the Hex view
+        // (08 §8). Unless the owner left in the same pass (its Esc asked the image window to
+        // close): then the hex window is not made, and its file — the stream with it — goes;
+        // the viewer closes below.
         let given_way = viewer.switch.as_ref().and_then(|s| s.take());
-        if let Some((file, notices)) = given_way.filter(|_| !asked) {
-            let (abs, read_only) = (viewer.abs.clone(), viewer.read_only);
-            self.drop_viewer();
-            // A file at a revision stays read-only in the hex window it gives way to.
-            let made = super::hex::embed(file, notices);
-            self.view(&ctx, made, None, abs, None, read_only);
-            ctx.request_repaint();
+        if let Some((file, notices, failed)) = given_way.filter(|_| !asked) {
+            self.views_given_way(&ctx, file, notices, failed);
+            self.views_after(&ctx);
             return;
         }
+        if asked && self.views_asked(&ctx) {
+            // The prompt was up for a switch of views: its answer was the switch's.
+            self.views_after(&ctx);
+            return;
+        }
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
         if asked {
             // Its prompt was answered, or a write it waited for landed — or it found it cannot
             // show its file after all: ask it again.
@@ -2407,6 +2448,7 @@ impl Browser {
             }
         }
         ctx.input_mut(|i| i.events.extend(withheld));
+        self.views_after(&ctx);
     }
 
     /// The two sides, side by side: each its list, or — the side opposite the active list, in
@@ -2507,8 +2549,11 @@ impl Browser {
                     "{what} waiting for an answer — F3 back to the list"
                 )),
                 (None, Some(line)) => Status::error(line.clone()),
-                (None, None) if !self.status.text.is_empty() => self.status.clone(),
-                (None, None) => Status::info(VIEWER_HINT),
+                (None, None) => match self.viewer.as_ref().and_then(|v| v.views.status()) {
+                    Some(said) => said,
+                    None if !self.status.text.is_empty() => self.status.clone(),
+                    None => Status::info(VIEWER_HINT),
+                },
             };
         }
         if let Some(listing) = self.listing.first() {
@@ -2557,7 +2602,7 @@ impl Browser {
             && self.opening.is_none()
             && !self.uncommitted
             && match &self.viewer {
-                Some(viewer) => viewer.embedded.window.ready(),
+                Some(viewer) => viewer.embedded.window.ready() && viewer.views.settled(),
                 None => self.preview.settled(),
             }
             // A running operation counts only while it waits at its question — not while a
@@ -2578,9 +2623,16 @@ impl Window for Browser {
         let ctx = ui.ctx().clone();
         // Before anything else this pass: did this frame's Esc take the keyboard from a field?
         let esc_was_a_fields = self.focused_before && ctx.memory(|m| m.focused()).is_none();
+        if self.viewer.is_none() {
+            // No viewer, no view keys (08 §8).
+            super::set_view_keys(&ctx, None);
+        }
         self.play(&ctx);
         self.git_stop_on_esc(&ctx);
         self.poll(&ctx);
+        // The viewer's views (08 §8): a view key's switch, a view made — before the title row,
+        // whose strip shows it.
+        self.views_before(&ctx);
         self.git_pass(&ctx);
         if self.tree.is_some() {
             self.tree_pass(&ctx);
@@ -2604,8 +2656,10 @@ impl Window for Browser {
                 .map_or_else(Vec::new, |i| self.git.panels[i].view.fkeys(self.mode)),
             (None, None) => keys::row(Context::List, self.mode),
         };
-        // The title, F-key and status rows in cells, a row each (10 §6).
-        chrome::title_panel(ui, "sopen-browser-title", &self.title);
+        // The title, F-key and status rows in cells, a row each (10 §6); over a viewer, its
+        // views on the title row (08 §8).
+        let strip = self.viewer.as_ref().map(|v| v.views.strip());
+        chrome::title_panel_with(ui, "sopen-browser-title", &self.title, strip.as_ref());
         chrome::key_panel_cells(ui, "sopen-browser-keys", &keys);
         self.fkeys_line = super::fkeys_status(&ctx);
         let status = self.status_line();

@@ -204,7 +204,11 @@ fn the_f_key_tables() {
         ]
     );
     assert_eq!(LIST_KEYS, row(Context::List, Mode::Preview).as_slice());
-    assert_eq!(pairs(VIEWER_KEYS), [(1, "Help"), (3, "Exit"), (4, "Edit")]);
+    // 9View in every view of the viewer (08 §8, VM-7).
+    assert_eq!(
+        pairs(VIEWER_KEYS),
+        [(1, "Help"), (3, "Exit"), (4, "Edit"), (9, "View")]
+    );
     assert_eq!(VIEWER_KEYS, row(Context::Viewer, Mode::Preview).as_slice());
     // The git panel's table row (03 §9.1) since S3 landed: every slot. The panel shows the
     // slots that act on the object under the bar (`GitView::fkeys`; F7 says Commit on the
@@ -239,7 +243,8 @@ fn the_f_key_tables() {
             (5, "Save"),
             (6, "Goto"),
             (7, "SaveAs"),
-            (8, "Asc/hx")
+            (8, "Asc/hx"),
+            (9, "View")
         ]
     );
     // A number in both keeps the first.
@@ -259,8 +264,8 @@ fn the_f_key_tables() {
         ]
     );
     // PC Shell's labels are six characters at most ("Disply", "Locate"); so are these.
-    assert_eq!(pairs(TEXT_WRAPPED_KEYS), [(2, "Unwrap")]);
-    assert_eq!(pairs(TEXT_UNWRAPPED_KEYS), [(2, "Wrap")]);
+    assert_eq!(pairs(TEXT_WRAPPED_KEYS), [(2, "Unwrap"), (8, "Encode")]);
+    assert_eq!(pairs(TEXT_UNWRAPPED_KEYS), [(2, "Wrap"), (8, "Encode")]);
     let all = LIST_KEYS
         .iter()
         .chain(VIEWER_KEYS)
