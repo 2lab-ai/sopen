@@ -312,7 +312,8 @@ changes: a folder still opens in a window.
   machine comes later); on Linux without a display it says how to get one.
 - What the terminal does not draw yet — the preview, the viewers, the directory tree, the git
   panel, their dialogs — is a box saying `F12 shows it in the window`; a click on it is F12.
-  F1's key help is drawn in the terminal as in the window.
+  F1's key help and the text viewer (Enter on a text file: its rows, wrapped or not, its
+  highlighting, Go to, F8's encodings) are drawn in the terminal as in the window.
 - **Keys**: where the terminal offers the kitty keyboard protocol sopen turns it on and every key
   arrives as in the window. Elsewhere Ctrl+digits and some Ctrl+Shift chords cannot arrive, so
   **Alt+1…0 are F1…F10** (on a Mac the terminal must send Option as Alt). Ctrl is the window's

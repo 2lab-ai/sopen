@@ -227,6 +227,8 @@ fn ea3_ii_a_long_line_with_no_sync_byte_waits_for_its_checkpoints() {
     assert!(!win.ready(), "the page waits for its checkpoints");
     let marked = check_rows(&win, &whole, "before the checkpoints");
     let rows = win.page.as_ref().unwrap().rows.len();
+    // The marks' top row holds the place (a mark is a byte, a cell).
+    let (first, _) = top(&win);
     assert_eq!(
         marked, rows,
         "every row is marks: no sync byte, no checkpoint yet"
@@ -234,15 +236,27 @@ fn ea3_ii_a_long_line_with_no_sync_byte_waits_for_its_checkpoints() {
     assert!(
         drv.texts()
             .iter()
-            .any(|(_, _, t)| t.contains("CP949: no character boundary known here")),
+            .any(|(_, _, t)| t.contains("CP949: no character boundary")),
         "{:?}",
         drv.texts()
     );
     let _ = go.send(());
     drv.until(&mut win, 10, |w| w.ready());
     assert_eq!(check_rows(&win, &whole, "with the checkpoints"), 0);
+    // Read again, the top row is the one that holds the marks' top row's first byte (the place
+    // the page keeps across a new reading of its rows); the place is on the page — on the top
+    // row, or the next where a syllable's row starts before the marks' did.
     let (from, to) = top(&win);
-    assert!(from <= place && place < to, "{place} on top: {from}..{to}");
+    assert!(from <= first && first < to, "{first} on top: {from}..{to}");
+    let page = win.page.as_ref().unwrap();
+    let end = page
+        .rows
+        .get(1)
+        .map_or(to, |r| r.at + r.start + r.cut.bytes as u64);
+    assert!(
+        from <= place && place < end,
+        "{place} on the first two rows: {from}..{end}"
+    );
     assert_eq!(
         win.doc.phases.lines[&0].len(),
         6,

@@ -1,12 +1,12 @@
 //! Word wrap for the text viewer: where one row of a line ends, from the row's first byte — by
-//! the width egui lays the row out at (Hangul, CJK and emoji are wider than a cell; Arabic and
-//! Hebrew are shaped right to left, an Indic syllable as one), only between grapheme clusters (a
-//! letter and its marks, a syllable, an emoji sequence stay whole), at the last place a row may
-//! break — after a space, or next to an ideograph or kana ([`Kind`]) — when what follows fits on
-//! the next row, else where the row is full. A few layouts per row, however
-//! the script is shaped: what fits is found by galloping and halving from an estimate.
+//! the cells the row takes on the grid (10 §4, §10: a grapheme cluster takes what unicode-width
+//! gives it, as the cell painter lays it — Hangul, CJK and an emoji two cells, a letter and its
+//! marks one, a control's code page 437 glyph one; never egui's layout of the text), only between
+//! grapheme clusters (a letter and its marks, a syllable, an emoji sequence stay whole), at the
+//! last place a row may break — after a space, or next to an ideograph or kana ([`Kind`]) — when
+//! what follows fits on the next row, else where the row is full.
 //!
-//! A row's end is a function of its first byte alone (and the width and fonts), and a line is
+//! A row's end is a function of its first byte alone (and the width), and a line is
 //! wrapped afresh from every [`RESTART`] bytes (the next word start, else cluster start): the rows of a
 //! line are the same whether they are reached going down or going back up, and going back up
 //! reads only from the restart point before the row — never the whole of a long line.
@@ -27,11 +27,10 @@
 
 use super::{chrome, Span, Stale, TextDoc, Window_, LINE_MAX, TAB};
 use crate::encoding::{Around, Encoding, AHEAD};
+use crate::gui::cells;
 use anyhow::Result;
-use eframe::egui::{self, Color32, FontId};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 
 /// A wrapped line starts a row afresh near every multiple of this many bytes (at the next word
 /// start, else grapheme cluster start: [`Wrapper::restart`]): going back up one row reads about
@@ -95,48 +94,9 @@ fn marked(
     (cells, from + used, marks)
 }
 
-/// How a row is measured: egui's own layout of the text, in the viewer's font.
-pub(super) struct Measure<'a> {
-    ctx: &'a egui::Context,
-    font: FontId,
-    /// The colour rows are laid out in (the plain one: a painted plain row is the same galley).
-    color: Color32,
-    /// The advance of a space (a tab is spaces to the next stop).
-    pub space: f32,
-}
-
-impl<'a> Measure<'a> {
-    pub fn new(ctx: &'a egui::Context, font: FontId, color: Color32) -> Self {
-        let space = ctx.fonts_mut(|f| f.glyph_width(&font, ' '));
-        Self {
-            ctx,
-            font,
-            color,
-            space,
-        }
-    }
-
-    /// Each character's advance by the font's glyph — an estimate (shaping can differ), only to
-    /// choose how much text to lay out.
-    fn estimate(&self, chars: &[char]) -> Vec<f32> {
-        self.ctx.fonts_mut(|f| {
-            chars
-                .iter()
-                .map(|&c| f.glyph_width(&self.font, c))
-                .collect()
-        })
-    }
-
-    /// `text` laid out on one row, as it is painted.
-    pub fn layout(&self, text: String) -> Arc<egui::Galley> {
-        #[cfg(test)]
-        LAID.with(|l| {
-            let (n, chars) = l.get();
-            l.set((n + 1, chars + text.chars().count()));
-        });
-        self.ctx
-            .fonts_mut(|f| f.layout_no_wrap(text, self.font.clone(), self.color))
-    }
+/// The cells `text` takes on the grid, as the cell painter lays it ([`cells::width`]).
+fn wide(text: &str) -> usize {
+    cells::width(text)
 }
 
 #[cfg(test)]
@@ -144,16 +104,16 @@ thread_local! {
     static LAID: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
-/// Tests: layouts wrapping made on this thread so far, and the characters laid out in them.
+/// Tests: rows wrapping cut on this thread so far, and the characters measured for them.
 #[cfg(test)]
 pub(super) fn laid() -> (usize, usize) {
     LAID.with(std::cell::Cell::get)
 }
 
-/// The most bytes one row of a window `width` points wide is read from, in cells `cell` points
-/// wide: 16 per column and a little (a row of zero-width characters is cut there).
-pub(super) fn read_cap(width: f32, cell: f32) -> usize {
-    16 * (width / cell.max(1.0)).ceil().max(1.0) as usize + 256
+/// The most bytes one row of `columns` cells is read from: 16 per column and a little (a row of
+/// zero-width characters is cut there).
+pub(super) fn read_cap(columns: usize) -> usize {
+    16 * columns.max(1) + 256
 }
 
 /// One row: the characters it takes from its first byte (`taken`, `bytes` long) and those it
@@ -171,6 +131,7 @@ pub(super) struct Cut {
     pub dots: Vec<usize>,
 }
 
+#[cfg(test)]
 impl Cut {
     /// The row as one string.
     pub fn text(&self) -> String {
@@ -236,17 +197,16 @@ impl Kind {
 }
 
 /// A row's candidates: the grapheme clusters of what is read from the row's first byte, each as
-/// painted (a tab as spaces to the next stop counted from the row's start, by the font's glyph
-/// widths; a control character as its code page 437 glyph).
+/// painted (a tab as spaces to the next stop counted in cells from the row's start; a control
+/// character as its code page 437 glyph) and the cells it takes.
 struct Clusters {
     /// The text as painted.
     text: String,
-    /// After each cluster: where it ends in `text`, its characters so far, the estimated width
-    /// so far (the font's glyph widths summed — shaping can differ: only to choose what to lay
-    /// out); and what it is to line breaking.
+    /// After each cluster: where it ends in `text`, its characters so far, the cells so far; and
+    /// what it is to line breaking.
     ends: Vec<usize>,
     chars: Vec<usize>,
-    guess: Vec<f32>,
+    x: Vec<usize>,
     kind: Vec<Kind>,
     /// Each character as painted, with how many times (a tab: spaces).
     shown: Vec<(char, u8)>,
@@ -255,43 +215,39 @@ struct Clusters {
 }
 
 impl Clusters {
-    fn new(cells: &[Cell], m: &Measure) -> Self {
+    fn new(cells: &[Cell]) -> Self {
         use unicode_segmentation::UnicodeSegmentation;
         // Tabs stay tabs here (a cluster of their own), widened below.
         let face: String = cells
             .iter()
             .map(|c| if c.ch == '\t' { '\t' } else { face(c.ch) })
             .collect();
-        let face_chars: Vec<char> = face.chars().collect();
-        let widths = m.estimate(&face_chars);
         let mut out = Clusters {
             text: String::with_capacity(face.len()),
             ends: Vec::new(),
             chars: Vec::new(),
-            guess: Vec::new(),
+            x: Vec::new(),
             kind: Vec::new(),
-            shown: Vec::with_capacity(face_chars.len()),
+            shown: Vec::with_capacity(cells.len()),
             dots: (0..cells.len()).filter(|&i| faint(cells[i].ch)).collect(),
         };
-        let (mut x, mut i) = (0f32, 0usize);
+        let (mut x, mut i) = (0usize, 0usize);
         for g in face.graphemes(true) {
-            for c in g.chars() {
-                if c == '\t' {
-                    let col = (x / m.space + 0.01).floor() as usize;
-                    let wide = TAB - col % TAB;
-                    out.text.extend(std::iter::repeat_n(' ', wide));
-                    out.shown.push((' ', wide as u8));
-                    x += wide as f32 * m.space;
-                } else {
-                    out.text.push(c);
-                    out.shown.push((c, 1));
-                    x += widths[i];
-                }
+            if g == "\t" {
+                let stop = TAB - x % TAB;
+                out.text.extend(std::iter::repeat_n(' ', stop));
+                out.shown.push((' ', stop as u8));
+                x += stop;
                 i += 1;
+            } else {
+                out.text.push_str(g);
+                out.shown.extend(g.chars().map(|c| (c, 1)));
+                x += wide(g);
+                i += g.chars().count();
             }
             out.ends.push(out.text.len());
             out.chars.push(i);
-            out.guess.push(x);
+            out.x.push(x);
             out.kind.push(Kind::of(g));
         }
         out
@@ -322,25 +278,20 @@ impl Clusters {
         &self.text[self.prefix(from).len()..self.prefix(to).len()]
     }
 
-    /// The estimated width of the first `k` clusters.
-    fn guess(&self, k: usize) -> f32 {
+    /// The cells the first `k` clusters take.
+    fn cells(&self, k: usize) -> usize {
         if k == 0 {
-            0.0
+            0
         } else {
-            self.guess[k - 1]
+            self.x[k - 1]
         }
     }
 }
 
-/// The row of `cells` (a line's characters from a row start) that fits `width` points, broken
+/// The row of `cells` (a line's characters from a row start) that fits `width` cells, broken
 /// only between grapheme clusters. `complete`: the cells run to where the row must end anyway
 /// (the line's end or a restart point); otherwise more of the line follows them.
-///
-/// Widths are what egui lays out — a prefix of the row is laid out as a whole, so its glyphs'
-/// order and shaping (right-to-left scripts come out in visual order, an Indic syllable is shaped
-/// as one) never matter. The most clusters that fit are found from the estimate by galloping and
-/// halving: a few layouts per row (two when the estimate is right, as in a monospace font).
-pub(super) fn cut_row(cells: &[Cell], complete: bool, width: f32, m: &Measure) -> Cut {
+pub(super) fn cut_row(cells: &[Cell], complete: bool, width: usize) -> Cut {
     if cells.is_empty() {
         return Cut {
             taken: 0,
@@ -350,76 +301,19 @@ pub(super) fn cut_row(cells: &[Cell], complete: bool, width: f32, m: &Measure) -
             dots: Vec::new(),
         };
     }
-    let c = Clusters::new(cells, m);
-    let total = c.len();
-    let mut widths: Vec<Option<f32>> = vec![None; total + 1];
-    let mut wide = |k: usize| -> f32 {
-        *widths[k].get_or_insert_with(|| m.layout(c.prefix(k).to_string()).size().x)
-    };
-    // Laid out: twice the row and a little, so a word that does not end in it is longer than a
-    // row; more when it all fits after all (the estimate was too wide).
-    let mut budget = 2.0 * width + 8.0 * m.space;
-    let (n, k, more) = loop {
-        let n = (1..=total)
-            .take_while(|&k| c.guess(k - 1) <= budget)
-            .last()
-            .unwrap_or(1);
-        let more = n < total;
-        let mut fits = |k: usize| wide(k) <= width + 0.01;
-        // The estimate's choice, then galloping to the last that fits and halving between.
-        let guess = (1..=n)
-            .take_while(|&k| c.guess(k) <= width + 0.01)
-            .last()
-            .unwrap_or(1);
-        let (mut lo, mut hi) = if fits(guess) {
-            let (mut lo, mut step) = (guess, 1);
-            let mut hi = None;
-            while lo < n {
-                let probe = (lo + step).min(n);
-                if fits(probe) {
-                    lo = probe;
-                    step *= 2;
-                } else {
-                    hi = Some(probe);
-                    break;
-                }
-            }
-            match hi {
-                Some(hi) => (lo, hi),
-                None if more => {
-                    budget *= 2.0;
-                    continue;
-                }
-                None => break (n, n, more),
-            }
-        } else {
-            let (mut hi, mut step) = (guess, 1);
-            let mut lo = None;
-            while hi > 1 {
-                let probe = hi.saturating_sub(step).max(1);
-                if fits(probe) {
-                    lo = Some(probe);
-                    break;
-                }
-                hi = probe;
-                step *= 2;
-            }
-            match lo {
-                Some(lo) => (lo, hi),
-                // Not even one cluster fits (a window narrower than a glyph): one anyway.
-                None => break (n, 1, more),
-            }
-        };
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if fits(mid) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        break (n, lo, more);
-    };
+    #[cfg(test)]
+    LAID.with(|l| {
+        let (n, chars) = l.get();
+        l.set((n + 1, chars + cells.len()));
+    });
+    let c = Clusters::new(cells);
+    let n = c.len();
+    // The most clusters that fit (a cluster of no width always does); not even one (a window
+    // narrower than a glyph): one anyway.
+    let k = (1..=n)
+        .take_while(|&k| c.cells(k) <= width)
+        .last()
+        .unwrap_or(1);
     let (mut taken, mut shown) = (k, k);
     if k < n {
         if c.part(k, k + 1) == " " {
@@ -429,13 +323,12 @@ pub(super) fn cut_row(cells: &[Cell], complete: bool, width: f32, m: &Measure) -
         } else if !c.breaks_before(k) {
             // Inside a word (or before a closing mark): back to the last place a row may break,
             // if what follows it up to the next such place — spaces after it not counted — fits
-            // on the next row (laid out on its own) and the row up to it fits.
+            // on the next row.
             if let Some(b) = (1..k).rev().find(|&b| c.breaks_before(b)) {
-                let word_end = (k + 1..n).find(|&e| c.breaks_before(e));
-                let word_end = match word_end {
+                let word_end = match (k + 1..n).find(|&e| c.breaks_before(e)) {
                     Some(e) => Some(e),
-                    None if !more && complete => Some(n),
-                    // It runs past what was laid out (longer than a row), or past what was read.
+                    None if complete => Some(n),
+                    // It runs past what was read.
                     None => None,
                 };
                 let fits_next = word_end.is_some_and(|e| {
@@ -443,9 +336,9 @@ pub(super) fn cut_row(cells: &[Cell], complete: bool, width: f32, m: &Measure) -
                         .rev()
                         .find(|&e| c.kind[e - 1] != Kind::Space)
                         .unwrap_or(e);
-                    m.layout(c.part(b, e).to_string()).size().x <= width + 0.01
+                    c.cells(e) - c.cells(b) <= width
                 });
-                if fits_next && wide(b) <= width + 0.01 {
+                if fits_next {
                     taken = b;
                     shown = b;
                 }
@@ -454,6 +347,7 @@ pub(super) fn cut_row(cells: &[Cell], complete: bool, width: f32, m: &Measure) -
     }
     let chars = |k: usize| if k == 0 { 0 } else { c.chars[k - 1] };
     let (taken, shown) = (chars(taken), chars(shown));
+    // (A tab is one character shown as one entry: `shown`'s entries are the characters.)
     Cut {
         taken,
         bytes: cells[..taken].iter().map(|c| usize::from(c.len)).sum(),
@@ -506,7 +400,7 @@ const MEMO_MAX: usize = 4096;
 /// when the width or the index changes.
 #[derive(Default)]
 pub(super) struct Memo {
-    width: f32,
+    width: usize,
     spans: HashMap<u64, Span>,
     /// Restart points by line start and `k`, and whether a character start was proven there:
     /// not (CP949, D28), the row that ends at one leaves a lead pending there to the row after.
@@ -518,7 +412,7 @@ pub(super) struct Memo {
 
 impl Memo {
     /// Forgets everything (another index); rows are then wrapped for `width`.
-    pub fn reset(&mut self, width: f32) {
+    pub fn reset(&mut self, width: usize) {
         *self = Memo {
             width,
             ..Memo::default()
@@ -526,7 +420,7 @@ impl Memo {
     }
 
     /// Whether the rows found so far are for `width` (else it forgets them: true then).
-    pub fn rewidth(&mut self, width: f32) -> bool {
+    pub fn rewidth(&mut self, width: usize) -> bool {
         if self.width == width {
             return false;
         }
@@ -543,14 +437,12 @@ fn remember<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>, key: K, value: 
     map.insert(key, value);
 }
 
-/// Rows of the file at one width: reads through the index, or past it by bytes (bounded,
-/// [`Stale`] when the file is not what was indexed), measures with [`Measure`], remembers in
-/// [`Memo`].
+/// Rows of the file at one width in cells: reads through the index, or past it by bytes
+/// (bounded, [`Stale`] when the file is not what was indexed), remembers in [`Memo`].
 pub(super) struct Wrapper<'a> {
     pub doc: &'a mut TextDoc,
     pub memo: &'a mut Memo,
-    pub m: Measure<'a>,
-    pub width: f32,
+    pub width: usize,
     /// The most bytes one row is read from.
     pub read: usize,
 }
@@ -749,7 +641,7 @@ impl Wrapper<'_> {
             let (cells, used) = enc.decode(&bytes, complete);
             (cells, used, 0)
         };
-        let mut cut = cut_row(&cells, complete, self.width, &self.m);
+        let mut cut = cut_row(&cells, complete, self.width);
         cut.dim = dim.min(cut.shown.len());
         if cr && cut.bytes == bytes.len() {
             cut.bytes += unit;
@@ -970,10 +862,11 @@ impl Wrapper<'_> {
     }
 
     /// Not wrapped: the byte of `span` a row starts at for the line's end to be at its right
-    /// edge. 0 for a line that fits, as it paints from its first byte. Else as many of
-    /// its last characters as are painted in `columns` columns and in the row's width, a tab
-    /// counted as wide as it can be (where it stops depends on where the row starts).
+    /// edge. 0 for a line that fits, as it paints from its first byte. Else as many of its last
+    /// grapheme clusters as are painted in `columns` cells, a tab counted as wide as it can be
+    /// (where it stops depends on where the row starts).
     pub fn end_left(&mut self, span: Span, columns: usize) -> Result<u64> {
+        use unicode_segmentation::UnicodeSegmentation;
         let enc = self.doc.enc;
         let unit = enc.unit();
         // The line's last bytes, from a unit's start: a line of an odd length (its last unit
@@ -993,34 +886,36 @@ impl Wrapper<'_> {
             end -= unit as u64;
         }
         let (cells, _) = enc.decode(&bytes[lead.min(bytes.len())..], true);
-        let faces: Vec<char> = cells.iter().map(|c| face(c.ch)).collect();
-        let widths = self.m.estimate(&faces);
+        // Each cluster as painted: its cells (a tab: `None`) and its bytes.
+        let faces: String = (cells.iter())
+            .map(|c| if c.ch == '\t' { '\t' } else { face(c.ch) })
+            .collect();
+        let mut clusters: Vec<(Option<usize>, u64)> = Vec::new();
+        let mut at = 0;
+        for g in faces.graphemes(true) {
+            let k = g.chars().count();
+            let bytes = cells[at..at + k].iter().map(|c| u64::from(c.len)).sum();
+            clusters.push(((g != "\t").then(|| wide(g)), bytes));
+            at += k;
+        }
         if from == 0 {
-            // The whole line is here: as it paints from its first byte, each tab to its
-            // stop. A line that fits is shown from its start.
-            let (mut cols, mut wide) = (0usize, 0f32);
-            for (cell, width) in cells.iter().zip(&widths) {
-                let (c, w) = match cell.ch {
-                    '\t' => (TAB - cols % TAB, (TAB - cols % TAB) as f32 * self.m.space),
-                    _ => (1, *width),
-                };
-                (cols, wide) = (cols + c, wide + w);
-            }
-            if cols <= columns && wide <= self.width + 0.01 {
+            // The whole line is here: as it paints from its first byte, each tab to its stop.
+            // A line that fits is shown from its start.
+            let cols = clusters
+                .iter()
+                .fold(0, |cols, &(w, _)| cols + w.unwrap_or(TAB - cols % TAB));
+            if cols <= columns {
                 return Ok(0);
             }
         }
-        let (mut left, mut cols, mut wide) = (end, 0usize, 0f32);
-        for (cell, width) in cells.iter().zip(widths).rev() {
-            let (c, w) = match cell.ch {
-                '\t' => (TAB, TAB as f32 * self.m.space),
-                _ => (1, width),
-            };
-            if cols + c > columns || wide + w > self.width + 0.01 {
+        let (mut left, mut cols) = (end, 0usize);
+        for &(w, bytes) in clusters.iter().rev() {
+            let w = w.unwrap_or(TAB);
+            if cols + w > columns {
                 break;
             }
-            (cols, wide) = (cols + c, wide + w);
-            left -= u64::from(cell.len);
+            cols += w;
+            left -= bytes;
         }
         // (All of a line that fits was taken: 0.)
         Ok(left)
@@ -1157,19 +1052,26 @@ impl Wrapper<'_> {
             };
             let mut shown = Vec::with_capacity(cells.len());
             let mut dots = Vec::new();
+            // By cluster as painted: a tab to its stop in cells from the row's start (a wide
+            // glyph takes two, a mark nothing past its base).
+            let faces: String = (cells.iter())
+                .map(|c| if c.ch == '\t' { '\t' } else { face(c.ch) })
+                .collect();
             let mut col = 0usize;
-            for cell in &cells {
-                if cell.ch == '\t' {
-                    let wide = TAB - col % TAB;
-                    shown.push((' ', wide as u8));
-                    col += wide;
-                } else {
-                    if faint(cell.ch) {
+            for g in unicode_segmentation::UnicodeSegmentation::graphemes(faces.as_str(), true) {
+                if g == "\t" {
+                    let stop = TAB - col % TAB;
+                    shown.push((' ', stop as u8));
+                    col += stop;
+                    continue;
+                }
+                for c in g.chars() {
+                    if faint(cells[shown.len()].ch) {
                         dots.push(shown.len());
                     }
-                    shown.push((face(cell.ch), 1));
-                    col += 1;
+                    shown.push((c, 1));
                 }
+                col += wide(g);
             }
             let first_char = self.chars_before(span, start)?;
             out.push(Row {

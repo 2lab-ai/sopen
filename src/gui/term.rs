@@ -21,8 +21,9 @@
 //!   window paints them. The cursor stands at the caret's cell (a field's: the terminal draws a
 //!   Hangul composition there, 10 §4), else it is hidden.
 //! - **Hand-off boxes** (T17, 10 §11): cells no layer covers are a pane the window draws in egui
-//!   (the preview, a viewer, the tree, the git panel) — in the terminal a frame saying `F12 shows
-//!   it in the window`; a click on it is the switch.
+//!   (the preview, a viewer, the tree, the git panel — not the text viewer or a text preview's
+//!   rows, which are cells: X3-text) — in the terminal a frame saying `F12 shows it in the
+//!   window`; a click on it is the switch.
 //! - **Colours** are sent as RGB when `COLORTERM` says `truecolor` or `24bit`, else through
 //!   [`cells::index256`]; never the 16 indexes a theme repaints (T15).
 //! - **Ambiguous width** (10 §10, TS-6): the first time the terminal is taken, `─` is written at
