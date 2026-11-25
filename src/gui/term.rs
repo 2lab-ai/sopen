@@ -26,9 +26,10 @@
 //! - **Colours** are sent as RGB when `COLORTERM` says `truecolor` or `24bit`, else through
 //!   [`cells::index256`]; never the 16 indexes a theme repaints (T15).
 //! - **Ambiguous width** (10 §10, TS-6): the first time the terminal is taken, `─` is written at
-//!   its corner and the cursor report read ([`probe_width`]: a second's wait at most). A terminal
-//!   that took two cells for it is sent §10's table as each screen is printed — frames `+ - = |`,
-//!   the cut `~` ([`narrow`]) — and a letter of ambiguous width (a name's `é`) in two cells
+//!   its corner and the cursor report read, with the kitty query's answer, in one round trip
+//!   ([`probe`]: two seconds' wait at most). A terminal that took two cells for it is sent §10's
+//!   stand-ins for sopen's chrome as each screen is printed — frames `+ - = |`, the cut `~`
+//!   ([`narrow`]) — and any other glyph of ambiguous width (a name's `é`, `♥`) in two cells
 //!   ([`for_ambiguous_wide`]), so no row is broken; the grid itself is the window's.
 //! - **The receipt** (10 §15): with `SOPEN_CELLS` the grid is written as text once the screen has
 //!   settled ([`cells_text`]), and the run ends; a window writes its own the same way
@@ -103,11 +104,10 @@ pub(crate) trait Tty {
     fn raw(&mut self, on: bool) -> io::Result<()>;
     /// The terminal's size in cells.
     fn size(&mut self) -> io::Result<(u16, u16)>;
-    /// Whether the terminal answers `CSI ? u` (the kitty keyboard protocol); asked in raw mode.
-    fn kitty(&mut self) -> bool;
-    /// Whether the terminal draws a glyph of ambiguous width in two cells (10 §10, TS-6): asked
-    /// once, in raw mode on the alternate screen ([`probe_width`]).
-    fn ambiguous_wide(&mut self) -> bool;
+    /// Whether the terminal answers `CSI ? u` (the kitty keyboard protocol) and draws a glyph of
+    /// ambiguous width in two cells (10 §10, TS-6): asked once, in one round trip, in raw mode on
+    /// the alternate screen ([`probe`]).
+    fn probe(&mut self) -> Probed;
     /// Drops what the terminal sent that nobody read (10 §4, T28).
     fn drop_input(&mut self);
     /// The next event, waiting at most `wait` for it.
@@ -172,13 +172,9 @@ impl Tty for Real {
         crossterm::terminal::size()
     }
 
-    fn kitty(&mut self) -> bool {
-        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
-    }
-
-    fn ambiguous_wide(&mut self) -> bool {
-        let probed = probe_width(libc::STDOUT_FILENO, libc::STDIN_FILENO, PROBE_WAIT);
-        probed.map_err(Self::hung_up).unwrap_or(false)
+    fn probe(&mut self) -> Probed {
+        let probed = probe(libc::STDOUT_FILENO, libc::STDIN_FILENO, PROBE_WAIT);
+        probed.map_err(Self::hung_up).unwrap_or_default()
     }
 
     fn drop_input(&mut self) {
@@ -255,26 +251,33 @@ pub(crate) fn wait_input(fd: libc::c_int, wait: Duration) -> io::Result<Input> {
     })
 }
 
-/// The ambiguous-width probe (10 §10, TS-6): `─` at the screen's corner, then the cursor
-/// position report asked for (DSR 6) and the device attributes (DA1) — answered in that order,
-/// so the attributes say that the answers are all in.
-pub(crate) const PROBE: &str = "\x1b[1;1H─\x1b[6n\x1b[c";
+/// The start's one round trip (10 §4, §10, TS-6): `─` at the screen's corner, then the cursor
+/// position report asked for (DSR 6), the kitty keyboard protocol's flags (`CSI ? u`) and the
+/// device attributes (DA1) — answered in that order, so the attributes say that the answers are
+/// all in.
+pub(crate) const PROBE: &str = "\x1b[1;1H─\x1b[6n\x1b[?u\x1b[c";
 
-/// The longest the probe waits for the terminal's answers.
-const PROBE_WAIT: Duration = Duration::from_secs(1);
+/// The longest the probe waits for the terminal's answers (crossterm's own kitty query waited as
+/// long).
+const PROBE_WAIT: Duration = Duration::from_secs(2);
 
-/// Whether the terminal behind `out` and `input` (in raw mode) draws `─` in two cells: [`PROBE`]
-/// written, then its answers read up to the device attributes' — the cursor's column in the
-/// report is 3 after a glyph that took two cells from the first. No report, or nothing within
-/// `wait`: one cell, as the grid lays it — the probe never holds the start for longer. Read to
-/// the end, the answers leave nothing for the next query (the kitty keyboard query's own device
-/// attributes would otherwise be taken for these). A hung-up input is an error (`BrokenPipe`), as
-/// [`wait_input`]'s.
-pub(crate) fn probe_width(
-    out: libc::c_int,
-    input: libc::c_int,
-    wait: Duration,
-) -> io::Result<bool> {
+/// What the terminal answered at start ([`probe`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Probed {
+    /// It answers `CSI ? u`: the kitty keyboard protocol's flag 1 is pushed.
+    pub kitty: bool,
+    /// It drew `─` in two cells: an ambiguous-wide terminal (10 §10).
+    pub ambiguous: bool,
+}
+
+/// What the terminal behind `out` and `input` (in raw mode) is ([`Probed`]): [`PROBE`] written,
+/// then its answers read up to the device attributes' — the last cursor report before them (a key
+/// typed ahead can read as one: Shift+F3 is `CSI 1;2R`), whose column is 3 after a glyph that took
+/// two cells from the first, and whether the kitty flags came. No answer, or nothing within
+/// `wait`: one cell and no kitty protocol — the probe never holds the start for longer. A key
+/// typed meanwhile is read with the answers and goes with them: input before the first screen is
+/// dropped (T28). A hung-up input is an error (`BrokenPipe`), as [`wait_input`]'s.
+pub(crate) fn probe(out: libc::c_int, input: libc::c_int, wait: Duration) -> io::Result<Probed> {
     let mut bytes = PROBE.as_bytes();
     while !bytes.is_empty() {
         // SAFETY: a write of a live buffer to an fd the caller owns.
@@ -291,10 +294,13 @@ pub(crate) fn probe_width(
     let deadline = Instant::now() + wait;
     let mut got = Vec::new();
     loop {
-        let (report, all_in) = answers(&got);
+        let answered = answers(&got);
         let left = deadline.saturating_duration_since(Instant::now());
-        if all_in || left.is_zero() {
-            return Ok(report.is_some_and(|(_, column)| column >= 3));
+        if answered.all_in || left.is_zero() {
+            return Ok(Probed {
+                kitty: answered.kitty,
+                ambiguous: answered.report.is_some_and(|(_, column)| column >= 3),
+            });
         }
         if wait_input(input, left)? == Input::Quiet {
             continue;
@@ -320,11 +326,20 @@ pub(crate) fn probe_width(
     }
 }
 
-/// What the terminal's answers in `got` (keys typed meanwhile among them) say: the cursor
-/// report's row and column (`CSI row ; column R`) if one came, and whether the device attributes
-/// (`CSI ? … c`), the last answer, have.
-fn answers(got: &[u8]) -> (Option<(u16, u16)>, bool) {
-    let mut report = None;
+/// What the terminal's answers to [`PROBE`] say so far ([`answers`]).
+#[derive(Debug, Default)]
+struct Answered {
+    /// The last cursor report (`CSI row ; column R`).
+    report: Option<(u16, u16)>,
+    /// The kitty flags came (`CSI ? flags u`).
+    kitty: bool,
+    /// The device attributes (`CSI ? … c`), the last answer, came.
+    all_in: bool,
+}
+
+/// What the answers in `got` (keys typed meanwhile among them) say, up to the device attributes.
+fn answers(got: &[u8]) -> Answered {
+    let mut out = Answered::default();
     let mut at = 0;
     while let Some(start) = (got[at..].windows(2)).position(|w| w == b"\x1b[") {
         let params = at + start + 2;
@@ -338,17 +353,22 @@ fn answers(got: &[u8]) -> (Option<(u16, u16)>, bool) {
         }
         let body = std::str::from_utf8(&got[params..end]).unwrap_or("");
         match got[end] {
-            b'R' if report.is_none() => {
-                report = body
+            b'R' => {
+                let read = body
                     .split_once(';')
                     .and_then(|(row, column)| Some((row.parse().ok()?, column.parse().ok()?)));
+                out.report = read.or(out.report);
             }
-            b'c' if body.starts_with('?') => return (report, true),
+            b'u' if body.starts_with('?') => out.kitty = true,
+            b'c' if body.starts_with('?') => {
+                out.all_in = true;
+                return out;
+            }
             _ => {}
         }
         at = end + 1;
     }
-    (report, false)
+    out
 }
 
 /// The most of the standard error kept while the terminal is held ([`Stderr`]): the last bytes.
@@ -887,13 +907,14 @@ pub(crate) fn ambiguous(c: char) -> bool {
             || (A_LETTERS.iter()).any(|&(from, to)| (from..=to).contains(&u32::from(c))))
 }
 
-/// The one-cell stand-in an ambiguous-wide terminal is sent for `symbol` (10 §10's table, T38):
-/// for a glyph of sopen's own tables that such a terminal draws in two cells — box lines `+`,
-/// `-`, `=` and `|`, blocks and shades `#`, arrows `^ v < > - |`, the cut's `…` `~`, `·` and the
-/// CP437 table's other symbols `.` — and `None` for any other glyph: one cell wide everywhere
-/// (ASCII, `░ ► ◄ ◙ »`), two everywhere (Hangul, U+1F3B5), or a letter, which is a name's or a
-/// text's and is laid in two cells instead ([`for_ambiguous_wide`]) — the printer cannot tell the
-/// CP437 table's `é` from a name's.
+/// The one-cell stand-in an ambiguous-wide terminal is sent for `symbol` (10 §10's table, T38),
+/// where it is sopen's own: box lines `+`, `-`, `=` and `|`, blocks and shades `#`, the arrows
+/// `^ v < > - |`, the cut's `…` `~`, `·` and the CP437 table's other symbols `.`; `None` for any
+/// other glyph — one cell wide everywhere (ASCII, `░ ► ◄ ◙ »`), two everywhere (Hangul,
+/// U+1F3B5), or a letter. The printer sends it only for a cell of sopen's chrome ([`chrome`]:
+/// frames, scroll bars, the cut); the rest is content, laid in two cells as written
+/// ([`for_ambiguous_wide`]). A viewer that knows a cell is a CP437 glyph substitutes it itself
+/// (X3-text, X3-hex).
 pub(crate) fn narrow(symbol: &str) -> Option<&'static str> {
     let mut chars = symbol.chars();
     let (Some(c), None) = (chars.next(), chars.next()) else {
@@ -919,85 +940,204 @@ pub(crate) fn narrow(symbol: &str) -> Option<&'static str> {
 }
 
 /// `screen` as an ambiguous-wide terminal is sent it (10 §10, T38), every cell in its own column:
-/// each glyph [`narrow`] has a stand-in for is that stand-in, and any other glyph such a terminal
-/// draws in two cells where the grid has one (a name's `é`) is laid in two ([`lay_wide`]). The
-/// cell a glyph's second half covers holds no symbol (`""`: never printed). With it, row by row,
-/// the grid's column each of its cells shows ([`Term::grid_column`]: where a click lands).
+/// a glyph of sopen's chrome ([`chrome`]) that such a terminal draws in two cells is [`narrow`]'s
+/// stand-in; any other glyph of ambiguous width is content and is laid in two cells, its run
+/// ([`lay_run`]) making room for it. The cell a glyph's second half covers holds no symbol (`""`:
+/// never printed). With it, row by row, the grid's column each of the terminal's cells shows
+/// ([`Term::grid_column`]: where a click lands).
 fn for_ambiguous_wide(screen: &Screen) -> (Screen, Vec<Vec<u16>>) {
     let mut out = screen.clone();
     let a = out.buf.area;
     let mut columns = vec![];
     for y in a.top()..a.bottom() {
-        let mut shown: Vec<u16> = (a.left()..a.right()).collect();
-        let mut x = a.left();
-        while x < a.right() {
-            let symbol = out.buf[(x, y)].symbol().to_string();
-            if cells::width(&symbol) > 1 {
-                if x + 1 < a.right() {
-                    out.buf[(x + 1, y)].set_symbol("");
-                }
-                x += 2;
-            } else if let Some(stand_in) = narrow(&symbol) {
-                out.buf[(x, y)].set_symbol(stand_in);
-                x += 1;
-            } else if symbol.chars().next().is_some_and(ambiguous)
-                && lay_wide(&mut out, &mut shown, x, y)
-            {
-                x += 2;
-            } else {
-                x += 1;
+        let mut row = Row {
+            units: glyphs(&screen.buf, y),
+            shown: (a.left()..a.right()).collect(),
+            place: (a.left()..a.right()).collect(),
+        };
+        let mut i = 0;
+        while i < row.units.len() {
+            let ours = |u: &Glyph, v: &Glyph| {
+                (u.cells[0].fg, u.cells[0].bg) == (v.cells[0].fg, v.cells[0].bg)
+            };
+            let mut j = i;
+            while j < row.units.len() && !row.units[j].frame && ours(&row.units[i], &row.units[j]) {
+                j += 1;
             }
+            if j == i {
+                j += 1;
+            }
+            lay_run(&mut out.buf, &mut row, y, i..j);
+            i = j;
         }
-        columns.push(shown);
+        if let Some(c) = out.caret.as_mut().filter(|c| c.y == y) {
+            c.x = row.place[usize::from(c.x - a.left())].min(a.right() - 1);
+        }
+        columns.push(row.shown);
     }
     (out, columns)
 }
 
-/// Lays the glyph at (`x`, `y`) of `screen` in two cells, so that no cell after it leaves its
-/// column: the rest of its run — the cells after it in its colours, up to a frame's cell — moves a
-/// cell to the right into the run's first blank that ends a word (before another blank, or the
-/// run's last cell), the caret with it; a run with no such blank gives up its last cell, and the
-/// one before shows the cut, `~` (01 §3a). `shown` (the row's grid column of each cell) moves
-/// with the cells. Where nothing of its run is after it (the screen's edge, a frame), it is cut
-/// itself: `~`, and false.
-fn lay_wide(screen: &mut Screen, shown: &mut [u16], x: u16, y: u16) -> bool {
-    let buf = &mut screen.buf;
-    let right = buf.area.right();
-    let left = buf.area.left();
-    let at = |k: u16| usize::from(k - left);
-    let (fg, bg) = (buf[(x, y)].fg, buf[(x, y)].bg);
-    let ours = |c: &ratatui_core::buffer::Cell| {
-        (c.fg, c.bg) == (fg, bg) && !cells::frame_cell(c.symbol(), colour(c.fg), colour(c.bg))
-    };
-    let end = (x + 1..right)
-        .find(|&k| !ours(&buf[(k, y)]))
-        .unwrap_or(right);
-    if end == x + 1 {
-        buf[(x, y)].set_symbol("~");
+/// One glyph of a row as the grid has it ([`glyphs`]): its cells (a wide glyph's second one too),
+/// where it starts, and how it is sent to an ambiguous-wide terminal.
+struct Glyph {
+    cells: Vec<ratatui_core::buffer::Cell>,
+    x: u16,
+    /// The cells it takes there: two for a wide glyph and for a letter of ambiguous width.
+    sent: u16,
+    /// A frame's cell: a run ends at it.
+    frame: bool,
+    blank: bool,
+}
+
+/// A row being laid: its glyphs, the grid's column each of the terminal's cells shows, and the
+/// terminal's cell each of the grid's columns is shown in (where the caret goes).
+struct Row {
+    units: Vec<Glyph>,
+    shown: Vec<u16>,
+    place: Vec<u16>,
+}
+
+/// Row `y` of `buf` as whole glyphs — a wide one with its second cell — each with its stand-in
+/// already where it is chrome ([`chrome`], [`narrow`]).
+fn glyphs(buf: &Buffer, y: u16) -> Vec<Glyph> {
+    let a = buf.area;
+    let mut out = vec![];
+    let mut x = a.left();
+    while x < a.right() {
+        let cell = &buf[(x, y)];
+        let width = (cells::width(cell.symbol()) as u16)
+            .clamp(1, 2)
+            .min(a.right() - x);
+        let mut cells: Vec<_> = (x..x + width).map(|k| buf[(k, y)].clone()).collect();
+        let symbol = cell.symbol().to_string();
+        let chrome = chrome(buf, x, y);
+        let mut sent = width;
+        if width == 1 && symbol.chars().next().is_some_and(ambiguous) {
+            match narrow(&symbol).filter(|_| chrome) {
+                Some(stand_in) => {
+                    cells[0].set_symbol(stand_in);
+                }
+                None => sent = 2,
+            }
+        }
+        out.push(Glyph {
+            frame: chrome && cells::frame_cell(&symbol, colour(cell.fg), colour(cell.bg)),
+            blank: symbol == " " && width == 1,
+            cells,
+            x,
+            sent,
+        });
+        x += width;
+    }
+    out
+}
+
+/// Whether the cell at (`x`, `y`) of `buf` is sopen's own chrome, which §10's stand-ins are for
+/// (content is not substituted, 10 §10): the cut's `…`, or a frame's cell — a box line or block,
+/// a scroll bar's arrow ([`cells::frame_cell`]) — but for a box line between two letters of its
+/// colours, which is a name's (`a─b`).
+pub(crate) fn chrome(buf: &Buffer, x: u16, y: u16) -> bool {
+    let cell = &buf[(x, y)];
+    let symbol = cell.symbol();
+    if symbol == "…" {
+        return true;
+    }
+    if !cells::frame_cell(symbol, colour(cell.fg), colour(cell.bg)) {
         return false;
     }
-    let blank = |k: u16| buf[(k, y)].symbol() == " ";
-    let room = (x + 1..end).find(|&k| blank(k) && (k + 1 == end || blank(k + 1)));
-    let last = room.unwrap_or(end - 1);
-    for k in (x + 2..=last).rev() {
-        buf[(k, y)] = buf[(k - 1, y)].clone();
-        shown[at(k)] = shown[at(k - 1)];
-    }
-    buf[(x + 1, y)] = buf[(x, y)].clone();
-    buf[(x + 1, y)].set_symbol("");
-    shown[at(x + 1)] = shown[at(x)];
-    if room.is_none() && last > x + 1 {
-        buf[(last, y)].set_symbol("~");
-        // The cut took a wide glyph's second half: the rest of it goes too.
-        if cells::width(buf[(last - 1, y)].symbol()) > 1 {
-            buf[(last - 1, y)].set_symbol(" ");
+    let a = buf.area;
+    let letter = |k: u16| {
+        let c = &buf[(k, y)];
+        (c.fg, c.bg) == (cell.fg, cell.bg)
+            && !c.symbol().trim().is_empty()
+            && !c.symbol().chars().any(cells::frame_glyph)
+    };
+    let inside = x > a.left() && x + 1 < a.right() && letter(x - 1) && letter(x + 1);
+    !inside
+}
+
+/// Lays the glyphs `run` of `row` (a stretch of one pair of colours, or a frame's cell) into
+/// `buf` at their own cells, so that no glyph after them leaves its column: a letter laid in two
+/// cells takes the room of the run's first blank after it that ends a word — before another
+/// blank, or the run's last glyph — never a wide glyph's second cell nor the space between two
+/// words; a run with no such blank is cut, a cell earlier, with `~` (01 §3a) — a wide glyph whole,
+/// never half.
+fn lay_run(buf: &mut Buffer, row: &mut Row, y: u16, run: std::ops::Range<usize>) {
+    let units = &row.units[run.clone()];
+    let start = units[0].x;
+    let room: u16 = units.iter().map(|u| u.cells.len() as u16).sum();
+    let mut gone = vec![false; units.len()];
+    let mut need: u16 = units.iter().map(|u| u.sent).sum();
+    for i in 0..units.len() {
+        if need <= room {
+            break;
+        }
+        if units[i].sent <= units[i].cells.len() as u16 {
+            continue;
+        }
+        let ends_word = |k: usize| units[k].blank && (k + 1 == units.len() || units[k + 1].blank);
+        if let Some(k) = (i + 1..units.len()).find(|&k| !gone[k] && ends_word(k)) {
+            gone[k] = true;
+            need -= 1;
         }
     }
-    let moved = |c: &Position| c.y == y && c.x > x && c.x <= last;
-    if let Some(c) = screen.caret.as_mut().filter(|c| moved(c)) {
-        c.x = (c.x + 1).min(right - 1);
+    let kept: Vec<usize> = (0..units.len()).filter(|&k| !gone[k]).collect();
+    let cut = need > room;
+    let left = buf.area.left();
+    let mut at = start;
+    let idx = |at: u16| usize::from(at - left);
+    let mut cut_at = None;
+    for &k in &kept {
+        let u = &units[k];
+        if cut && at + u.sent + 1 > start + room {
+            cut_at = Some(k);
+            break;
+        }
+        for (n, cell) in u.cells.iter().enumerate() {
+            let x = at + n as u16;
+            buf[(x, y)] = cell.clone();
+            if n > 0 {
+                buf[(x, y)].set_symbol("");
+            }
+            row.shown[idx(x)] = u.x + n as u16;
+        }
+        if u.sent > u.cells.len() as u16 {
+            // A letter laid in two cells: its second shows its own column.
+            let x = at + 1;
+            buf[(x, y)] = u.cells[0].clone();
+            buf[(x, y)].set_symbol("");
+            row.shown[idx(x)] = u.x;
+        }
+        for n in 0..u.cells.len() as u16 {
+            row.place[usize::from(u.x + n - left)] = at + n.min(u.sent - 1);
+        }
+        at += u.sent;
     }
-    true
+    if let Some(first) = cut_at {
+        // The cut: `~` in the run's colours, then blanks to its end.
+        let pen = units[first].cells[0].clone();
+        for x in at..start + room {
+            buf[(x, y)] = pen.clone();
+            buf[(x, y)].set_symbol(if x == at { "~" } else { " " });
+            row.shown[idx(x)] = x.max(units[first].x).min(start + room - 1);
+        }
+        for u in &units[first..] {
+            for n in 0..u.cells.len() as u16 {
+                row.place[usize::from(u.x + n - left)] = at;
+            }
+        }
+    }
+    for (k, u) in units.iter().enumerate() {
+        if gone[k] {
+            // A blank given up: where the next glyph is shown.
+            let next = (k + 1..units.len()).find(|&n| !gone[n]);
+            let to = next.map_or(start + room - 1, |n| {
+                row.place[usize::from(units[n].x - left)]
+            });
+            row.place[usize::from(u.x - left)] = to.min(start + room - 1);
+        }
+    }
 }
 
 /// A cell's colour as egui's, when it is RGB.
@@ -1383,8 +1523,8 @@ pub(crate) struct Backend<T: Tty, O: Write> {
     input: TermInput,
     /// The grid: the terminal's size in cells.
     pub size: (u16, u16),
-    /// Whether the terminal answered the kitty keyboard query (asked once).
-    kitty: Option<bool>,
+    /// What the terminal answered at start (asked once, [`probe`]).
+    probed: Option<Probed>,
     /// The kitty flag is pushed now.
     pushed: bool,
     /// The terminal is held (raw mode, the alternate screen, the modes).
@@ -1399,10 +1539,10 @@ pub(crate) struct Backend<T: Tty, O: Write> {
     /// The texts egui itself drew in the last pass (not a cell's glyph), where: a hand-off box's
     /// title is the pane's or the dialog's own.
     titles: Vec<(Pos2, String)>,
-    /// What the terminal answered the ambiguous-width probe (asked once).
-    ambiguous: Option<bool>,
     /// `SOPEN_CELLS` (10 §15): the receipt the run writes once the screen has settled, then ends.
     pub receipt: Option<Receipt>,
+    /// `SOPEN_STATE`'s `help=1`: F1 is still to be pressed once the screen is ready.
+    pub help_first: bool,
     /// When a repaint asked for since the last look wants its pass — from any thread
     /// (`Context::set_request_repaint_callback`): a worker done while the terminal is idle.
     asked: Arc<Mutex<Option<Instant>>>,
@@ -1434,15 +1574,15 @@ impl<T: Tty, O: Write> Backend<T, O> {
             ctx,
             input: TermInput::new(cfg!(target_os = "macos")),
             size: (80, 24),
-            kitty: None,
+            probed: None,
             pushed: false,
             held: false,
             close_pending: false,
             said: None,
             hand_offs: vec![],
             titles: vec![],
-            ambiguous: None,
             receipt: None,
+            help_first: false,
             asked,
             started: Instant::now(),
             offset: 0.0,
@@ -1458,9 +1598,10 @@ impl<T: Tty, O: Write> Backend<T, O> {
     }
 
     /// Takes the terminal (see the module's header): raw mode, the modes, the size; the first
-    /// time the ambiguous-width probe (on the alternate screen, which the first print clears) and
-    /// then the kitty keyboard query, each reading its answers to their end; the kitty flag where
-    /// the terminal answers; its unread input dropped.
+    /// time the start's one round trip ([`probe`]: the ambiguous width and the kitty keyboard
+    /// protocol, on the alternate screen, which the first print clears); the kitty flag where the
+    /// terminal answers; its unread input dropped. A terminal that hung up meanwhile is asked
+    /// nothing more.
     pub fn enter(&mut self) -> io::Result<()> {
         self.tty.raw(true)?;
         self.held = true;
@@ -1470,17 +1611,18 @@ impl<T: Tty, O: Write> Backend<T, O> {
             }
         }
         self.term.out.write_all(ENTER.as_bytes())?;
-        // The probe and the query write past the buffer: what is in it goes first.
+        // The probe writes past the buffer: what is in it goes first.
         self.term.out.flush()?;
-        if self.ambiguous.is_none() {
-            self.ambiguous = Some(self.tty.ambiguous_wide());
-        }
-        self.term.wide = self.ambiguous == Some(true);
-        let kitty = match self.kitty {
-            Some(kitty) => kitty,
-            None => *self.kitty.insert(self.tty.kitty()),
+        let probed = match self.probed {
+            Some(probed) => probed,
+            None => *self.probed.insert(self.tty.probe()),
         };
-        if kitty {
+        // A terminal that hung up meanwhile is asked nothing more: the loop ends the run.
+        if self.tty.stopped().is_some() {
+            return Ok(());
+        }
+        self.term.wide = probed.ambiguous;
+        if probed.kitty {
             self.term.out.write_all(KITTY_PUSH.as_bytes())?;
             self.pushed = true;
         }
@@ -1682,11 +1824,26 @@ impl<T: Tty, O: Write> Backend<T, O> {
             if let Some(at) = self.asked.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 due = Some(due.map_or(at, |d| d.min(at)));
             }
-            let (events, hand_off) = match next {
+            // A receipt run reads no input but Ctrl+C, which ends it as SIGINT would.
+            if self.receipt.is_some() && next.as_ref().is_some_and(ctrl_c) {
+                return Ok(End::Signal(libc::SIGINT));
+            }
+            let (mut events, hand_off) = match next {
                 Some(ev) => self.take(&ev),
                 None if due.is_some_and(|d| Instant::now() >= d) => (vec![], false),
                 None => continue,
             };
+            // `help=1`: F1, once the screen is ready, as the window's shell presses it.
+            if self.help_first && win.ready() {
+                self.help_first = false;
+                events.extend([true, false].map(|pressed| egui::Event::Key {
+                    key: egui::Key::F1,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }));
+            }
             let passed = self.pass(win, events)?;
             if passed.closed {
                 return Ok(End::Closed);
@@ -1713,6 +1870,9 @@ impl<T: Tty, O: Write> Backend<T, O> {
             if let Some(at) = self.asked.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 due = Some(due.map_or(at, |d| d.min(at)));
             }
+            if self.help_first && win.ready() {
+                due = Some(Instant::now());
+            }
             if self.take_receipt(&*win, &mut due)? {
                 return Ok(End::Closed);
             }
@@ -1720,7 +1880,8 @@ impl<T: Tty, O: Write> Backend<T, O> {
     }
 
     /// `SOPEN_CELLS` after a pass (10 §15): once the screen has been ready for three passes in a
-    /// row — `SOPEN_KEYS` played, nothing on its way, as the screenshot hook waits — the receipt
+    /// row — `SOPEN_KEYS` played, nothing on its way, `help=1`'s F1 pressed, as the screenshot
+    /// hook waits — the receipt
     /// of the last one is written, and the run ends (true). Meanwhile a ready pass asks for the
     /// next at once: an idle terminal runs none.
     fn take_receipt<W: Window + ?Sized>(
@@ -1728,9 +1889,10 @@ impl<T: Tty, O: Write> Backend<T, O> {
         win: &W,
         due: &mut Option<Instant>,
     ) -> io::Result<bool> {
+        let settled = win.ready() && !self.help_first;
         let ready = match self.receipt.as_mut() {
             Some(r) => {
-                r.ready = if win.ready() { r.ready + 1 } else { 0 };
+                r.ready = if settled { r.ready + 1 } else { 0 };
                 r.ready
             }
             None => return Ok(false),
@@ -1759,6 +1921,13 @@ impl<T: Tty, O: Write> Drop for Backend<T, O> {
     fn drop(&mut self) {
         self.leave();
     }
+}
+
+/// Whether `ev` is Ctrl+C pressed.
+fn ctrl_c(ev: &CEvent) -> bool {
+    matches!(ev, CEvent::Key(k) if k.kind != KeyEventKind::Release
+        && k.code == crossterm::event::KeyCode::Char('c')
+        && k.modifiers == crossterm::event::KeyModifiers::CONTROL)
 }
 
 /// The cells `rect` (points) touches on a `cols` × `rows` grid; `None` when it is off it.
@@ -1995,8 +2164,9 @@ pub fn open(start: browser::Start, hooks: &Hooks, to: Destination) -> Result<Out
     let shot = hooks.screenshot.clone();
     let limit = Duration::from_secs(super::watchdog_secs());
     let receipt = hooks.cells.clone().map(|path| Receipt::new(path, limit));
+    let help = hooks.state.help;
     let outcome = browser::open_on(start, hooks, |title, browser| {
-        signal = here(title, browser, &to, shot, receipt)?;
+        signal = here(title, browser, &to, shot, receipt, help)?;
         Ok(())
     })?;
     match signal {
@@ -2008,13 +2178,15 @@ pub fn open(start: browser::Start, hooks: &Hooks, to: Destination) -> Result<Out
 /// The browser in this terminal; the signal that ended it, if one did. `shot` (the
 /// `SOPEN_SCREENSHOT` receipt): a window the switch opens is shot, then closes. `receipt`
 /// (`SOPEN_CELLS`): the terminal's screen is written once it has settled, the run ends, and the
-/// receipt's line is printed once the terminal is back.
+/// receipt's line is printed once the terminal is back. `help` (`SOPEN_STATE`'s `help=1`): F1 is
+/// pressed once the screen is ready, as in the window.
 fn here(
     title: &str,
     browser: Browser,
     to: &Destination,
     shot: Option<std::path::PathBuf>,
     receipt: Option<Receipt>,
+    help: bool,
 ) -> Result<Option<i32>> {
     let ctx = egui::Context::default();
     chrome::install(&ctx);
@@ -2023,6 +2195,7 @@ fn here(
     let out = io::BufWriter::with_capacity(1 << 16, io::stdout());
     let mut backend = Backend::new(Real::default(), out, ctx, truecolor);
     backend.receipt = receipt;
+    backend.help_first = help;
     let mut switch = |b: &mut Backend<Real, _>| {
         let size = b.points();
         let hooks = Hooks {
