@@ -16,22 +16,14 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
 
 | ID | Status | What | Who |
 |---|---|---|---|
-| XW-kit | 🟡 merging | 10 §17: the test kit's text queries also answer from cell layers (#108) | coder |
-| XW-shell | 🟡 running | 10 §17: route B (`create_native`, one event loop per process), F12 / Alt+G / Alt+digits, the start-up failure path; branch `feat/xw-shell` | coder |
-| XW-grid | 🔴 open | 10 §17: `panels_ui` on the cell grid, the panes and the viewer at grid rectangles; after XW-kit | coder |
-| XW-list | 🔴 open | 10 §17: the list, title, status and F-key rows in cells (ships X1a); after XW-grid. Carried from #108's review: re-measure whether a cell substring can win a lookup over a later exact egui label (the kit merges both in painting order; the spike looked at cells only when the shapes found nothing) | coder |
-| XW-dialogs | 🔴 open | 10 §17: the list's dialogs in cells; after XW-list | coder |
-| XW-term | 🔴 open | 10 §17: the terminal backend and `sopen --tui` (ships X1b); after XW-list, XW-input, XW-shell and XW-dialogs | coder |
-| VM-2 | 🟡 running | 08 §13: the text document per encoding, the bar's encoding and `SOPEN_STATE enc=`; branch `feat/vm2-text-doc` | coder |
-| VM-3 | 🔴 open | 08 §13: UTF-16/32 sniffed as text; after VM-2 | coder |
-| VM-4 | 🔴 open | 08 §13: CP949 / EUC-KR through `encoding_rs`; after VM-2 | coder |
-| VM-7 | 🔴 open | 08 §13: the egui binding of the view keys and the views; after XW-list (it shares `browser.rs`) | coder |
+| XW-term | 🟡 running | 10 §17: the terminal backend and `sopen --tui` (ships X1b); branch `feat/xw-term` | coder |
+| VM-7 | 🟡 running | 08 §13: the egui binding of the view keys and the views (1/2/3, 9 View, F8 encodings); branch `feat/vm7-egui-views` | coder |
 | VM-8 | 🔴 open | 08 §13: the terminal binding. Carried: `src/view_keys.rs`'s module doc now names `term_input::RELEASES` (the translator makes every release); VM-8 builds on that | coder |
 | VM-D0 | 🔴 open | 08 §13: 04 §2 and K-R1 brought to the shipped code | orchestrator |
-| WV-E1 | 🔴 open | 09 §12: the CLI half of the address window (starts at once) | coder |
-| WV-rest | 🔴 open | 09 §12's WV-0, WV-C, WV-A, WV-B, WV-D, WV-E2 and WV-F, in its order after X-W1 | coder |
+| WV-A | 🟡 merging | 09 §12: the macOS engine (#126, in review) | coder |
+| WV-rest | 🔴 open | 09 §12's WV-C2, WV-B, WV-D, WV-E2 and WV-F, in its order (X-W1, WV-0, WV-E1 and WV-C are closed) | coder |
 | X3-hex | 🔴 open | 10 §16's hex step. Carried from #108's review: point the hex tests' `drawn()` at `texts()` once hex paints cells (`galleys()` then holds one-character glyphs), and note that `rects()` will list cell backgrounds and the caret | coder |
-| ED-units | 🔴 open | 12 §16's units: ED-0, ED-buf, ED-enc, ED-ops, ED-save can start now (no screen); then ED-screen, ED-dialogs, ED-layout (ships X5), ED-git, ED-route, after their 10 units | coder |
+| ED-units | 🔴 open | 12 §16's units: ED-enc, ED-ops, ED-save (no screen); then ED-screen, ED-dialogs, ED-layout (ships X5), ED-git, ED-route, after their 10 units | coder |
 
 ## Follow-ups found on the way (not units yet)
 
@@ -41,7 +33,9 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
 | F-numpad | 🔴 open | The Ctrl+numpad digit alias reads the physical key first (`src/gui/mod.rs`, `fkey_events`) | coder |
 | F-keynames | 🔴 open | Key names outside help still mix forms: "Cmd/Ctrl+R" literals, "⌘/Ctrl" hovers, README line 95; 01, 02 and 03 write `Cmd/Ctrl+Z` | coder |
 | F-ci-macos | 🔴 open | A merge to main runs `ci.yml` twice on macOS: CI's own push run and Preview's `gate` (`preview.yml` calls `ci.yml`). Dropping CI's push trigger for main, so that Preview's gate is the one run, would halve the macOS checks per merge while runners are short | orchestrator |
-| F-k_d1 | 🔴 open | `gui::browser::tests::s6::k_d1_f8_here_goes_to_the_trash_and_shift_f8_does_not` failed once in a loaded full run; it passes alone 3/3 | coder |
+| F-timing | 🔴 open | Wall-clock bounds that fail under a loaded full run and pass alone, seen 2026-11-25: `gui::image::robustness_tests::malformed_headers_never_panic_the_header_read` (one interlaced-PNG case took 2.86 s against `CASE_LIMIT` 2 s, Linux load ~12; alone 5/5), `s3::g_r5_a_waiting_hook…` (no hook pid within 10 s) and `git::tests::runner::a_record_or_an_output_past_its_bound_is_stopped` (each once at load 33–45; alone 5/5 and 3/3), and `s5::d2_the_first_frame_and_the_screens_info_lines_arrive_in_time` (first frame 618 ms in ED-buf's Linux full run; alone 3/3). Bound the work, not the wall clock, as #101–#103 did | coder |
+| F-cell-select | 🔴 open | Text drawn in cells (the list since #119, the dialogs since XW-dialogs) cannot be selected or copied; main's egui labels could (`selectable_labels`), e.g. a report's failure reason or the clash question's path. A cell selection with Cmd/Ctrl+C, the same in the window and the terminal (where the terminal's own selection works only with mouse reporting off) | coder |
+| F-list-perf | 🔴 open | The list in cells costs 0.71 ms a frame in release against main's 0.23 ms (2,000 entries, 1000×700 at 2×; #119): one galley per glyph. One galley per run of one-cell glyphs measured 0.47 ms; it needs 10 §4's "its glyph at its own cell, never through egui's text layout" amended, `cells.rs` paint and its tests, and the kit's `glyphs`/`placed` | coder |
 
 ## Build facts
 
