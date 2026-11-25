@@ -6,10 +6,11 @@
 //! - TS-1 (10 §14): the window's cells — what a window pass painted in cells, laid in the order it
 //!   painted them — equal the terminal's, cell by cell (character, foreground, background) and
 //!   the caret, for the list, the F-key row and F7's dialog with `새 폴더 2026` typed, Korean names
-//!   and U+1F3B5, at 100×30; under truecolor and through the 256-colour table. TS-5: the same
-//!   at 80×24 and 160×50 after a resize.
+//!   and U+1F3B5, at 100×30; under truecolor and through the 256-colour table; and again with
+//!   F1's help open. TS-5: the same at 80×24 and 160×50 after a resize.
 //! - Keys and the mouse through the backend: Alt+digits, Alt+G, F12, typed Hangul, a click on a
-//!   row, the wheel, Ctrl+Q; OSC 52 for a copy; a hand-off box and a click on it.
+//!   row, the wheel, Ctrl+Q; F1's help and its keys; OSC 52 for a copy; a hand-off box and a
+//!   click on it.
 //! - Leaving (TL-1): on a close, a panic in a pass, a signal — every mode off, the kitty flag
 //!   popped only where it was pushed, raw mode off.
 //! - The switch (TW-1, TW-5): the browser in a window and back with its dialog, its typed text
@@ -788,6 +789,60 @@ fn ts1_the_terminal_shows_the_windows_cells_under_truecolor_and_256_colours() {
     assert_eq!(differences(&changed, &vt, Ink::Rgb).len(), 2);
 }
 
+/// TS-1 again with F1's help open (10 §14): its box over the list — the list's Korean names
+/// under its edges among them — is the same cells in the terminal as in the window, under
+/// truecolor, through the 256-colour table and in tmux; the help's rows that scroll included.
+#[test]
+fn ts1_with_f1s_help_open_the_terminal_shows_the_windows_cells() {
+    let fx = fixture(0);
+    let (mut drv, mut win) = window(&fx, 100, 30);
+    drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
+    drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
+    drv.key(&mut win, Key::F1, Modifiers::NONE);
+    drv.idle(&mut win, 2);
+    assert!(crate::gui::help::is_open(&drv.ctx));
+    let mut sw = switched(&fx);
+    let painted = window_cells(&window_pass(&drv.ctx, &mut sw, 100, 30), 100, 30);
+    assert!(painted.0.iter().all(|c| c.covered), "every cell is painted");
+    let vt = terminal_of(&drv.ctx, &mut win, 100, 30, true);
+    let text = vt.text();
+    for shown in [
+        "Keys in the file list",
+        "Rename the entry under the bar, in place",
+        "Esc, F1 or F3: back",
+        "7MkDir",
+    ] {
+        assert!(text.contains(shown), "{shown:?} on screen:\n{text}");
+    }
+    assert!(vt.caret().is_none(), "no caret: the help has no field");
+    let d = differences(&painted, &vt, Ink::Rgb);
+    only_the_mode_button(&d, &vt, "truecolor");
+    let vt = terminal_of(&drv.ctx, &mut win, 100, 30, false);
+    let d = differences(&painted, &vt, |c| Ink::Index(cells::index256(c)));
+    only_the_mode_button(&d, &vt, "256 colours");
+    // Scrolled to its end: the alias lines, the scroll bar's thumb at the foot.
+    drv.key(&mut win, Key::End, Modifiers::NONE);
+    drv.idle(&mut win, 2);
+    let painted = window_cells(&window_pass(&drv.ctx, &mut sw, 100, 30), 100, 30);
+    let vt = terminal_of(&drv.ctx, &mut win, 100, 30, true);
+    assert!(vt.text().contains("Ctrl/⌘+1…0 · Alt+1…0"), "{}", vt.text());
+    only_the_mode_button(&differences(&painted, &vt, Ink::Rgb), &vt, "at the end");
+    // TS-1 (b): the same bytes in tmux.
+    let tape = Tape::default();
+    tape.0.borrow_mut().size = (100, 30);
+    let bytes = Bytes::default();
+    let mut b = Backend::new(tape, bytes.clone(), drv.ctx.clone(), true);
+    b.offset = later();
+    b.enter().unwrap();
+    b.pass(&mut win, vec![]).unwrap();
+    b.draw().unwrap();
+    let Some(vt) = tmux_screen(&bytes.0.borrow(), 100, 30) else {
+        return;
+    };
+    assert!(vt.text().contains("Keys in the file list"), "{}", vt.text());
+    only_the_mode_button(&differences(&painted, &vt, Ink::Rgb), &vt, "tmux");
+}
+
 /// Skips the tmux test with `why` — or, under `SOPEN_REQUIRE_TMUX=1` (as the other
 /// `SOPEN_REQUIRE_*`), fails it.
 fn tmux_skip(why: &str) -> Option<Vt> {
@@ -1338,6 +1393,56 @@ fn the_switch_runs_the_browser_in_a_window_and_back_with_its_state() {
     );
 }
 
+/// F1's help open in the terminal crosses the switch as it is — open, scrolled to where it was —
+/// and comes back as the window left it: scrolled back to its top there, or closed by Esc.
+#[test]
+fn the_help_crosses_the_switch_as_it_is() {
+    for close_there in [false, true] {
+        let fx = fixture(0);
+        let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+        let events = [
+            plain(KeyCode::F(1)),
+            plain(KeyCode::End),
+            plain(KeyCode::F(12)),
+        ];
+        tape.0.borrow_mut().events.extend(events);
+        tape.0.borrow_mut().stop = Some(libc::SIGTERM);
+        let browser = fx.b.clone();
+        let mut switch = |b: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
+            to_window(b, &browser, Ok(Place::Here), |mut switched| {
+                let mut drv = Driver::new(800.0, 480.0);
+                drv.as_shell();
+                drv.until(&mut switched, 20, |w| w.ready());
+                drv.idle(&mut switched, 2);
+                assert!(crate::gui::help::is_open(&drv.ctx), "open in the window");
+                let layers = cells::layers(&drv.ctx);
+                let at_end = cells::find(&layers, "Ctrl/⌘+1…0 · Alt+1…0");
+                assert!(
+                    !at_end.is_empty(),
+                    "scrolled to its end, as in the terminal"
+                );
+                let key = if close_there { Key::Escape } else { Key::Home };
+                drv.key(&mut switched, key, Modifiers::NONE);
+                drv.key(&mut switched, Key::F12, Modifiers::NONE);
+                drv.idle(&mut switched, 1);
+                assert!(drv.window_closed, "F12 there closes the window");
+                Ok(())
+            })
+        };
+        let mut win = Shared(fx.b.clone());
+        let end = b.run(&mut win, &mut switch).unwrap();
+        assert_eq!(end, End::Signal(libc::SIGTERM));
+        assert_eq!(crate::gui::help::is_open(&b.ctx), !close_there);
+        let screen = bytes.last_screen(100, 30).text();
+        if close_there {
+            assert!(!screen.contains("Keys in the file list"), "{screen}");
+        } else {
+            assert!(screen.contains("This screen"), "at its top:\n{screen}");
+            assert!(!screen.contains("Ctrl/⌘+1…0 · Alt+1…0"), "{screen}");
+        }
+    }
+}
+
 #[test]
 fn a_switch_to_a_host_or_without_a_display_or_a_window_that_does_not_open_says_why() {
     let cases: [(Place, &str); 3] = [
@@ -1426,46 +1531,70 @@ fn the_mode_button_switches_from_the_terminal_and_back_from_the_window() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// What the terminal cannot show yet (10 §11, T17).
+// The key help, and what the terminal cannot show yet (10 §11, T17).
 
-/// F1 (and Alt+1, its alias) in the terminal opens no help it could not show — it would take
-/// every key, unseen: the status row says where the help is, and the next key reaches the list.
+/// F1 (and Alt+1, its alias) in the terminal opens the key help, in cells: its box on screen,
+/// its title, a row and the alias line, nothing on the status row. While it is open the keys are
+/// its own — ↓ scrolls it, the list's bar stays — Esc closes it, and the next ↓ moves the bar.
 #[test]
-fn f1_in_the_terminal_opens_no_help_and_says_where_it_is() {
+fn f1_in_the_terminal_opens_the_help_in_cells_and_its_keys_are_its_own() {
     for f1 in [
         plain(KeyCode::F(1)),
         key(KeyCode::Char('1'), KeyModifiers::ALT),
     ] {
+        // The run ends with the help open: the last screen is the help's.
         let fx = fixture(0);
         let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
-        let help_seen = Rc::new(RefCell::new(None));
-        let seen = help_seen.clone();
-        let ctx = b.ctx.clone();
-        // Down once F1 has been read: is the help open then?
-        let mut events = vec![f1.clone()];
-        events.push(plain(KeyCode::Down));
-        events.push(ctrl_q());
-        tape.0.borrow_mut().events.extend(events);
-        let gate_ctx = ctx.clone();
-        let b_gate = fx.b.clone();
-        tape.0.borrow_mut().gate = Some(Box::new(move || {
-            if seen.borrow().is_none() {
-                *seen.borrow_mut() = Some(false);
-            }
-            if crate::gui::help::is_open(&gate_ctx) {
-                *seen.borrow_mut() = Some(true);
-            }
-            b_gate.borrow().ready()
-        }));
-        assert_eq!(play(&mut b, &tape, &fx, vec![]), End::Closed);
-        assert_eq!(*help_seen.borrow(), Some(false), "{f1:?}: no help opened");
-        let text = bytes.text();
-        assert!(text.contains(F1_LINE), "{f1:?}: the line on the status row");
+        tape.0
+            .borrow_mut()
+            .events
+            .extend([f1.clone(), plain(KeyCode::End)]);
+        tape.0.borrow_mut().stop = Some(libc::SIGTERM);
+        let mut win = Shared(fx.b.clone());
+        let mut no_switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
+            panic!("no switch in this test")
+        };
+        let end = b.run(&mut win, &mut no_switch).unwrap();
+        assert_eq!(end, End::Signal(libc::SIGTERM));
+        assert!(
+            crate::gui::help::is_open(&b.ctx),
+            "{f1:?}: the help is open"
+        );
         let vt = bytes.vt(100, 30);
+        let screen = vt.text();
+        for shown in [
+            "Keys in the file list",
+            "Ctrl/⌘+1…0 · Alt+1…0",
+            "Esc, F1 or F3: back · ↑ ↓ PgUp PgDn: more",
+        ] {
+            assert!(
+                screen.contains(shown),
+                "{f1:?}: {shown:?} on screen:\n{screen}"
+            );
+        }
+        // No hand-off box, and no line on the status row saying the help is the window's.
+        assert!(!screen.contains(HAND_OFF), "{f1:?}:\n{screen}");
+        // Its keys are its own; Esc gives them back.
+        let fx = fixture(0);
+        let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+        let events = vec![
+            f1.clone(),
+            plain(KeyCode::Down),
+            plain(KeyCode::Esc),
+            plain(KeyCode::Down),
+            ctrl_q(),
+        ];
+        assert_eq!(play(&mut b, &tape, &fx, events), End::Closed);
+        let vt = bytes.vt(100, 30);
+        let bar = Ink::Rgb(chrome::PALETTE.bar);
         assert_eq!(
-            vt.cell(3, 4).bg,
-            Ink::Rgb(chrome::PALETTE.bar),
-            "{f1:?}: Down after it moved the bar:\n{}",
+            (vt.cell(3, 3).bg, vt.cell(3, 4).bg, vt.cell(3, 5).bg),
+            (
+                Ink::Rgb(chrome::PALETTE.back),
+                bar,
+                Ink::Rgb(chrome::PALETTE.back)
+            ),
+            "{f1:?}: one Down moved the bar, the help's did not:\n{}",
             vt.text()
         );
     }

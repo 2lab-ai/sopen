@@ -33,7 +33,7 @@ mod git_host;
 mod git_panel;
 pub(crate) mod keys;
 mod list_cells;
-mod ops;
+pub(crate) mod ops;
 #[cfg(test)]
 pub(crate) use ops::shown_wrapped;
 mod panel;

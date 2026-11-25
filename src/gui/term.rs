@@ -67,8 +67,6 @@ pub(crate) const IN_A_WINDOW: &str =
     "xtools is in a window now — close it, or press F12 there, to come back here.";
 /// What a hand-off box says (10 §11).
 pub(crate) const HAND_OFF: &str = "F12 shows it in the window";
-/// The status line for F1 in the terminal: its help is egui's, not yet cells.
-pub(crate) const F1_LINE: &str = "F1's help: F12 shows it in the window";
 /// The status line while a dialog egui draws (not yet cells) is open.
 pub(crate) const MODAL_LINE: &str =
     "a dialog the terminal does not draw yet: F12 shows it in the window, Esc closes it";
@@ -868,8 +866,6 @@ impl<T: Tty, O: Write> Backend<T, O> {
     pub fn new(tty: T, out: O, ctx: egui::Context, truecolor: bool) -> Self {
         cells::set_recording(&ctx, true);
         super::mark_terminal(&ctx);
-        // After the shell's own hook (added by `chrome::install`): it sees F1 after the aliases.
-        ctx.add_plugin(TermKeys);
         let asked: Arc<Mutex<Option<Instant>>> = Arc::default();
         let tell = asked.clone();
         ctx.set_request_repaint_callback(move |info| {
@@ -990,13 +986,6 @@ impl<T: Tty, O: Write> Backend<T, O> {
             super::closing(ui.ctx(), win, false);
             win.ui(ui);
         });
-        if self
-            .ctx
-            .data_mut(|d| d.remove_temp::<HelpAsked>(help_asked_id()))
-            .is_some()
-        {
-            self.said = Some(F1_LINE.to_string());
-        }
         // No renderer: the textures stay in the context.
         out.textures_delta.clear();
         for command in std::mem::take(&mut out.platform_output.commands) {
@@ -1162,48 +1151,6 @@ impl<T: Tty, O: Write> Drop for Backend<T, O> {
     }
 }
 
-/// The terminal's own input hook, after the shell's ([`super::FKeyInput`], whose aliases it
-/// sees): F1 — the key, Alt+1, a click on the F-key row's slot 1 — opens no help here, which is
-/// egui's and not yet cells (it would take every key, unseen); the pass says so instead
-/// ([`F1_LINE`]).
-struct TermKeys;
-
-/// F1 was pressed in this pass.
-#[derive(Debug, Clone, Copy, Default)]
-struct HelpAsked;
-
-fn help_asked_id() -> egui::Id {
-    egui::Id::unique("sopen-term-help-asked")
-}
-
-impl egui::Plugin for TermKeys {
-    fn debug_name(&self) -> &'static str {
-        "sopen-term-keys"
-    }
-
-    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
-        if !super::in_terminal(ctx) {
-            return;
-        }
-        let mut asked = false;
-        input.events.retain(|e| match e {
-            egui::Event::Key {
-                key: egui::Key::F1,
-                pressed,
-                repeat,
-                ..
-            } => {
-                asked |= *pressed && !*repeat;
-                false
-            }
-            _ => true,
-        });
-        if asked {
-            ctx.data_mut(|d| d.insert_temp(help_asked_id(), HelpAsked));
-        }
-    }
-}
-
 /// The cells `rect` (points) touches on a `cols` × `rows` grid; `None` when it is off it.
 fn cells_over(rect: Rect, cols: u16, rows: u16) -> Option<Cells> {
     let clamp = |v: f32, cell: f32, n: u16| (v / cell).clamp(0.0, f32::from(n));
@@ -1260,11 +1207,13 @@ impl Destination {
 
 /// What moves with the browser between the terminal's context and the window's: what has the
 /// keyboard, and the edit state (cursor, selection) of the field that has it — a context's own,
-/// so a dialog's caret would be lost on the way.
+/// so a dialog's caret would be lost on the way — and F1's help, open where it was scrolled to
+/// or closed (the context's too).
 #[derive(Clone, Default)]
 pub(crate) struct Carry {
     focus: Option<egui::Id>,
     edit: Option<egui::text_edit::TextEditState>,
+    help: super::help::Carried,
 }
 
 impl Carry {
@@ -1273,10 +1222,12 @@ impl Carry {
         Carry {
             focus,
             edit: focus.and_then(|id| egui::text_edit::TextEditState::load(ctx, id)),
+            help: super::help::carried(ctx),
         }
     }
 
     pub fn apply(&self, ctx: &egui::Context) {
+        super::help::carry_into(ctx, &self.help);
         match self.focus {
             Some(id) => {
                 if let Some(edit) = self.edit.clone() {
