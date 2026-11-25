@@ -218,6 +218,34 @@ pub const ENCODE_KEY: FKey = FKey {
     label: "Encode",
 };
 
+/// The page view's own keys (09 §6) while its scripts are off: F2 names what it does, `JS on`
+/// (§3.3: where the engine does not contain a file view's scripts it says why and does nothing).
+pub const PAGE_KEYS: &[FKey] = &[JS_ON_KEY];
+
+/// The page view's own keys while its scripts are on: F2 turns them off.
+pub const PAGE_KEYS_ON: &[FKey] = &[JS_OFF_KEY];
+
+/// [`PAGE_KEYS`] while a link the page did not follow is on its row: F5 copies it (§3.4).
+pub const PAGE_LINK_KEYS: &[FKey] = &[JS_ON_KEY, LINK_KEY];
+
+/// [`PAGE_KEYS_ON`] while a link the page did not follow is on its row.
+pub const PAGE_LINK_KEYS_ON: &[FKey] = &[JS_OFF_KEY, LINK_KEY];
+
+const JS_ON_KEY: FKey = FKey {
+    n: 2,
+    label: "JS on",
+};
+
+const JS_OFF_KEY: FKey = FKey {
+    n: 2,
+    label: "JS off",
+};
+
+const LINK_KEY: FKey = FKey {
+    n: 5,
+    label: "Link",
+};
+
 /// The key of slot `n` (1–10): F1…F10.
 pub fn fkey(n: u8) -> Option<egui::Key> {
     use egui::Key::*;

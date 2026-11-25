@@ -21,10 +21,12 @@ use crate::gui::image::{self, Doc, ImageFile};
 use crate::gui::media::{self, Media};
 use crate::gui::streamed::{self, Lease};
 use crate::gui::text::{self, TextDoc};
+use crate::gui::web::page::{self, PreviewSession, Served};
 use crate::gui::{chrome, Embedded, Origin, Outcome, Placeholder, Reconnect, Window};
 use crate::kind::{self, Kind};
 use crate::remote::{RemoteFs, Stat};
 use crate::stream::{Opening, ReadError, ReaderKind, Source, Waker};
+use crate::views::PageClass;
 use anyhow::{anyhow, bail, Context as _, Result};
 use eframe::egui;
 use sha2::Digest as _;
@@ -84,6 +86,93 @@ pub enum Prepared {
         notices: Vec<String>,
         claim: Option<Claim>,
     },
+    /// A page file as its page (09 §6): its server running from its root, on this machine in
+    /// place, a remote one over the connection that opened the file; its view is made on the
+    /// frame.
+    Page {
+        page: Served,
+    },
+}
+
+/// How a page file opens (09 §4–§6), as the window that asks decided it on its frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pages {
+    /// As its page, when the page is its default view (`kind::page_default`): its root found
+    /// from `opened_on`, the folder the browser was opened on, when that is on the file's host
+    /// (§3.1).
+    Page { opened_on: Option<String> },
+    /// As its source, `line` its first row where the page would have been its view 1 (§4:
+    /// `no web engine here (…): showing the source`); `None`: no line.
+    Source(Option<String>),
+}
+
+impl Pages {
+    /// How a file named `name` opens in `ctx`'s window, asked on its frame (the engine is the
+    /// windows' thread's): a page file as its page where pages show here (09 §4), else as its
+    /// source with the line saying why — `failed`, a view the engine refused before, says it
+    /// for the rest of the window. Any other name opens as before 09, no engine asked.
+    pub fn here(
+        ctx: &egui::Context,
+        name: &str,
+        opened_on: Option<String>,
+        failed: Option<&crate::gui::web::Unavailable>,
+    ) -> Pages {
+        if !kind::page_file(name) {
+            return Pages::Source(None);
+        }
+        let here = match failed {
+            Some(why) => Err(why.clone()),
+            None => page::pages_here(ctx),
+        };
+        match here {
+            Ok(()) => Pages::Page { opened_on },
+            Err(why) => Pages::Source(Some(page::source_line(&why))),
+        }
+    }
+
+    /// Whether page files show their page.
+    pub fn shown(&self) -> bool {
+        matches!(self, Pages::Page { .. })
+    }
+}
+
+/// What a preparation makes: the opening's first view, a view of a kind (08 §5), or the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Want {
+    Opening,
+    Kind(Kind),
+    Page,
+}
+
+/// Where the page goes among the views of the file at `abs` — its resolved path — (09 §5–§6, the
+/// one page decision): by its name, and for an `.xml` by its first 8 KiB, read on `fs` (a local
+/// file in place) — at most that much more than the opening read before 09.
+fn page_class_on(fs: &mut dyn RemoteFs, abs: &str) -> Result<PageClass> {
+    let name = crate::remote::split_parent(abs).1;
+    if !kind::page_file(name) {
+        return Ok(PageClass::Plain);
+    }
+    let head = if kind::extension(name).as_deref() == Some("xml") {
+        fs.read_head(abs, kind::SNIFF_BYTES)?
+    } else {
+        Vec::new()
+    };
+    Ok(PageClass::of(name, kind::page_default(name, &head)))
+}
+
+/// The page of the file at `req.abs` (09 §3.1): its root resolved on `fs`, its server started —
+/// in place on this machine, over `fs` for a remote file (the viewer's one channel).
+fn page_prepared(
+    req: &Request,
+    mut fs: Box<dyn RemoteFs + Send>,
+    opened_on: Option<&str>,
+) -> Result<Prepared> {
+    let root = crate::stream::page::root(fs.as_mut(), opened_on, req.abs)?;
+    let page = match req.label {
+        None => Served::local(root, false),
+        Some(label) => Served::remote(fs, root, label, req.connect.clone(), None),
+    };
+    Ok(Prepared::Page { page })
 }
 
 /// Where the file is and how to reach it.
@@ -178,19 +267,36 @@ pub struct Opened {
     pub kind: Kind,
     pub stat: Stat,
     pub undecodable: Option<String>,
+    /// Where the page goes among its views (09 §5–§6), decided from the file opened — its
+    /// resolved name and head, never the name the list shows (the opening's only).
+    pub page: PageClass,
 }
 
 /// [`prepare`] with what the view set keeps ([`Opened`]). `in_place`: a file at a revision or a
 /// diff (03 §6.2–§6.3, S2-F), opened read-only from the cache's `.revisions` — read where it is:
 /// an image is not copied into the cache's mirror (it is never saved, and nothing of it may
-/// outlive its window).
+/// outlive its window). A page file opens as its source, with no line.
+#[cfg_attr(not(test), allow(dead_code))] // The browser asks [`prepare_paged`].
 pub fn prepare_opening(
     req: &Request,
     in_place: bool,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Opened> {
-    prepare_with(req, in_place, None, cancel, progress)
+    prepare_paged(req, in_place, &Pages::Source(None), cancel, progress)
+}
+
+/// [`prepare_opening`], a page file opening as `pages` says (09 §5–§6): as its page when that
+/// is its default view and the window shows pages, else as its source — its first row the
+/// line `pages` gives where the page would have been view 1.
+pub fn prepare_paged(
+    req: &Request,
+    in_place: bool,
+    pages: &Pages,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Opened> {
+    prepare_with(req, in_place, Want::Opening, pages, cancel, progress)
 }
 
 /// One view of a file already opened (08 §5: made the first time it is chosen), as `kind` would
@@ -204,13 +310,29 @@ pub fn prepare_view(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Opened> {
-    prepare_with(req, in_place, Some(kind), cancel, progress)
+    let source = Pages::Source(None);
+    prepare_with(req, in_place, Want::Kind(kind), &source, cancel, progress)
+}
+
+/// The page view of a file already opened (09 §6: plain XML's view 3, or a page's view 1 made
+/// again), its root found from `opened_on` (§3.1), on a connection of its own.
+pub fn prepare_page_view(
+    req: &Request,
+    in_place: bool,
+    opened_on: Option<&str>,
+    cancel: &AtomicBool,
+) -> Result<Opened> {
+    let pages = Pages::Page {
+        opened_on: opened_on.map(str::to_string),
+    };
+    prepare_with(req, in_place, Want::Page, &pages, cancel, &mut |_, _| {})
 }
 
 fn prepare_with(
     req: &Request,
     in_place: bool,
-    want: Option<Kind>,
+    want: Want,
+    pages: &Pages,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Opened> {
@@ -228,11 +350,32 @@ fn prepare_with(
         );
     }
     let (kind, sniff) = kind::detect_sniffed(fs.as_mut(), req.abs, &stat)?;
-    let kind = want.unwrap_or(kind);
+    // 09 §5: the page decision, before the view is made, from the file opened (`req.abs` is
+    // resolved) — an `.xml`'s head read on this connection. A page file stays Text for the
+    // views and everything else (§5).
+    let class = match (want, kind) {
+        (Want::Opening, Kind::Text) => page_class_on(fs.as_mut(), req.abs)?,
+        _ => PageClass::Plain,
+    };
+    let first = class == PageClass::PageFirst;
+    let (page, source_line) = match (want, pages) {
+        (Want::Page, _) if !kind::page_file(crate::remote::split_parent(req.abs).1) => {
+            bail!("{} is not a page file", req.show())
+        }
+        (Want::Page, Pages::Page { opened_on }) => (Some(opened_on), None),
+        (Want::Opening, Pages::Page { opened_on }) if first => (Some(opened_on), None),
+        (Want::Opening, Pages::Source(line)) if first => (None, line.clone()),
+        _ => (None, None),
+    };
+    let kind = match want {
+        Want::Kind(kind) => kind,
+        Want::Opening | Want::Page => kind,
+    };
     let mut undecodable = None;
-    let prepared = match req.label {
-        Some(label) => streamed_prepared(req, label, fs, kind, sniff, cancel)?,
-        None => local_prepared(
+    let mut prepared = match (page, req.label) {
+        (Some(opened_on), _) => page_prepared(req, fs, opened_on.as_deref())?,
+        (None, Some(label)) => streamed_prepared(req, label, fs, kind, sniff, cancel)?,
+        (None, None) => local_prepared(
             req,
             in_place,
             fs,
@@ -243,6 +386,10 @@ fn prepare_with(
             cancel,
         )?,
     };
+    // §4: the source, saying why it is not the page.
+    if let (Some(line), Prepared::Text { notices, .. }) = (source_line, &mut prepared) {
+        notices.insert(0, line);
+    }
     // The kind as the views see it (08 §3): what the preparation found the file to be.
     let kind = match &prepared {
         Prepared::Hex { .. } if undecodable.is_none() => Kind::Other,
@@ -260,6 +407,7 @@ fn prepare_with(
         kind,
         stat,
         undecodable,
+        page: class,
     })
 }
 
@@ -848,6 +996,8 @@ enum Parts {
         origin: Origin,
         made: Box<media::preview::Prepared>,
     },
+    /// A page file's page (09 §6), served from its root within the preview's budget.
+    Page(Served),
     Card(Card),
 }
 
@@ -858,6 +1008,27 @@ pub struct Previewed {
     /// A streamed preview's hold on the window's preview connection.
     lease: Option<Lease>,
     cache: PathBuf,
+    /// 09: see [`HandedOver::page`].
+    page: PageSeen,
+}
+
+/// What a preview found of a page file (09 §5–§6), for the views of the viewer it becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageSeen {
+    /// It was prepared with pages shown (`Pages::Page`).
+    pub shown: bool,
+    /// Where the page goes among its views, from the file previewed (its resolved name, its
+    /// head).
+    pub class: PageClass,
+}
+
+impl Default for PageSeen {
+    fn default() -> Self {
+        PageSeen {
+            shown: false,
+            class: PageClass::Plain,
+        }
+    }
 }
 
 impl Previewed {
@@ -876,7 +1047,7 @@ impl Previewed {
         let cache = &self.cache;
         // What the viewer it is handed over to has for views (08 §3).
         let kind = match &self.parts {
-            Parts::Text { .. } | Parts::TextStream { .. } => Kind::Text,
+            Parts::Text { .. } | Parts::TextStream { .. } | Parts::Page(_) => Kind::Text,
             Parts::Image { .. } => Kind::Image,
             Parts::Media { made, .. } if made.media.video.is_some() => Kind::Video,
             Parts::Media { .. } => Kind::Audio,
@@ -902,6 +1073,7 @@ impl Previewed {
                 None,
             ),
             Parts::Media { origin, made } => (media::embed_preview(origin, *made, cache), None),
+            Parts::Page(served) => (page::embed(served), None),
             Parts::Card(card) => (card_window(card.clone()), Some(card)),
         };
         let mut embedded = embedded;
@@ -912,6 +1084,7 @@ impl Previewed {
             shown: true,
             lease: self.lease,
             kind,
+            page: self.page,
         }
     }
 }
@@ -928,6 +1101,7 @@ pub struct Preview {
     lease: Option<Lease>,
     /// The file's kind as its viewer has views for it (08 §3).
     kind: Kind,
+    page: PageSeen,
 }
 
 /// A preview handed over (Enter or F3 on it): the viewer, a viewer again.
@@ -942,6 +1116,8 @@ pub struct HandedOver {
     pub notices: Vec<String>,
     /// The file's kind, as the preview found it: what views the viewer has (08 §3).
     pub kind: Kind,
+    /// What the preview found of a page file: whether its views have the page (09 §6).
+    pub page: PageSeen,
 }
 
 impl Preview {
@@ -955,6 +1131,7 @@ impl Preview {
             shown: true,
             lease: None,
             kind: Kind::Other,
+            page: PageSeen::default(),
         }
     }
 
@@ -999,6 +1176,7 @@ impl Preview {
             hold: None,
             notices: Vec::new(),
             kind: self.kind,
+            page: self.page,
         })
     }
 }
@@ -1012,6 +1190,7 @@ struct Known {
     kind: Option<Kind>,
     link: Option<Link>,
     lease: Option<Lease>,
+    page: PageSeen,
 }
 
 /// Prepares the preview of the file at `req.abs` (02 §4.2–§4.4), on the window's preview
@@ -1022,8 +1201,24 @@ struct Known {
 /// ffmpeg runs the same stops reach ([`media::preview`]). A file that cannot be previewed —
 /// unreadable, vanished, a budget hit — is the info card. `Err` only when cancelled
 /// ([`crate::remote::Cancelled`]).
+#[cfg_attr(not(test), allow(dead_code))] // The preview host asks [`preview_paged`].
 pub fn preview(
     req: PreviewRequest,
+    budget: &Budget,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Previewed> {
+    preview_paged(req, &Pages::Source(None), None, budget, cancel, progress)
+}
+
+/// [`preview`], a page file previewed as `pages` says (09 §6): its page — scripts off, served
+/// from its root within the preview's budget (§3.1), a remote one on the window's preview
+/// session (`session`, as the preview host keeps it: what `req.conn` and `req.back` are) — where
+/// the page is its default view and the window shows pages; else its source.
+pub fn preview_paged(
+    req: PreviewRequest,
+    pages: &Pages,
+    session: Option<PreviewSession>,
     budget: &Budget,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
@@ -1036,14 +1231,16 @@ pub fn preview(
         kind: None,
         link: None,
         lease: None,
+        page: PageSeen::default(),
     };
     let host = req.label.unwrap_or(cache::LOCAL_HOST).to_string();
     let cache = req.cache.to_path_buf();
-    match preview_parts(req, budget, cancel, progress, &mut known) {
+    match preview_parts(req, pages, session, budget, cancel, progress, &mut known) {
         Ok(parts) => Ok(Previewed {
             parts,
             lease: known.lease,
             cache,
+            page: known.page,
         }),
         Err(e) if crate::remote::is_cancelled(&e) => Err(e),
         Err(e) => {
@@ -1060,6 +1257,7 @@ pub fn preview(
                 parts: Parts::Card(card),
                 lease: None,
                 cache,
+                page: PageSeen::default(),
             })
         }
     }
@@ -1067,6 +1265,8 @@ pub fn preview(
 
 fn preview_parts(
     req: PreviewRequest,
+    pages: &Pages,
+    session: Option<PreviewSession>,
     budget: &Budget,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
@@ -1151,6 +1351,31 @@ fn preview_parts(
     budget.check(cancel)?;
     let (kind, sniff) = kind::detect_sniffed(fs.as_mut(), &real, &stat)?;
     known.kind = Some(kind);
+    // 09 §5–§6: a page file whose default view is its page shows it, where the window shows
+    // pages; the decision reads an `.xml`'s head on this connection.
+    if let (Kind::Text, Pages::Page { opened_on }) = (kind, pages) {
+        known.page.shown = true;
+        budget.check(cancel)?;
+        known.page.class = page_class_on(fs.as_mut(), &real)?;
+        // A remote page lends the window's preview session; without it, its source.
+        let lent = session.filter(|_| label.is_some());
+        if known.page.class == PageClass::PageFirst && (label.is_none() || lent.is_some()) {
+            budget.check(cancel)?;
+            let root = crate::stream::page::root(fs.as_mut(), opened_on.as_deref(), &real)?;
+            budget.check(cancel)?;
+            let served = match (label, lent) {
+                (Some(label), Some(session)) => {
+                    // The window's one preview session is the page's while it is a preview,
+                    // and comes back when its server ends (06 §13), as a stream's does.
+                    let conn = conn.take().expect("opened above");
+                    Served::remote(conn, root, label, connect.clone(), Some(session))
+                }
+                _ => Served::local(root, true),
+            };
+            budget.read_done();
+            return Ok(Parts::Page(served));
+        }
+    }
     if kind == Kind::Image
         && budget
             .limit(limits.image_bytes)

@@ -311,14 +311,14 @@ fn rows() -> Vec<Row> {
         Text,
         None,
     ));
-    // D30: before 09 (or with no engine) all of them are 1 Text, 2 Hex, 3 Raw.
+    // D30: with no engine (09 §4) all of them are 1 Text, 2 Hex, 3 Raw.
     for (what, opening) in [
-        ("html before 09", html),
-        ("htm before 09", htm),
-        ("styled xml before 09", styled),
-        ("plain xml before 09", plain),
+        ("html, no engine", html),
+        ("htm, no engine", htm),
+        ("styled xml, no engine", styled),
+        ("plain xml, no engine", plain),
     ] {
-        out.push(row(what, opening, gui, [t, h, r], Text, None));
+        out.push(row(what, opening, Screen::NO_ENGINE, [t, h, r], Text, None));
     }
     let blob = routed("blob.bin", &[0x7f, 0, 1, 2]);
     out.push(row("binary", blob, gui, [h, h, t], Hex, None));
@@ -1295,7 +1295,7 @@ fn d10_a_media_view_that_cannot_be_made_gives_way_to_hex() {
 /// A different view chosen during a make replaces it; an abandoned make's answer is ignored.
 #[test]
 fn another_view_chosen_during_a_make_replaces_it() {
-    let mut set = open(paged(named("index.html"), false));
+    let mut set = ViewSet::open(paged(named("index.html"), false), Screen::NO_ENGINE).unwrap();
     let mut set_pages = ViewSet::open(paged(named("index.html"), false), PAGES).unwrap();
     run(
         &mut set_pages,
@@ -1310,7 +1310,7 @@ fn another_view_chosen_during_a_make_replaces_it() {
             (Input::Made(Ticket(1)), CLEAN, vec![hide(Page), show(Text)]),
         ],
     );
-    // Before 09: Text on screen, Hex being made; Raw is the document on screen.
+    // With no engine: Text on screen, Hex being made; Raw is the document on screen.
     run(
         &mut set,
         vec![

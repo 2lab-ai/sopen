@@ -567,6 +567,8 @@ struct Opening {
     /// How its file is reached: what its views are made over later (08 §6).
     connect: Connect,
     label: Option<String>,
+    /// How a page file opens (09 §4–§6), as this window decided when it began.
+    pages: prepare::Pages,
 }
 
 /// Where an opening's file comes from.
@@ -736,6 +738,11 @@ fn report_lines(report: &Report) -> Vec<String> {
 pub(crate) struct Browser {
     /// `host:/abs` of the folder opened.
     title: String,
+    /// The folder opened (`Start::abs`): a page's root when the page is inside it (09 §3.1).
+    opened_on: String,
+    /// A page view the engine refused in this window (09 §4): page files open as their source
+    /// from then on.
+    page_failed: Option<crate::gui::web::Unavailable>,
     label: Option<String>,
     /// The browser's own connection (listing), shared with its listing workers.
     conn: Arc<Mutex<Box<dyn RemoteFs + Send>>>,
@@ -916,16 +923,19 @@ impl Browser {
         let _ = std::thread::Builder::new()
             .name("legacy-previews".into())
             .spawn(move || crate::cache::sweep_legacy_previews(&cache));
-        let preview = preview::Host::new(
+        let mut preview = preview::Host::new(
             start.connect.clone(),
             start.label.clone(),
             start.cache.clone(),
         );
+        preview.set_opened_on(start.abs.clone());
         let tree_connect = tree_connect(start.label.clone(), start.state_dir.clone());
         let tree_host = start.label.clone().unwrap_or_default();
         let git = GitSide::new(start.git, start.label.as_deref());
         let mut browser = Self {
             title: show(start.label.as_deref(), &start.abs),
+            opened_on: start.abs.clone(),
+            page_failed: None,
             label: start.label,
             conn: Arc::new(Mutex::new(start.fs)),
             connect: start.connect,
@@ -1083,6 +1093,11 @@ impl Browser {
         let in_place = read_only.is_some();
         let cache = self.cache.clone();
         let (kept_connect, kept_label) = (connect.clone(), label.clone());
+        // 09 §4–§6, on the frame: a page file as its page or its source; its root from the
+        // folder opened when that is on the file's host (a revision's is this machine's).
+        let opened_on = (label == self.label).then(|| self.opened_on.clone());
+        let pages = prepare::Pages::here(ctx, &name, opened_on, self.page_failed.as_ref());
+        let kept_pages = pages.clone();
         let (d, t, stop, waker, path) = (
             done.clone(),
             total.clone(),
@@ -1107,7 +1122,7 @@ impl Browser {
                 t.store(all, Ordering::Relaxed);
                 waker.request_repaint();
             };
-            let result = prepare::prepare_opening(&req, in_place, &stop, &mut progress);
+            let result = prepare::prepare_paged(&req, in_place, &pages, &stop, &mut progress);
             let _ = tx.send(result);
             waker.request_repaint();
         });
@@ -1126,6 +1141,7 @@ impl Browser {
             read_only,
             connect: kept_connect,
             label: kept_label,
+            pages: kept_pages,
         });
     }
 
@@ -1566,7 +1582,7 @@ impl Browser {
         };
         let cancelled = opening.cancel.load(Ordering::Relaxed);
         let (abs, name, read_only) = (opening.abs, opening.name, opening.read_only);
-        let (connect, label) = (opening.connect, opening.label);
+        let (connect, label, pages) = (opening.connect, opening.label, opening.pages);
         if let Source::Fresh {
             worker: Some(worker),
             ..
@@ -1598,7 +1614,7 @@ impl Browser {
                     label,
                     in_place: read_only.is_some(),
                 };
-                self.opened(ctx, result, means, read_only)
+                self.opened(ctx, result, means, read_only, pages)
             }
             // The preview's preparation, taken over, came to its end: the live preview becomes
             // the viewer — or it is an info card (an error), and the file opens as from the
@@ -1626,6 +1642,7 @@ impl Browser {
         result: Result<prepare::Opened>,
         mut means: view_set::Means,
         read_only: Option<ReadOnly>,
+        pages: prepare::Pages,
     ) {
         let opened = match result {
             Ok(opened) => opened,
@@ -1646,6 +1663,14 @@ impl Browser {
         };
         means.title = title.clone();
         let opened_as = view_set::OpenedAs::of(&opened);
+        let page = view_set::PageOpen {
+            class: opened.page,
+            shown: pages.shown(),
+            opened_on: match pages {
+                prepare::Pages::Page { opened_on } => opened_on,
+                prepare::Pages::Source(_) => None,
+            },
+        };
         // `at=` and `enc=` are the first text file's: taken by a text viewer, kept past any
         // other.
         let text = match opened.prepared {
@@ -1673,7 +1698,7 @@ impl Browser {
             Some(r) => (r.edit, true),
             None => (abs, false),
         };
-        let views = view_set::open(ctx, &opened_as, means, self.open_view.take());
+        let views = view_set::open_paged(ctx, &opened_as, means, self.open_view.take(), page);
         self.view(ctx, made, abs, read_only, views);
     }
 
@@ -1734,7 +1759,12 @@ impl Browser {
             },
             undecodable: None,
         };
-        let views = view_set::open(ctx, &opened_as, means, self.open_view.take());
+        let page = view_set::PageOpen {
+            class: viewer.page.class,
+            shown: viewer.page.shown,
+            opened_on: viewer.page.shown.then(|| self.opened_on.clone()),
+        };
+        let views = view_set::open_paged(ctx, &opened_as, means, self.open_view.take(), page);
         let made = view_set::Made {
             embedded: viewer.embedded,
             hold: viewer.hold,
@@ -1882,6 +1912,8 @@ impl Browser {
                             read_only: None,
                             connect: self.connect.clone(),
                             label: self.label.clone(),
+                            // The preview's own decision goes with what it hands over.
+                            pages: prepare::Pages::Source(None),
                         });
                     }
                     preview::Taken::Nothing => self.start_open(ctx, path, entry.name),
@@ -2408,6 +2440,15 @@ impl Browser {
             self.views_after(&ctx);
             return;
         }
+        // 09 §4: the engine refused the page view on screen — the source shows in its place,
+        // and page files open as their source in this window from now on.
+        if let Some(why) = crate::gui::web::page::take_failure(&ctx).filter(|_| !asked) {
+            self.preview.set_page_failed(why.clone());
+            self.page_failed = Some(why.clone());
+            self.views_page_failed(&ctx, &why);
+            self.views_after(&ctx);
+            return;
+        }
         if asked && self.views_asked(&ctx) {
             // The prompt was up for a switch of views: its answer was the switch's.
             self.views_after(&ctx);
@@ -2505,7 +2546,15 @@ impl Browser {
         for (i, side) in cells::halves(grid.all()).into_iter().enumerate() {
             let rect = grid.rect(side);
             match self.shown.as_ref().map(|s| s[i].clone()) {
-                Some(view::Content::Preview(_)) => self.preview.ui(ui, rect),
+                Some(view::Content::Preview(_)) => {
+                    self.preview.ui(ui, rect);
+                    // 09 §4: the engine refused the preview's page — the preview shows the
+                    // source now, and page files open as their source in this window.
+                    if let Some(why) = self.preview.take_refused() {
+                        self.status = Status::error(crate::gui::web::page::source_line(&why));
+                        self.page_failed = Some(why);
+                    }
+                }
                 Some(view::Content::Tree) if self.tree.is_some() => self.tree_ui(ui, rect),
                 Some(view::Content::Git(top)) => self.git_ui(ui, i, rect, &top),
                 _ => self.panel_cells(ui, i, &grid, side),
