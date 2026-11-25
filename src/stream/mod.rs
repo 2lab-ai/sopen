@@ -8,6 +8,7 @@
 
 mod cache;
 pub mod http;
+pub mod page;
 mod prefetch;
 mod source;
 #[cfg(test)]

@@ -2634,11 +2634,13 @@ mod tests {
         let asks = format!("Make a folder in {}", fx.root);
         fx.drv.click(&mut fx.b, at_seven);
         fx.settle();
-        assert!(fx.drv.find_text(&asks).is_some(), "the MkDir slot asked");
+        // The folder's path makes the line wider than the dialog: it wraps by cells.
+        let shown = |fx: &BrowserFx| browser::shown_wrapped(&fx.drv, &asks);
+        assert!(shown(&fx), "the MkDir slot asked");
         fx.drv
             .key(&mut fx.b, egui::Key::Escape, egui::Modifiers::NONE);
         fx.settle();
-        assert!(fx.drv.find_text(&asks).is_none(), "Esc closed it");
+        assert!(!shown(&fx), "Esc closed it");
         assert!(!fx.viewer());
         fx.drv.click_text(&mut fx.b, "View   ");
         fx.settle();
@@ -2646,10 +2648,12 @@ mod tests {
         fx.drv.click(&mut fx.b, at_seven);
         fx.settle();
         assert!(fx.viewer(), "an empty slot: still the viewer");
-        assert!(fx.drv.find_text(&asks).is_none(), "and no dialog");
         fx.drv.click_text(&mut fx.b, "Exit   ");
         fx.settle();
         assert!(!fx.viewer(), "the Exit slot left it");
+        // Over a viewer the list's dialogs are not drawn; back in the list, one the empty slot
+        // had opened would be.
+        assert!(!shown(&fx), "and no dialog");
         fx.drv.click_text(&mut fx.b, "Edit   ");
         assert_eq!(fx.edited(), [format!("{}/main.rs", fx.root)]);
     }

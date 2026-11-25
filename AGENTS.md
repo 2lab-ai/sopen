@@ -143,7 +143,11 @@ downloaded and checked by build.rs; `SHERPA_ONNX_LIB_DIR` for offline builds); `
   `live_the_plain_rename_over_a_real_master`), the git panel's stop of a remote fetch, 03 G-R3's live
   receipt (`SOPEN_TEST_GIT_HOST=<ssh destination>`, `SOPEN_TEST_GIT_DIR=/tmp/<a new folder>`;
   `src/gui/browser/tests/s3.rs`, `live_g_r3_esc_stops_a_remote_fetch`; it makes and removes that
-  folder) and the system Trash (`src/remote/local/trash.rs`,
+  folder), the editor buffer's two measurements, each alone in a release build (`cargo test --release
+  --lib -- --ignored --exact <path>`, `--exact` taking the full path; `src/edit/buffer/tests.rs`:
+  `edit::buffer::tests::eb1_100_mib_within_1_ms_and_1_1x`, 12 EB-1's 100 MB timing and memory, and
+  `edit::buffer::tests::eb5_a_200_mb_delete_adds_only_its_pieces`, EB-5's 200 MB delete; each
+  prints `1 passed`) and the system Trash (`src/remote/local/trash.rs`,
   `the_system_trash_takes_a_file_and_a_link`; it puts two entries in the Trash and prints where). A test build
   never reaches the owner's Trash: `LocalFs`'s Trash is a stand-in of the test process's own.
 - Public repo hygiene: no machine names, IP addresses, home-directory paths or session scratch paths in

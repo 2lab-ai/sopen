@@ -400,6 +400,9 @@ and one rule. The rule sits right after rule 1 (a viewer covers both sides, `:11
   225.2 MiB [M *editor* §3.1].
 - **The first cut** keeps pieces in a `Vec`, with the original's line starts, and splits by binary
   search. Lines are found by the encoding's LF unit (`Encoding::find_lf`, `encoding.rs:326`).
+  - The line starts are kept as the count of LF units before every 4 KiB of each buffer (ED-buf).
+    A split or a lookup is then a binary search and a scan of at most 4 KiB, and the index is 1/512
+    of the file however short its lines are.
   - The prototype's linear scan already stayed well within a frame after 20,000 edits on 100 MB:
     24 µs an edit and 8 µs a lookup, where a frame is 16,000 µs [M *editor* §3.1].
   - A balanced tree waits for a measured need.
@@ -916,8 +919,13 @@ sends (10 §15).
   final LF; UTF-8 with a BOM; UTF-16LE with a BOM, Hangul and CRLF; UTF-16LE with a lone `D800`; CP949
   `똠`; CP949 lead `C8` before LF.
   - On a 100 MB file: 1,000 typed characters, 10,000 scattered inserts and 10,000 deletes, 20,000
-    line ↔ offset lookups → no operation above 1 ms, and peak RSS at most 1.1× the file plus 10 MiB
-    (*editor* §3.1's prototype is the floor).
+    line ↔ offset lookups → no operation above 1 ms, and what the file and the buffer add to the
+    process's peak RSS, over its resident size before the file is read, at most 1.1× the file plus
+    10 MiB: 120 MiB for 100 MiB (*editor* §3.1's prototype is the floor). A test binary's own
+    resident size is not the editor's (decision of 2026-11-25).
+  - Measured [M, ED-buf; release build, run alone]: 106.8–108.6 MiB added over a 12.8 MiB baseline,
+    so about 11 MiB to spare. The slowest operation took 198–333 µs, except one run in nine, taken
+    at a load average of about 43, which had one operation at 1.75 ms.
 - EB-2 [ED-enc] `encode("A한")` → UTF-8 `41 ED 95 9C`; UTF-16LE `41 00 5C D5`; UTF-16BE `00 41 D5 5C`;
   UTF-32LE `41 00 00 00 5C D5 00 00`.
   - U+1F600 → UTF-16LE `3D D8 00 DE`; UCS-2 refuses it.
@@ -1169,6 +1177,9 @@ sends (10 §15).
 ## 15. Test plan
 
 - **The model units** (ED-buf, ED-enc, ED-ops, ED-save) are plain unit tests.
+  - EB-1's 100 MB item and EB-5's 200 MB item are `#[ignore]`d tests, run by hand, each alone in
+    a release build (AGENTS.md's list). EB-1's memory bound counts what the file and the buffer add
+    (§14).
   - The tests generate their fixtures; there are no binary fixtures (08 §12).
   - A read through the stream is compared with the whole file (08 §12's "ranged equals whole").
   - E32's guard is tested on the local disk and against `sftp-server`, with test hooks that write
@@ -1208,7 +1219,7 @@ table waits on "X3's unit" and "X4's units".
 | ED-0 | Scaffold: the `edit` module and its docs. Each later unit adds its own `mod` line, so the scaffold declares no file that does not exist yet | `src/edit.rs` (new: module docs only); `src/lib.rs` (`pub mod edit;` beside `pub mod encoding;`, `lib.rs:22`) | ≈15 | — | no change — **starts now** |
 | ED-buf | §7.1 and §7.3: the original and the add buffer with stable identities, pieces, the original's line starts by the encoding's LF unit, insert, delete, line ↔ offset, serialise; undo steps as pieces, their groups and bound. EB-1, EB-5 | `src/edit/buffer.rs`, `src/edit/buffer/tests.rs` (new); `src/edit.rs` (its `mod buffer;` line) | ≈450 (the prototype's table: 150) | ED-0 | no change — **starts now** |
 | ED-enc | §7.2's encode side: `Encoding::encode` for every encoding but CP949, as an `impl Encoding` in a child module, refusing what it cannot hold; then CP949 through encoding_rs's EUC-KR encoder. EB-2 | `src/encoding/encode.rs`, `src/encoding/encode/tests.rs` (new); `src/encoding.rs` (its `mod encode;` line only: VM-1's file, whose `cp949` slot, `encoding.rs:713`, is VM-4's, as is `encoding_rs` in `Cargo.toml`, 08 §13) | ≈150 | — (VM-1 has merged); the CP949 part after VM-4 | no change — **starts now**, CP949 later |
-| ED-ops | §5's commands over the buffer: the caret by characters, lines and words; the block; the clipboard's pieces (E36); CR LF as one (E35); the Ctrl+K and `^S` armings and their precedence (`edit::arm::decide`, E31, E34); find and replace over decoded characters; autoindent, the tab and line-ending rules, paste; §5.5's jamo match; §7.2's encoding question as a state; 08's view-key state of an editing Text view. EB-3, EB-4, EB-6–EB-8, EK-1. Text: 08 §4 | `src/edit/ops.rs`, `src/edit/ops/tests.rs`, `src/edit/arm.rs`, `src/edit/arm/tests.rs` (new); `src/edit.rs` (its `mod ops;` and `mod arm;` lines); `src/view_keys.rs` (an editing Text state in the DigitsAreData row, `view_keys.rs:45-71`) and `src/view_keys/tests.rs` (its rows); `.prd/08-viewer.md` §4 | ≈800 | ED-buf, ED-enc | no change — **starts now** |
+| ED-ops | §5's commands over the buffer: the caret by characters, lines and words; the block; the clipboard's pieces (E36); CR LF as one (E35); the Ctrl+K and `^S` armings and their precedence (`edit::arm::decide`, E31, E34); find and replace over decoded characters; autoindent, the tab and line-ending rules, paste; §5.5's jamo match; §7.2's encoding question as a state; 08's view-key state of an editing Text view. Offsets and lengths handed to the buffer are whole encoding units, because the buffer counts LF units at the unit's alignment. So in a UTF-16 or UTF-32 file whose last unit is cut short (a 5-byte UTF-16LE file), nothing is typed past its last whole unit, and ED-ops guards it. ED-buf's counterexample: `b` LF inserted at byte 5 gives `lines()` 3, where `find_lf` from byte 0 gives 2. EB-3, EB-4, EB-6–EB-8, EK-1. Text: 08 §4 | `src/edit/ops.rs`, `src/edit/ops/tests.rs`, `src/edit/arm.rs`, `src/edit/arm/tests.rs` (new); `src/edit.rs` (its `mod ops;` and `mod arm;` lines); `src/view_keys.rs` (an editing Text state in the DigitsAreData row, `view_keys.rs:45-71`) and `src/view_keys/tests.rs` (its rows); `.prd/08-viewer.md` §4 | ≈800 | ED-buf, ED-enc | no change — **starts now** |
 | ED-save | §7.4 and §9 without a screen. The whole read takes a local path or any byte reader (the stream's `Bulk` reader in the product, the `Ranged` Fake in tests) and records the baseline; Save by §9.1's steps; `replace_guarded` (E32) with its intent phases (`exchanging`, `swapped back`, `linked`, `committed`, `verified`, `kept`, beside `Step`, `remote/mod.rs:83-104`) and their reconcile; Save As, Save copy, the backup; the conflict outcomes and Overwrite; `journal::Kind::Text`, self-contained, with `original` (durable before any generation, replaced per re-read generation `k`), `add-<n>`, the recovery row's size and Restore's rebuild. A Save's result says what landed; ED-layout turns it into §9.3. ES-1's model half, ES-2, ES-3 | `src/edit/file.rs`, `src/edit/file/tests.rs` (new); `src/edit.rs` (its `mod file;` line); `src/journal.rs` (`Kind::Text`, `journal.rs:233-237`, and its format), `src/journal/tests.rs` (its tests); `src/remote/mod.rs` (`replace_guarded` and its default: the link guard, else `write_atomic_with`), `src/remote/local.rs` (the exchange), `src/remote/tests.rs` (their rows). No other open unit owns these files | ≈850 | ED-buf | no change — **starts now** (its tests run against `sftp-server`, as the hex and image Saves' do) |
 | ED-screen | §4 in cells: frame, gutter, rows with syntect's runs through a line source that both the text document and the buffer give, caret, block, scroll bar, the status row's fields and armings, the title row's menu names, the F-key row. Also: the 64-line kept states and EH-3; the window's IME output and preedit (E10, E20); the text document handing out a `Bulk` reader of its `Source`. EH-1–EH-3 | `src/gui/edit.rs`, `src/gui/edit/tests.rs` (new); `src/gui/text.rs` (only `Highlight`'s line-source seam and the document's Bulk reader: VM-2's file, then X3's, passing here after them); `src/gui/mod.rs` (its `mod edit;` line) | ≈900 | X3's unit (the text view in cells), XW-list (the title, status and F-key rows in cells), ED-ops | no change: nothing opens it yet |
 | ED-dialogs | In cells, with E6's focus rule: Find / Replace's confirmation, Go to line, the F10 menus, the close prompt (§9.6), the conflict dialog (§9.2), Ctrl/⌘+R's question and the encoding question (§7.2). ES-5 | `src/gui/edit/dialogs.rs`, `src/gui/edit/dialogs/tests.rs` (new); `src/gui/edit.rs` (its `mod dialogs;` line, after ED-screen) | ≈500 | XW-dialogs, ED-screen, ED-save | no change |

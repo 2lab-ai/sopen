@@ -38,8 +38,8 @@ fn the_make_folder_dialog_names_its_folder_and_esc_cancels() {
     h.ops.open_make_folder(&h.panel, None);
     drv.idle(&mut h, 2);
     assert!(drv.find_text("Make a folder in /srv/src").is_some());
-    assert!(drv.find_text("Cancel").is_some());
-    drv.click_text_on_top(&mut h, "Cancel");
+    assert!(drv.find_text("[ Cancel ]").is_some());
+    drv.click_text_on_top(&mut h, "[ Cancel ]");
     assert!(!h.ops.holds_keyboard(), "Cancel closed it");
     drv.idle(&mut h, 2);
     assert!(jobs(&log).is_empty());
@@ -258,7 +258,7 @@ fn the_delete_dialog_says_what_and_where_it_goes() {
         at(&mut h.panel, name);
         delete_says(&mut drv, &mut h, *on_host, *asked, *trash_here);
         check(&drv, said);
-        assert!(drv.find_text("Delete").is_some(), "its button");
+        assert!(drv.find_text("[ Delete ]").is_some(), "its button");
         drv.key(&mut h, Key::Escape, Modifiers::NONE);
         assert!(!h.ops.holds_keyboard(), "Esc closed it: {}", said.question);
         assert!(drv.find_text(said.question).is_none());

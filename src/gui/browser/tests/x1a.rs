@@ -247,7 +247,7 @@ fn q1_the_keyboard_moves_between_the_grid_and_egui_fields_dialogs_and_the_viewer
     fx.select("main.rs");
     let name = fx.drv.find_text("main").expect("main's cells");
     let band = Rect::from_x_y_ranges(left.x_range(), name.y_range());
-    // F2: today's egui field at the row's cells inside the grid's list.
+    // F2: the field in the row's cells inside the grid's list (egui's editing, X1b).
     fx.key(Key::F2);
     assert_eq!(fx.b.ops.renaming(), Some("main.rs"));
     assert!(fx.drv.ctx.text_edit_focused(), "the field has the typing");
@@ -267,7 +267,7 @@ fn q1_the_keyboard_moves_between_the_grid_and_egui_fields_dialogs_and_the_viewer
     fx.select("main.rs");
     fx.key(Key::ArrowDown);
     assert_eq!(fx.current(), "notes.txt", "the list has the keyboard back");
-    // F7: an egui dialog over the grid holds the keyboard; Esc gives it back.
+    // F7: a dialog over the grid (cells since X1b) holds the keyboard; Esc gives it back.
     fx.key(Key::F7);
     assert!(fx.b.ops.holds_keyboard());
     fx.typed("p");
@@ -521,13 +521,17 @@ fn the_rename_field_is_a_field_in_its_row_of_cells() {
     assert_eq!(fx.b.ops.renaming(), Some("notes.txt"));
     let field = fx.drv.find_text("notes.txt").expect("the field's text");
     assert_eq!(field.min, cells.min, "the field's text where the name was");
-    // Over Name (21 cells) and Ext (5) and the gap between: from cell 1 to cell 28.
-    let bodies: Vec<Rect> = (fx.drv.rects().into_iter())
-        .filter(|&(r, _, _)| r.top() == cells.top() && r.left() == 8.0 && r.height() == CELL)
-        .map(|(r, _, _)| r)
+    // Over Name (21 cells) and Ext (5) and the gap between: from cell 1 to cell 28 — the stem
+    // `notes` selected in the bar's colour, then black cells to the field's end.
+    let bodies: Vec<(Rect, egui::Color32)> = (fx.drv.rects().into_iter())
+        .filter(|&(r, _, _)| r.top() == cells.top() && r.height() == CELL)
+        .map(|(r, fill, _)| (r, fill))
         .collect();
+    let run = |left: f32, right: f32, fill| {
+        bodies.contains(&(Rect::from_x_y_ranges(left..=right, cells.y_range()), fill))
+    };
     assert!(
-        bodies.iter().any(|r| r.right() == 28.0 * 8.0),
+        run(8.0, 48.0, chrome::PALETTE.bar) && run(48.0, 28.0 * 8.0, chrome::cga::BLACK),
         "the field over Name and Ext: {bodies:?}"
     );
     fx.drv
