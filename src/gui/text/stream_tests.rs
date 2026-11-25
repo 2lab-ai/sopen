@@ -2953,3 +2953,31 @@ fn a_pass_that_ends_short_of_the_sample_indexes_what_it_read() {
         assert_eq!(rows(&win)[0], lines[0]);
     });
 }
+
+/// At the window's least width (480 points) a stream's stats are longer than the bar: the
+/// encoding, their last part, stays whole and the rest is cut before it.
+#[test]
+fn at_the_least_width_the_bar_keeps_the_encoding_whole() {
+    bounded(
+        "at the least width the bar keeps the encoding whole",
+        || {
+            let text = "2026-11-25 10:00:00 INFO user=0001 사용자가 로그인\r\n".repeat(13_000);
+            let body = encoded(&text, Utf16Le, false);
+            assert!(body.len() > 1_000_000);
+            let mut net = net(&body, gate());
+            let mut win = net.window("notes.dat");
+            let mut drv = Driver::new(480.0, 400.0);
+            run(&mut drv, &mut win, &mut net, "the first screen", |w, _| {
+                has_rows(w)
+            });
+            drv.idle(&mut win, 1);
+            assert!(!win.doc.whole(), "the bar says how far the lines are known");
+            assert!(says(&drv, "lines known to"), "{:?}", painted(&drv));
+            assert!(
+                drv.find_text("UTF-16LE (guessed)").is_some(),
+                "{:?}",
+                painted(&drv)
+            );
+        },
+    );
+}

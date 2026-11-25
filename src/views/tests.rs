@@ -221,7 +221,7 @@ fn row(
     }
 }
 
-/// Every row of §3, its kinds as kind.rs routes them (the UTF-16/32 row as VM-3 will: D18).
+/// Every row of §3, its kinds as kind.rs routes them (the UTF-16/32 row by D18 since VM-3).
 fn rows() -> Vec<Row> {
     let (i, v, a, h) = (Some(Image), Some(Video), Some(Audio), Some(Hex));
     let (t, r, p) = (Some(Text), Some(Raw), Some(Page));
@@ -279,7 +279,7 @@ fn rows() -> Vec<Row> {
     }
     let makefile = routed("Makefile", b"all:\n\ttrue\n");
     out.push(row("text by sniff", makefile, gui, [t, h, r], Text, None));
-    let utf16 = of_kind(Kind::Text, 4096);
+    let utf16 = routed("notes.dat", &[0xFF, 0xFE, b'h', 0, b'i', 0, b'\n', 0]);
     out.push(row(
         "UTF-16, no known extension (D18)",
         utf16,

@@ -149,12 +149,13 @@ fn ea3_a_cp949_txt_is_guessed_and_reads_as_encoding_rs_decodes() {
     let mut drv = Driver::new(900.0, 500.0);
     drv.until(&mut win, 10, |w| w.ready());
     drv.idle(&mut win, 1);
+    // The bar: the stats up to their ` ·`, then the encoding as a label of its own (VM-3).
     let bar = drv.texts();
     assert!(
-        bar.iter()
-            .any(|(_, _, t)| t.contains("plain text · CP949 (guessed)")),
+        bar.iter().any(|(_, _, t)| t.ends_with("plain text ·")),
         "{bar:?}"
     );
+    assert!(drv.find_text("CP949 (guessed)").is_some(), "{bar:?}");
     for line in &lines[..5] {
         assert!(drv.find_text(line).is_some(), "{line}");
     }

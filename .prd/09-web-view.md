@@ -204,11 +204,17 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   else 200 with `Content-Length` (measured on both engines, `<video>` seeking on macOS, *web* §4).
 - **Type** by extension, a fixed table (html/htm `text/html`, xml `application/xml`, xsl/xslt
   `text/xsl`, and css, js, json, svg, png, jpeg, gif, webp, woff/woff2, ttf/otf, mp4/webm, mp3/ogg/wav,
-  pdf); anything else `application/octet-stream`. A text type gets `; charset=utf-8` only when its
-  first 8 KiB is valid UTF-8 — a character cut at the 8 KiB edge accepted, as `kind::looks_like_text`
-  does (kind.rs:157-165) — and names no charset itself (`<meta charset`, `http-equiv`, `encoding=`);
-  else none, and the engine decides as a browser does **[decision; that the engine honours the header
-  추정]**.
+  pdf); anything else `application/octet-stream`. A text type that names no charset itself (`<meta
+  charset`, `http-equiv`, `encoding=`) gets the one `crate::encoding::pick` gives for its first 8 KiB
+  (`kind::SNIFF_BYTES`) — the text view's default (08 §7.2), so the page and its source agree:
+  `; charset=utf-8` for UTF-8 by its BOM, or by step 4 when the sample is valid UTF-8 — a character
+  cut at the 8 KiB edge accepted: `kind::utf8_text`, never `kind::looks_like_text` (UTF-16/32 too)
+  (step 4 is UTF-8 "valid or not": bytes that are not get none); `utf-16le` / `utf-16be` for UTF-16 by
+  its BOM or the NUL pattern (a BOM decides before the header anyway: the Encoding Standard's
+  *decode*); `utf-32le` / `utf-32be` for UTF-32, though the Encoding Standard defines no UTF-32
+  label, so WebKit is expected to ignore it and not render the page as UTF-32 text **[추정: not
+  measured]** — 08's text view reads it; anything else (CP949, once VM-4 fills step 3) none, and the
+  engine decides as a browser does **[decision; that the engine honours the header 추정]**.
 - **Cancel**: the engine's stop (`webView:stopURLSchemeTask:`; the request's cancellable on Linux)
   ends the request after the piece in flight; nothing is sent to a stopped task (WebKit throws on
   that **[추정]**); closing the view stops all.
@@ -454,8 +460,9 @@ own act: copying a link the row showed (F5) and opening it themselves.
 - `.xml`: the page is the default when its first 8 KiB holds `<?xml-stylesheet` before the first
   element; plain XML and RSS default to the highlighted source — both engines show them as run-on text
   (*web* §5) — with the page as view 3 (§6).
-  - **The 8 KiB**: today an `.xml` is decided by extension with nothing read (kind.rs:55,
-    :238-240). The page decision reads `kind::SNIFF_BYTES` (kind.rs:30) on the opening's connection
+  - **The 8 KiB**: today an `.xml` is decided by extension with nothing read (`xml` in `kind.rs`'s
+    `TEXT` table, which `kind::detect_sniffed` checks before any read). The page decision reads
+    `kind::SNIFF_BYTES` on the opening's connection
     before the view is made (a local file in place): at most 8 KiB more than today.
   - Only `type="text/xsl"` was measured; `text/css` rendering styled is **[추정]**. XSLT is leaving
     browsers (Chrome 158 stops it on Stable, *web* §5); if WebKit drops it the page shows what the
