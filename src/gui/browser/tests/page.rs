@@ -14,11 +14,14 @@ const INDEX: &str = "<!doctype html>\n<html><head><link rel=stylesheet href=\"st
 const STYLE: &str = "body { background: #ffd; }\n";
 const STYLED: &str =
     "<?xml version=\"1.0\"?>\n<?xml-stylesheet type=\"text/xsl\" href=\"s.xsl\"?>\n<doc/>\n";
+const XSL: &str =
+    "<xsl:stylesheet version=\"1.0\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"/>\n";
 const FEED: &str =
     "<?xml version=\"1.0\"?>\n<rss version=\"2.0\"><channel><title>feed</title></channel></rss>\n";
 
 /// The page tree: `index.html` (its stylesheet, a picture of the folder and one outside it),
-/// a page in `sub/`, a styled and a plain XML, text; `outside.txt` beside the folder, outside
+/// a page in `sub/`, an `.htm`, a styled XML and its `.xsl`, a plain XML, text, links named as
+/// another kind than their targets; `outside.txt` beside the folder, outside
 /// every root; a 33 MiB `big.bin` (sparse) past the preview's budget.
 fn page_tree(root: &Path) {
     std::fs::create_dir_all(root.join("sub")).unwrap();
@@ -30,7 +33,18 @@ fn page_tree(root: &Path) {
     )
     .unwrap();
     std::fs::write(root.join("styled.xml"), STYLED).unwrap();
+    std::fs::write(root.join("s.xsl"), XSL).unwrap();
     std::fs::write(root.join("feed.xml"), FEED).unwrap();
+    std::fs::write(root.join("page.htm"), "<p>an htm page</p>\n").unwrap();
+    // Links whose names say another kind than their targets (one decision, from the target).
+    for (link, to) in [
+        ("x.html", "feed.xml"),
+        ("y.html", "notes.txt"),
+        ("alias.xml", "index.html"),
+        ("alias.txt", "index.html"),
+    ] {
+        std::os::unix::fs::symlink(to, root.join(link)).unwrap();
+    }
     std::fs::write(root.join("notes.txt"), "plain notes\n").unwrap();
     image::RgbImage::from_fn(8, 8, |x, y| image::Rgb([x as u8 * 30, y as u8 * 30, 90]))
         .save(root.join("img.png"))
@@ -84,6 +98,37 @@ fn page_fixture_with(label: Option<&str>, inside: bool, connect: Connect) -> (Fx
     (fx, fake)
 }
 
+/// A `Connect` on this machine that counts the connections it makes.
+fn counted() -> (Connect, impl Fn() -> usize) {
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = n.clone();
+    let connect: Connect = Arc::new(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)
+    });
+    (connect, move || n.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// A window of its own (the terminal's switch opens one: a new context) drawing the browser
+/// until `done`, at most 20 passes.
+fn passes_until(drv: &mut Driver, fx: &mut Fx, done: impl Fn(&Browser) -> bool) -> bool {
+    for _ in 0..20 {
+        drv.idle(&mut fx.b, 1);
+        if done(&fx.b) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// A terminal's passes over the browser (its own context, marked as the terminal backend's).
+fn terminal() -> Driver {
+    let t = Driver::new(1000.0, 700.0);
+    crate::gui::mark_terminal(&t.ctx);
+    t
+}
+
 /// [`page_fixture`] in dual mode: Enter opens each file from the start, no preview made first.
 fn dual(label: Option<&str>) -> (Fx, FakeEngine) {
     let (mut fx, fake) = page_fixture(label, false);
@@ -123,7 +168,7 @@ fn enter_other(fx: &mut Fx, name: &str) {
 
 /// `n` pressed as the keyboard sends it, then settled (a view made, or one loaded).
 fn digit(fx: &mut Fx, n: u8) {
-    let key = [Key::Num0, Key::Num1, Key::Num2, Key::Num3][usize::from(n)];
+    let key = [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4][usize::from(n)];
     fx.drv.press_typed(&mut fx.b, key, &n.to_string());
     fx.drv.idle(&mut fx.b, 2);
 }
@@ -217,7 +262,7 @@ fn wv_d_enter_shows_a_page_in_its_own_scheme_under_its_root() {
     fake.events(0).send(WebEvent::Blocked(1));
     fx.drv.idle(&mut fx.b, 2);
     assert!(shows(&fx, "1 outside request blocked"), "the row's count");
-    assert!(fx.b.status.text.is_empty() || !shows(&fx, "no web engine"));
+    assert!(!shows(&fx, "no web engine"), "no fallback line");
 }
 
 /// 09 §3.1, WV-P2: the root is the folder the browser was opened on, the file inside it — a page
@@ -497,6 +542,22 @@ fn wv_d_the_preview_is_the_page_and_enter_hands_it_over() {
         }
     );
     assert!(!shows(&fx, "scripts off"), "a preview has no bars");
+    // Its keys are the list's (Cmd/Ctrl+R reads the folder again, F2 renames): never the page's.
+    fx.drv
+        .key(&mut fx.b, Key::R, crate::gui::testkit::command(false));
+    fx.settle();
+    fx.key(Key::F2);
+    fx.drv.idle(&mut fx.b, 2);
+    fx.key(Key::Escape);
+    fx.settle();
+    let calls = fake.calls(0);
+    assert!(
+        !calls.iter().any(|d| matches!(d, Did::Scripts(_))),
+        "{calls:?}"
+    );
+    assert_eq!(count(&calls, &Did::Reload), 0, "{calls:?}");
+    assert_eq!(fake.views(), 1, "the same preview");
+    fx.select("index.html");
     fx.key(Key::Enter);
     fx.settle();
     assert!(fx.b.viewer.is_some());
@@ -648,6 +709,8 @@ fn wv_d_in_a_terminal_the_page_is_a_hand_off_box() {
     // The switch: a window of its own (a new context) makes the view.
     let mut window = Driver::new(1000.0, 700.0);
     window.until(&mut fx.b, 20, |_| fake.views() == 1);
+    window.idle(&mut fx.b, 5);
+    assert_eq!(fake.views(), 1, "one view while its window stays");
     assert_eq!(loads(&fake.calls(0)), [fake.host(0).url("index.html")]);
     // That window goes (its views with it); in the terminal again, then another window.
     crate::gui::web::teardown(&window.ctx);
@@ -656,4 +719,288 @@ fn wv_d_in_a_terminal_the_page_is_a_hand_off_box() {
     let mut again = Driver::new(1000.0, 700.0);
     again.until(&mut fx.b, 20, |_| fake.views() == 2);
     assert_eq!(loads(&fake.calls(1)), [fake.host(1).url("index.html")]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The fix-check of WV-D.
+
+/// Review MF1 (a): a remote preview whose window went (the terminal's switch) is made again in
+/// the next window on the window's preview session — the connection its server gave back — no
+/// session more, and not the closed line.
+#[test]
+fn wv_d_a_remote_preview_is_made_again_in_the_next_window() {
+    let (connect, connects) = counted();
+    let (mut fx, fake) = page_fixture_with(Some("box"), false, connect);
+    fx.select("index.html");
+    fx.drv.idle(&mut fx.b, 12);
+    loaded(&mut fx, &fake, 0, "index.html");
+    assert_eq!(connects(), 1);
+    crate::gui::web::teardown(&fx.drv.ctx);
+    assert_eq!(count(&fake.calls(0), &Did::Close), 1);
+    let mut t = terminal();
+    t.idle(&mut fx.b, 3);
+    let mut window = Driver::new(1000.0, 700.0);
+    assert!(
+        passes_until(&mut window, &mut fx, |_| fake.views() == 2),
+        "made again: {:?}",
+        window
+            .texts()
+            .iter()
+            .map(|t| t.2.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(matches!(fake.calls(1)[0], Did::Open { preview: true, .. }));
+    let (head, _, _) = answer(
+        &fake,
+        1,
+        fake.request(1, &fake.host(1).url("style.css"), None),
+    );
+    assert_eq!(head.map(|h| h.code()), Some(200), "served");
+    assert_eq!(connects(), 1, "on the preview session");
+}
+
+/// Review MF1 (b), the reviewer's RED: preview, its window goes, Enter in the terminal, the next
+/// window — the viewer's page is made (its connection went back to the preview session, so it
+/// connects on its own, 06 §13) and comes ready; never stuck with no view and no line.
+#[test]
+fn wv_d_a_preview_handed_over_in_the_terminal_is_made_in_the_next_window() {
+    let (connect, connects) = counted();
+    let (mut fx, fake) = page_fixture_with(Some("box"), false, connect);
+    fx.select("index.html");
+    fx.drv.idle(&mut fx.b, 12);
+    loaded(&mut fx, &fake, 0, "index.html");
+    crate::gui::web::teardown(&fx.drv.ctx);
+    let mut t = terminal();
+    t.idle(&mut fx.b, 3);
+    t.key(&mut fx.b, Key::Enter, Modifiers::NONE);
+    t.idle(&mut fx.b, 2);
+    assert!(fx.b.viewer.is_some(), "handed over in the terminal");
+    let mut window = Driver::new(1000.0, 700.0);
+    assert!(
+        passes_until(&mut window, &mut fx, |_| fake.views() == 2),
+        "no view, no line"
+    );
+    assert!(matches!(fake.calls(1)[0], Did::Open { preview: false, .. }));
+    let events = fake.events(1);
+    events.send(WebEvent::Loading);
+    events.send(WebEvent::Finished);
+    assert!(
+        passes_until(&mut window, &mut fx, |b| b.ready()),
+        "comes ready"
+    );
+    let (head, _, _) = answer(
+        &fake,
+        1,
+        fake.request(1, &fake.host(1).url("index.html"), None),
+    );
+    assert_eq!(head.map(|h| h.code()), Some(200));
+    assert_eq!(connects(), 2, "the viewer's own session");
+}
+
+/// Review MF1, the dual-window run: a remote viewer's page, its window gone, a terminal's pass,
+/// a second window: made again on the connection its server gave back, and answering.
+#[test]
+fn wv_d_a_remote_viewer_is_made_again_in_a_second_window() {
+    let (connect, connects) = counted();
+    let (mut fx, fake) = page_fixture_with(Some("box"), false, connect);
+    fx.b.mode = view::Mode::Dual;
+    enter_page(&mut fx, &fake, "index.html", 0);
+    crate::gui::web::teardown(&fx.drv.ctx);
+    let mut t = terminal();
+    t.idle(&mut fx.b, 2);
+    let mut window = Driver::new(1000.0, 700.0);
+    assert!(passes_until(&mut window, &mut fx, |_| fake.views() == 2));
+    let (head, body, _) = answer(
+        &fake,
+        1,
+        fake.request(1, &fake.host(1).url("style.css"), None),
+    );
+    assert_eq!(head.map(|h| h.code()), Some(200));
+    assert_eq!(body, STYLE.as_bytes());
+    assert_eq!(connects(), 1, "the viewer's one connection, given back");
+}
+
+/// Review MF2 (one page decision): what a file's views are is decided from the file opened —
+/// its resolved name and head — not the name the list shows: a link `x.html` to plain XML is
+/// `1 Text · 2 Hex · 3 Page`, one `y.html` to text has no page, one `alias.xml` to an HTML is
+/// its page; a link whose name asks no page (`alias.txt`) opens as text, no engine asked.
+#[test]
+fn wv_d_a_links_views_are_its_targets() {
+    let (mut fx, fake) = dual(None);
+    enter_other(&mut fx, "x.html");
+    assert_eq!(strip(&fx), "1 Text · 2 Hex · 3 Page");
+    assert!(shows(&fx, "<rss version=\"2.0\">"), "its source");
+    fx.key(Key::Escape);
+    enter_other(&mut fx, "y.html");
+    assert_eq!(strip(&fx), "1 Text · 2 Hex · 3 Raw");
+    assert!(shows(&fx, "plain notes"));
+    fx.key(Key::Escape);
+    enter_other(&mut fx, "alias.txt");
+    assert_eq!(strip(&fx), "1 Text · 2 Hex · 3 Raw");
+    assert_eq!(fake.views(), 0, "no page view");
+    fx.key(Key::Escape);
+    enter_page(&mut fx, &fake, "alias.xml", 0);
+    assert_eq!(strip(&fx), "1 Page · 2 Hex · 3 Text");
+    assert_eq!(loads(&fake.calls(0)), [fake.host(0).url("index.html")]);
+}
+
+/// Review MF2: the preview's decision goes with the view it hands over — a link `x.html` to
+/// plain XML previews its source and Enter keeps `1 Text · 2 Hex · 3 Page`; `alias.xml` to an
+/// HTML previews its page and keeps `1 Page · 2 Hex · 3 Text`.
+#[test]
+fn wv_d_the_preview_hands_its_page_decision_over() {
+    let (mut fx, fake) = page_fixture(None, false);
+    fx.select("x.html");
+    fx.drv.idle(&mut fx.b, 12);
+    fx.settle();
+    assert_eq!(fake.views(), 0, "its source");
+    fx.key(Key::Enter);
+    fx.settle();
+    assert_eq!(strip(&fx), "1 Text · 2 Hex · 3 Page");
+    fx.key(Key::Escape);
+    fx.select("alias.xml");
+    fx.drv.idle(&mut fx.b, 12);
+    loaded(&mut fx, &fake, 0, "index.html");
+    fx.key(Key::Enter);
+    fx.settle();
+    assert_eq!(strip(&fx), "1 Page · 2 Hex · 3 Text");
+    assert_eq!(fake.views(), 1, "the same view");
+}
+
+/// Review MF4: an engine that refuses the preview's view — the preview shows the file's source
+/// at once, the bar where it was, the reason said; the preview session comes back for it (no
+/// session more), and Enter opens the source too.
+#[test]
+fn wv_d_a_preview_the_engine_refuses_shows_the_source() {
+    let (connect, connects) = counted();
+    let (mut fx, fake) = page_fixture_with(Some("box"), false, connect);
+    fake.refuse_open(Some("the content rule list did not compile: x"));
+    fx.select("index.html");
+    fx.drv.idle(&mut fx.b, 12);
+    fx.settle();
+    fx.drv.idle(&mut fx.b, 4);
+    fx.settle();
+    assert_eq!(fx.current(), "index.html", "the bar where it was");
+    assert!(shows(&fx, "<h1>Index</h1>"), "the source in the preview");
+    let line = "no web engine here (the content rule list did not compile: x): showing the source";
+    assert!(shows(&fx, line), "{:?}", fx.b.status_line().text);
+    assert_eq!(connects(), 1, "the preview session came back for it");
+    fx.key(Key::Enter);
+    fx.settle();
+    assert_eq!(strip(&fx), "1 Text · 2 Hex · 3 Raw");
+}
+
+/// Review MF3 (the hand-over keeps the session): a remote page previewed, Enter — the viewer
+/// keeps the preview session — Esc, the next remote preview connects again: 2 sessions. Were
+/// the session given back to the preview at the hand-over, it would be 1.
+#[test]
+fn wv_d_the_viewer_keeps_the_preview_session_it_was_handed() {
+    let (connect, connects) = counted();
+    let (mut fx, fake) = page_fixture_with(Some("box"), false, connect);
+    fx.select("index.html");
+    fx.drv.idle(&mut fx.b, 12);
+    loaded(&mut fx, &fake, 0, "index.html");
+    fx.key(Key::Enter);
+    fx.settle();
+    assert_eq!(connects(), 1);
+    fx.key(Key::Escape);
+    // Back in the list, the bar on the page: its preview is made again, on a session of its
+    // own — the one the viewer had is the viewer's.
+    fx.drv.idle(&mut fx.b, 12);
+    loaded(&mut fx, &fake, 1, "index.html");
+    assert_eq!(connects(), 2, "the next preview's own session");
+    let n = fake.views();
+    fx.select("styled.xml");
+    fx.drv.idle(&mut fx.b, 12);
+    loaded(&mut fx, &fake, n, "styled.xml");
+    assert_eq!(connects(), 2, "and the one after it on the same");
+}
+
+/// Enter while a page's preview is still being prepared (02 §4.4): that preparation becomes the
+/// viewer's opening — one view, opened as the viewer's (no shield), loaded once.
+#[test]
+fn wv_d_enter_while_a_page_preview_is_prepared_makes_one_view() {
+    let gate = Gate::default();
+    let held = gate.clone();
+    let connect: Connect = Arc::new(move || {
+        held.hold();
+        Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)
+    });
+    let (mut fx, fake) = page_fixture_with(Some("box"), false, connect);
+    fx.select("index.html");
+    fx.drv.idle(&mut fx.b, 12);
+    gate.reached();
+    fx.key(Key::Enter);
+    gate.release();
+    loaded(&mut fx, &fake, 0, "index.html");
+    assert!(fx.b.viewer.is_some());
+    assert_eq!(fake.views(), 1);
+    let calls = fake.calls(0);
+    assert_eq!(
+        calls[0],
+        Did::Open {
+            page: true,
+            preview: false,
+            scripts: false
+        }
+    );
+    assert_eq!(loads(&calls).len(), 1);
+}
+
+/// D25 with the page: Page, 2 Hex, an edit, 1 — the prompt's Save lands — the hidden page view
+/// is stale: closed once, and 1 shows a page view made again from the file as saved.
+#[test]
+fn wv_d_a_save_in_hex_makes_the_page_view_again() {
+    let (mut fx, fake) = dual(None);
+    let file = format!("{}/index.html", fx.root);
+    enter_page(&mut fx, &fake, "index.html", 0);
+    digit(&mut fx, 2);
+    fx.settle();
+    fx.key(Key::Enter);
+    digit(&mut fx, 4);
+    digit(&mut fx, 1);
+    fx.key(Key::F9);
+    digit(&mut fx, 1);
+    assert!(fx.drv.find_text("Unsaved changes").is_some(), "the prompt");
+    fx.drv.click_text_on_top(&mut fx.b, "Save");
+    fx.drv.until(&mut fx.b, 20, |_| {
+        std::fs::read(&file).unwrap()[0] == 0x41 && fake.views() == 2
+    });
+    assert_eq!(
+        count(&fake.calls(0), &Did::Close),
+        1,
+        "the stale view closed once"
+    );
+    loaded(&mut fx, &fake, 1, "index.html");
+    assert_eq!(loads(&fake.calls(1)), [fake.host(1).url("index.html")]);
+    assert_eq!(strip(&fx), "1 Page · 2 Hex · 3 Text");
+}
+
+/// WV-S6's viewer half: a remote page in the viewer holds one session, the one that opened it;
+/// `.htm` is a page; a styled XML's stylesheet is fetched through the scheme, as its type.
+#[test]
+fn wv_d_one_session_an_htm_and_a_stylesheet_through_the_scheme() {
+    let (connect, connects) = counted();
+    let (mut fx, fake) = page_fixture_with(Some("box"), false, connect);
+    fx.b.mode = view::Mode::Dual;
+    fx.drv.idle(&mut fx.b, 2);
+    enter_page(&mut fx, &fake, "index.html", 0);
+    let (head, _, _) = answer(
+        &fake,
+        0,
+        fake.request(0, &fake.host(0).url("style.css"), None),
+    );
+    assert_eq!(head.map(|h| h.code()), Some(200));
+    assert_eq!(connects(), 1, "one session");
+    fx.key(Key::Escape);
+    enter_page(&mut fx, &fake, "page.htm", 1);
+    assert_eq!(strip(&fx), "1 Page · 2 Hex · 3 Text");
+    assert_eq!(loads(&fake.calls(1)), [fake.host(1).url("page.htm")]);
+    fx.key(Key::Escape);
+    enter_page(&mut fx, &fake, "styled.xml", 2);
+    let (head, body, _) = answer(&fake, 2, fake.request(2, &fake.host(2).url("s.xsl"), None));
+    let head = head.expect("a head");
+    assert_eq!(head.code(), 200);
+    assert!(head.mime().starts_with("text/xsl"), "{}", head.mime());
+    assert_eq!(body, XSL.as_bytes());
 }

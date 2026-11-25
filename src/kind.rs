@@ -281,10 +281,10 @@ pub fn page_file(name: &str) -> bool {
 }
 
 /// Whether the page is a file's default view (09 §5): `.html` and `.htm` always; an `.xml` when
-/// `head` — its first [`SNIFF_BYTES`], read on the opening's connection — holds
-/// `<?xml-stylesheet` before the first element (plain XML and RSS default to their source);
-/// any other name never. `head` is not looked at for `.html`/`.htm`, and nothing past
-/// [`SNIFF_BYTES`] is.
+/// `head` — its first [`SNIFF_BYTES`], read on the opening's connection — holds a whole
+/// `<?xml-stylesheet …?>` instruction before the first element (plain XML and RSS default to
+/// their source); any other name never. `head` is not looked at for `.html`/`.htm`, and nothing
+/// past [`SNIFF_BYTES`] is.
 pub fn page_default(name: &str, head: &[u8]) -> bool {
     match extension(name).as_deref() {
         Some("html" | "htm") => true,
@@ -293,48 +293,54 @@ pub fn page_default(name: &str, head: &[u8]) -> bool {
     }
 }
 
-/// `<?xml-stylesheet` before the first element of `head`, read as bytes (a UTF-8 BOM skipped;
-/// a UTF-16 file names nothing here — 09 §3.4: no link test rests on this): comments, the
-/// doctype with its internal subset and other processing instructions are stepped over; the
-/// first `<` that opens anything else is the first element.
+/// A whole `<?xml-stylesheet …?>` instruction before the first element of `head`, read as XML's
+/// prolog is (a lexer, not a search): a UTF-8 BOM skipped, UTF-16 with its BOM (either order)
+/// decoded first; character data, comments, other instructions and the doctype — its quoted
+/// literals and its internal subset, with the declarations, literals, comments and instructions
+/// in it — stepped over; an instruction whose `?>` is not in `head` is not one. Anything else
+/// opened by `<` is the first element.
 fn styled(head: &[u8]) -> bool {
-    const TARGET: &[u8] = b"<?xml-stylesheet";
-    let mut at = usize::from(head.starts_with(b"\xEF\xBB\xBF")) * 3;
-    let after = |at: usize, end: &[u8]| -> Option<usize> {
-        head[at..]
-            .windows(end.len())
-            .position(|w| w == end)
-            .map(|i| at + i + end.len())
-    };
-    while let Some(i) = head[at..].iter().position(|&b| b == b'<') {
-        at += i;
-        let rest = &head[at..];
-        if rest.starts_with(TARGET) {
-            // The target name ends there: a space or the instruction's end, not `-sheets`.
-            match rest.get(TARGET.len()) {
-                Some(b) if b.is_ascii_whitespace() || *b == b'?' => return true,
-                None => return false,
-                Some(_) => {}
-            }
+    let decoded: Vec<u8>;
+    let s: &[u8] = match head {
+        [0xFF, 0xFE, rest @ ..] | [0xFE, 0xFF, rest @ ..] => {
+            let le = head[0] == 0xFF;
+            let units = rest.as_chunks::<2>().0.iter().map(|&u| match le {
+                true => u16::from_le_bytes(u),
+                false => u16::from_be_bytes(u),
+            });
+            decoded = char::decode_utf16(units)
+                .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+                .collect::<String>()
+                .into_bytes();
+            &decoded
         }
+        [0xEF, 0xBB, 0xBF, rest @ ..] => rest,
+        _ => head,
+    };
+    let mut at = 0;
+    loop {
+        let Some(i) = s[at..].iter().position(|&b| b == b'<') else {
+            return false;
+        };
+        at += i;
+        let rest = &s[at..];
         let next = if rest.starts_with(b"<?") {
-            after(at, b"?>")
-        } else if rest.starts_with(b"<!--") {
-            after(at + 4, b"-->")
-        } else if rest.starts_with(b"<!") {
-            // A doctype: its internal subset, `[…]`, may hold `>` and `<` of its own.
-            let close = rest.iter().position(|&b| b == b'>');
-            match rest.iter().position(|&b| b == b'[') {
-                Some(open) if close.is_none_or(|c| open < c) => {
-                    after(at + open, b"]").and_then(|end| {
-                        head[end..]
-                            .iter()
-                            .position(|&b| b == b'>')
-                            .map(|i| end + i + 1)
-                    })
-                }
-                _ => close.map(|c| at + c + 1),
+            let Some(end) = past(s, at + 2, b"?>") else {
+                return false;
+            };
+            let body = &s[at + 2..end - 2];
+            let target = body
+                .iter()
+                .position(u8::is_ascii_whitespace)
+                .map_or(body, |n| &body[..n]);
+            if target == b"xml-stylesheet" {
+                return true;
             }
+            Some(end)
+        } else if rest.starts_with(b"<!--") {
+            past(s, at + 4, b"-->")
+        } else if rest.starts_with(b"<!") {
+            doctype_end(s, at + 2)
         } else {
             return false;
         };
@@ -343,7 +349,70 @@ fn styled(head: &[u8]) -> bool {
             None => return false,
         }
     }
-    false
+}
+
+/// Where `pattern`, found from `from` on, ends.
+fn past(s: &[u8], from: usize, pattern: &[u8]) -> Option<usize> {
+    s.get(from..)?
+        .windows(pattern.len())
+        .position(|w| w == pattern)
+        .map(|i| from + i + pattern.len())
+}
+
+/// Past the quoted literal that starts at `at`.
+fn quoted_end(s: &[u8], at: usize) -> Option<usize> {
+    let quote = s[at];
+    s[at + 1..]
+        .iter()
+        .position(|&b| b == quote)
+        .map(|i| at + 1 + i + 1)
+}
+
+/// Past the doctype whose words start at `at`: its quoted literals and its internal subset
+/// stepped over, to its `>`.
+fn doctype_end(s: &[u8], mut at: usize) -> Option<usize> {
+    while let Some(&b) = s.get(at) {
+        at = match b {
+            b'"' | b'\'' => quoted_end(s, at)?,
+            b'[' => subset_end(s, at + 1)?,
+            b'>' => return Some(at + 1),
+            _ => at + 1,
+        };
+    }
+    None
+}
+
+/// Past the internal subset whose first byte is at `at`: its comments, instructions and
+/// declarations (their quoted literals) stepped over, to its `]`.
+fn subset_end(s: &[u8], mut at: usize) -> Option<usize> {
+    while let Some(&b) = s.get(at) {
+        let rest = &s[at..];
+        at = if rest.starts_with(b"<!--") {
+            past(s, at + 4, b"-->")?
+        } else if rest.starts_with(b"<?") {
+            past(s, at + 2, b"?>")?
+        } else if rest.starts_with(b"<!") {
+            declaration_end(s, at + 2)?
+        } else if b == b']' {
+            return Some(at + 1);
+        } else {
+            at + 1
+        };
+    }
+    None
+}
+
+/// Past a markup declaration whose words start at `at`: its quoted literals stepped over, to its
+/// `>`.
+fn declaration_end(s: &[u8], mut at: usize) -> Option<usize> {
+    while let Some(&b) = s.get(at) {
+        at = match b {
+            b'"' | b'\'' => quoted_end(s, at)?,
+            b'>' => return Some(at + 1),
+            _ => at + 1,
+        };
+    }
+    None
 }
 
 /// A "video" file whose probe shows no video stream is audio (spec §3).
@@ -957,7 +1026,7 @@ mod tests {
             ("only its start", b"<?xml-styleshee", false),
             ("an unclosed comment", b"<!-- <?xml-stylesheet", false),
             ("text before", b"hello <?xml-stylesheet href=\"s\"?>", true),
-            ("UTF-16 is not read", b"\xFF\xFE<\0?\0x\0m\0l\0-\0", false),
+            ("UTF-16 cut short", b"\xFF\xFE<\0?\0x\0m\0l\0-\0", false),
         ];
         for (what, head, want) in cases {
             assert_eq!(page_default("a.xml", head), want, "{what}");
@@ -970,6 +1039,93 @@ mod tests {
         let mut early = b"<?xml-stylesheet href=\"s.xsl\"?>".to_vec();
         early.extend(std::iter::repeat_n(b' ', SNIFF_BYTES));
         assert!(page_default("a.xml", &early));
+    }
+
+    /// The fix-check of WV-D (review MF2): the sniff is lexical — a stylesheet instruction inside
+    /// a comment of the doctype's internal subset, inside a quoted literal or inside the subset
+    /// itself is not one; only a whole instruction, its `?>` within the 8 KiB, counts.
+    #[test]
+    fn wv_d_the_stylesheet_sniff_is_lexical() {
+        let cases: [(&str, &[u8], bool); 9] = [
+            (
+                "in a comment of the internal subset",
+                b"<!DOCTYPE a [<!-- ]> <?xml-stylesheet href=\"s\"?> -->]><a/>",
+                false,
+            ),
+            (
+                "in a quoted literal of the doctype",
+                b"<!DOCTYPE a SYSTEM \"x<?xml-stylesheet href='s'?>\"><a/>",
+                false,
+            ),
+            (
+                "in an entity's literal",
+                b"<!DOCTYPE a [<!ENTITY e \"]><?xml-stylesheet href='s'?>\">]><a/>",
+                false,
+            ),
+            (
+                "an instruction of the internal subset",
+                b"<!DOCTYPE a [<?xml-stylesheet href=\"s\"?>]><a/>",
+                false,
+            ),
+            (
+                "after a subset with all of those",
+                b"<!DOCTYPE a [<!-- ]> --><!ENTITY e \"]>\"><?pi ]>?>]><?xml-stylesheet href=\"s\"?><a/>",
+                true,
+            ),
+            ("unterminated, at the end", b"<?xml version=\"1.0\"?><?xml-stylesheet ", false),
+            ("unterminated, no space", b"<?xml-stylesheet", false),
+            ("with no pseudo-attributes", b"<?xml-stylesheet?><a/>", true),
+            (
+                "its first `?>` ends it, a quote or not (XML has no quoting there)",
+                b"<?xml-stylesheet href=\"a?>b\"?><a/>",
+                true,
+            ),
+        ];
+        for (what, head, want) in cases {
+            assert_eq!(page_default("a.xml", head), want, "{what}");
+        }
+        // Its `?>` past the 8 KiB: not a whole instruction within the head.
+        let mut cut = b"<?xml-stylesheet href=\"".to_vec();
+        cut.extend(std::iter::repeat_n(b'x', SNIFF_BYTES));
+        cut.extend(b"\"?><a/>");
+        assert!(!page_default("a.xml", &cut), "its end past 8 KiB");
+    }
+
+    /// The fix-check of WV-D (review MF3): UTF-16 XML with a BOM, in either byte order, is decoded
+    /// from its bounded head and sniffed as text.
+    #[test]
+    fn wv_d_utf16_xml_with_a_bom_is_sniffed() {
+        let utf16 = |text: &str, le: bool| -> Vec<u8> {
+            let mut out = if le {
+                vec![0xFF, 0xFE]
+            } else {
+                vec![0xFE, 0xFF]
+            };
+            for unit in text.encode_utf16() {
+                out.extend(if le {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+            }
+            out
+        };
+        let styled = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<?xml-stylesheet type=\"text/xsl\" href=\"s.xsl\"?>\n<doc>한글</doc>\n";
+        let plain =
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<rss><channel>한글</channel></rss>\n";
+        for le in [true, false] {
+            assert!(page_default("a.xml", &utf16(styled, le)), "styled, LE {le}");
+            assert!(!page_default("a.xml", &utf16(plain, le)), "plain, LE {le}");
+        }
+        // An odd byte last (a unit cut by the head's end): what is whole is read.
+        let mut cut = utf16(styled, true);
+        cut.push(0x41);
+        assert!(page_default("a.xml", &cut));
+        // Past the 8 KiB in UTF-16: its units beyond the head are not read.
+        let mut late = utf16("<?xml version=\"1.0\"?>", false);
+        late.extend(utf16(&" ".repeat(SNIFF_BYTES), false).split_off(2));
+        late.extend(utf16("<?xml-stylesheet href=\"s\"?><a/>", false).split_off(2));
+        assert!(!page_default("a.xml", &late), "past 8 KiB");
     }
 
     /// The route `main.rs` and the browser take (`detect_sniffed`), on a file on disk.

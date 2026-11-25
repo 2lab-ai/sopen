@@ -139,6 +139,8 @@ pub(super) struct Host {
     opened_on: Option<String>,
     /// A page view the engine refused in this window: page files preview as their source.
     page_failed: Option<crate::gui::web::Unavailable>,
+    /// The engine refused the preview's page in the last pass: for the window to say.
+    refused: Option<crate::gui::web::Unavailable>,
     #[cfg(test)]
     spawned: usize,
 }
@@ -159,6 +161,7 @@ impl Host {
             budget: Box::new(Budget::preview),
             opened_on: None,
             page_failed: None,
+            refused: None,
             #[cfg(test)]
             spawned: 0,
         }
@@ -167,6 +170,12 @@ impl Host {
     /// The folder the browser was opened on (09 §3.1's root).
     pub fn set_opened_on(&mut self, folder: String) {
         self.opened_on = Some(folder);
+    }
+
+    /// The engine refused the preview's page (09 §4) since the last call: why. The preview shows
+    /// the source in its place already.
+    pub fn take_refused(&mut self) -> Option<crate::gui::web::Unavailable> {
+        self.refused.take()
     }
 
     /// The engine refused a page view in this window (09 §4): page files preview as their source
@@ -282,6 +291,11 @@ impl Host {
         let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let (cancel, budget) = (Arc::new(AtomicBool::new(false)), (self.budget)());
         let (tx, rx) = mpsc::channel();
+        // The window's preview session, as a remote page lends it (06 §13).
+        let session = crate::gui::web::page::PreviewSession {
+            conn: self.conn.clone(),
+            back: self.back.clone(),
+        };
         let (conn, back, connect, label, cache) = (
             self.conn.clone(),
             self.back.clone(),
@@ -315,11 +329,18 @@ impl Host {
                 wake: &wake,
                 began,
             };
-            let result = prepare::preview_paged(req, &pages, &limits, &stop, &mut |now, all| {
-                d.store(now, Ordering::Relaxed);
-                t.store(all, Ordering::Relaxed);
-                waker.request_repaint();
-            });
+            let result = prepare::preview_paged(
+                req,
+                &pages,
+                Some(session),
+                &limits,
+                &stop,
+                &mut |now, all| {
+                    d.store(now, Ordering::Relaxed);
+                    t.store(all, Ordering::Relaxed);
+                    waker.request_repaint();
+                },
+            );
             drop(conn);
             // Nobody may be listening (the window closed): the preview, and its stream, go here.
             let _ = tx.send(result);
@@ -433,6 +454,16 @@ impl Host {
                 });
                 ctx.input_mut(|i| *i = saved);
                 self.drawn = true;
+                // 09 §4: the engine refused its page — the source in its place, at once. The
+                // page's server ended with the view it never had: the preview session comes
+                // back for the next preparation.
+                if let Some(why) = crate::gui::web::page::take_preview_failure(&ctx) {
+                    self.page_failed = Some(why.clone());
+                    self.refused = Some(why);
+                    self.shown = None;
+                    self.last_progress.clear();
+                    ctx.request_repaint();
+                }
             }
             Some(Shown::Failed(why)) => {
                 let why = why.clone();

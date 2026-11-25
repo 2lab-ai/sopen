@@ -1664,7 +1664,7 @@ impl Browser {
         means.title = title.clone();
         let opened_as = view_set::OpenedAs::of(&opened);
         let page = view_set::PageOpen {
-            styled: opened.styled,
+            class: opened.page,
             shown: pages.shown(),
             opened_on: match pages {
                 prepare::Pages::Page { opened_on } => opened_on,
@@ -1760,7 +1760,7 @@ impl Browser {
             undecodable: None,
         };
         let page = view_set::PageOpen {
-            styled: viewer.page.styled,
+            class: viewer.page.class,
             shown: viewer.page.shown,
             opened_on: viewer.page.shown.then(|| self.opened_on.clone()),
         };
@@ -2546,7 +2546,15 @@ impl Browser {
         for (i, side) in cells::halves(grid.all()).into_iter().enumerate() {
             let rect = grid.rect(side);
             match self.shown.as_ref().map(|s| s[i].clone()) {
-                Some(view::Content::Preview(_)) => self.preview.ui(ui, rect),
+                Some(view::Content::Preview(_)) => {
+                    self.preview.ui(ui, rect);
+                    // 09 §4: the engine refused the preview's page — the preview shows the
+                    // source now, and page files open as their source in this window.
+                    if let Some(why) = self.preview.take_refused() {
+                        self.status = Status::error(crate::gui::web::page::source_line(&why));
+                        self.page_failed = Some(why);
+                    }
+                }
                 Some(view::Content::Tree) if self.tree.is_some() => self.tree_ui(ui, rect),
                 Some(view::Content::Git(top)) => self.git_ui(ui, i, rect, &top),
                 _ => self.panel_cells(ui, i, &grid, side),

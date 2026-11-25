@@ -19,18 +19,25 @@
 //! - **The hand-over** (§6): the shield goes, the preview's budget lifts — a page it cut reloads
 //!   once — and the connection stays with the viewer, given back to it, not to the window's
 //!   preview session, when its server ends.
-//! - **A view that cannot be made** (§4: the engine refused it) says why on its row and, in the
-//!   viewer, to the browser ([`take_failure`]), which shows the file's source instead.
+//! - **A remote page served again** (its window went): on the connection its last server gave
+//!   back; a preview on the window's preview session (06 §13, the one it lent); else — the
+//!   connection lost with its server's link, or the preview session's now — connected again on
+//!   a worker, a preview's becoming the preview session, a viewer's its own. Only a connection
+//!   that cannot be made again leaves the closed line.
+//! - **A view that cannot be made** (§4: the engine refused it) says why on its row and to its
+//!   host — the browser for the viewer ([`take_failure`]), the preview host for a preview
+//!   ([`take_preview_failure`]) — which shows the file's source instead.
 
 use super::{Content, Event, Keyboard, Settings, Unavailable, Web, WindowKey};
 use crate::gui::browser::keys::{self, Mods};
+use crate::gui::browser::Connect;
 use crate::gui::cells::{self, Cells, Grid, Pen};
 use crate::gui::{chrome, Embedded, Outcome, Window};
 use crate::remote::RemoteFs;
 use crate::stream::page::{self as server, Control, Options, Root};
 use eframe::egui::{self, Key};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 
 /// The page viewer's frame title.
 const TITLE: &str = "Page Viewer";
@@ -38,10 +45,73 @@ const TITLE: &str = "Page Viewer";
 /// A connection on its way back.
 type Conn = Box<dyn RemoteFs + Send>;
 
-/// Where a remote page's connection goes when its server ends (§3.1 "Channels"): the window's
-/// preview session while the page is a preview, the page's own after the hand-over (its next
-/// server runs on it), or nowhere (closed).
-type Target = Arc<Mutex<Option<Sender<Conn>>>>;
+/// Where a remote page's connection is (§3.1 "Channels", 06 §13).
+enum Held {
+    /// Lent to the server running now. When that ends it goes to the window's preview session
+    /// (`Some`: the page is a preview), else back here.
+    Serving(Option<Sender<Conn>>),
+    /// Back from the server that ended: the next one runs on it.
+    Here(Conn),
+    /// Not here: lost with its server's link, or the preview session's now.
+    Gone,
+}
+
+/// A remote page's connection, shared with the give-back of its server ([`options`]).
+type Session = Arc<Mutex<Held>>;
+
+fn held(session: &Session) -> std::sync::MutexGuard<'_, Held> {
+    session.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The window's preview session as the preview host keeps it (02 §4.4, 06 §13): idle in `conn`,
+/// or on its way back from what borrowed it through `back`.
+#[derive(Clone)]
+pub struct PreviewSession {
+    pub conn: Arc<Mutex<Option<Conn>>>,
+    pub back: Arc<Mutex<Option<Receiver<Conn>>>>,
+}
+
+/// What [`PreviewSession::take`] found.
+enum Take {
+    Conn(Conn),
+    /// On its way back, or the host has it now: look again.
+    Wait,
+    /// Not there (lost).
+    Nothing,
+}
+
+impl PreviewSession {
+    /// The session, if it is back: through `back` (what the last server gave), else idle in
+    /// `conn`. Never waits: the frame looks again.
+    fn take(&self) -> Take {
+        let mut back = self.back.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(rx) = back.take() {
+            match rx.try_recv() {
+                Ok(conn) => return Take::Conn(conn),
+                Err(TryRecvError::Empty) => {
+                    *back = Some(rx);
+                    return Take::Wait;
+                }
+                Err(TryRecvError::Disconnected) => {}
+            }
+        }
+        drop(back);
+        match self.conn.try_lock() {
+            Ok(mut conn) => conn.take().map_or(Take::Nothing, Take::Conn),
+            Err(TryLockError::Poisoned(p)) => {
+                p.into_inner().take().map_or(Take::Nothing, Take::Conn)
+            }
+            Err(TryLockError::WouldBlock) => Take::Wait,
+        }
+    }
+
+    /// Lent to a page's server: it comes back through `back` when that ends.
+    fn lend(&self) -> Sender<Conn> {
+        let (tx, rx) = mpsc::channel();
+        *self.back.lock().unwrap_or_else(PoisonError::into_inner) = Some(rx);
+        tx
+    }
+}
 
 /// Why file pages show their source in `ctx`'s window, if they do (09 §4): no engine on this
 /// thread, or one that does not contain a file view with scripts off. In a terminal no engine
@@ -65,6 +135,20 @@ fn failure_id() -> egui::Id {
     egui::Id::unique("sopen-page-failed")
 }
 
+fn preview_failure_id() -> egui::Id {
+    egui::Id::unique("sopen-page-preview-failed")
+}
+
+/// The preview's page could not be made this pass, and why (§4): the preview host shows the
+/// source in its place. Taken once per pass.
+pub(crate) fn take_preview_failure(ctx: &egui::Context) -> Option<Unavailable> {
+    ctx.data_mut(|d| {
+        let why = d.get_temp::<Unavailable>(preview_failure_id());
+        d.remove::<Unavailable>(preview_failure_id());
+        why
+    })
+}
+
 /// The page on screen in the viewer could not be made this pass, and why (§4): the browser
 /// shows the source in its place. Taken once per pass.
 pub(crate) fn take_failure(ctx: &egui::Context) -> Option<Unavailable> {
@@ -82,9 +166,10 @@ pub struct Served {
     root: Root,
     /// `[user@]host`; `None` on this machine.
     label: Option<String>,
-    target: Target,
-    /// A remote page's own way back for its connection (the viewer's).
-    own: Option<(Sender<Conn>, Receiver<Conn>)>,
+    session: Session,
+    /// How a remote page connects again; a preview's session.
+    connect: Option<Connect>,
+    preview_session: Option<PreviewSession>,
     preview: bool,
 }
 
@@ -98,50 +183,89 @@ impl Served {
             control,
             root,
             label: None,
-            target: Arc::default(),
-            own: None,
+            session: Arc::new(Mutex::new(Held::Gone)),
+            connect: None,
+            preview_session: None,
             preview,
         }
     }
 
     /// A remote page over `conn` — the connection that resolved, stat'ed and sniffed the file
-    /// (the viewer's, §3.1 "Channels") or, with `back`, the window's preview session, which
-    /// goes back there when the preview's server ends.
-    pub fn remote(conn: Conn, root: Root, label: &str, back: Option<Sender<Conn>>) -> Served {
-        let preview = back.is_some();
-        let own = (!preview).then(mpsc::channel);
-        let target: Target = Arc::new(Mutex::new(match &own {
-            Some((tx, _)) => Some(tx.clone()),
-            None => back,
-        }));
-        let (server, control) = server::serve(conn, &root.root, options(preview, Some(&target)));
+    /// (the viewer's, §3.1 "Channels") or, with `preview`, the window's preview session, lent:
+    /// it goes back there when the preview's server ends. `connect` connects again (a viewer's
+    /// own session, a preview's lost one).
+    pub fn remote(
+        conn: Conn,
+        root: Root,
+        label: &str,
+        connect: Connect,
+        preview: Option<PreviewSession>,
+    ) -> Served {
+        let to = preview.as_ref().map(PreviewSession::lend);
+        let session = Arc::new(Mutex::new(Held::Serving(to)));
+        let options = options(preview.is_some(), Some(&session));
+        let (server, control) = server::serve(conn, &root.root, options);
         Served {
             server,
             control,
             root,
             label: Some(label.to_string()),
-            target,
-            own,
-            preview,
+            session,
+            connect: Some(connect),
+            preview: preview.is_some(),
+            preview_session: preview,
+        }
+    }
+}
+
+/// The give-back of a remote page's server: the connection to where [`Held::Serving`] says.
+/// Dropped without being called — the server ended without its connection, lost with its link —
+/// it marks the connection gone, so the next server connects again.
+struct Giving {
+    session: Session,
+    given: bool,
+}
+
+impl Giving {
+    fn give(mut self, conn: Conn) {
+        self.given = true;
+        let mut held = held(&self.session);
+        match std::mem::replace(&mut *held, Held::Gone) {
+            // The window's preview session: back to it (gone from here).
+            Held::Serving(Some(to)) => {
+                let _ = to.send(conn);
+            }
+            Held::Serving(None) | Held::Here(_) | Held::Gone => *held = Held::Here(conn),
+        }
+    }
+}
+
+impl Drop for Giving {
+    fn drop(&mut self) {
+        if !self.given {
+            let mut held = held(&self.session);
+            if matches!(*held, Held::Serving(_)) {
+                // A preview's lent session is lost: the window's next preview connects again.
+                *held = Held::Gone;
+            }
         }
     }
 }
 
 /// A server's options: the preview's budget or none, the throttle hook, and — remote — the
-/// connection given back where `target` says.
-fn options(preview: bool, target: Option<&Target>) -> Options {
+/// connection given back as `session` says ([`Giving`]).
+fn options(preview: bool, session: Option<&Session>) -> Options {
     let mut options = if preview {
         Options::preview()
     } else {
         Options::viewer()
     };
-    if let Some(target) = target.cloned() {
-        options.give_back = Some(Box::new(move |conn| {
-            let to = target.lock().unwrap_or_else(PoisonError::into_inner).take();
-            if let Some(tx) = to {
-                let _ = tx.send(conn);
-            }
-        }));
+    if let Some(session) = session.cloned() {
+        let giving = Giving {
+            session,
+            given: false,
+        };
+        options.give_back = Some(Box::new(move |conn| giving.give(conn)));
     }
     options
 }
@@ -171,8 +295,8 @@ enum Line {
     Said(String),
     /// The view could not be made (§4).
     Unmade(String),
-    /// The page's view closed with its window and has no connection to be served on again.
-    Closed,
+    /// The page's view closed with its window and its connection could not be made again.
+    Closed(String),
 }
 
 impl Line {
@@ -190,7 +314,9 @@ impl Line {
             Line::Failed(why) => format!("the page did not load: {why} — Cmd/Ctrl+R reloads"),
             Line::Ended => "the page's process ended — Cmd/Ctrl+R reloads".to_string(),
             Line::Said(words) | Line::Unmade(words) => words.clone(),
-            Line::Closed => "the page closed with its window: Esc, then Enter opens it".to_string(),
+            Line::Closed(why) => format!(
+                "the page closed with its window and cannot connect again: {why} — Esc, then Enter opens it"
+            ),
         }
     }
 }
@@ -203,8 +329,11 @@ pub struct PageWindow {
     control: Control,
     root: Root,
     label: Option<String>,
-    target: Target,
-    own: Option<(Sender<Conn>, Receiver<Conn>)>,
+    session: Session,
+    connect: Option<Connect>,
+    preview_session: Option<PreviewSession>,
+    /// A connection being made on a worker, for the next server.
+    dialing: Option<Receiver<anyhow::Result<Conn>>>,
     /// The view and the window it is in.
     web: Option<(Web, WindowKey)>,
     /// `Web::new` did not make it: why (§4).
@@ -231,8 +360,10 @@ impl PageWindow {
             control: served.control,
             root: served.root,
             label: served.label,
-            target: served.target,
-            own: served.own,
+            session: served.session,
+            connect: served.connect,
+            preview_session: served.preview_session,
+            dialing: None,
             web: None,
             failed: None,
             told: false,
@@ -262,7 +393,7 @@ impl PageWindow {
         let Some(key) = key else {
             return;
         };
-        if self.web.is_some() || self.failed.is_some() {
+        if self.web.is_some() || self.failed.is_some() || self.closed() {
             return;
         }
         let Some(server) = self.served.take().or_else(|| self.serve_again()) else {
@@ -289,9 +420,8 @@ impl PageWindow {
         }
     }
 
-    /// A server for a view made again: in place on this machine; a remote one on the connection
-    /// the last server gave back, once it has — a preview's went to the window's preview session,
-    /// so it says why instead.
+    /// A server for a view made again: in place on this machine; a remote one once its
+    /// connection is here ([`PageWindow::connection`]).
     fn serve_again(&mut self) -> Option<server::Page> {
         if self.label.is_none() {
             let (server, control) =
@@ -299,16 +429,76 @@ impl PageWindow {
             self.control = control;
             return Some(server);
         }
-        let Some((tx, rx)) = &self.own else {
-            self.line = Some(Line::Closed);
-            return None;
+        let conn = self.connection()?;
+        let to = match (&self.preview_session, self.preview) {
+            (Some(session), true) => Some(session.lend()),
+            _ => None,
         };
-        let conn = rx.try_recv().ok()?;
-        *self.target.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx.clone());
-        let options = options(self.preview, Some(&self.target));
+        *held(&self.session) = Held::Serving(to);
+        let options = options(self.preview, Some(&self.session));
         let (server, control) = server::serve(conn, &self.root.root, options);
         self.control = control;
         Some(server)
+    }
+
+    /// The connection for a remote page's next server, when it is here: given back by the last
+    /// one; a preview's, the window's preview session; else made again on a worker (looked at on
+    /// the next passes). `None` while it is on its way, and for good when it cannot be made (the
+    /// closed line).
+    fn connection(&mut self) -> Option<Conn> {
+        if let Some(dialing) = &self.dialing {
+            let made = match dialing.try_recv() {
+                Ok(made) => made,
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!("its worker stopped")),
+            };
+            self.dialing = None;
+            return match made {
+                Ok(conn) => Some(conn),
+                Err(e) => {
+                    self.line = Some(Line::Closed(crate::stream::explain(&e)));
+                    None
+                }
+            };
+        }
+        {
+            let mut held = held(&self.session);
+            match std::mem::replace(&mut *held, Held::Gone) {
+                Held::Here(conn) => return Some(conn),
+                // The last server has not ended yet: it gives the connection back.
+                serving @ Held::Serving(_) => {
+                    *held = serving;
+                    return None;
+                }
+                Held::Gone => {}
+            }
+        }
+        if self.preview {
+            match self.preview_session.as_ref().map(PreviewSession::take) {
+                Some(Take::Conn(conn)) => return Some(conn),
+                Some(Take::Wait) => return None,
+                Some(Take::Nothing) | None => {}
+            }
+        }
+        let Some(connect) = self.connect.clone() else {
+            self.line = Some(Line::Closed("no way to connect".to_string()));
+            return None;
+        };
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("sopen-page-connect".into())
+            .spawn(move || {
+                let _ = tx.send(connect());
+            });
+        match spawned {
+            Ok(_) => self.dialing = Some(rx),
+            Err(e) => self.line = Some(Line::Closed(e.to_string())),
+        }
+        None
+    }
+
+    fn closed(&self) -> bool {
+        matches!(self.line, Some(Line::Closed(_)))
     }
 
     fn web(&mut self) -> Option<&mut Web> {
@@ -503,13 +693,18 @@ impl Window for PageWindow {
         }
         if !self.preview {
             self.keys(&ctx);
-            if let Some(why) = self.failed.as_ref().filter(|_| !self.told) {
-                ctx.data_mut(|d| d.insert_temp(failure_id(), why.clone()));
-                self.told = true;
-            }
+        }
+        if let Some(why) = self.failed.as_ref().filter(|_| !self.told) {
+            // Its host shows the source in its place: the browser's viewer, the preview host.
+            let id = match self.preview {
+                false => failure_id(),
+                true => preview_failure_id(),
+            };
+            ctx.data_mut(|d| d.insert_temp(id, why.clone()));
+            self.told = true;
         }
         let waiting = self.web.is_none() && self.failed.is_none() && !self.terminal;
-        if self.loading || (waiting && self.line != Some(Line::Closed)) {
+        if self.loading || (waiting && !self.closed()) {
             // Its rows follow the load; a view waiting for its connection looks again.
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -522,7 +717,7 @@ impl Window for PageWindow {
         self.painted
             && match &self.web {
                 Some(_) => self.loaded,
-                None => self.terminal || self.failed.is_some() || self.line == Some(Line::Closed),
+                None => self.terminal || self.failed.is_some() || self.closed(),
             }
     }
 
@@ -541,11 +736,13 @@ impl Window for PageWindow {
         let handed_over = std::mem::replace(&mut self.preview, on) && !on;
         if handed_over {
             let cut = self.control.lift();
-            if self.label.is_some() && self.own.is_none() {
-                let (tx, rx) = mpsc::channel();
-                *self.target.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx.clone());
-                self.own = Some((tx, rx));
+            // The connection is the viewer's from now on: its server gives it back here. One the
+            // preview session has back already is gone from here — connected again, if needed.
+            let mut held = held(&self.session);
+            if let Held::Serving(to) = &mut *held {
+                *to = None;
             }
+            drop(held);
             if let Some(web) = self.web() {
                 web.set_preview(false);
                 if cut {
@@ -573,5 +770,43 @@ impl Window for PageWindow {
             Keyboard::Page => crate::view_keys::State::Field,
             Keyboard::Sopen => crate::view_keys::State::Free,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fix-check of WV-D (review MF1 c): a server that ends without its connection — lost
+    /// with its link — drops its give-back unused, and the connection is gone, so the next
+    /// server connects again; one called gives it back here, or a preview's to the window's
+    /// preview session.
+    #[test]
+    fn wv_d_a_lost_link_marks_the_connection_gone() {
+        let conn = || Box::new(crate::remote::LocalFs::new()) as Conn;
+        let session: Session = Arc::new(Mutex::new(Held::Serving(None)));
+        drop(options(false, Some(&session)));
+        assert!(matches!(*held(&session), Held::Gone), "lost");
+        *held(&session) = Held::Serving(None);
+        let give = options(false, Some(&session)).give_back.expect("remote");
+        give(conn());
+        assert!(matches!(*held(&session), Held::Here(_)), "back here");
+        let (tx, rx) = mpsc::channel();
+        *held(&session) = Held::Serving(Some(tx));
+        let give = options(true, Some(&session)).give_back.expect("remote");
+        give(conn());
+        assert!(
+            matches!(*held(&session), Held::Gone),
+            "the preview session's"
+        );
+        assert!(rx.try_recv().is_ok(), "sent to it");
+        let (tx, rx) = mpsc::channel();
+        *held(&session) = Held::Serving(Some(tx));
+        drop(options(true, Some(&session)));
+        assert!(matches!(*held(&session), Held::Gone));
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Disconnected)),
+            "the preview session's next preparation connects again"
+        );
     }
 }

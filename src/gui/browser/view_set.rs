@@ -115,11 +115,12 @@ struct Picker {
 }
 
 /// How a viewer's views treat a page file (09 §5–§6).
-#[derive(Default)]
 pub(super) struct PageOpen {
-    /// The page is its default view (`kind::page_default`).
-    pub styled: bool,
-    /// The window shows pages: the page is one of its views (else D30's source, 09 §4).
+    /// Where the page goes among its views: the preparation's one decision, from the file
+    /// opened (its resolved name and head), never the name the list shows.
+    pub class: PageClass,
+    /// The window shows pages (else D30's source, 09 §4): with a class other than `Plain`, the
+    /// page is one of its views.
     pub shown: bool,
     /// The folder the browser was opened on (§3.1's root).
     pub opened_on: Option<String>,
@@ -135,7 +136,12 @@ pub(super) fn open(
     means: Means,
     wanted: Option<u8>,
 ) -> Views {
-    open_paged(ctx, opened, means, wanted, PageOpen::default())
+    let page = PageOpen {
+        class: PageClass::Plain,
+        shown: false,
+        opened_on: None,
+    };
+    open_paged(ctx, opened, means, wanted, page)
 }
 
 /// [`open`], a page file's views as `page` says: 1 Page · 2 Hex · 3 Text for HTML, HTM and
@@ -158,10 +164,10 @@ pub(super) fn open_paged(
         kind => kind,
     };
     let mut opening = Opening::new(kind, means.path.clone(), opened.stat, reach);
-    opening.page = PageClass::of(&means.name, page.styled);
+    opening.page = page.class;
     opening.read_only = means.in_place;
     opening.undecodable = opened.undecodable.clone();
-    let screen = if page.shown {
+    let screen = if page.shown && page.class != PageClass::Plain {
         Screen::GUI
     } else {
         Screen::NO_ENGINE

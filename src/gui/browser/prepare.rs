@@ -21,11 +21,12 @@ use crate::gui::image::{self, Doc, ImageFile};
 use crate::gui::media::{self, Media};
 use crate::gui::streamed::{self, Lease};
 use crate::gui::text::{self, TextDoc};
-use crate::gui::web::page::{self, Served};
+use crate::gui::web::page::{self, PreviewSession, Served};
 use crate::gui::{chrome, Embedded, Origin, Outcome, Placeholder, Reconnect, Window};
 use crate::kind::{self, Kind};
 use crate::remote::{RemoteFs, Stat};
 use crate::stream::{Opening, ReadError, ReaderKind, Source, Waker};
+use crate::views::PageClass;
 use anyhow::{anyhow, bail, Context as _, Result};
 use eframe::egui;
 use sha2::Digest as _;
@@ -143,20 +144,20 @@ enum Want {
     Page,
 }
 
-/// Whether the page is the file at `abs`'s default view (09 §5): by its name, and for an `.xml`
-/// by its first 8 KiB, read on `fs` (a local file in place) — at most that much more than the
-/// opening read before 09.
-fn page_default_on(fs: &mut dyn RemoteFs, abs: &str) -> Result<bool> {
+/// Where the page goes among the views of the file at `abs` — its resolved path — (09 §5–§6, the
+/// one page decision): by its name, and for an `.xml` by its first 8 KiB, read on `fs` (a local
+/// file in place) — at most that much more than the opening read before 09.
+fn page_class_on(fs: &mut dyn RemoteFs, abs: &str) -> Result<PageClass> {
     let name = crate::remote::split_parent(abs).1;
     if !kind::page_file(name) {
-        return Ok(false);
+        return Ok(PageClass::Plain);
     }
     let head = if kind::extension(name).as_deref() == Some("xml") {
         fs.read_head(abs, kind::SNIFF_BYTES)?
     } else {
         Vec::new()
     };
-    Ok(kind::page_default(name, &head))
+    Ok(PageClass::of(name, kind::page_default(name, &head)))
 }
 
 /// The page of the file at `req.abs` (09 §3.1): its root resolved on `fs`, its server started —
@@ -169,7 +170,7 @@ fn page_prepared(
     let root = crate::stream::page::root(fs.as_mut(), opened_on, req.abs)?;
     let page = match req.label {
         None => Served::local(root, false),
-        Some(label) => Served::remote(fs, root, label, None),
+        Some(label) => Served::remote(fs, root, label, req.connect.clone(), None),
     };
     Ok(Prepared::Page { page })
 }
@@ -266,9 +267,9 @@ pub struct Opened {
     pub kind: Kind,
     pub stat: Stat,
     pub undecodable: Option<String>,
-    /// The page is the file's default view (09 §5, `kind::page_default`): an `.html`, `.htm`
-    /// or styled `.xml` (the opening's only).
-    pub styled: bool,
+    /// Where the page goes among its views (09 §5–§6), decided from the file opened — its
+    /// resolved name and head, never the name the list shows (the opening's only).
+    pub page: PageClass,
 }
 
 /// [`prepare`] with what the view set keeps ([`Opened`]). `in_place`: a file at a revision or a
@@ -349,14 +350,21 @@ fn prepare_with(
         );
     }
     let (kind, sniff) = kind::detect_sniffed(fs.as_mut(), req.abs, &stat)?;
-    // 09 §5: the page decision, before the view is made — an `.xml`'s head read on this
-    // connection. A page file stays Text for the views and everything else (§5).
-    let styled =
-        want == Want::Opening && kind == Kind::Text && page_default_on(fs.as_mut(), req.abs)?;
+    // 09 §5: the page decision, before the view is made, from the file opened (`req.abs` is
+    // resolved) — an `.xml`'s head read on this connection. A page file stays Text for the
+    // views and everything else (§5).
+    let class = match (want, kind) {
+        (Want::Opening, Kind::Text) => page_class_on(fs.as_mut(), req.abs)?,
+        _ => PageClass::Plain,
+    };
+    let first = class == PageClass::PageFirst;
     let (page, source_line) = match (want, pages) {
+        (Want::Page, _) if !kind::page_file(crate::remote::split_parent(req.abs).1) => {
+            bail!("{} is not a page file", req.show())
+        }
         (Want::Page, Pages::Page { opened_on }) => (Some(opened_on), None),
-        (Want::Opening, Pages::Page { opened_on }) if styled => (Some(opened_on), None),
-        (Want::Opening, Pages::Source(line)) if styled => (None, line.clone()),
+        (Want::Opening, Pages::Page { opened_on }) if first => (Some(opened_on), None),
+        (Want::Opening, Pages::Source(line)) if first => (None, line.clone()),
         _ => (None, None),
     };
     let kind = match want {
@@ -399,7 +407,7 @@ fn prepare_with(
         kind,
         stat,
         undecodable,
-        styled,
+        page: class,
     })
 }
 
@@ -1005,12 +1013,22 @@ pub struct Previewed {
 }
 
 /// What a preview found of a page file (09 §5–§6), for the views of the viewer it becomes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageSeen {
     /// It was prepared with pages shown (`Pages::Page`).
     pub shown: bool,
-    /// The page is its default view (`kind::page_default`).
-    pub styled: bool,
+    /// Where the page goes among its views, from the file previewed (its resolved name, its
+    /// head).
+    pub class: PageClass,
+}
+
+impl Default for PageSeen {
+    fn default() -> Self {
+        PageSeen {
+            shown: false,
+            class: PageClass::Plain,
+        }
+    }
 }
 
 impl Previewed {
@@ -1190,15 +1208,17 @@ pub fn preview(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Previewed> {
-    preview_paged(req, &Pages::Source(None), budget, cancel, progress)
+    preview_paged(req, &Pages::Source(None), None, budget, cancel, progress)
 }
 
 /// [`preview`], a page file previewed as `pages` says (09 §6): its page — scripts off, served
 /// from its root within the preview's budget (§3.1), a remote one on the window's preview
-/// session — where the page is its default view and the window shows pages; else its source.
+/// session (`session`, as the preview host keeps it: what `req.conn` and `req.back` are) — where
+/// the page is its default view and the window shows pages; else its source.
 pub fn preview_paged(
     req: PreviewRequest,
     pages: &Pages,
+    session: Option<PreviewSession>,
     budget: &Budget,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
@@ -1215,7 +1235,7 @@ pub fn preview_paged(
     };
     let host = req.label.unwrap_or(cache::LOCAL_HOST).to_string();
     let cache = req.cache.to_path_buf();
-    match preview_parts(req, pages, budget, cancel, progress, &mut known) {
+    match preview_parts(req, pages, session, budget, cancel, progress, &mut known) {
         Ok(parts) => Ok(Previewed {
             parts,
             lease: known.lease,
@@ -1246,6 +1266,7 @@ pub fn preview_paged(
 fn preview_parts(
     req: PreviewRequest,
     pages: &Pages,
+    session: Option<PreviewSession>,
     budget: &Budget,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
@@ -1335,20 +1356,21 @@ fn preview_parts(
     if let (Kind::Text, Pages::Page { opened_on }) = (kind, pages) {
         known.page.shown = true;
         budget.check(cancel)?;
-        known.page.styled = page_default_on(fs.as_mut(), &real)?;
-        if known.page.styled {
+        known.page.class = page_class_on(fs.as_mut(), &real)?;
+        // A remote page lends the window's preview session; without it, its source.
+        let lent = session.filter(|_| label.is_some());
+        if known.page.class == PageClass::PageFirst && (label.is_none() || lent.is_some()) {
             budget.check(cancel)?;
             let root = crate::stream::page::root(fs.as_mut(), opened_on.as_deref(), &real)?;
             budget.check(cancel)?;
-            let served = match label {
-                None => Served::local(root, true),
-                Some(label) => {
+            let served = match (label, lent) {
+                (Some(label), Some(session)) => {
                     // The window's one preview session is the page's while it is a preview,
                     // and comes back when its server ends (06 §13), as a stream's does.
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    *back.lock().unwrap_or_else(|p| p.into_inner()) = Some(rx);
-                    Served::remote(conn.take().expect("opened above"), root, label, Some(tx))
+                    let conn = conn.take().expect("opened above");
+                    Served::remote(conn, root, label, connect.clone(), Some(session))
                 }
+                _ => Served::local(root, true),
             };
             budget.read_done();
             return Ok(Parts::Page(served));
