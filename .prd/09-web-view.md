@@ -833,8 +833,9 @@ handle; §3.1's ~4 and ~2 RTT. Its result goes into §3.1.
 
 **Order**: X-W1 → WV-0 (trait first) ∥ WV-C → WV-A ∥ WV-B → WV-D ∥ WV-E2 → WV-F; WV-E1 from the
 start. **Only WV-F waits on 08's model** (VM-5 the view set, VM-6 the keys, VM-7 the binding) and on
-10: WV-D ships before them with the page as the default view and Esc back (§6 names the gap), and
-WV-F plugs it into the set and the GUI backend's pixel regions. **Shared files are sequenced**:
+10: WV-D shipped with VM-7's binding already landed, so a page file's views 1, 2 and 3 are §6's table
+from WV-D on (§6, "The views in the viewer"); WV-F adds the hidden page view's session given back
+and the GUI backend's pixel regions. **Shared files are sequenced**:
 `src/gui/web/mod.rs` gets one `mod` line each from WV-A (with `platform()`), WV-D and WV-E2;
 `src/lib.rs` one from WV-0 beside
 08's VM-1/5/6 lines; `src/gui/mod.rs` (WV-0) is shared with 08's VM-2 and VM-7 and the browser
@@ -847,9 +848,10 @@ looked at (06 §13).
 
 ## Tensions
 
-- **08 D30 vs WV-D before WV-F.** D30 shows HTML/HTM/XML as 1 Text, 3 Raw until 09's page view
-  lands; WV-D makes the page view 1 before 08's keys reach the GUI, so the in-sopen source waits for
-  WV-F (§6's gap). (08's D40 already carries §6's table.)
+- **08 D30 vs WV-D.** D30 shows HTML/HTM/XML as 1 Text, 3 Raw until 09's page view lands; WV-D
+  landed it with VM-7's keys already in the GUI, so §6's table holds from WV-D on (§6, "The views
+  in the viewer") and D30 stays only where file pages show their source (§4: no engine here, or
+  one not contained; `Screen::NO_ENGINE`). (08's D40 already carries §6's table.)
 - ***web* §8-6 and decision 4.** The research defaulted to blocking outside subresources; the first
   round allowed them with scripts off; the review round (decision 4 revised) blocks them in every file
   view, for XSLT's sake. Outside CSS and fonts therefore never style a file page.
