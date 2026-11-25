@@ -5035,13 +5035,38 @@ impl TextWindow {
                 syntax,
             ]
         };
-        // Its encoding beside its syntax (08 §7.5, D34): `UTF-16LE (BOM)`, `UTF-8 (guessed)`.
-        let mut parts = parts;
-        parts.extend(self.doc.encoding_label());
-        ui.horizontal(|ui| {
-            super::one_line(ui, &self.title, p.text);
+        // Laid out from the right: its encoding beside its syntax (08 §7.5, D34: `UTF-16LE
+        // (BOM)`, `UTF-8 (guessed)`) whole, then the rest of the stats, cut at their end where
+        // the window is too narrow for them (06 §7.2's `lines known to …` is the longest), then
+        // the title in the room left, cut from the left as a path is: a long path never hides
+        // the stats, and nothing hides the encoding.
+        let mut stats = parts.join(" · ");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(encoding) = self.doc.encoding_label() {
+                // One cell after it, a space of the grid (a trailing space in the rest's text
+                // would take no width): with the rest's ` ·` they read as one line.
+                let gap = ui.spacing().item_spacing.x;
+                ui.spacing_mut().item_spacing.x = chrome::CELL.x;
+                let label = egui::RichText::new(encoding).color(p.dim);
+                ui.add(egui::Label::new(label).extend());
+                ui.spacing_mut().item_spacing.x = gap;
+                stats.push_str(" ·");
+            }
+            super::one_line(ui, &stats, p.dim);
+            if ui.available_width() < 2.0 * chrome::CELL.x {
+                // No room for even `…`.
+                return;
+            }
             ui.separator();
-            super::one_line(ui, &parts.join(" · "), p.dim);
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let room = ui.available_width();
+            let title = chrome::fit_left(ui.ctx(), &self.title, &font, room);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let label = ui.add(egui::Label::new(egui::RichText::new(&title).color(p.text)));
+                if title != self.title {
+                    label.on_hover_text(&self.title);
+                }
+            });
         });
     }
 
