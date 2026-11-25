@@ -1000,23 +1000,50 @@ fn line_end(e: Encoding, crlf: bool) -> Tok {
     }
 }
 
-/// Bytes the encoding cannot decode, one U+FFFD that joins nothing where the generator puts it.
-fn bad_tok(e: Encoding) -> Tok {
-    let bytes = match e {
-        Utf8 => vec![0xFF],
-        Utf16Le => vec![0x00, 0xDC],
-        Utf16Be => vec![0xDC, 0x00],
-        Utf32Le => vec![0xFF; 4],
-        Utf32Be => vec![0xFF; 4],
-        // A lead with no trail: the generator puts a line end after it.
-        Cp949 => vec![0x8C],
+/// Bytes the encoding cannot decode, one U+FFFD that joins nothing where the generator puts it,
+/// and whether a line end must follow it: a fragment that what comes next could finish — a UTF-8
+/// lead cut short, a UTF-16 high surrogate, a CP949 lead — which a block brought after it can.
+fn bad_tok(e: Encoding, pick: usize) -> (Tok, bool) {
+    let (bytes, fragment) = match (e, pick % 3) {
+        (Utf8, 0) => (vec![0xFF], false),
+        (Utf8, 1) => (vec![0xE3, 0x81], true),
+        // A stray continuation byte: after `E3 81` it would finish it.
+        (Utf8, _) => (vec![0x80], false),
+        (Utf16Le, 0 | 2) => (vec![0x00, 0xDC], false),
+        (Utf16Le, _) => (vec![0x3D, 0xD8], true),
+        (Utf16Be, 0 | 2) => (vec![0xDC, 0x00], false),
+        (Utf16Be, _) => (vec![0xD8, 0x3D], true),
+        (Utf32Le | Utf32Be, _) => (vec![0xFF; 4], false),
+        (Cp949, _) => (vec![0x8C], true),
         _ => unreachable!(),
     };
-    Tok {
+    let tok = Tok {
         cells: vec![(FFFD, bytes.len() as u8)],
         bytes,
         ch: FFFD,
         end: false,
+    };
+    (tok, fragment)
+}
+
+/// A fragment [`bad_tok`] makes: a character begun and not finished.
+fn fragment(e: Encoding, t: &Tok) -> bool {
+    matches!(
+        (e, t.bytes.as_slice()),
+        (Utf8, [0xE3, 0x81]) | (Utf16Le, [0x3D, 0xD8]) | (Utf16Be, [0xD8, 0x3D]) | (Cp949, [0x8C])
+    )
+}
+
+/// A token that can finish a fragment before it: a UTF-8 continuation byte, a UTF-16 low
+/// surrogate, a byte CP949 takes as a trail.
+fn finishes(e: Encoding, t: &Tok) -> bool {
+    let b = &t.bytes;
+    match e {
+        Utf8 => b[0] & 0xC0 == 0x80,
+        Utf16Le => (0xDC..=0xDF).contains(&b[1]),
+        Utf16Be => (0xDC..=0xDF).contains(&b[0]),
+        Cp949 => matches!(b[0], 0x41..=0x5A | 0x61..=0x7A | 0x81..=0xFE),
+        _ => false,
     }
 }
 
@@ -1034,8 +1061,9 @@ fn generate(e: Encoding, rng: &mut Rng) -> Vec<Tok> {
             0 => toks.push(line_end(e, false)),
             1 => toks.push(line_end(e, true)),
             2 => {
-                toks.push(bad_tok(e));
-                if e == Cp949 {
+                let (tok, fragment) = bad_tok(e, rng.below(3));
+                toks.push(tok);
+                if fragment {
                     toks.push(line_end(e, rng.below(2) == 0));
                 }
             }
@@ -1269,8 +1297,8 @@ fn decoded(e: Encoding, bytes: &[u8]) -> Vec<(char, u8)> {
 #[test]
 fn random_block_operations_match_the_model() {
     let mut rng = Rng(0xB10C);
-    let mut refusals = 0;
-    for round in 0..600 {
+    let mut refusals = [0usize; MODEL_ENCODINGS.len()];
+    for round in 0..1800 {
         let e = MODEL_ENCODINGS[round % MODEL_ENCODINGS.len()];
         let toks = generate(e, &mut rng);
         let n = toks.len();
@@ -1283,16 +1311,30 @@ fn random_block_operations_match_the_model() {
         if i > j {
             std::mem::swap(&mut i, &mut j);
         }
+        let op = rng.below(4);
+        // Half the cut-and-paste rounds aim at a join: the block starts with a token that can
+        // finish a fragment, and goes right after one (where the document has both).
+        let aim = op == 3 && rng.below(2) == 0;
+        let finishers: Vec<usize> = (0..n).filter(|&t| finishes(e, &toks[t])).collect();
+        if aim && !finishers.is_empty() {
+            i = finishers[rng.below(finishers.len())];
+            j = i + 1 + rng.below(n - i);
+        }
         if i == j {
             continue;
         }
-        let k = rng.below(n + 1);
+        let mut k = rng.below(n + 1);
+        let fragments: Vec<usize> = (0..n)
+            .filter(|&t| fragment(e, &toks[t]) && (t < i || t + 1 >= j))
+            .collect();
+        if aim && !fragments.is_empty() {
+            k = fragments[rng.below(fragments.len())] + 1;
+        }
         let mut ed = open(&doc, e);
         select(&mut ed, off(i), off(j));
         assert_eq!(ed.shown(), Some(off(i)..off(j)));
         at(&mut ed, off(k));
         let block: Vec<Tok> = toks[i..j].to_vec();
-        let op = rng.below(4);
         let (said, want): (Outcome, Vec<Tok>) = match op {
             // Ctrl+K C at k.
             0 => {
@@ -1355,7 +1397,7 @@ fn random_block_operations_match_the_model() {
                     if matches!(said, Some(Said::Refused(_))) {
                         assert!(joins, "{label}: refused, yet nothing would join");
                         assert_eq!(bytes_of(&ed), doc_of(&rest), "{label}");
-                        refusals += 1;
+                        refusals[round % MODEL_ENCODINGS.len()] += 1;
                         continue;
                     }
                     assert!(!joins, "{label}: pasted, yet it joined the bytes beside it");
@@ -1385,7 +1427,11 @@ fn random_block_operations_match_the_model() {
         }
         assert_eq!(bytes_of(&ed), want_bytes, "{label}: redone");
     }
-    assert!(refusals > 0, "the runs met a join");
+    // The runs meet a paste that would join a fragment in every encoding that has one.
+    for (e, n) in MODEL_ENCODINGS.iter().zip(refusals) {
+        let fragments = !matches!(e, Utf32Le | Utf32Be);
+        assert_eq!(n > 0, fragments, "{e:?}: {n} pastes refused");
+    }
 }
 
 /// Lines longer than the look-back window and the decode chunk: ← and → step where the tokens
@@ -1460,4 +1506,338 @@ fn long_lines_step_find_and_count_across_windows_and_chunks() {
     doc.push(0xFF);
     let doubt = Doubt::of(&Original::new(doc, Utf8), false);
     assert_eq!(doubt.undecodable, 2);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review of ED-ops (2026-11-25).
+
+/// The bytes decoded while `f` runs.
+fn decoding(ed: &mut Editor, f: impl FnOnce(&mut Editor)) -> u64 {
+    DECODED.with(|n| n.set(0));
+    f(ed);
+    DECODED.with(|n| n.get())
+}
+
+/// One operation's decode, bounded whatever the line's length: a decode chunk and the look-back
+/// window, a few times over.
+const OP_BOUND: u64 = 4 * CHUNK + 4 * WINDOW;
+
+/// Item 1: one 8 MiB line and an LF — a click mid-line, typing, Up and Down, Home and End,
+/// ← → and Backspace each decode a bounded number of bytes, and land where they should.
+#[test]
+fn one_huge_line_costs_a_bounded_decode_per_operation() {
+    for e in [Utf8, Utf16Le] {
+        let unit = enc(e, "ab한 ");
+        let n = (8 << 20) / unit.len();
+        let mut doc = unit.repeat(n);
+        let line_end = doc.len() as u64;
+        doc.extend(e.lf());
+        let len = doc.len() as u64;
+        let mut ed = open(&doc, e);
+        let u = unit.len() as u64;
+        let (one, han) = (e.unit() as u64, enc(e, "한").len() as u64);
+        let mid = u * (n as u64 / 2);
+        let in_han = mid + 2 * one + 1;
+        let after_x = mid + 2 * one + enc(e, "x").len() as u64;
+        type Step = (&'static str, Box<dyn Fn(&mut Editor)>, u64);
+        let ops: Vec<Step> = vec![
+            (
+                "click",
+                Box::new(move |ed| ed.place(in_han, false)),
+                mid + 2 * one,
+            ),
+            (
+                "type",
+                Box::new(|ed| assert_eq!(ed.type_text("x"), None)),
+                after_x,
+            ),
+            (
+                "Up",
+                Box::new(|ed| ed.move_caret(Motion::Up, false)),
+                after_x,
+            ),
+            (
+                "Down",
+                Box::new(|ed| ed.move_caret(Motion::Down, false)),
+                len + one,
+            ),
+            (
+                "Up again",
+                Box::new(|ed| ed.move_caret(Motion::Up, false)),
+                after_x,
+            ),
+            (
+                "Left",
+                Box::new(|ed| ed.move_caret(Motion::Left, false)),
+                mid + 2 * one,
+            ),
+            (
+                "Right",
+                Box::new(|ed| ed.move_caret(Motion::Right, false)),
+                after_x,
+            ),
+            (
+                "Backspace",
+                Box::new(|ed| assert_eq!(ed.delete_left(), None)),
+                mid + 2 * one,
+            ),
+            (
+                "Shift+→",
+                Box::new(|ed| ed.move_caret(Motion::Right, true)),
+                mid + 2 * one + han,
+            ),
+            ("Home", Box::new(|ed| ed.move_caret(Motion::Home, false)), 0),
+            (
+                "End",
+                Box::new(|ed| ed.move_caret(Motion::End, false)),
+                line_end,
+            ),
+            (
+                "Shift+click",
+                Box::new(move |ed| ed.place(in_han, true)),
+                mid + 2 * one,
+            ),
+        ];
+        for (name, op, want) in ops {
+            let work = decoding(&mut ed, |ed| op(ed));
+            assert!(work <= OP_BOUND, "{e:?} {name}: {work} bytes decoded");
+            assert_eq!(ed.caret(), want, "{e:?} {name}");
+        }
+        assert_eq!(bytes_of(&ed), doc, "{e:?}: x typed and taken back");
+        // Tab needs the column: the first walks the line once, keeping checkpoints; the next,
+        // after an edit past them, starts from the last one before it.
+        at(&mut ed, mid);
+        assert_eq!(ed.tab(), None);
+        let work = decoding(&mut ed, |ed| assert_eq!(ed.tab(), None));
+        assert!(work <= OP_BOUND, "{e:?} second Tab: {work} bytes decoded");
+    }
+}
+
+/// Item 2: Replace with G and N is one pass over the text, one undo step.
+#[test]
+fn replace_all_is_one_pass() {
+    let n = 1_000_000;
+    let doc = "a,".repeat(n);
+    let mut ed = open(doc.as_bytes(), Utf8);
+    let mut said = None;
+    let work = decoding(&mut ed, |ed| {
+        said = Some(ed.replace_all(&search(",", "gn"), ";"))
+    });
+    assert_eq!(said, Some((n, None)));
+    assert!(
+        work <= 2 * doc.len() as u64 + OP_BOUND,
+        "{work} bytes decoded"
+    );
+    assert_eq!(bytes_of(&ed), "a;".repeat(n).as_bytes());
+    assert_eq!(ed.buffer().steps(), 1);
+    assert!(ed.undo());
+    assert_eq!(bytes_of(&ed), doc.as_bytes());
+}
+
+/// Item 2: backward, the matches are chosen from the caret back: `aaa`, `aa` → `aX`.
+#[test]
+fn replace_all_backward_chooses_matches_from_the_caret_back() {
+    let mut ed = open(b"aaa", Utf8);
+    ed.move_caret(Motion::FileEnd, false);
+    assert_eq!(ed.replace_all(&search("aa", "bn"), "X"), (1, None));
+    assert_eq!(bytes_of(&ed), b"aX");
+    // Forward from the start: `Xa`.
+    let mut ed = open(b"aaa", Utf8);
+    assert_eq!(ed.replace_all(&search("aa", "n"), "X"), (1, None));
+    assert_eq!(bytes_of(&ed), b"Xa");
+    // Backward without G stops at the file's start; matches past the caret stay.
+    let mut ed = open(b"ab ab ab", Utf8);
+    at(&mut ed, 5);
+    assert_eq!(ed.replace_all(&search("ab", "bn"), "Q"), (2, None));
+    assert_eq!(bytes_of(&ed), b"Q Q ab");
+    // Whole words, both ways.
+    let mut ed = open(b"cat concat cat", Utf8);
+    ed.move_caret(Motion::FileEnd, false);
+    assert_eq!(ed.replace_all(&search("cat", "bwn"), "dog"), (2, None));
+    assert_eq!(bytes_of(&ed), b"dog concat dog");
+}
+
+/// Item 3: both pastes rewrite line breaks (egui-winit CR LF → LF; a terminal CR LF and lone
+/// CR → LF), so the clip is matched with its line breaks as LF; its pieces go in when its line
+/// ends fit (the same file, or none), else its bytes with the destination's line ends.
+#[test]
+fn a_clip_is_matched_with_line_breaks_as_lf_and_pasted_with_the_destinations_ends() {
+    use crate::edit::arm::{Backend, Keys, Press};
+    use eframe::egui::{Key, Modifiers};
+    let ctrl = Modifiers {
+        ctrl: true,
+        command: true,
+        ..Modifiers::NONE
+    };
+    let doc = [0x61, 0xFF, 0x0D, 0x0A, 0x62];
+    let mut ed = open(&doc, Utf8);
+    let mut keys = Keys::new(Backend::Window);
+    let mut clip = None;
+    for press in [Press::key(Key::A, ctrl), Press::Cut] {
+        let command = keys.press(&press);
+        ed.apply(&command, &mut clip);
+    }
+    assert_eq!(bytes_of(&ed), b"");
+    let pasted = clip
+        .as_ref()
+        .map(|c| c.text().replace("\r\n", "\n"))
+        .unwrap();
+    assert_eq!(pasted, "a\u{FFFD}\nb");
+    let command = keys.press(&Press::Paste(pasted));
+    assert_eq!(ed.apply(&command, &mut clip), None);
+    assert_eq!(bytes_of(&ed), doc, "the FF byte and the CR LF back");
+    // A terminal's paste turns a lone CR into LF too.
+    let mut ed = open(b"x\ry\xFF", Utf8);
+    ed.select_all();
+    let clip = ed.copy().unwrap();
+    ed.move_caret(Motion::FileEnd, false);
+    assert_eq!(ed.paste("x\ny\u{FFFD}", Some(&clip)), None);
+    assert_eq!(bytes_of(&ed), b"x\ry\xFFx\ry\xFF");
+    // A clip from an LF file into a CR LF file: CR LF ends, none mixed — the FF kept.
+    let mut lf = open(b"p\nq\xFF", Utf8);
+    lf.select_all();
+    let clip = lf.copy().unwrap();
+    let mut crlf = open(b"1\r\n2", Utf8);
+    at(&mut crlf, 1);
+    assert_eq!(crlf.paste("p\nq\u{FFFD}", Some(&clip)), None);
+    assert_eq!(bytes_of(&crlf), b"1p\r\nq\xFF\r\n2");
+    // With no line end in the clip, another file takes its pieces' bytes as they are.
+    let mut one = open(b"\xFFz", Utf8);
+    one.select_all();
+    let clip = one.copy().unwrap();
+    let mut other = open(b"1\r\n", Utf8);
+    assert_eq!(other.paste("\u{FFFD}z", Some(&clip)), None);
+    assert_eq!(bytes_of(&other), b"\xFFz1\r\n");
+}
+
+/// Item 6: pasted bytes that would join the undecodable bytes beside them are refused.
+#[test]
+fn a_paste_that_would_join_fragments_is_refused() {
+    // UTF-8: `ED` LF `95 9C`; `95 9C` cut and pasted after `ED` would be 한.
+    let mut ed = open(&[0xED, 0x0A, 0x95, 0x9C], Utf8);
+    select(&mut ed, 2, 4);
+    let (clip, said) = ed.cut();
+    assert_eq!(said, None);
+    let clip = clip.unwrap();
+    at(&mut ed, 1);
+    assert!(matches!(
+        ed.paste(clip.text(), Some(&clip)),
+        Some(Said::Refused(_))
+    ));
+    assert_eq!(bytes_of(&ed), [0xED, 0x0A]);
+    // UTF-16LE: a lone high surrogate, LF, a lone low one; the low one pasted after the high
+    // one would be 😀.
+    let mut ed = open(&[0x3D, 0xD8, 0x0A, 0x00, 0x00, 0xDE], Utf16Le);
+    select(&mut ed, 4, 6);
+    let (clip, said) = ed.cut();
+    assert_eq!(said, None);
+    let clip = clip.unwrap();
+    at(&mut ed, 2);
+    assert!(matches!(
+        ed.paste(clip.text(), Some(&clip)),
+        Some(Said::Refused(_))
+    ));
+    assert_eq!(bytes_of(&ed), [0x3D, 0xD8, 0x0A, 0x00]);
+}
+
+/// Item 7: what ED-save and ED-layout call — a Save landed, a re-read, a journal's Restore.
+#[test]
+fn mark_saved_reread_and_restore() {
+    let mut doc = Utf8.bom().to_vec();
+    doc.extend(b"\tab\n");
+    let mut ed = open(&doc, Utf8);
+    ed.move_caret(Motion::FileEnd, false);
+    assert_eq!(ed.type_text("x"), None);
+    assert!(!ed.buffer().is_saved());
+    ed.mark_saved();
+    assert!(ed.buffer().is_saved());
+    assert!(ed.undo());
+    assert!(!ed.buffer().is_saved(), "undo past a Save: unsaved again");
+    assert!(ed.redo());
+    assert!(ed.buffer().is_saved());
+    // A re-read: the new original, the caret after its BOM, no block, a new generation, no
+    // steps, no question, the doubt the new read found.
+    ed.select_all();
+    let new = b"  no bom\n".to_vec();
+    ed.reread(
+        Original::new(new.clone(), Utf8),
+        Doubt {
+            guessed: true,
+            undecodable: 0,
+        },
+    );
+    assert_eq!(bytes_of(&ed), new);
+    assert_eq!((ed.bom(), ed.caret(), ed.shown()), (0, 0, None));
+    assert_eq!(ed.buffer().generation(), 2);
+    assert_eq!(ed.buffer().steps(), 0);
+    assert!(ed.question().is_none());
+    assert!(
+        matches!(ed.type_text("한"), Some(Said::Asked(_))),
+        "the new doubt"
+    );
+    assert_eq!(ed.answer(Answer::Cancel), None);
+    assert_eq!(ed.tab(), None);
+    assert_eq!(
+        bytes_of(&ed),
+        b"      no bom\n",
+        "spaces: the new file indents with them"
+    );
+    // Restore: a buffer a journal rebuilt.
+    let original = Original::new(doc.clone(), Utf8);
+    let spans = [
+        crate::edit::buffer::Span::Original { k: 1, range: 0..4 },
+        crate::edit::buffer::Span::Add(0..1),
+        crate::edit::buffer::Span::Original { k: 1, range: 4..6 },
+    ];
+    let buffer = Buffer::restore(original, 1, b"Z".to_vec(), &spans).unwrap();
+    let ed = Editor::restore(buffer, Doubt::default());
+    let mut want = Utf8.bom().to_vec();
+    want.extend(b"\tZab");
+    assert_eq!(bytes_of(&ed), want);
+    assert_eq!((ed.bom(), ed.caret()), (3, 3));
+    assert!(!ed.buffer().is_saved());
+}
+
+/// Item 8: while the encoding question is up nothing else edits the document, so the held
+/// edit's offsets stay true.
+#[test]
+fn no_edit_while_the_encoding_question_is_up() {
+    let doubt = Doubt {
+        guessed: true,
+        undecodable: 0,
+    };
+    let mut ed = open_with(b"a cat", Utf8, doubt);
+    let found = ed.find(&search("cat", ""), false).unwrap();
+    assert!(matches!(
+        ed.replace_at(found.clone(), "개"),
+        Some(Said::Asked(_))
+    ));
+    assert!(matches!(ed.type_text("zz"), Some(Said::Refused(_))));
+    assert!(matches!(ed.delete_left(), Some(Said::Refused(_))));
+    assert!(!ed.undo());
+    assert_eq!(bytes_of(&ed), b"a cat");
+    assert_eq!(ed.answer(Answer::Type), None);
+    assert_eq!(bytes_of(&ed), "a 개".as_bytes());
+}
+
+/// Item 8: CP949's lead run is read for at most `W` bytes; a longer one is settled by a decode
+/// of what is before the caret — a lone lead after it still takes no typed trail, and a long run
+/// of whole syllables takes typing after it.
+#[test]
+fn a_cp949_lead_run_longer_than_w_is_settled_by_a_decode() {
+    let run = enc(Cp949, &"한".repeat(200));
+    assert!(run.len() > crate::encoding::W);
+    let mut doc = run.clone();
+    doc.extend([0x8C, 0x0A]);
+    let mut ed = open(&doc, Cp949);
+    at(&mut ed, run.len() as u64 + 1);
+    assert_eq!(ed.caret(), run.len() as u64 + 1, "after the lone lead");
+    assert!(matches!(ed.type_text("c"), Some(Said::Refused(_))));
+    assert_eq!(bytes_of(&ed), doc);
+    let mut doc = run.clone();
+    doc.push(0x0A);
+    let mut ed = open(&doc, Cp949);
+    ed.move_caret(Motion::End, false);
+    assert_eq!(ed.type_text("c"), None);
+    assert_eq!(&bytes_of(&ed)[run.len()..], b"c\n");
 }

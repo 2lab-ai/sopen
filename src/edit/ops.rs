@@ -8,15 +8,21 @@
 //!   line's ending (LF, or CR LF) being one; ↑ ↓ PgUp PgDn keep the column in cells (a tab to the
 //!   next multiple of [`TAB`], a wide character two); Ctrl+← → go by words (letters, digits, `_`).
 //!   A character start is looked for from the line's start, or within [`WINDOW`] bytes before the
-//!   place by the encoding's own rules (08 §7.3 rule 4), so a step costs at most that.
+//!   place by the encoding's own rules (08 §7.3 rule 4), so a step, a click and an edit's caret
+//!   cost at most that, however long the line. A column is walked from the last of the line's
+//!   checkpoints before it ([`Cols`]); ↑ ↓ find the target line first, and walk the column only as
+//!   far as that line could reach. CP949 with no sync byte within its look-back W falls back to
+//!   the line's start, as the viewer's rules have no proof there either (08 D28).
 //! - **The block** is Turbo's ([`Block`]): two markers that stay where text is inserted at them,
 //!   kept while the caret moves (persistent: typing does not replace it), shown while begin <
 //!   end and not hidden. Del and Backspace delete it while it is shown; Shift with a move
 //!   extends it from its other end.
 //! - **The clipboard** (E36): Copy and Cut give a [`Clip`] — the decoded text and the block's
-//!   pieces and bytes. A paste of exactly its text pastes the pieces (their bytes, the
-//!   undecodable ones too); pieces another buffer made are stale here, so the bytes, when the
-//!   encodings are one; any other paste holding U+FFFD is refused whole, before it is encoded.
+//!   pieces and bytes. A paste of its text — compared with line breaks as LF, as both pastes
+//!   give them — puts its bytes back, the undecodable ones too: its pieces where its line ends
+//!   are this file's (copied here, or none), else its bytes with this file's line ends; pieces
+//!   another buffer made are stale here, so the bytes, when the encodings are one. Any other
+//!   paste holding U+FFFD is refused whole, before it is encoded.
 //! - **New lines** (§7.2): a line break typed or pasted — LF, CR LF, a lone CR, as the
 //!   terminal's paste gives them all as LF — is written as the ending of the line it splits,
 //!   else the file's first ending, else LF. Enter autoindents while `Indent` is on.
@@ -32,18 +38,24 @@
 //!   is done, and says so).
 //! - **The encoding question** (E37) is a state: the first non-ASCII character typed, pasted or
 //!   given as a replacement in a file whose encoding was guessed or does not decode every byte
-//!   is held until [`Editor::answer`].
+//!   is held until [`Editor::answer`]; meanwhile no other edit, undo or redo is made, so the held
+//!   edit's offsets stay true.
 //! - **Undo** (§7.3): typing (Overwrite's too) and Enter in one run, a Backspace run, a Del run;
 //!   every other command one step; each with the caret and the block before and after it.
 //! - **Find** (E28) matches decoded characters, a line's ending as one `\n`, with Turbo C 2.0's
 //!   options ([`Options`]; G as the research note reads it, `research/editor.md` §1.4 [추정]).
+//!   Replace with N is one pass, forward or back, and one change.
+//! - **ED-save and ED-layout** call [`Editor::mark_saved`], [`Editor::reread`] and
+//!   [`Editor::restore`]; the buffer is not handed out to change.
 
 use super::arm::{BlockOp, Command, Motion};
 use super::buffer::{Buffer, Group, Original, Piece};
 use crate::encoding::encode::Refused;
-use crate::encoding::{Around, Cell, Encoding, AHEAD};
-use std::collections::VecDeque;
+use crate::encoding::{Around, Cell, Encoding, AHEAD, W};
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use unicode_width::UnicodeWidthChar;
 
 /// The viewer's tab width (`gui/text.rs`'s `TAB`): Tab's spaces reach the next multiple of it.
@@ -58,7 +70,22 @@ const CHUNK: u64 = 16 * 1024;
 /// How much of the file Tab's rule reads for indented lines.
 const TABS_SAMPLE: u64 = 64 * 1024;
 
+/// A long line keeps its column every this many bytes walked ([`Cols`]).
+const COL_STRIDE: u64 = 64 * 1024;
+
+/// The widest a character is, in cells: a tab at most [`TAB`], else two.
+const WIDEST: u64 = if TAB > 2 { TAB } else { 2 };
+
+/// Every editor's id, so a clip knows the file it was copied from (E36).
+static EDITORS: AtomicU64 = AtomicU64::new(1);
+
 const FFFD: char = char::REPLACEMENT_CHARACTER;
+
+#[cfg(test)]
+thread_local! {
+    /// The bytes this thread's editors decoded: the tests' measure of an operation's work.
+    static DECODED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Turbo's block: two markers, shown while the begin is before the end and it is not hidden.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +117,10 @@ pub struct Clip {
     pieces: Vec<Piece>,
     bytes: Vec<u8>,
     encoding: Encoding,
+    /// The editor it was copied in: its line ends are that file's.
+    editor: u64,
+    /// It holds a line end.
+    breaks: bool,
 }
 
 impl Clip {
@@ -239,12 +270,14 @@ impl Verb {
 #[derive(Debug, Clone)]
 enum Put<'c> {
     Nothing,
-    /// Encoded bytes, appended to the add buffer.
+    /// Encoded text, appended to the add buffer: whole characters, so nothing after it can
+    /// finish one of them.
     Bytes(Vec<u8>),
     /// A range of the document as it is before the edit, as its pieces (Ctrl+K C, V).
     Old(Range<u64>),
-    /// The caller's clip's pieces, its bytes where they are stale: nothing copied.
-    Clip(&'c [Piece], &'c [u8]),
+    /// A clip's pieces, its bytes where they are stale or none are given (its bytes with this
+    /// file's line ends): the file's own bytes, which may end in a fragment.
+    Clip(&'c [Piece], Cow<'c, [u8]>),
 }
 
 /// One change, in the document's offsets before the edit: `remove` bytes at `at`, then `put`.
@@ -271,16 +304,171 @@ enum Wrong {
 /// The document as an edit would make it: ranges of today's document and new bytes, in order.
 enum Seg<'a> {
     Old(Range<u64>),
-    New(&'a [u8]),
+    /// New bytes; `whole`: they end with a whole character (encoded text).
+    New(&'a [u8], bool),
 }
 
 impl Seg<'_> {
     fn len(&self) -> u64 {
         match self {
             Seg::Old(r) => r.end - r.start,
-            Seg::New(b) => b.len() as u64,
+            Seg::New(b, _) => b.len() as u64,
         }
     }
+}
+
+/// [`Seg`]s with where each starts, so a read finds its first one by a binary search.
+struct Segs<'a> {
+    segs: Vec<Seg<'a>>,
+    starts: Vec<u64>,
+    total: u64,
+}
+
+impl<'a> Segs<'a> {
+    fn new(segs: Vec<Seg<'a>>) -> Self {
+        let mut starts = Vec::with_capacity(segs.len());
+        let mut total = 0;
+        for s in &segs {
+            starts.push(total);
+            total += s.len();
+        }
+        Segs {
+            segs,
+            starts,
+            total,
+        }
+    }
+
+    /// The segment byte `x` is in, and where it starts.
+    fn at(&self, x: u64) -> (&Seg<'a>, u64) {
+        let i = self.starts.partition_point(|&s| s <= x).saturating_sub(1);
+        (&self.segs[i], self.starts[i])
+    }
+
+    /// `r` of the document they make.
+    fn read(&self, d: Doc<'_>, r: Range<u64>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let first = self
+            .starts
+            .partition_point(|&s| s <= r.start)
+            .saturating_sub(1);
+        for (s, &at) in self.segs[first..].iter().zip(&self.starts[first..]) {
+            if at >= r.end {
+                break;
+            }
+            let (a, b) = (r.start.max(at), r.end.min(at + s.len()));
+            if a < b {
+                match s {
+                    Seg::Old(o) => d.b.read(o.start + a - at..o.start + b - at, &mut out),
+                    Seg::New(bytes, _) => {
+                        out.extend_from_slice(&bytes[(a - at) as usize..(b - at) as usize])
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A long line's columns (item 1 of ED-ops's review): per line, by its start, the column at a
+/// character start every [`COL_STRIDE`] bytes walked, so a column is walked from the last one
+/// before it. An edit drops what it may change: the lines from its first place on, and the
+/// checkpoints past that place.
+#[derive(Debug, Default)]
+struct Cols(HashMap<u64, Vec<(u64, u64)>>);
+
+impl Cols {
+    /// The last checkpoint at or before `x` on the line starting at `ls`, else the line's start.
+    fn before(&self, ls: u64, x: u64) -> (u64, u64) {
+        let v = self.0.get(&ls).map_or(&[][..], Vec::as_slice);
+        let i = v.partition_point(|&(o, _)| o <= x);
+        if i == 0 {
+            (ls, 0)
+        } else {
+            v[i - 1]
+        }
+    }
+
+    /// The last checkpoint whose column is at most `col`, else the line's start.
+    fn at_most(&self, ls: u64, col: u64) -> (u64, u64) {
+        let v = self.0.get(&ls).map_or(&[][..], Vec::as_slice);
+        let i = v.partition_point(|&(_, c)| c <= col);
+        if i == 0 {
+            (ls, 0)
+        } else {
+            v[i - 1]
+        }
+    }
+
+    fn record(&mut self, ls: u64, at: u64, col: u64) {
+        let v = self.0.entry(ls).or_default();
+        if at >= v.last().map_or(ls, |l| l.0) + COL_STRIDE {
+            v.push((at, col));
+        }
+    }
+
+    /// An edit from byte `p` on.
+    fn edited(&mut self, p: u64) {
+        self.0.retain(|&ls, v| {
+            v.retain(|&(o, _)| o <= p);
+            ls < p
+        });
+    }
+}
+
+/// Walks `line` (from `ls` to `le`) from `from` — a character start and its column — until
+/// `stop(start, column, width)` says so or the line ends, keeping checkpoints: where it stopped
+/// and its column.
+fn walk(
+    d: Doc<'_>,
+    cols: &mut Cols,
+    (ls, le): (u64, u64),
+    from: (u64, u64),
+    mut stop: impl FnMut(u64, u64, u64) -> bool,
+) -> (u64, u64) {
+    let (mut at, mut col) = from;
+    for (s, c, e) in d.chars_from(at) {
+        if s >= le {
+            break;
+        }
+        let w = width(c, col);
+        if stop(s, col, w) {
+            return (s, col);
+        }
+        col += w;
+        at = e;
+        cols.record(ls, at, col);
+    }
+    (le, col)
+}
+
+/// The column `x` is at, or `None` once it is past `cap`.
+fn column_at(d: Doc<'_>, cols: &mut Cols, x: u64, cap: u64) -> Option<u64> {
+    let line = d.line_of(x);
+    let ends = (d.line_start(line), d.line_end(line));
+    let from = cols.before(ends.0, x);
+    let (_, col) = walk(d, cols, ends, from, |s, col, _| s >= x || col > cap);
+    (col <= cap).then_some(col)
+}
+
+/// The place on `line` at column `goal`: the first character reaching past it, or the line's end.
+fn at_column(d: Doc<'_>, cols: &mut Cols, line: u64, goal: u64) -> u64 {
+    let ends = (d.line_start(line), d.line_end(line));
+    let from = cols.at_most(ends.0, goal);
+    walk(d, cols, ends, from, |_, col, w| col + w > goal).0
+}
+
+/// What a Replace's pass found: the span from its first match to its last, the span's new
+/// bytes, the count of matches.
+type Replaced = (Range<u64>, Vec<u8>, usize);
+
+/// The column ↑ ↓ keep (§5.1): where the first of a run of them started, and its column once
+/// known. A run comes back to that place on its own line.
+#[derive(Debug, Clone, Copy)]
+struct Goal {
+    line: u64,
+    x: u64,
+    col: Option<u64>,
 }
 
 /// The encodings `pick` takes a byte-order mark for (08 §7.2 step 1), the longest first.
@@ -421,6 +609,8 @@ impl<'a> Doc<'a> {
     /// The cells of `from..to`, `from` a character start, each with where it starts; and where
     /// the cells end (short of `to` when not `whole`).
     fn cells(self, from: u64, to: u64, whole: bool) -> (Vec<(u64, Cell)>, u64) {
+        #[cfg(test)]
+        DECODED.with(|n| n.set(n.get() + to.saturating_sub(from)));
         let bytes = self.read(from..to);
         let (cells, used) = self.enc().decode(&bytes, whole);
         let mut at = from;
@@ -499,30 +689,6 @@ impl<'a> Doc<'a> {
         }
     }
 
-    /// The column `x` is at, in cells.
-    fn column(self, x: u64) -> u64 {
-        let ls = self.line_start(self.line_of(x));
-        let mut col = 0;
-        for (_, c) in self.cells(ls, x, true).0 {
-            col += width(c.ch, col);
-        }
-        col
-    }
-
-    /// The place on `line` at column `goal`, or the line's end.
-    fn at_column(self, line: u64, goal: u64) -> u64 {
-        let (ls, le) = (self.line_start(line), self.line_end(line));
-        let mut col = 0;
-        for (s, c) in self.cells(ls, le, true).0 {
-            let w = width(c.ch, col);
-            if col + w > goal {
-                return s;
-            }
-            col += w;
-        }
-        le
-    }
-
     fn word_right(self, x: u64) -> u64 {
         let mut in_word = true;
         let mut at = x;
@@ -566,7 +732,9 @@ impl<'a> Doc<'a> {
             let past = self.fix(at);
             return if past > at { past } else { le };
         }
-        let (cells, _) = self.cells(self.anchor(at), le, true);
+        // The character holding `at` ends within four bytes of it, so eight past it are enough.
+        let to = (at + 8).min(le);
+        let (cells, _) = self.cells(self.anchor(at), to, to == le);
         cells
             .iter()
             .take_while(|(s, _)| *s <= at)
@@ -636,84 +804,85 @@ impl<'a> Doc<'a> {
     // The check before an edit.
 
     /// The document `changes` (sorted, apart) would make, as segments.
-    fn segments<'c>(self, changes: &'c [Change<'_>]) -> Vec<Seg<'c>> {
+    fn segments<'c>(self, changes: &'c [Change<'_>]) -> Segs<'c> {
         let mut segs = Vec::new();
         let mut from = 0;
         for c in changes {
             segs.push(Seg::Old(from..c.at));
             match &c.put {
                 Put::Nothing => {}
-                Put::Bytes(b) => segs.push(Seg::New(b)),
-                Put::Clip(_, b) => segs.push(Seg::New(b)),
+                Put::Bytes(b) => segs.push(Seg::New(b, true)),
+                Put::Clip(_, b) => segs.push(Seg::New(b, false)),
                 Put::Old(r) => segs.push(Seg::Old(r.clone())),
             }
             from = c.at + c.remove;
         }
         segs.push(Seg::Old(from..self.len()));
         segs.retain(|s| s.len() > 0);
-        segs
+        Segs::new(segs)
     }
 
-    /// `r` of the document `segs` make.
-    fn read_segs(self, segs: &[Seg], r: Range<u64>) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut at = 0;
-        for s in segs {
-            let n = s.len();
-            let (a, b) = (r.start.max(at), r.end.min(at + n));
-            if a < b {
-                match s {
-                    Seg::Old(o) => self.b.read(o.start + a - at..o.start + b - at, &mut out),
-                    Seg::New(bytes) => {
-                        out.extend_from_slice(&bytes[(a - at) as usize..(b - at) as usize])
-                    }
-                }
-            }
-            at += n;
+    /// Whether a CP949 lead waits for its trail at seam `p` of `segs`' document: the run of
+    /// 0x81–0xFE right before `p` is odd (`cp949.rs`'s phase rule; a line's start follows an LF,
+    /// which ends a run). The run is read for at most [`W`] bytes, cp949's look-back; a longer
+    /// one is settled by what is before `p` — today's document, decoded from a character start
+    /// its rules prove (a line's start where none is nearer), or new bytes decoded from their
+    /// start.
+    fn lead_waits(self, segs: &Segs<'_>, p: u64) -> bool {
+        let is_lead = |b: &u8| (0x81..=0xFE).contains(b);
+        let from = p.saturating_sub(W as u64);
+        let bytes = segs.read(self, from..p);
+        let run = bytes.iter().rev().take_while(|b| is_lead(b)).count();
+        if run < bytes.len() || from == 0 {
+            return run % 2 == 1;
         }
-        out
-    }
-
-    /// The bytes of 0x81–0xFE right before `p` in `segs`' document: CP949's pending lead is an
-    /// odd run (`cp949.rs`'s phase rule; a line's start follows an LF, which ends the run).
-    fn leads_before(self, segs: &[Seg], p: u64) -> u64 {
-        let (mut n, mut q) = (0, p);
-        while q > 0 {
-            let from = q.saturating_sub(4096);
-            let bytes = self.read_segs(segs, from..q);
-            let k = bytes
-                .iter()
-                .rev()
-                .take_while(|b| (0x81..=0xFE).contains(*b))
-                .count();
-            n += k as u64;
-            if k < bytes.len() {
-                break;
+        let lone = |cells: &[(u64, Cell)], bytes: &dyn Fn(u64) -> u8| {
+            cells
+                .last()
+                .is_some_and(|&(s, c)| c.len == 1 && is_lead(&bytes(s)))
+        };
+        match segs.at(p - 1) {
+            (Seg::Old(r), at) => {
+                let o = r.start + (p - at);
+                let (cells, _) = self.cells(self.anchor(o), o, true);
+                lone(&cells, &|s| self.read(s..s + 1)[0])
             }
-            q = from;
+            (Seg::New(b, _), at) => {
+                let n = (p - at) as usize;
+                let (cells, _) = self.enc().decode(&b[..n], true);
+                let mut s = 0;
+                let starts: Vec<(u64, Cell)> = cells
+                    .into_iter()
+                    .map(|c| {
+                        let x = s;
+                        s += u64::from(c.len);
+                        (x, c)
+                    })
+                    .collect();
+                lone(&starts, &|s| b[s as usize])
+            }
         }
-        n
     }
 
-    /// Whether a character starting before seam `p` of `segs`' document (`total` bytes long)
-    /// would take bytes after it: the bytes before `p` leave one unfinished (a UTF-8 sequence
-    /// cut short, a UTF-16 high surrogate, a CP949 lead) and those after finish it.
-    fn joins_at(self, segs: &[Seg], p: u64, total: u64) -> bool {
+    /// Whether a character starting before seam `p` of `segs`' document would take bytes after
+    /// it: the bytes before `p` leave one unfinished (a UTF-8 sequence cut short, a UTF-16 high
+    /// surrogate, a CP949 lead) and those after finish it.
+    fn joins_at(self, segs: &Segs<'_>, p: u64) -> bool {
         let e = self.enc();
         let start = match e {
             Encoding::Utf8 | Encoding::Utf16Le | Encoding::Utf16Be => {
                 let from = p.saturating_sub(e.look_back() as u64);
-                let before = self.read_segs(segs, from..p);
+                let before = segs.read(self, from..p);
                 e.grid_cut(Around::new(from, &before), p).unwrap_or(p)
             }
-            Encoding::Cp949 if self.leads_before(segs, p) % 2 == 1 => p - 1,
+            Encoding::Cp949 if self.lead_waits(segs, p) => p - 1,
             _ => p,
         };
         if start == p {
             return false;
         }
-        let to = (p + 8).min(total);
-        let (cells, _) = e.decode(&self.read_segs(segs, start..to), to == total);
+        let to = (p + 8).min(segs.total);
+        let (cells, _) = e.decode(&segs.read(self, start..to), to == segs.total);
         let mut at = start;
         for c in cells {
             at += u64::from(c.len);
@@ -726,32 +895,31 @@ impl<'a> Doc<'a> {
 
     /// §7.2, E35 and ED-ops's carried rules over the document `changes` would make: whole units
     /// but at its end, and no typed or pasted text joined with the bytes beside it (carried rule
-    /// (a)). Where a delete or a block command brings the file's own bytes together, they read
-    /// as they read: a faithful decode, never refused (decision of 2026-11-25). `Ok`: the
-    /// byte-order mark it would newly start with, if any.
+    /// (a)) — at the start of new bytes, and at the end of a clip's, which may end in a
+    /// fragment; encoded text ends with a whole character. Where a delete or a block command
+    /// brings the file's own bytes together, they read as they read: a faithful decode, never
+    /// refused (decision of 2026-11-25). `Ok`: the byte-order mark it would newly start with.
     fn check(self, changes: &[Change<'_>]) -> Result<Option<Encoding>, Wrong> {
         let segs = self.segments(changes);
-        let total: u64 = segs.iter().map(Seg::len).sum();
+        let list = &segs.segs;
         let u = self.unit();
-        if let Some((i, _)) = segs[..segs.len().saturating_sub(1)]
+        if let Some((i, _)) = list[..list.len().saturating_sub(1)]
             .iter()
             .enumerate()
             .find(|(_, s)| s.len() % u != 0)
         {
-            let end = matches!(&segs[i], Seg::Old(r) if r.end == self.len())
-                && matches!(segs[i + 1], Seg::New(_));
+            let end = matches!(&list[i], Seg::Old(r) if r.end == self.len())
+                && matches!(list[i + 1], Seg::New(..));
             return Err(Wrong::Unit { end });
         }
-        let mut p = 0;
-        for w in segs.windows(2) {
-            p += w[0].len();
-            let typed = matches!(w[0], Seg::New(_)) || matches!(w[1], Seg::New(_));
-            if typed && self.joins_at(&segs, p, total) {
+        for (i, w) in list.windows(2).enumerate() {
+            let seam = matches!(w[1], Seg::New(..)) || matches!(w[0], Seg::New(_, false));
+            if seam && self.joins_at(&segs, segs.starts[i + 1]) {
                 return Err(Wrong::Join);
             }
         }
         let head = |n: u64| self.read(0..n.min(self.len()));
-        let new_head = self.read_segs(&segs, 0..4.min(total));
+        let new_head = segs.read(self, 0..4.min(segs.total));
         let made = bom_of(&new_head);
         Ok(made.filter(|_| made != bom_of(&head(4))))
     }
@@ -808,6 +976,136 @@ impl<'a> Doc<'a> {
             }
         }
         hit(&win, prev, None).or(found)
+    }
+
+    /// Whether the replacement `put` written right after the character `prev` (its bytes'
+    /// range) would finish it — an undecodable fragment, a CP949 lead, a UTF-16 high surrogate —
+    /// into another character (carried rule (a)).
+    fn finishes(self, prev: Option<(char, u64, u64)>, put: &[u8]) -> bool {
+        let Some((FFFD, s, e)) = prev else {
+            return false;
+        };
+        let mut bytes = self.read(s..e);
+        let n = bytes.len();
+        bytes.extend_from_slice(&put[..put.len().min(8)]);
+        let (cells, _) = self.enc().decode(&bytes, put.len() <= 8);
+        cells.first().is_some_and(|c| usize::from(c.len) > n)
+    }
+
+    /// One pass forward from `lo` (a character start): the matches, none overlapping, chosen
+    /// from the left, each replaced by `put(start)`. `Ok(Some)`: the span from the first match
+    /// to the last, its new bytes, the count; `Err`: a replacement would finish the fragment
+    /// before it.
+    fn replace_forward<'p>(
+        self,
+        needle: &[char],
+        o: Options,
+        lo: u64,
+        put: &dyn Fn(u64) -> Cow<'p, [u8]>,
+    ) -> Result<Option<Replaced>, ()> {
+        let m = needle.len();
+        let key = |c: char| if o.ignore_case { fold(c) } else { c };
+        let mut prev = self.chars_back(lo).next().map(|(s, c, e)| (c, s, e));
+        let mut win: VecDeque<(char, u64, u64)> = VecDeque::with_capacity(m + 1);
+        let (mut out, mut span, mut copied, mut n) = (Vec::new(), None::<u64>, lo, 0);
+        let mut chars = self.chars_from(lo).map(|(s, c, e)| (c, s, e));
+        loop {
+            let next = chars.next();
+            let hit = win.len() == m
+                && win.iter().zip(needle).all(|(w, k)| key(w.0) == *k)
+                && !(o.whole_words
+                    && ((is_word(needle[0]) && prev.is_some_and(|p| is_word(p.0)))
+                        || (is_word(needle[m - 1]) && next.is_some_and(|c| is_word(c.0)))));
+            if hit {
+                let (ms, me) = (win[0].1, win[m - 1].2);
+                let bytes = put(ms);
+                // The character before a match that follows another is a replacement's: whole.
+                if (span.is_none() || copied < ms) && self.finishes(prev, &bytes) {
+                    return Err(());
+                }
+                if span.is_none() {
+                    span = Some(ms);
+                    copied = ms;
+                }
+                self.b.read(copied..ms, &mut out);
+                out.extend_from_slice(&bytes);
+                copied = me;
+                n += 1;
+                prev = win.back().copied();
+                win.clear();
+            }
+            let Some(c) = next else { break };
+            win.push_back(c);
+            if win.len() > m {
+                prev = win.pop_front();
+            }
+        }
+        Ok(span.map(|s| (s..copied, out, n)))
+    }
+
+    /// One pass back from `hi` (a character start): the matches before it, none overlapping,
+    /// chosen from the right. As [`Doc::replace_forward`]; the new bytes are gathered reversed.
+    fn replace_back<'p>(
+        self,
+        needle: &[char],
+        o: Options,
+        hi: u64,
+        put: &dyn Fn(u64) -> Cow<'p, [u8]>,
+    ) -> Result<Option<Replaced>, ()> {
+        let m = needle.len();
+        let key = |c: char| if o.ignore_case { fold(c) } else { c };
+        // The character after the window, and the window in the text's order.
+        let mut after = self.chars_from(hi).next().map(|(s, c, e)| (c, s, e));
+        let mut win: VecDeque<(char, u64, u64)> = VecDeque::with_capacity(m + 1);
+        let (mut rev, mut end, mut copied, mut n) = (Vec::new(), None::<u64>, hi, 0);
+        // The last replacement's start, first bytes and the character before it: the check for
+        // a fragment it would finish waits until the pass knows whether another match ends
+        // right there, whose replacement, a whole character, would stand before it instead.
+        type Waiting = (u64, Vec<u8>, Option<(char, u64, u64)>);
+        let mut waiting: Option<Waiting> = None;
+        let settle = |w: Option<Waiting>, before: Option<u64>| match w {
+            Some((ms, head, p)) if before != Some(ms) => self.finishes(p, &head),
+            _ => false,
+        };
+        let mut chars = self.chars_back(hi).map(|(s, c, e)| (c, s, e));
+        loop {
+            let prev = chars.next();
+            let hit = win.len() == m
+                && win.iter().zip(needle).all(|(w, k)| key(w.0) == *k)
+                && !(o.whole_words
+                    && ((is_word(needle[0]) && prev.is_some_and(|p| is_word(p.0)))
+                        || (is_word(needle[m - 1]) && after.is_some_and(|c| is_word(c.0)))));
+            if hit {
+                let (ms, me) = (win[0].1, win[m - 1].2);
+                if settle(waiting.take(), Some(me)) {
+                    return Err(());
+                }
+                let bytes = put(ms);
+                if end.is_none() {
+                    end = Some(me);
+                    copied = me;
+                }
+                let mut old = Vec::new();
+                self.b.read(me..copied, &mut old);
+                rev.extend(old.iter().rev());
+                rev.extend(bytes.iter().rev());
+                copied = ms;
+                n += 1;
+                waiting = Some((ms, bytes[..bytes.len().min(8)].to_vec(), prev));
+                after = win.front().copied();
+                win.clear();
+            }
+            let Some(c) = prev else { break };
+            win.push_front(c);
+            if win.len() > m {
+                after = win.pop_back();
+            }
+        }
+        if settle(waiting, None) {
+            return Err(());
+        }
+        rev.reverse();
+        Ok(end.map(|e| (copied..e, rev, n)))
     }
 
     fn find(self, needle: &[char], o: Options, from: u64) -> Option<Range<u64>> {
@@ -929,6 +1227,8 @@ enum Pending {
 
 /// One editor's document and its state.
 pub struct Editor {
+    /// This editor's id, which its clips carry (E36).
+    id: u64,
     buffer: Buffer<Sel>,
     sel: Sel,
     bom: u64,
@@ -936,22 +1236,35 @@ pub struct Editor {
     indent: bool,
     tabs: bool,
     /// The column ↑ ↓ keep, from the first of a run of them.
-    goal: Option<u64>,
+    goal: Option<Goal>,
+    cols: Cols,
     page: u64,
     /// Until the question is answered Type: E37's reason, once.
     doubt: Option<Doubt>,
     question: Option<(Pending, String)>,
 }
 
+/// The BOM `original` starts with under its encoding: the caret's first place (§7.2).
+fn bom_len(original: &Original) -> u64 {
+    let head = &original.bytes()[..original.bytes().len().min(4)];
+    original.encoding().bom_len(head) as u64
+}
+
 impl Editor {
     /// The editor on `original` as read at F4, in its encoding, `doubt` from the read's pass.
     /// The caret at the file's start, after a BOM; `Insert` and `Indent` on.
     pub fn open(original: Original, doubt: Doubt) -> Editor {
-        let e = original.encoding();
-        let head = &original.bytes()[..original.bytes().len().min(4)];
-        let bom = e.bom_len(head) as u64;
+        Self::restore(Buffer::new(original), doubt)
+    }
+
+    /// The editor on a buffer a journal rebuilt (ED-save's Restore, ES-3: `Buffer::restore`),
+    /// as [`Editor::open`] makes one: the caret after its original's BOM, no block, no undo
+    /// steps but the buffer's.
+    pub fn restore(buffer: Buffer<Sel>, doubt: Doubt) -> Editor {
+        let bom = bom_len(buffer.original());
         let mut ed = Editor {
-            buffer: Buffer::new(original),
+            id: EDITORS.fetch_add(1, Ordering::Relaxed),
+            buffer,
             sel: Sel {
                 caret: bom,
                 block: None,
@@ -961,12 +1274,35 @@ impl Editor {
             indent: true,
             tabs: false,
             goal: None,
+            cols: Cols::default(),
             page: 20,
             doubt: doubt.any().then_some(doubt),
             question: None,
         };
         ed.tabs = ed.doc().indents_with_tabs();
         ed
+    }
+
+    /// A Save landed (§9.3): the undo stack is marked saved here (ED-save).
+    pub fn mark_saved(&mut self) {
+        self.buffer.mark_saved();
+    }
+
+    /// A re-read (§7.3: Reload, E30's re-read of a clean editor): `original` in the same
+    /// encoding, `doubt` from its read. The undo history starts over; the caret goes after its
+    /// BOM, the block, the question and the kept column go, and Tab's rule is read again.
+    pub fn reread(&mut self, original: Original, doubt: Doubt) {
+        self.bom = bom_len(&original);
+        self.buffer.reread(original);
+        self.sel = Sel {
+            caret: self.bom,
+            block: None,
+        };
+        self.goal = None;
+        self.cols = Cols::default();
+        self.doubt = doubt.any().then_some(doubt);
+        self.question = None;
+        self.tabs = self.doc().indents_with_tabs();
     }
 
     fn doc(&self) -> Doc<'_> {
@@ -1071,15 +1407,14 @@ impl Editor {
         };
         let x = self.sel.caret;
         let line = d.line_of(x);
-        let vertical = |goal: u64, delta: i64| -> u64 {
-            let target = (line as i64 + delta).clamp(0, d.last_line() as i64) as u64;
-            if target == line {
-                x
-            } else {
-                d.at_column(target, goal)
-            }
-        };
         let page = self.page as i64;
+        let delta = match motion {
+            Motion::Up => -1,
+            Motion::Down => 1,
+            Motion::PageUp => -page,
+            Motion::PageDown => page,
+            _ => 0,
+        };
         let to = match motion {
             Motion::Left => d.prev(x).unwrap_or(x),
             Motion::Right => d.next(x).unwrap_or(x),
@@ -1090,14 +1425,29 @@ impl Editor {
             Motion::FileStart => self.bom,
             Motion::FileEnd => d.len(),
             Motion::Up | Motion::Down | Motion::PageUp | Motion::PageDown => {
-                let goal = *self.goal.get_or_insert_with(|| d.column(x));
-                let delta = match motion {
-                    Motion::Up => -1,
-                    Motion::Down => 1,
-                    Motion::PageUp => -page,
-                    _ => page,
+                // The target line first: a move that stays on its line needs no column.
+                let target = (line as i64 + delta).clamp(0, d.last_line() as i64) as u64;
+                let goal = self.goal.get_or_insert(Goal { line, x, col: None });
+                let to = if target == line {
+                    x
+                } else if target == goal.line {
+                    goal.x
+                } else {
+                    let (ts, te) = (d.line_start(target), d.line_end(target));
+                    // The column is walked only as far as the target line could reach: past
+                    // that the caret goes to its end, whatever the exact column.
+                    let col = goal.col.or_else(|| {
+                        let cap = WIDEST * (te - ts);
+                        column_at(d, &mut self.cols, goal.x, cap)
+                    });
+                    match col {
+                        Some(c) => {
+                            goal.col = Some(c);
+                            at_column(d, &mut self.cols, target, c)
+                        }
+                        None => te,
+                    }
                 };
-                let to = vertical(goal, delta);
                 self.go(to, extend);
                 return;
             }
@@ -1151,6 +1501,13 @@ impl Editor {
             .collect();
         if changes.is_empty() {
             return None;
+        }
+        if self.question.is_some() {
+            // Its held edit names byte offsets of the document as it is (E37).
+            return refuse(format!(
+                "the encoding question waits for its answer — nothing was {}",
+                verb.word()
+            ));
         }
         let label = self.buffer.encoding().label();
         let made = match self.doc().check(&changes) {
@@ -1250,6 +1607,7 @@ impl Editor {
         );
         let before = self.sel;
         let bom = self.bom;
+        self.cols.edited(changes[0].at);
         let mut e = self.buffer.edit(group, before);
         for (c, (pieces, put_first)) in changes.iter().zip(&plans).rev() {
             let end = c.at + c.remove;
@@ -1259,10 +1617,13 @@ impl Editor {
                     e.insert(at, b);
                 }
                 Put::Old(_) => {
-                    let _ = e.insert_pieces(at, pieces);
+                    // A moved block's pieces are this buffer's, taken just now: never stale, so
+                    // the block is never lost.
+                    e.insert_pieces(at, pieces)
+                        .expect("a block's own pieces are held");
                 }
                 Put::Clip(p, b) => {
-                    if e.insert_pieces(at, p).is_err() {
+                    if p.is_empty() || e.insert_pieces(at, p).is_err() {
                         e.insert(at, b);
                     }
                 }
@@ -1405,7 +1766,11 @@ impl Editor {
         if self.tabs {
             return self.insert_text("\t");
         }
-        let col = self.doc().column(self.sel.caret);
+        let d = Doc {
+            b: &self.buffer,
+            bom: self.bom,
+        };
+        let col = column_at(d, &mut self.cols, self.sel.caret, u64::MAX).unwrap_or(0);
         let spaces = " ".repeat((TAB - col % TAB) as usize);
         self.insert_text(&spaces)
     }
@@ -1687,11 +2052,15 @@ impl Editor {
     pub fn copy(&self) -> Option<Clip> {
         let r = self.shown()?;
         let d = self.doc();
+        let bytes = d.read(r.clone());
+        let e = self.buffer.encoding();
         Some(Clip {
             text: d.text(r.clone()),
-            pieces: self.buffer.pieces_in(r.clone()),
-            bytes: d.read(r),
-            encoding: self.buffer.encoding(),
+            pieces: self.buffer.pieces_in(r),
+            breaks: e.find_lf(&bytes, 0).is_some(),
+            bytes,
+            encoding: e,
+            editor: self.id,
         })
     }
 
@@ -1706,18 +2075,29 @@ impl Editor {
         }
     }
 
-    /// A paste of `text` at the caret, one undo step: the pieces of `clip` when `text` is its
-    /// text (their bytes where another buffer made them, in the same encoding); else the text,
-    /// refused whole when it holds U+FFFD (E36, before it is encoded) or a character the
-    /// encoding cannot hold; its line breaks as the ending of the line it lands in.
+    /// A paste of `text` at the caret, one undo step (E36, §7.2). When `text` is `clip`'s text —
+    /// compared with every line break as LF, as both pastes give them (egui-winit turns CR LF
+    /// into LF, a terminal CR LF and a lone CR) — the clip's bytes go in, the undecodable ones
+    /// too: its pieces where its line ends are this file's (copied here, or none), else its bytes
+    /// with each line end as the line it lands in ends. Any other text is refused whole when it
+    /// holds U+FFFD (before it is encoded) or a character the encoding cannot hold; its line
+    /// breaks are written as the ending of the line it lands in.
     pub fn paste(&mut self, text: &str, clip: Option<&Clip>) -> Outcome {
         if text.is_empty() {
             return None;
         }
         let x = self.sel.caret;
         let e = self.buffer.encoding();
-        let (put, ask) = match clip.filter(|c| c.text == text && c.encoding == e) {
-            Some(c) => (Put::Clip(&c.pieces, &c.bytes), None),
+        let ending = self.doc().new_line(self.doc().line_of(x));
+        let ours = clip.filter(|c| c.encoding == e && lf_only(&c.text) == lf_only(text));
+        let (put, ask) = match ours {
+            Some(c) if c.editor == self.id || !c.breaks => {
+                (Put::Clip(&c.pieces, Cow::Borrowed(&c.bytes)), None)
+            }
+            Some(c) => (
+                Put::Clip(&[], Cow::Owned(with_ending(e, &c.bytes, &ending))),
+                None,
+            ),
             None => {
                 if text.contains(FFFD) {
                     return refuse(
@@ -1725,7 +2105,6 @@ impl Editor {
                             .to_string(),
                     );
                 }
-                let ending = self.doc().new_line(self.doc().line_of(x));
                 match self.encode(text, &ending) {
                     Ok(b) => (
                         Put::Bytes(b),
@@ -1753,7 +2132,11 @@ impl Editor {
 
     /// Undo (§7.3): the caret and the block as they were before the step.
     pub fn undo(&mut self) -> bool {
+        if self.question.is_some() {
+            return false;
+        }
         self.goal = None;
+        self.cols = Cols::default();
         match self.buffer.undo() {
             Some(sel) => {
                 self.sel = sel;
@@ -1765,7 +2148,11 @@ impl Editor {
 
     /// Redo: the caret and the block as they were after the step.
     pub fn redo(&mut self) -> bool {
+        if self.question.is_some() {
+            return false;
+        }
         self.goal = None;
+        self.cols = Cols::default();
         match self.buffer.redo() {
             Some(sel) => {
                 self.sel = sel;
@@ -1848,54 +2235,67 @@ impl Editor {
         )
     }
 
-    /// Replace with N (no asking), one undo step: every match from the caret on (backward, before
-    /// it), or with G every match in the file. The count replaced.
+    /// Replace with N (no asking), one undo step, in one pass over the text: every match from the
+    /// caret on, or backward every match before it — chosen from the caret back, so `aaa` with
+    /// `aa` gives `aX` — or with G every match in the file, in the search's direction. The text
+    /// from the first match to the last is written again as one change, so the memory it takes
+    /// is that text's, however many matches. The count replaced.
     pub fn replace_all(&mut self, search: &Search, text: &str) -> (usize, Outcome) {
-        let o = search.options;
-        let d = self.doc();
-        let needle = Self::needle(search);
-        let (lo, hi) = match (o.global, o.backward) {
-            (true, _) => (self.bom, u64::MAX),
-            (false, false) => (self.sel.caret, u64::MAX),
-            (false, true) => (self.bom, self.sel.caret),
-        };
-        let forward = Options {
-            backward: false,
-            ..o
-        };
-        let mut found: Vec<Range<u64>> = Vec::new();
-        let mut from = lo;
-        while let Some(r) = d.scan(&needle, forward, from, hi, false) {
-            from = r.end;
-            found.push(r);
+        if self.question.is_some() {
+            return (
+                0,
+                refuse("the encoding question waits for its answer — nothing was replaced".into()),
+            );
         }
-        if found.is_empty() {
+        let o = search.options;
+        let needle = Self::needle(search);
+        if needle.is_empty() {
             return (0, None);
         }
-        let mut changes: Vec<Change<'_>> = Vec::new();
-        for r in &found {
-            let ending = d.new_line(d.line_of(r.start));
-            let bytes = match self.encode(text, &ending) {
-                Ok(b) => b,
-                Err(e) => return (0, refuse(format!("{e} — nothing was replaced"))),
-            };
-            // Matches that touch become one change, so no part goes in next to another's seam.
-            match changes.last_mut() {
-                Some(c) if c.at + c.remove == r.start => {
-                    c.remove += r.end - r.start;
-                    if let Put::Bytes(b) = &mut c.put {
-                        b.extend(bytes);
-                    }
-                }
-                _ => changes.push(change(r.start, r.end - r.start, Put::Bytes(bytes))),
+        let d = self.doc();
+        let e = d.enc();
+        // The replacement, encoded once; per match only where it holds a line break, which is
+        // written as the ending of the match's line.
+        let lf = match self.encode(text, e.lf()) {
+            Ok(b) => b,
+            Err(r) => return (0, refuse(format!("{r} — nothing was replaced"))),
+        };
+        let breaks = text.contains(['\r', '\n']);
+        let encoded = |at: u64| -> Cow<'_, [u8]> {
+            if breaks {
+                let ending = d.new_line(d.line_of(at));
+                Cow::Owned(self.encode(text, &ending).unwrap_or_default())
+            } else {
+                Cow::Borrowed(&lf)
             }
-        }
+        };
+        let found = if o.backward {
+            let hi = if o.global { d.len() } else { self.sel.caret };
+            d.replace_back(&needle, o, hi, &encoded)
+        } else {
+            let lo = if o.global { self.bom } else { self.sel.caret };
+            d.replace_forward(&needle, o, lo, &encoded)
+        };
+        let (span, bytes, n) = match found {
+            Err(()) => {
+                return (
+                    0,
+                    refuse(
+                        "that would make one character of it and the undecodable bytes beside it — nothing was replaced"
+                            .to_string(),
+                    ),
+                )
+            }
+            Ok(None) => return (0, None),
+            Ok(Some(found)) => found,
+        };
         let ask = Self::ask(text, Pending::ReplaceAll(search.clone(), text.to_string()));
-        let said = self.commit(Group::Single, changes, Verb::Replaced, ask, Self::kept);
+        let change = change(span.start, span.end - span.start, Put::Bytes(bytes));
+        let said = self.commit(Group::Single, vec![change], Verb::Replaced, ask, Self::kept);
         let n = if matches!(said, Some(Said::Refused(_) | Said::Asked(_))) {
             0
         } else {
-            found.len()
+            n
         };
         (n, said)
     }
@@ -1960,6 +2360,32 @@ impl Editor {
 
 fn refuse(line: String) -> Outcome {
     Some(Said::Refused(line))
+}
+
+/// `text` with every line break — CR LF, a lone CR — as LF, as a paste gives it.
+fn lf_only(text: &str) -> Cow<'_, str> {
+    if text.contains('\r') {
+        Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// `bytes` (of encoding `e`, from a character start) with each line end — an LF unit, and the CR
+/// unit right before it — as `ending`. A lone CR is a character, and stays.
+fn with_ending(e: Encoding, bytes: &[u8], ending: &[u8]) -> Vec<u8> {
+    let (lf, u) = (e.lf().len(), e.unit());
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut from = 0;
+    while let Some(i) = e.find_lf(&bytes[from..], from as u64) {
+        let at = from + i;
+        let cr = at >= from + u && e.ends_with_cr(&bytes[from..at], from as u64);
+        out.extend_from_slice(&bytes[from..if cr { at - u } else { at }]);
+        out.extend_from_slice(ending);
+        from = at + lf;
+    }
+    out.extend_from_slice(&bytes[from..]);
+    out
 }
 
 #[cfg(test)]

@@ -389,10 +389,11 @@ impl Chord {
     }
 }
 
-/// An input that is no key: an arming keeps waiting through it (no timeout, 12 §5.4).
+/// An input that is no key: an arming keeps waiting through it (no timeout, 12 §5.4). A focus
+/// report is not one: the owner may have typed elsewhere meanwhile, so it ends an arming.
 fn is_quiet(press: &Press) -> bool {
     match press {
-        Press::Focus | Press::Resize => true,
+        Press::Resize => true,
         Press::Key { key, .. } => is_modifier(*key),
         _ => false,
     }
@@ -441,10 +442,19 @@ pub fn decide(
             if is_fkey(press, Key::F2) || is_fkey(press, Key::F5) || is_slot(press, &[2, 5]) {
                 return (Command::Save, Armed::None);
             }
-            let command = match armed_letter(press, true) {
-                Some('S') => Command::Save,
-                Some(l) => block_op(l).map_or(Command::Disarm, Command::Block),
-                None => Command::Disarm,
+            let command = match press {
+                // Ctrl/⌘+C arrives as Copy in both backends, and the window's Ctrl/⌘+V as
+                // Paste; the terminal's Paste is its own paste, no key, and Ctrl+X's Cut no
+                // block letter.
+                Press::Copy => Command::Block(BlockOp::Copy),
+                Press::Paste(_) if backend == Backend::Window => Command::Block(BlockOp::Move),
+                // A legacy terminal sends Ctrl+I as Tab.
+                _ if is_fkey(press, Key::Tab) => Command::Block(BlockOp::Indent),
+                _ => match armed_letter(press, true) {
+                    Some('S') => Command::Save,
+                    Some(l) => block_op(l).map_or(Command::Disarm, Command::Block),
+                    None => Command::Disarm,
+                },
             };
             (command, Armed::None)
         }

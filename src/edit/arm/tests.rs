@@ -319,11 +319,18 @@ fn eb6_ctrl_k_then_each_letter_with_and_without_ctrl() {
     for backend in BACKENDS {
         for (l, key, jamo, want) in letters.clone() {
             let lower = l.to_ascii_lowercase().to_string();
-            let presses = [
+            // Ctrl/⌘ with C and V arrive as the clipboard's events, in both backends (the
+            // window's Ctrl/⌘+V only with something on the clipboard; a terminal's not at all):
+            // no backend sends them as keys.
+            let with_ctrl: Vec<Press> = match key {
+                Key::C => vec![Press::Copy],
+                Key::V if backend == Backend::Window => vec![Press::Paste("p".to_string())],
+                Key::V => vec![],
+                _ => vec![km(key, ctrl()), km(key, mac_cmd())],
+            };
+            let mut presses = vec![
                 k(key),
                 km(key, shift()),
-                km(key, ctrl()),
-                km(key, mac_cmd()),
                 km(key, mac_ctrl()),
                 text(&lower),
                 text(&jamo.to_string()),
@@ -335,6 +342,7 @@ fn eb6_ctrl_k_then_each_letter_with_and_without_ctrl() {
                     modifiers: NONE,
                 },
             ];
+            presses.extend(with_ctrl);
             for press in presses {
                 let mut keys = armed_block(backend);
                 let command = keys.press(&press);
@@ -351,15 +359,21 @@ fn eb6_ctrl_k_then_each_letter_with_and_without_ctrl() {
                 }
             }
         }
-        // Esc or any other key disarms: dropped, nothing typed.
-        for (press, typed) in [
+        // Esc or any other key disarms: dropped, nothing typed — Ctrl+X's Cut, and a
+        // terminal's own paste among them.
+        let mut others = vec![
             (k(Key::Escape), None),
             (k(Key::X), Some("x")),
             (text("x"), None),
             (k(Key::Enter), None),
             (k(Key::F9), None),
             (k(Key::Space), Some(" ")),
-        ] {
+            (Press::Cut, None),
+        ];
+        if backend == Backend::Terminal {
+            others.push((Press::Paste("v".to_string()), None));
+        }
+        for (press, typed) in others {
             let mut keys = armed_block(backend);
             let command = keys.press(&press);
             assert_eq!(command, Disarm, "{press:?}");
@@ -371,12 +385,35 @@ fn eb6_ctrl_k_then_each_letter_with_and_without_ctrl() {
         // No timeout: a thousand inputs that are no key leave it armed.
         let mut keys = armed_block(backend);
         for i in 0..1000 {
-            let quiet = [Press::Focus, Press::Resize, k(Key::ShiftLeft)][i % 3].clone();
+            let quiet = [Press::Resize, k(Key::ShiftLeft), k(Key::ControlLeft)][i % 3].clone();
             assert_eq!(keys.press(&quiet), Nothing);
         }
         assert_eq!(keys.armed(), Armed::Block);
         assert_eq!(keys.press(&k(Key::B)), Block(BlockOp::Begin));
+        // A legacy terminal sends Ctrl+I as Tab: Ctrl+K Tab is Ctrl+K I.
+        let mut keys = armed_block(backend);
+        assert_eq!(keys.press(&k(Key::Tab)), Block(BlockOp::Indent));
     }
+}
+
+/// Losing or gaining the focus ends an arming (the owner may have typed elsewhere meanwhile):
+/// Ctrl+K, a focus report out and back, then S types S; a waiting `^S` is cancelled, unsaved.
+#[test]
+fn a_focus_report_disarms() {
+    for backend in BACKENDS {
+        let mut keys = armed_block(backend);
+        assert_eq!(keys.press(&Press::Focus), Disarm, "{backend:?}: focus lost");
+        assert_eq!(keys.armed(), Armed::None);
+        assert_eq!(keys.press(&Press::Focus), Nothing, "focus gained");
+        assert_eq!(keys.press(&k(Key::S)), Typing);
+        assert_eq!(keys.press(&text("s")), Type("s".to_string()));
+    }
+    let mut keys = armed_save();
+    let command = keys.press(&Press::Focus);
+    assert_eq!(command, Cancel);
+    assert_eq!(command.line("notes.txt").as_deref(), Some(CANCELLED));
+    assert_eq!(keys.armed(), Armed::None);
+    assert_eq!(keys.press(&k(Key::F2)), Save, "F2 is a plain Save again");
 }
 
 #[test]
