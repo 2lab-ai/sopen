@@ -3113,10 +3113,10 @@ fn closing_during_a_taken_over_probe_leaves_no_process() {
 
 /// A video whose index is whole and whose pictures are missing (the live probe's `head -c` of a
 /// faststart MP4): its preview is a card saying there is no frame, and Enter on it does not
-/// leave a media window decoding for ever — the open fails, the list is back, and the status
-/// row says why, in red.
+/// leave a media window decoding for ever — it gives way to the Hex view, the reason its first
+/// row (08 D10), and no ffmpeg of it is left.
 #[test]
-fn enter_on_a_video_with_no_frame_comes_back_to_the_list_with_the_reason() {
+fn enter_on_a_video_with_no_frame_opens_on_hex_with_the_reason() {
     let Some(tools) = media_tools() else { return };
     watched_over(180, move |t| {
         let mut fx = fixture();
@@ -3128,9 +3128,15 @@ fn enter_on_a_video_with_no_frame_comes_back_to_the_list_with_the_reason() {
         let why = fx.right_text("no frame at 0:00.00").expect("why");
         assert!(!why.contains("0x") && !why.contains('['), "{why}");
         fx.key(Key::Enter);
-        fx.wait(|b| b.opening.is_none() && b.viewer.is_none() && b.status.error);
-        assert!(fx.status().contains("no frame"), "{}", fx.status());
-        assert_eq!(fx.current(), "cut.mp4", "back in the list");
+        fx.wait(|b| {
+            b.opening.is_none()
+                && b.ready()
+                && b.viewer
+                    .as_ref()
+                    .is_some_and(|v| v.views.set.on_screen() == Some(crate::views::View::Hex))
+        });
+        assert!(shows(&fx, "no frame"), "the reason on Hex");
+        assert!(shows(&fx, "the file is shown as bytes"));
         assert_none_left(&base(&fx));
     });
 }

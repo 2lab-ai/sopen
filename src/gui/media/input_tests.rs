@@ -393,6 +393,24 @@ fn a_running_export_never_moves_the_frame() {
     );
 }
 
+/// A running Export holds the window as a Save does (08 §5, D2): a switch of views waits for
+/// it, so its publish never meets the save session given back.
+#[test]
+fn a_running_export_holds_the_window_as_a_save() {
+    let Some(mut fx) = fixture() else { return };
+    use crate::gui::Window as _;
+    assert_eq!(fx.win.hold(), crate::views::Hold::Clean);
+    let (_tx, rx) = mpsc::channel();
+    fx.win.job = Some(ExportJob {
+        progress: Arc::new(AtomicU32::new(0)),
+        rx,
+        stop: Arc::default(),
+    });
+    assert_eq!(fx.win.hold(), crate::views::Hold::Saving, "while it runs");
+    fx.win.job = None;
+    assert_eq!(fx.win.hold(), crate::views::Hold::Clean);
+}
+
 /// The transport's clock line is never broken across rows: at every width it is one line drawn
 /// inside its clip and the window, cut with "…" (the whole line on hover) where the window is
 /// too narrow for it. It used to share

@@ -14,18 +14,28 @@
 //! checked before anything else in a pass: whatever the window did after it (closed, kept its
 //! notes on screen), the hidden views are stale (D25).
 //!
-//! Not built here (08 §13's VM-7b): a remote view is made through a stream of its own, so a
-//! remote file's views read it again (D13); a hidden view keeps its save connection (D14); a
-//! reload does not make the hidden views stale (D25's reload half); F9 in a field takes the
-//! typing from it, which closes the hex window's Go to but leaves the text view's open (D29).
+//! A remote file's views share what its opening kept (08 §6, VM-7b): its stream, beside the
+//! views, which every view made later reads through (D13: nothing read again), and one save
+//! session for their `Origin`s, given back when the view that used it is hidden or closed
+//! (D14) — once the operation on it is over, asked again on later passes until then — so a
+//! viewer holds 06 §6's "1; 2 from its first Save". Where the stream stands (its epoch) tells a
+//! reload — a view's Cmd/Ctrl+R, a Save's own — looked at before every input the set gets, so
+//! no hidden view is shown from before it (D25's reload half). A Save that did not reload the
+//! stream (an image's, a sound's) leaves it behind the file, so the next view made reloads it
+//! first. A video none of whose frames decode gives way to Hex with the reason, as an image
+//! does (D10).
+//!
+//! A viewer handed over by the preview (02 §4.4) hands its stream (none for an image, read
+//! whole) and its save session to the set as well ([`OpenedAs::with`]).
 
-use super::prepare::{self, Opened, Prepared};
+use super::prepare::{self, Opened, Over, Prepared, SaveSlot, Shared};
 use super::{Browser, Closing, Connect, Viewer};
 use crate::encoding::Encoding;
 use crate::gui::web::Unavailable;
-use crate::gui::{chrome, help, Embedded, Outcome, Status, ViewKeySlot, Window};
+use crate::gui::{chrome, help, Embedded, Outcome, Placeholder, Status, ViewKeySlot, Window};
 use crate::kind::Kind;
 use crate::remote::Stat;
+use crate::stream::{ReadError, Reader, ReaderKind, State};
 use crate::view_keys::{self, Command, Ending, ViewKeys};
 use crate::views::{
     Effect, Hold, Input, Now, Opening, PageClass, Reach, Screen, Slot, Ticket, View, ViewSet, Why,
@@ -35,6 +45,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Poll;
 use std::thread::JoinHandle;
 
 /// What the opening keeps to make a view later (08 §6): where the bytes are and how to reach
@@ -76,12 +87,94 @@ pub(super) struct Views {
     /// Tests: views made on a worker so far.
     #[cfg(test)]
     pub(super) makes: usize,
+    /// Tests: run in the pass right after the reload receipt, before the pass's view keys (a
+    /// reload that lands between the two).
+    #[cfg(test)]
+    pub(super) between: Option<Box<dyn FnMut()>>,
     /// `SOPEN_STATE` `view=N`: chosen once the first view is on screen and ready.
     wanted: Option<Slot>,
     /// The folder the browser was opened on, for a page view made later (09 §3.1's root).
     opened_on: Option<String>,
     /// The page view could not be made (09 §4): the first row of the text view made next.
     pub(super) source_line: Option<String>,
+    /// A remote file's stream, kept beside the views (D13): what every view made later reads
+    /// through. `None` for a local file, and until a remote one has one (a page file's views
+    /// before Hex or Text, a handed-over image's before its second view).
+    stream: Option<KeptStream>,
+    /// A remote file's save session, which every view's `Origin` connects through and a hidden
+    /// view gives back (D14). `None` for a local file.
+    save: Option<SaveSlot>,
+    /// A give-back asked for (the view that saved hidden or closed), as the session's requests
+    /// stood then; refused for now while an operation holds the session, it is asked again on
+    /// a later pass ([`SaveSlot::give_back`]).
+    giving: Option<prepare::Asked>,
+    /// The view a switch chose that waits for what the view on screen runs (D2).
+    waited: Option<Slot>,
+}
+
+/// The stream the views of a remote file share, and where it stood (its epoch, 06 §5) when
+/// the set was last told of it and when the view on screen's Save began.
+struct KeptStream {
+    stream: prepare::Stream,
+    /// The version the set was last told of: a reload past it — the view on screen's
+    /// Cmd/Ctrl+R, its Save's own — makes the hidden views stale (D25).
+    told: Epoch,
+    /// The version when the view on screen's Save began (moved along while none runs): a
+    /// reload past it when the Save lands is the Save's own (the hex view's), which left the
+    /// stream on the file saved.
+    at_save: Epoch,
+    /// The file changed since the stream last read it: a Save landed that did not reload the
+    /// stream (the image's, the media window's, which read no more from it). The next view
+    /// made reloads it first (D25: made again, it shows the file as it is now). A file another
+    /// writer changed is not this: the stream says `Changed`, the views say it, and Cmd/Ctrl+R
+    /// is the owner's.
+    behind: bool,
+}
+
+/// A reader of the stream's that reads nothing: it tells whether the stream was reloaded since
+/// it last moved (a read of nothing reads nothing, 06 §5).
+struct Epoch(Reader);
+
+impl Epoch {
+    fn new(source: &crate::stream::Source) -> Self {
+        Epoch(source.reader(ReaderKind::Interactive))
+    }
+
+    /// The stream was reloaded since: this moves to the version open now.
+    fn moved(&mut self) -> bool {
+        match self.0.try_read(0, 0) {
+            Poll::Ready(Err(ReadError::Reloaded)) => {
+                self.0.renew();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl KeptStream {
+    fn new(stream: prepare::Stream) -> Self {
+        KeptStream {
+            told: Epoch::new(&stream.source),
+            at_save: Epoch::new(&stream.source),
+            stream,
+            behind: false,
+        }
+    }
+
+    /// A reload the set was not told of yet.
+    fn reloaded(&mut self) -> bool {
+        let moved = self.told.moved();
+        self.caught_up(moved);
+        moved
+    }
+
+    /// A reload was seen (`moved`): the stream is on the file again — if it reads it. A reload
+    /// that failed (the file gone meanwhile) leaves it behind, so the next make reloads.
+    fn caught_up(&mut self, moved: bool) {
+        let live = matches!(self.stream.source.state(), State::Live | State::Replaced);
+        self.behind &= !(moved && live);
+    }
 }
 
 /// A hidden view: its window, the cached copy it holds, its give-way.
@@ -99,6 +192,8 @@ struct Making {
     at: Option<u64>,
     notice: Option<String>,
     encoding: Option<Encoding>,
+    /// It reloads the kept stream first ([`KeptStream::behind`]).
+    reload: bool,
     cancel: Arc<AtomicBool>,
     rx: Receiver<anyhow::Result<Opened>>,
     worker: Option<JoinHandle<()>>,
@@ -132,7 +227,7 @@ pub(super) struct PageOpen {
 #[cfg_attr(not(test), allow(dead_code))] // The browser asks [`open_paged`].
 pub(super) fn open(
     ctx: &egui::Context,
-    opened: &OpenedAs,
+    opened: &impl Opens,
     means: Means,
     wanted: Option<u8>,
 ) -> Views {
@@ -146,18 +241,28 @@ pub(super) fn open(
 
 /// [`open`], a page file's views as `page` says: 1 Page · 2 Hex · 3 Text for HTML, HTM and
 /// styled XML, 1 Text · 2 Hex · 3 Page for other XML, where the window shows pages (09 §6).
+/// What a remote opening kept for its views ([`Opens::shared`]) is kept beside them (08 §6).
 pub(super) fn open_paged(
     ctx: &egui::Context,
-    opened: &OpenedAs,
+    opened: &impl Opens,
     means: Means,
     wanted: Option<u8>,
     page: PageOpen,
 ) -> Views {
+    let shared = opened.shared();
+    let opened = opened.opened_as();
     let reach = if means.label.is_some() {
         Reach::Stream
     } else {
         Reach::Local
     };
+    // A remote viewer's `Origin`s of the views made from now on save through one session
+    // (D14): the opening's, or one of the set's own (a viewer handed over brings none).
+    let save = means.label.as_ref().map(|_| {
+        let save = shared.save.clone();
+        save.unwrap_or_else(|| SaveSlot::new(Placeholder::YES))
+    });
+    let stream = shared.stream.filter(|_| means.label.is_some());
     // A viewer shows a file: a folder is never opened (§3), so none is here.
     let kind = match opened.kind {
         Kind::Directory => Kind::Other,
@@ -196,9 +301,15 @@ pub(super) fn open_paged(
         chose: false,
         #[cfg(test)]
         makes: 0,
+        #[cfg(test)]
+        between: None,
         wanted: wanted.and_then(Slot::from_number),
         opened_on: page.opened_on,
         source_line: None,
+        stream: stream.map(KeptStream::new),
+        save,
+        giving: None,
+        waited: None,
     }
 }
 
@@ -210,13 +321,56 @@ pub(super) struct OpenedAs {
     pub undecodable: Option<String>,
 }
 
+/// What [`open_paged`] reads of an opening: what the set needs, and what the views of a remote
+/// file share from it (08 §6) — nothing, for an [`OpenedAs`] alone (a viewer handed over by
+/// the preview, 02 §4.4).
+pub(super) trait Opens {
+    fn opened_as(&self) -> &OpenedAs;
+    fn shared(&self) -> Shared {
+        Shared::default()
+    }
+}
+
+impl Opens for OpenedAs {
+    fn opened_as(&self) -> &OpenedAs {
+        self
+    }
+}
+
+/// A preparation's opening: what the set needs, and what its views share ([`Opened::shared`]).
+pub(super) struct OpenedShared {
+    opened: OpenedAs,
+    shared: Shared,
+}
+
+impl Opens for OpenedShared {
+    fn opened_as(&self) -> &OpenedAs {
+        &self.opened
+    }
+
+    fn shared(&self) -> Shared {
+        self.shared.clone()
+    }
+}
+
 impl OpenedAs {
-    /// From a preparation's [`Opened`].
-    pub fn of(opened: &Opened) -> Self {
-        OpenedAs {
-            kind: opened.kind,
-            stat: opened.stat,
-            undecodable: opened.undecodable.clone(),
+    /// With what its views share: a preview's, handed over ([`prepare::HandedOver::shared`]).
+    pub fn with(self, shared: Shared) -> OpenedShared {
+        OpenedShared {
+            opened: self,
+            shared,
+        }
+    }
+
+    /// From a preparation's [`Opened`], with what its views share.
+    pub fn of(opened: &Opened) -> OpenedShared {
+        OpenedShared {
+            opened: OpenedAs {
+                kind: opened.kind,
+                stat: opened.stat,
+                undecodable: opened.undecodable.clone(),
+            },
+            shared: opened.shared.clone(),
         }
     }
 }
@@ -426,6 +580,24 @@ impl Views {
         }
     }
 
+    /// Tests: a give-back is asked for and not done yet.
+    #[cfg(test)]
+    pub(super) fn giving(&self) -> bool {
+        self.giving.is_some()
+    }
+
+    /// Tests: the stream the views share is behind the file ([`KeptStream::behind`]).
+    #[cfg(test)]
+    pub(super) fn behind(&self) -> bool {
+        self.stream.as_ref().is_some_and(|k| k.behind)
+    }
+
+    /// Tests: the stream the views share.
+    #[cfg(test)]
+    pub(super) fn kept_source(&self) -> Option<crate::stream::Source> {
+        self.stream.as_ref().map(|k| k.stream.source.clone())
+    }
+
     /// A diff or a file at a revision (03 §6.3): every view read-only.
     pub(super) fn read_only(&self) -> bool {
         self.means.in_place
@@ -474,8 +646,23 @@ impl Browser {
     /// the strip's click and the view keys' commands, the view being made, the prompt or the
     /// Save a switch waits for, `view=`.
     pub(super) fn views_before(&mut self, ctx: &egui::Context) {
-        // First a Save that landed since: no switch below may show a view it made stale.
+        // First a Save that landed since, and a reload: no switch below may show a view they
+        // made stale.
         self.save_receipt(ctx);
+        self.reload_receipt(ctx);
+        if let Some(viewer) = self.viewer.as_mut() {
+            // While no Save runs, where the stream stands is where the next one begins.
+            let saving =
+                viewer.views.shown.is_some() && viewer.embedded.window.hold() == Hold::Saving;
+            if let Some(kept) = viewer.views.stream.as_mut().filter(|_| !saving) {
+                kept.at_save.moved();
+            }
+            give_back(&mut viewer.views, ctx);
+        }
+        #[cfg(test)]
+        if let Some(between) = self.viewer.as_mut().and_then(|v| v.views.between.as_mut()) {
+            between();
+        }
         if let Some(n) = chrome::take_strip_click(ctx) {
             if let Some(viewer) = self.viewer.as_mut() {
                 viewer
@@ -557,6 +744,22 @@ impl Browser {
         let Some(viewer) = self.viewer.as_mut() else {
             return false;
         };
+        // D10, found once on screen: a video none of whose frames decode asked to close with
+        // why — it gives way to Hex, the reason its first row, and 1 says it from then on. Only
+        // over a live stream, as for the image (06 §7.3): a stream that changed or failed is
+        // what failed, and an image's failure is a stream's (one that does not decode gives
+        // way by its switch) — said as before, back in the list.
+        let video = viewer.views.shown == Some(View::Video);
+        let live = viewer
+            .views
+            .stream
+            .as_ref()
+            .is_none_or(|k| matches!(k.stream.source.state(), State::Live | State::Replaced));
+        if let Some(why) = viewer.embedded.window.failure().filter(|_| video && live) {
+            viewer.views.asked = false;
+            self.view_input(ctx, Input::Failed(Why::Undecodable(why)));
+            return true;
+        }
         if !viewer.views.asked {
             return false;
         }
@@ -581,7 +784,35 @@ impl Browser {
         }
         let landed = viewer.embedded.window.saves_landed();
         if std::mem::replace(&mut viewer.views.saves_seen, landed) != landed {
+            // A Save that reloaded the stream it reads (the hex view's, 06 §5) left it on the
+            // file saved; any other left it behind the file.
+            if let Some(kept) = viewer.views.stream.as_mut() {
+                if !kept.at_save.moved() {
+                    kept.behind = true;
+                }
+            }
+            // The set goes on with a switch that waited for it.
+            viewer.views.waited = None;
             self.view_input(ctx, Input::SaveEnded { landed: true });
+        }
+    }
+
+    /// The stream the views share was reloaded since the set last looked — by the view on
+    /// screen's Cmd/Ctrl+R (06 §5), or by its Save's own reload — so the hidden views read a
+    /// version before it: stale (D25's reload half), made again when next shown. Looked at
+    /// before every input the set gets, so no view is shown from before a reload that landed
+    /// since the pass began. Not while a view being made reloads the stream itself
+    /// ([`KeptStream::behind`]): that one is taken with it.
+    fn reload_receipt(&mut self, ctx: &egui::Context) {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        let views = &mut viewer.views;
+        if views.making.as_ref().is_some_and(|m| m.reload) {
+            return;
+        }
+        if views.stream.as_mut().is_some_and(KeptStream::reloaded) {
+            self.view_input(ctx, Input::Reloaded);
         }
     }
 
@@ -651,7 +882,8 @@ impl Browser {
                 }
             }
             Command::Arm(Ending::Field) => {
-                // The field closes, as Esc would (D29): it loses the typing.
+                // The field closes, as Esc would (D29): it loses the typing, and the hex
+                // window's and the text view's Go to close when they lose it.
                 ctx.memory_mut(|m| {
                     if let Some(id) = m.focused() {
                         m.surrender_focus(id);
@@ -670,11 +902,29 @@ impl Browser {
     /// `input` to the view set, given what the view on screen holds now; its effects carried
     /// out.
     fn view_input(&mut self, ctx: &egui::Context, input: Input) {
+        // A reload that landed since the pass's receipt (D25): told first — but for a make's
+        // answer, whose window is kept already: the next input tells it, the view then on
+        // screen reading the version open now (06 §5).
+        if !matches!(
+            input,
+            Input::Reloaded | Input::Made(_) | Input::MakeFailed(..)
+        ) {
+            self.reload_receipt(ctx);
+        }
         let Some(viewer) = self.viewer.as_mut() else {
             return;
         };
         let now = views_now(viewer);
+        let chose = match input {
+            Input::Choose(slot) => Some(slot),
+            _ => None,
+        };
         let effects = viewer.views.set.apply(input, now);
+        // A switch that waits for what the view on screen runs (D2): asked again if that ends
+        // without a Save that landed ([`Browser::poll_saves`]).
+        if effects.contains(&Effect::WaitForSave) {
+            viewer.views.waited = chose;
+        }
         self.view_effects(ctx, effects, None);
     }
 
@@ -734,7 +984,26 @@ impl Browser {
                     // What the switch said (`saving…`) is over; a reason for it follows.
                     self.status = Status::default();
                 }
-                Effect::ReleaseSaveConnection(_) | Effect::OpenStream => {}
+                // D14: the view just hidden gives its save session back; its `Origin` connects
+                // again on its next use.
+                // Only for a window that holds nothing (D2: the switch waited for its Save, Save
+                // copy, Save As or Export): its operation, publish and cleanup included, ended.
+                Effect::ReleaseSaveConnection(view) => {
+                    let views = &mut viewer.views;
+                    let kept = views
+                        .hidden
+                        .iter_mut()
+                        .rev()
+                        .find(|k| same_doc(k.view, view));
+                    let clean = kept.is_none_or(|k| k.embedded.window.hold() == Hold::Clean);
+                    debug_assert!(clean, "a give-back for {view:?}, which holds something");
+                    if clean {
+                        ask_give_back(views, ctx);
+                    }
+                }
+                // A view made with no stream kept opens one, and the set keeps it from then on
+                // (`poll_making`): nothing to do ahead of the make.
+                Effect::OpenStream => {}
                 Effect::Make {
                     ticket,
                     view,
@@ -767,6 +1036,11 @@ impl Browser {
                 }
                 Effect::Close(view) => {
                     let closed = if viewer.views.shown.is_some_and(|s| same_doc(s, view)) {
+                        // The view on screen closed (its prompt answered, D2; it failed): one
+                        // that saves gives the session back, as a hidden one does (D14).
+                        if view.saves() && !viewer.views.read_only() {
+                            ask_give_back(&mut viewer.views, ctx);
+                        }
                         viewer.views.shown = None;
                         let old = std::mem::replace(&mut viewer.embedded, blank());
                         viewer.switch = None;
@@ -849,6 +1123,13 @@ impl Browser {
             means.path.clone(),
             means.in_place,
         );
+        // What the views share (08 §6): the view reads through the kept stream, reloaded first
+        // when it is behind the file, and saves through the views' session.
+        let reload = views.stream.as_ref().is_some_and(|k| k.behind);
+        let shared = Shared {
+            stream: views.stream.as_ref().map(|k| k.stream.clone()),
+            save: views.save.clone(),
+        };
         let cache = self.cache.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
@@ -866,13 +1147,20 @@ impl Browser {
                 began,
             };
             let result = match view {
-                // 09 §6: the page, from its root.
+                // 09 §6: the page, from its root, on its own connection.
                 View::Page => {
                     prepare::prepare_page_view(&req, in_place, opened_on.as_deref(), &stop)
                 }
-                _ => prepare::prepare_view(&req, in_place, kind_of(view), &stop, &mut |_, _| {
-                    waker.request_repaint()
-                }),
+                _ => {
+                    let over = Over {
+                        shared: &shared,
+                        reload,
+                    };
+                    let kind = kind_of(view);
+                    prepare::prepare_view(&req, in_place, kind, over, &stop, &mut |_, _| {
+                        waker.request_repaint()
+                    })
+                }
             };
             let _ = tx.send(result);
             waker.request_repaint();
@@ -883,6 +1171,7 @@ impl Browser {
             at,
             notice,
             encoding,
+            reload: reload && view != View::Page,
             cancel,
             rx,
             worker: Some(worker),
@@ -908,7 +1197,23 @@ impl Browser {
             let _ = worker.join();
         }
         let (ticket, view) = (making.ticket, making.view);
+        if making.reload {
+            // The make's own reload of the kept stream (`KeptStream::behind`): the set moves past
+            // it — it is no view's reload. Only a reload seen puts the stream on the file again:
+            // a make that failed before it (the file gone meanwhile) leaves it behind, and the
+            // next make reloads.
+            if let Some(kept) = viewer.views.stream.as_mut() {
+                let seen = kept.told.moved();
+                kept.at_save.moved();
+                kept.caught_up(seen);
+            }
+        }
         let made = result.and_then(|opened| {
+            // The first remote view made where none was kept (a page file's Hex or Text, a
+            // handed-over image's): its stream is the views' from now on (D13).
+            if viewer.views.stream.is_none() && viewer.views.means.label.is_some() {
+                viewer.views.stream = opened.shared.stream.clone().map(KeptStream::new);
+            }
             // A picture view whose file does not decode is not made (D10).
             if let (true, Some(why)) = (view.is_media(), &opened.undecodable) {
                 anyhow::bail!("{why}");
@@ -936,6 +1241,12 @@ impl Browser {
                     kept.embedded.window.go_to_byte(at);
                 }
                 viewer.views.hidden.push(kept);
+                // Made hidden, the view told the stream it shares with the view on screen that
+                // nobody sees it (one flag, 08 §8): the view on screen says it is seen again.
+                // (A page view reads no stream; told again, it would say its failure again.)
+                if viewer.views.shown.is_some_and(|v| v != View::Page) {
+                    viewer.embedded.window.set_shown(true);
+                }
                 Input::Made(ticket)
             }
             Err(e) => {
@@ -968,10 +1279,16 @@ impl Browser {
         }
         let hold = viewer.embedded.window.hold();
         if waiting && hold != Hold::Saving {
-            // The switch's `saving…` is over: the Save did not land, so the view stays (07
-            // §10), the window saying why.
+            // The switch's `saving…` is over with no Save that landed: an Export or a Save copy
+            // (they leave the file as it was), or a Save that did not. The set lets the view
+            // stay (07 §10), and the switch is asked again: clean, it goes ahead; with edits
+            // still unsaved, it asks the close prompt (D2).
             self.status = Status::default();
+            let again = viewer.views.waited.take();
             self.view_input(ctx, Input::SaveEnded { landed: false });
+            if let Some(slot) = again {
+                self.view_input(ctx, Input::Choose(slot));
+            }
             return;
         }
         let question = viewer.embedded.window.view_state() == view_keys::State::Question;
@@ -1099,6 +1416,30 @@ fn kept(view: View, made: Made, read_only: bool) -> Kept {
         switch: made.switch,
     }
 }
+
+/// D14: the view that used the save session is hidden or closed — the session goes back, now
+/// or (an operation holds it) on a later pass ([`give_back`]).
+fn ask_give_back(views: &mut Views, ctx: &egui::Context) {
+    if let Some(save) = &views.save {
+        views.giving = Some(save.ask());
+        give_back(views, ctx);
+    }
+}
+
+/// A give-back asked for, asked again: done, or the session is the view on screen's now (it
+/// used it since), or — an operation holds it — again on a later pass.
+fn give_back(views: &mut Views, ctx: &egui::Context) {
+    let (Some(save), Some(asked)) = (&views.save, views.giving) else {
+        return;
+    };
+    match save.give_back(asked) {
+        prepare::GiveBack::NotNow => ctx.request_repaint_after(GIVE_BACK_AGAIN),
+        prepare::GiveBack::Done | prepare::GiveBack::InUse => views.giving = None,
+    }
+}
+
+/// How soon a give-back an operation held off is asked again.
+const GIVE_BACK_AGAIN: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// What the view on screen holds now (`views::Now`): its edits or Save, its byte place.
 fn views_now(viewer: &mut Viewer) -> Now {
