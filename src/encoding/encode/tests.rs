@@ -224,6 +224,44 @@ fn a_refusal_says_which_character_and_which_encoding() {
 }
 
 #[test]
+fn a_character_with_no_glyph_of_its_own_is_named_by_its_code_point() {
+    let cases: [(Encoding, &str, &str); 12] = [
+        // Zero-width, combining, C1.
+        (Ascii, "a\u{200B}b", "U+200B cannot be written in ASCII"),
+        (Ascii, "e\u{301}", "U+0301 cannot be written in ASCII"),
+        (Ascii, "\u{85}", "U+0085 cannot be written in ASCII"),
+        // Latin-1 holds the C1 controls; CP437 holds none.
+        (Cp437, "\u{9F}", "U+009F cannot be written in CP437"),
+        (Latin1, "\u{2028}", "U+2028 cannot be written in Latin-1"),
+        (Latin1, "\u{3000}", "U+3000 cannot be written in Latin-1"),
+        (Latin1, "\u{FEFF}", "U+FEFF cannot be written in Latin-1"),
+        (Latin1, "\u{FE0F}", "U+FE0F cannot be written in Latin-1"),
+        (Cp949, "\u{E000}", "U+E000 cannot be written in CP949"),
+        (Ucs2Le, "\u{E0041}", "U+E0041 cannot be written in UCS-2LE"),
+        (Ascii, "\u{A0}", "U+00A0 cannot be written in ASCII"),
+        // A visible one is shown as itself.
+        (Ascii, "\u{2014}", "\u{2014} cannot be written in ASCII"),
+    ];
+    for (e, text, line) in cases {
+        assert_eq!(refused(e, text).to_string(), line, "{text:?}");
+    }
+    assert_eq!(enc(Latin1, "\u{85}\u{AD}"), [0x85, 0xAD]);
+}
+
+#[test]
+fn a_fixed_width_encoder_reserves_its_output_not_the_texts_bytes_times_the_unit() {
+    // 3 bytes a syllable in the text, 2 in UCS-2: never 6 reserved for each.
+    let text = "한".repeat(1000);
+    for e in [Ucs2Le, Ucs2Be] {
+        let bytes = enc(e, &text);
+        assert_eq!(bytes.len(), 2000);
+        assert!(bytes.capacity() < text.len(), "{}", bytes.capacity());
+    }
+    let bytes = enc(Latin1, &"é".repeat(1000));
+    assert!(bytes.capacity() < 2000, "{}", bytes.capacity());
+}
+
+#[test]
 fn cp949_refuses_what_encoding_rs_would_write_as_a_character_reference() {
     // encoding_rs's own `encode` writes an unmappable character as `&#…;` and only flags it.
     for text in ["😀", "\u{4E02}", "𠀀", "\u{FFFD}", "\u{80}"] {

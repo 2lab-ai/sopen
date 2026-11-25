@@ -37,16 +37,62 @@ pub struct Refused {
 }
 
 /// `한 cannot be written in Latin-1`: 12 §7.2's status line without its tail, which says what
-/// was not done (typed, pasted).
+/// was not done (typed, pasted). A character with no glyph of its own is named by its code
+/// point instead: `U+200B cannot be written in ASCII`.
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} cannot be written in {}",
-            self.ch,
-            self.encoding.label()
-        )
+        let label = self.encoding.label();
+        if invisible(self.ch) {
+            write!(
+                f,
+                "U+{:04X} cannot be written in {label}",
+                u32::from(self.ch)
+            )
+        } else {
+            write!(f, "{} cannot be written in {label}", self.ch)
+        }
     }
+}
+
+/// A character that shows nothing of its own, or nothing at all, so a line naming it would
+/// name a blank: the controls (C0, DEL, C1) and the white space, the combining marks of their
+/// blocks, the zero-width and other format characters, the variation selectors, the tags, the
+/// Hangul fillers, private use and the noncharacters. The ranges std and a short list tell
+/// apart without a table; a rarer one not listed is shown as itself.
+fn invisible(c: char) -> bool {
+    let u = u32::from(c);
+    c.is_control()
+        || c.is_whitespace()
+        || u & 0xFFFE == 0xFFFE
+        || matches!(
+            u,
+            0x00AD
+                | 0x0300..=0x036F
+                | 0x0483..=0x0489
+                | 0x0600..=0x0605
+                | 0x061C
+                | 0x06DD
+                | 0x070F
+                | 0x115F..=0x1160
+                | 0x180B..=0x180F
+                | 0x1AB0..=0x1AFF
+                | 0x1DC0..=0x1DFF
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x206F
+                | 0x20D0..=0x20FF
+                | 0x3164
+                | 0xE000..=0xF8FF
+                | 0xFDD0..=0xFDEF
+                | 0xFE00..=0xFE0F
+                | 0xFE20..=0xFE2F
+                | 0xFEFF
+                | 0xFFA0
+                | 0xFFF9..=0xFFFB
+                | 0x1D173..=0x1D17A
+                | 0xE0000..=0xE0FFF
+                | 0xF0000..
+        )
 }
 
 impl std::error::Error for Refused {}
@@ -76,14 +122,15 @@ impl Encoding {
         }
     }
 
-    /// `text` character by character, each written as `put` gives it; the first it gives
-    /// none for is refused.
+    /// `text` character by character, each written as `put` gives it — N bytes, so the output
+    /// is exactly N per character (a Hangul paste of 3 bytes a character takes 2 in UCS-2, not
+    /// 6); the first it gives none for is refused.
     fn each<const N: usize>(
         self,
         text: &str,
         put: impl Fn(char) -> Option<[u8; N]>,
     ) -> Result<Vec<u8>, Refused> {
-        let mut out = Vec::with_capacity(text.len() * N);
+        let mut out = Vec::with_capacity(text.chars().count() * N);
         for (at, ch) in text.char_indices() {
             let Some(bytes) = put(ch) else {
                 return Err(Refused {
