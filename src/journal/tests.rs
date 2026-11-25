@@ -5079,6 +5079,24 @@ fn a_cut_off_exchange_is_reconciled_from_what_is_at_each_name() {
     );
     let cases: Vec<Case> = vec![
         (
+            "exchanged, a copy of the version read at the temp's name (another inode)",
+            exchanging.clone(),
+            (&new, s_id),
+            Some((&orig, FileId { dev: 1, ino: 40 })),
+            Outcome::Landed,
+            Temp::None,
+            Other::Rename(TEMP.into()),
+        ),
+        (
+            "exchanged, then the target replaced by a byte-identical copy, the temp gone",
+            exchanging.clone(),
+            (&new, FileId { dev: 1, ino: 50 }),
+            None,
+            Outcome::Unknown,
+            Temp::Gone(TEMP.into()),
+            Other::None,
+        ),
+        (
             "exchanged, the version read displaced",
             exchanging.clone(),
             (&new, s_id),
@@ -5178,6 +5196,11 @@ fn a_cut_off_exchange_is_reconciled_from_what_is_at_each_name() {
             (outcome, &want_temp, &want_other),
             "{case}"
         );
+        assert_eq!(
+            reconcile(&intent, HOST, &mut remote),
+            r,
+            "{case}: again, the same"
+        );
         if outcome == Outcome::Landed {
             let (base, _) = r.next.clone().unwrap();
             assert_eq!(base.sha256, Some(new.whole()), "{case}");
@@ -5218,11 +5241,13 @@ fn a_cut_off_link_check_is_reconciled_by_hashing_the_link() {
             Other::Remove(link()),
         ),
         (
+            // Never at `renaming`, nothing can have been replaced: not landed, whatever the file
+            // is now (a text Restore applies nothing to it).
             "linked, then written in place",
             created,
             Guarded::Linked { link: link() },
             vec![(PATH, &other), (LINK, &other)],
-            Outcome::Unknown,
+            Outcome::NotLanded,
             Other::Rename(link()),
         ),
         (
@@ -5293,4 +5318,38 @@ fn a_text_restore_check_says_whether_the_file_is_the_one_the_edits_were_made_aga
             }
         );
     }
+}
+
+/// The chunks' offsets are untrusted input: a sum past `u64::MAX` is refused, never a panic.
+#[test]
+fn text_edits_with_offsets_that_overflow_are_refused() {
+    let sha = crate::cache::hex(&[0; 32]);
+    let text = format!(
+        "text 1\nencoding UTF-8\nid -\noriginal 1 4 {sha}\nchunk 1 0 {max} {sha}\nchunk 2 {max} 1 \
+         {sha}\nadd 0\nsaved 0\n",
+        max = u64::MAX
+    );
+    let parsed = std::panic::catch_unwind(|| TextEdits::parse(&text));
+    assert!(matches!(parsed, Ok(Err(_))), "{parsed:?}");
+}
+
+/// A local text Save's displaced file is removed only when it is provably the version read: its
+/// device and inode the recorded original's, and its content the baseline's. Where the file layer
+/// tells no identity, it is kept and named, never removed.
+#[test]
+fn a_displaced_file_without_its_identity_is_kept() {
+    let (orig, new) = text_files();
+    let guard = Guarded::Exchanging {
+        temp: FileId { dev: 1, ino: 20 },
+        target: FileId { dev: 1, ino: 10 },
+    };
+    let mut remote = FakeRemote::with(&[(PATH, &new), (TEMP, &orig)]);
+    let intent = text_intent(Route::Exchange, text_renaming(TEMP), Some(guard));
+    let r = reconcile(&intent, HOST, &mut remote);
+    assert_eq!(r.outcome, Outcome::Landed);
+    assert!(
+        matches!(&r.other, Other::Keep { path, .. } if path == TEMP),
+        "{:?}",
+        r.other
+    );
 }

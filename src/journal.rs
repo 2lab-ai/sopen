@@ -914,7 +914,7 @@ impl TextEdits {
                 },
                 _ => bail!("original is `<k> <len> <sha256>`"),
             };
-            let mut chunks = Vec::new();
+            let mut chunks: Vec<Chunk> = Vec::new();
             let mut line = next()?;
             while line.starts_with("chunk ") {
                 let [n, start, len, sha] = <[String; 4]>::try_from(field(line, "chunk")?)
@@ -925,11 +925,12 @@ impl TextEdits {
                     len: num(&len)?,
                     sha256: parse_sha(sha.as_bytes())?,
                 };
-                let want = chunks
-                    .last()
-                    .map_or((1, 0), |c: &Chunk| (c.n + 1, c.start + c.len));
+                let want = match chunks.last() {
+                    None => Some((1, 0)),
+                    Some(c) => c.n.checked_add(1).zip(c.start.checked_add(c.len)),
+                };
                 ensure!(
-                    (chunk.n, chunk.start) == want && chunk.len > 0,
+                    Some((chunk.n, chunk.start)) == want && chunk.len > 0,
                     "the chunks follow one another"
                 );
                 chunks.push(chunk);
@@ -939,10 +940,11 @@ impl TextEdits {
                 [n] => num(n)?,
                 _ => bail!("add is one number"),
             };
-            ensure!(
-                chunks.last().map_or(0, |c| c.start + c.len) == add,
-                "the chunks hold the add buffer's bytes"
-            );
+            let held = match chunks.last() {
+                None => Some(0),
+                Some(c) => c.start.checked_add(c.len),
+            };
+            ensure!(held == Some(add), "the chunks hold the add buffer's bytes");
             let saved = match field(next()?, "saved")?.as_slice() {
                 [v] if v == "0" => false,
                 [v] if v == "1" => true,
@@ -2825,6 +2827,11 @@ pub fn reconcile(intent: &SaveIntent, host: &str, inspect: &mut dyn Inspect) -> 
         "the evidence kept cannot tell it within what reconciliation reads (at most 256 MiB whole)";
     type Decided = (Outcome, Option<(Fingerprint, Seen)>, Option<String>);
     let decided = (|| -> Result<Decided> {
+        // A text Save that never reached `renaming` replaced nothing, whatever the file is now;
+        // and a text Restore applies nothing to the file, so not landed is safe to say.
+        if intent.kind == Kind::Text && !matches!(intent.phase, Phase::Renaming { .. }) {
+            return Ok((Outcome::NotLanded, None, None));
+        }
         let Some(now) = inspect
             .lstat(target)?
             .filter(|s| s.is_file && !s.is_symlink)
@@ -2964,45 +2971,48 @@ fn reconcile_exchange(intent: &SaveIntent, host: &str, inspect: &mut dyn Inspect
     let decided = (|| -> Result<(Outcome, Temp, Other)> {
         if staged_at(intent, ids, target, inspect)? {
             let other = match &from {
-                Some((from, kept)) => match judge(intent, from, inspect) {
+                Some((from, kept)) => match displaced(intent, from, None, inspect) {
                     Other::Gone(_) if matches!(inspect.lstat(kept), Ok(Some(_))) => {
                         Other::Kept(kept.clone())
                     }
                     other => other,
                 },
-                None => judge(intent, &temp, inspect),
+                None => displaced(intent, &temp, ids.map(|(_, target_id)| target_id), inspect),
             };
             return Ok((Outcome::Landed, Temp::None, other));
         }
         if from.is_none() && staged_at(intent, ids, &temp, inspect)? {
             return Ok((Outcome::NotLanded, Temp::Remove(temp.clone()), Other::None));
         }
-        // Nothing at the temp's name and the target not sopen's file — another inode, or the
-        // version the Save started from: the staged copy was removed (a failed exchange, an
-        // exchange back) and the Save did not land.
-        if from.is_none() && inspect.lstat(&temp)?.is_none() {
+        let temp_gone = inspect.lstat(&temp)?.is_none();
+        // Nothing at the temp's name, and the file the Save started from at the target — its
+        // recorded device and inode where the file layer tells them, else its stat and content:
+        // the staged copy was removed (a failed exchange, an exchange back), not landed. Another
+        // inode there, even byte for byte the same, is no proof of either: unknown.
+        if from.is_none() && temp_gone {
             let now = inspect
                 .lstat(target)?
                 .filter(|s| s.is_file && !s.is_symlink);
-            let not_ours = match (ids, &now) {
-                (Some((temp_id, _)), Some(_)) => {
-                    inspect.file_id(target)?.is_some_and(|id| id != temp_id)
-                }
-                _ => false,
+            let old = match (ids, &now) {
+                (_, None) => false,
+                (Some((_, target_id)), Some(now)) => match inspect.file_id(target)? {
+                    Some(id) => id == target_id,
+                    None => matches_pre(intent, now, inspect)? == Verdict::Holds,
+                },
+                (None, Some(now)) => matches_pre(intent, now, inspect)? == Verdict::Holds,
             };
-            let as_read = match &now {
-                Some(now) => matches_pre(intent, now, inspect)? == Verdict::Holds,
-                None => false,
-            };
-            if not_ours || as_read {
+            if old {
                 return Ok((Outcome::NotLanded, Temp::Gone(temp.clone()), Other::None));
             }
         }
-        let keep = Temp::Keep {
-            path: temp.clone(),
-            why: "the outcome is unknown".to_string(),
+        let verdict = match temp_gone {
+            true => Temp::Gone(temp.clone()),
+            false => Temp::Keep {
+                path: temp.clone(),
+                why: "the outcome is unknown".to_string(),
+            },
         };
-        Ok((Outcome::Unknown, keep, Other::None))
+        Ok((Outcome::Unknown, verdict, Other::None))
     })();
     let (outcome, verdict, other, why) = match decided {
         Ok((outcome, temp, other)) => (outcome, temp, other, None),
@@ -3039,6 +3049,30 @@ fn reconcile_exchange(intent: &SaveIntent, host: &str, inspect: &mut dyn Inspect
         other,
         next,
         line,
+    }
+}
+
+/// What an exchange displaced, at `path`, against the version the Save started from
+/// ([`judge`]), removed only when it is provably that version: its device and inode the recorded
+/// original's (`want`) as well as its content. Another inode is kept beside the file; one whose
+/// identity cannot be told is kept where it is.
+fn displaced(
+    intent: &SaveIntent,
+    path: &str,
+    want: Option<FileId>,
+    inspect: &mut dyn Inspect,
+) -> Other {
+    match judge(intent, path, inspect) {
+        Other::Remove(path) => match (want, inspect.file_id(&path)) {
+            (Some(want), Ok(Some(id))) if id == want => Other::Remove(path),
+            (Some(_), Ok(Some(_))) => Other::Rename(path),
+            _ => Other::Keep {
+                path,
+                why: "its device and inode could not be checked against the version read"
+                    .to_string(),
+            },
+        },
+        other => other,
     }
 }
 

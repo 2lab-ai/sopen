@@ -145,17 +145,18 @@ pub fn read_local(
     }
     let (bytes, sha) = read_whole(&mut file, before.len(), progress, cancel)
         .with_context(|| format!("cannot read {real}"))?;
+    // The baseline is the bytes read: they, and the file after, are the size it had before.
     let after = std::fs::symlink_metadata(&real)?;
     let same = |m: &std::fs::Metadata| {
         (m.dev(), m.ino(), m.len(), m.modified().ok())
             == (
                 before.dev(),
                 before.ino(),
-                bytes.len() as u64,
+                before.len(),
                 before.modified().ok(),
             )
     };
-    if !same(&after) || !same(&file.metadata()?) {
+    if bytes.len() as u64 != before.len() || !same(&after) || !same(&file.metadata()?) {
         bail!("{real} changed while it was read; try again when it is quiet");
     }
     let stat = remote::stat_of(&before);
@@ -401,6 +402,12 @@ impl Told {
         snap: Option<&Snapshot>,
         (target, route, sha): (&str, Route, Sha),
     ) -> Result<()> {
+        // What is uploaded must be what was staged, before anything is replaced.
+        if let Guard::Step(Step::Staged { uploaded, .. }) = guard {
+            if uploaded.sha256 != sha {
+                bail!("the upload is not the bytes staged; nothing was replaced");
+            }
+        }
         let j = journal.filter(|_| self.begun || snap.is_some());
         let Some(j) = j else {
             if let Guard::Step(Step::Staged { stat, .. }) = guard {
@@ -417,8 +424,11 @@ impl Told {
                     temp: temp.to_string(),
                 };
                 let Some(snap) = snap else { return Ok(()) };
+                // Refused because another Save is recorded, it wrote nothing: that record is
+                // not this Save's to clear.
+                let earlier = j.pending_save().is_some();
                 if let Err(e) = j.begin_save(snap, plan) {
-                    self.unrecorded = true;
+                    self.unrecorded = !earlier;
                     return Err(e.context("the save could not be recorded; nothing was sent"));
                 }
                 self.begun = true;
@@ -715,7 +725,14 @@ impl Session {
                 }
             };
             match make(&path) {
-                Ok(()) => return Ok(path),
+                Ok(()) => {
+                    // The backup's name made durable in its folder.
+                    let dir = path.parent().unwrap_or(Path::new("/"));
+                    std::fs::File::open(dir)
+                        .and_then(|d| d.sync_all())
+                        .with_context(|| format!("cannot make {} durable", dir.display()))?;
+                    return Ok(path);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => {
                     return Err(e)
@@ -894,7 +911,22 @@ impl Session {
         };
         self.baseline = Baseline::of(&now, up.sha256, id);
         editor.mark_saved();
-        self.landed(editor, &told);
+        // The link check never finished (still `committed`), or the version it found was not
+        // moved (still `kept` at the link): the record stays, and the next Save runs it first.
+        let unfinished = self
+            .journal
+            .as_ref()
+            .and_then(|j| j.pending_save())
+            .and_then(|i| i.guard.as_ref())
+            .is_some_and(|g| match g {
+                Guarded::Committed { .. } => true,
+                Guarded::Kept { from, .. } => kept.as_deref() == Some(from.as_str()),
+                _ => false,
+            });
+        match (unfinished && told.begun, self.journal.as_mut()) {
+            (true, Some(j)) => j.save_unknown(),
+            _ => self.landed(editor, &told),
+        }
         if let Some(u) = unguarded {
             let key = match (u, self.baseline.id) {
                 (Unguarded::NoExchange, Some(id)) => format!("dev {}", id.dev),
@@ -1006,6 +1038,9 @@ impl Session {
                 self.show(&self.target)
             );
             return Ok(Saved::CannotReplace(line));
+        }
+        if let Some(found) = self.settle(editor, fs)? {
+            return Ok(found);
         }
         let target = self.target.clone();
         match fs.lstat_opt(&target)? {
@@ -1246,6 +1281,9 @@ pub fn restore(
         None => p.to_string(),
     };
     let mut lines = Vec::new();
+    // A cut-off Save found landed with edits kept after it: the file is that Save's, and its
+    // baseline the one the edits are now against (as the next Save's `settle` takes it).
+    let mut landed = None;
     if let Some(r) = orphan.reconcile(&mut Look(fs)) {
         let target = match &orphan.save {
             journal::SaveFile::Intent(intent) => intent.target.clone(),
@@ -1256,7 +1294,14 @@ pub fn restore(
         lines.extend(notes);
         match r.outcome {
             journal::Outcome::Landed => match orphan.landed()? {
-                Some(later) => orphan = later,
+                Some(later) => {
+                    orphan = later;
+                    let sha = r.next.as_ref().and_then(|(base, _)| base.sha256);
+                    if let (Some(now), Some(sha)) = (fs.lstat_opt(&target)?, sha) {
+                        let id = fs.file_id(&target)?.map(|(id, _)| id);
+                        landed = Some((now, sha, id));
+                    }
+                }
                 None => return Ok(Restoring::Landed(lines)),
             },
             journal::Outcome::NotLanded => orphan.clear_save()?,
@@ -1271,7 +1316,11 @@ pub fn restore(
     let edits = &backing.edits;
     let encoding = Encoding::from_label(&edits.encoding)
         .with_context(|| format!("the journal names an unknown encoding {}", edits.encoding))?;
-    let check = journal::restore_check(&gen, Kind::Text, &mut Look(fs));
+    let check = match landed {
+        // The file is the landed Save's: the edits are against it.
+        Some(_) => journal::Restore::Apply { notes: Vec::new() },
+        None => journal::restore_check(&gen, Kind::Text, &mut Look(fs)),
+    };
     let name = remote::split_parent(&gen.head.path).1.to_string();
     match check {
         journal::Restore::Apply { notes } => {
@@ -1315,11 +1364,14 @@ pub fn restore(
         label: label.map(str::to_string),
         host: gen.head.host.clone(),
         target: gen.head.path.clone(),
-        baseline: Baseline {
-            size: base.size,
-            mtime: base.mtime,
-            sha256: sha,
-            id: edits.id,
+        baseline: match landed {
+            Some((now, sha, id)) => Baseline::of(&now, sha, id.filter(|_| edits.id.is_some())),
+            None => Baseline {
+                size: base.size,
+                mtime: base.mtime,
+                sha256: sha,
+                id: edits.id,
+            },
         },
         cache: cache.to_path_buf(),
         journal_fs,

@@ -614,6 +614,12 @@ struct Dying<F> {
     fail: Option<&'static str>,
     /// The request named here takes effect and its reply is lost.
     lose: Option<&'static str>,
+    /// The exchange is not offered (`ENOSYS`).
+    no_exchange: bool,
+    /// The local staged file gets one more byte right before its upload.
+    tamper: bool,
+    /// Another version written into the file in place right before the temp's rename.
+    write_before_rename: Option<PathBuf>,
 }
 
 impl<F> Dying<F> {
@@ -625,6 +631,9 @@ impl<F> Dying<F> {
             exchanges: 0,
             fail: None,
             lose: None,
+            no_exchange: false,
+            tamper: false,
+            write_before_rename: None,
         }
     }
 }
@@ -686,6 +695,13 @@ impl<F: RemoteFs + ?Sized + Send + 'static> RemoteFs for Dying<Box<F>> {
         out: &mut dyn std::io::Write,
         progress: &mut dyn FnMut(u64),
     ) -> Result<u64> {
+        if path.contains(".sopen-prev-") {
+            self.refused("read link")?;
+            if self.after == Some("read link") {
+                // Killed while the link is read.
+                self.dead.store(true, Ordering::SeqCst);
+            }
+        }
         self.alive()?;
         self.inner.read_to(path, out, progress)
     }
@@ -696,6 +712,13 @@ impl<F: RemoteFs + ?Sized + Send + 'static> RemoteFs for Dying<Box<F>> {
         like: Option<remote::Like>,
     ) -> std::result::Result<Uploaded, CreateError> {
         self.alive().map_err(|e| CreateError::new(Created::No, e))?;
+        if std::mem::take(&mut self.tamper) {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(local)
+                .unwrap();
+            f.write_all(b"!").unwrap();
+        }
         self.inner.create_from(local, path, like)
     }
     fn set_mode(&mut self, path: &str, mode: u32) -> Result<()> {
@@ -704,6 +727,9 @@ impl<F: RemoteFs + ?Sized + Send + 'static> RemoteFs for Dying<Box<F>> {
     }
     fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
         self.refused("rename")?;
+        if let Some(target) = self.write_before_rename.take() {
+            write_in_place(&target, THEIRS);
+        }
         let r = self.inner.rename_over(from, to);
         self.done("rename", r)
     }
@@ -723,13 +749,17 @@ impl<F: RemoteFs + ?Sized + Send + 'static> RemoteFs for Dying<Box<F>> {
         self.inner.remove(path)
     }
     fn exchange(&mut self, a: &str, b: &str) -> Result<()> {
-        self.refused("exchange")?;
+        let op = match self.exchanges {
+            0 => "exchange",
+            _ => "exchange back",
+        };
+        self.refused(op)?;
+        if self.no_exchange {
+            return Err(anyhow::Error::new(remote::NoExchange(libc::ENOSYS)));
+        }
         self.exchanges += 1;
         let r = self.inner.exchange(a, b);
-        match self.exchanges {
-            1 => self.done("exchange", r),
-            _ => self.done("exchange back", r),
-        }
+        self.done(op, r)
     }
     fn file_id(&mut self, path: &str) -> Result<Option<(FileId, u64)>> {
         self.alive()?;
@@ -738,6 +768,10 @@ impl<F: RemoteFs + ?Sized + Send + 'static> RemoteFs for Dying<Box<F>> {
     fn sync_dir(&mut self, dir: &str) -> Result<()> {
         self.alive()?;
         self.inner.sync_dir(dir)
+    }
+    fn move_new(&mut self, from: &str, to: &str) -> Result<()> {
+        self.alive()?;
+        self.inner.move_new(from, to)
     }
 }
 
@@ -807,7 +841,12 @@ impl journal::Fs for DyingDisk {
 struct Kill {
     at: Option<&'static str>,
     after: Option<&'static str>,
+    /// The step at which another version is written in place, or `rename`: right before it.
     change: Option<&'static str>,
+    /// A request that fails (a status reply) on the way.
+    fail: Option<&'static str>,
+    /// The exchange is not offered: today's route.
+    unguarded: bool,
 }
 
 fn word(g: &Guard<'_>) -> &'static str {
@@ -851,6 +890,12 @@ fn listed(r: &Rig, host: &str) -> Vec<Recovery> {
 type Killed = (Vec<u8>, Vec<String>, Option<Vec<u8>>);
 
 fn killed_save(r: &Rig, remote: bool, kill: Kill) -> Option<Killed> {
+    kill_save(r, remote, kill)?;
+    reopen(r, remote, kill)
+}
+
+/// A Save killed at `kill`, the process gone.
+fn kill_save(r: &Rig, remote: bool, kill: Kill) -> Option<()> {
     let label = remote.then_some("box");
     let (inner, rd) = opened(r, remote)?;
     let dead = Arc::new(AtomicBool::new(false));
@@ -860,6 +905,11 @@ fn killed_save(r: &Rig, remote: bool, kill: Kill) -> Option<Killed> {
         typed(&mut ed, 0, "x-");
         kept(&mut s, &ed);
         let mut fs = Dying::over(inner, &dead, kill.after);
+        fs.fail = kill.fail;
+        fs.no_exchange = kill.unguarded;
+        if kill.change == Some("rename") {
+            fs.write_before_rename = Some(r.target.clone());
+        }
         let target = r.target.clone();
         let _ = s.save_with(&mut ed, &mut fs, &mut |g, intent| {
             if kill.change == Some(word(g)) {
@@ -873,6 +923,12 @@ fn killed_save(r: &Rig, remote: bool, kill: Kill) -> Option<Killed> {
         });
         assert!(dead.load(Ordering::SeqCst), "{kill:?}: the kill came");
     }
+    Some(())
+}
+
+/// The next F4 after a killed Save: the journal listed and restored, which reconciles it.
+fn reopen(r: &Rig, remote: bool, kill: Kill) -> Option<Killed> {
+    let label = remote.then_some("box");
     let (mut fresh, _) = opened(r, remote)?;
     let jfs = journal::disk();
     let host = label.unwrap_or(crate::cache::LOCAL_HOST);
@@ -895,7 +951,13 @@ fn killed_save(r: &Rig, remote: bool, kill: Kill) -> Option<Killed> {
 /// and named; nothing is removed unhashed.
 #[test]
 fn a_save_killed_at_any_phase_reconciles_to_the_old_file_or_the_new_one() {
-    let k = |at, after, change| Kill { at, after, change };
+    let k = |at, after, change| Kill {
+        at,
+        after,
+        change,
+        fail: None,
+        unguarded: false,
+    };
     // (remote, the kill, the file after, the version kept beside it, landed)
     type Row = (bool, Kill, &'static [u8], Option<&'static [u8]>, bool);
     let rows: Vec<Row> = vec![
@@ -933,7 +995,7 @@ fn a_save_killed_at_any_phase_reconciles_to_the_old_file_or_the_new_one() {
         (true, k(Some("committed"), None, None), NEW, None, true),
         (
             true,
-            k(Some("committed"), None, Some("staged")),
+            k(Some("committed"), None, Some("rename")),
             NEW,
             Some(THEIRS),
             true,
@@ -941,9 +1003,31 @@ fn a_save_killed_at_any_phase_reconciles_to_the_old_file_or_the_new_one() {
         (true, k(Some("verified"), None, None), NEW, None, true),
         (
             true,
-            k(Some("kept"), None, Some("staged")),
+            k(Some("kept"), None, Some("rename")),
             NEW,
             Some(THEIRS),
+            true,
+        ),
+        (true, k(None, Some("read link"), None), NEW, None, true),
+        (false, k(Some("removed"), None, None), NEW, None, true),
+        (
+            false,
+            Kill {
+                fail: Some("exchange back"),
+                ..k(Some("kept"), None, Some("exchanging"))
+            },
+            NEW,
+            Some(THEIRS),
+            true,
+        ),
+        (
+            false,
+            Kill {
+                unguarded: true,
+                ..k(None, Some("rename"), None)
+            },
+            NEW,
+            None,
             true,
         ),
     ];
@@ -1405,4 +1489,206 @@ fn the_next_save_reconciles_a_cut_off_one_first() {
     assert!(ed.buffer().is_saved());
     assert_eq!(s.baseline().sha256, sha(&want));
     assert_eq!(leftovers(&r.dir), (vec![], vec![]));
+}
+
+/// The local read's baseline is the bytes read: a file that grew while it was read — its mtime
+/// put back — is refused, never given a baseline of its size before.
+#[test]
+fn a_file_that_grew_during_the_read_is_refused() {
+    let r = rig(OLD);
+    let target = r.target.clone();
+    let mut grown = false;
+    let got = read_local(
+        p(&r.target),
+        Encoding::Utf8,
+        &mut |_, _| {
+            if !std::mem::replace(&mut grown, true) {
+                let meta = std::fs::metadata(&target).unwrap();
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&target)
+                    .unwrap();
+                f.write_all(b"+").unwrap();
+                f.set_modified(meta.modified().unwrap()).unwrap();
+            }
+        },
+        &never(),
+    );
+    let e = got.err().expect("refused");
+    assert!(
+        format!("{e:#}").contains("changed while it was read"),
+        "{e:#}"
+    );
+}
+
+/// Step 5 that never finished (the link's read failed after the rename): the Save landed, the
+/// hidden link named, and the record kept — the next Save runs the link check first.
+#[test]
+fn a_link_check_that_never_finished_keeps_the_record() {
+    let r = rig(OLD);
+    let Some((conn, rd)) = opened(&r, true) else {
+        return;
+    };
+    let mut ed = editor(&rd);
+    let mut s = Session::new(&rd, Some("box"), &r.cache, journal::disk());
+    typed(&mut ed, 0, "x-");
+    kept(&mut s, &ed);
+    let dead = Arc::new(AtomicBool::new(false));
+    let mut fs = Dying::over(conn, &dead, None);
+    fs.fail = Some("read link");
+    let saved = s.save(&mut ed, &mut fs).unwrap();
+    let (_, notes) = written(&saved);
+    let (links, _) = leftovers(&r.dir);
+    assert_eq!(links.len(), 1, "{links:?}");
+    let link = p(&r.dir.join(&links[0])).to_string();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains(&link) && n.contains("could not be checked")),
+        "{notes:?}"
+    );
+    let pending = s.journal.as_ref().unwrap().pending_save().cloned();
+    assert!(
+        matches!(
+            pending.as_ref().and_then(|i| i.guard.clone()),
+            Some(Guarded::Committed { .. })
+        ),
+        "{pending:?}"
+    );
+    assert_eq!(std::fs::read(&r.target).unwrap(), NEW);
+    let found = s.save(&mut ed, fs.inner.as_mut()).unwrap();
+    assert!(matches!(found, Saved::Found { .. }), "{found:?}");
+    assert_eq!(
+        leftovers(&r.dir),
+        (vec![], vec![]),
+        "the link checked and removed"
+    );
+}
+
+/// §9.2 / 07 §3.1: Overwrite reconciles a cut-off Save of this session first, and a refused
+/// start never wipes another Save's record — Save → conflict → Overwrite, its rename's reply lost
+/// → Overwrite again → the first one found landed.
+#[test]
+fn overwrite_reconciles_a_cut_off_save_first() {
+    let r = rig(OLD);
+    let Some((conn, rd)) = opened(&r, true) else {
+        return;
+    };
+    let mut ed = editor(&rd);
+    let mut s = Session::new(&rd, Some("box"), &r.cache, journal::disk());
+    typed(&mut ed, 0, "x-");
+    kept(&mut s, &ed);
+    write_in_place(&r.target, THEIRS);
+    let dead = Arc::new(AtomicBool::new(false));
+    let mut fs = Dying::over(conn, &dead, None);
+    let first = s.save(&mut ed, &mut fs).unwrap();
+    assert!(matches!(first, Saved::Conflict { .. }), "{first:?}");
+    fs.lose = Some("rename");
+    let e = s.overwrite(&mut ed, &mut fs).unwrap_err();
+    assert!(format!("{e:#}").contains("outcome unknown"), "{e:#}");
+    assert!(s.journal.as_ref().unwrap().pending_save().is_some());
+    fs.lose = None;
+    let again = s.overwrite(&mut ed, &mut fs).unwrap();
+    assert!(matches!(again, Saved::Found { .. }), "{again:?}");
+    assert!(s.journal.as_ref().unwrap().pending_save().is_none());
+    assert_eq!(std::fs::read(&r.target).unwrap(), NEW);
+    assert!(ed.buffer().is_saved());
+    assert_eq!(leftovers(&r.dir), (vec![], vec![]));
+}
+
+/// Restore after a Save whose reply was lost had landed, with edits kept after it: the baseline
+/// is the landed file's, no `changed since` line, and the next Save lands — no false conflict.
+#[test]
+fn restore_after_a_landed_lost_save_takes_its_baseline() {
+    let r = rig(OLD);
+    let Some((conn, rd)) = opened(&r, true) else {
+        return;
+    };
+    {
+        let mut ed = editor(&rd);
+        let mut s = Session::new(&rd, Some("box"), &r.cache, journal::disk());
+        typed(&mut ed, 0, "x-");
+        kept(&mut s, &ed);
+        let dead = Arc::new(AtomicBool::new(false));
+        let mut fs = Dying::over(conn, &dead, None);
+        fs.lose = Some("rename");
+        assert!(s.save(&mut ed, &mut fs).is_err());
+        typed(&mut ed, 0, "B");
+        kept(&mut s, &ed);
+    }
+    assert_eq!(std::fs::read(&r.target).unwrap(), NEW);
+    let (mut fresh, _) = opened(&r, true).unwrap();
+    let mut recs = listed(&r, "box");
+    let Restoring::Restored(mut back) = restore(
+        recs.remove(0),
+        fresh.as_mut(),
+        Some("box"),
+        &r.cache,
+        journal::disk(),
+        false,
+    )
+    .unwrap() else {
+        panic!("later edits are kept")
+    };
+    let mut want = b"B".to_vec();
+    want.extend_from_slice(NEW);
+    assert_eq!(doc(&back.editor), want);
+    assert!(back.lines[0].contains("landed"), "{:?}", back.lines);
+    assert!(
+        !back.lines.iter().any(|l| l.contains("changed since")),
+        "{:?}",
+        back.lines
+    );
+    assert_eq!(back.session.baseline().sha256, sha(NEW));
+    let saved = back.session.save(&mut back.editor, fresh.as_mut()).unwrap();
+    written(&saved);
+    assert_eq!(std::fs::read(&r.target).unwrap(), want);
+}
+
+/// What is uploaded must be what was staged: a staged file changed before its upload is refused
+/// before anything is replaced.
+#[test]
+fn an_upload_that_is_not_the_staged_bytes_is_refused() {
+    let r = rig(OLD);
+    let rd = read(&r, Encoding::Utf8);
+    let mut ed = editor(&rd);
+    let mut s = Session::new(&rd, None, &r.cache, journal::disk());
+    typed(&mut ed, 0, "x-");
+    kept(&mut s, &ed);
+    let dead = Arc::new(AtomicBool::new(false));
+    let mut fs = Dying::over(Box::new(LocalFs::new()), &dead, None);
+    fs.tamper = true;
+    let e = s.save(&mut ed, &mut fs).unwrap_err();
+    assert!(format!("{e:#}").contains("not the bytes staged"), "{e:#}");
+    assert_eq!(std::fs::read(&r.target).unwrap(), OLD);
+    assert_eq!(leftovers(&r.dir), (vec![], vec![]));
+}
+
+/// Reconciling a cut-off Save and acting on it twice changes nothing the second time: the kept
+/// version stays one, the file as it was.
+#[test]
+fn reconcile_and_act_twice_is_the_same_as_once() {
+    let r = rig(OLD);
+    let kill = Kill {
+        at: None,
+        after: Some("exchange"),
+        change: Some("exchanging"),
+        fail: None,
+        unguarded: false,
+    };
+    kill_save(&r, false, kill).unwrap();
+    let recs = listed(&r, "local");
+    let journal::SaveFile::Intent(intent) = &recs[0].orphan.save else {
+        panic!("a save is recorded")
+    };
+    let show = |p: &str| p.to_string();
+    let mut fs = LocalFs::new();
+    for round in 0..2 {
+        let r2 = journal::reconcile(intent, "local", &mut Look(&mut fs));
+        assert_eq!(r2.outcome, journal::Outcome::Landed, "{round}");
+        act(&mut fs, &r2, &intent.target, &show);
+        assert_eq!(leftovers(&r.dir).1.len(), 1, "{round}");
+        assert_eq!(leftovers(&r.dir).0, Vec::<String>::new(), "{round}");
+        assert_eq!(std::fs::read(&r.target).unwrap(), NEW, "{round}");
+    }
 }

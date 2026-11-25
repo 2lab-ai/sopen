@@ -2884,7 +2884,8 @@ fn a_zero_byte_data_reply_is_an_early_end() {
 
 /// Any file layer with the guard's faults put in: the exchange refused or failing on its way
 /// back, and the remote link (`.sopen-prev-`) refused, unanswered, unreadable, unmovable or not
-/// removable.
+/// removable; a writer in place right before the rename; the stat after the rename failing; a
+/// competitor taking a kept version's name; and a log of the requests, beside the steps.
 #[derive(Default)]
 struct Faults<F> {
     inner: F,
@@ -2896,6 +2897,17 @@ struct Faults<F> {
     fail_prev_read: bool,
     fail_prev_keep: bool,
     fail_prev_remove: bool,
+    /// Right before the temp's rename over the target: this written into the target in place.
+    write_before_rename: Option<(PathBuf, Vec<u8>)>,
+    /// From the rename on, the target's `lstat` fails.
+    fail_lstat_after_rename: bool,
+    renamed: bool,
+    /// Hard links to a kept version's name fail (a filesystem without them).
+    no_kept_links: bool,
+    /// The first move or rename to a kept version's name finds another recovery copy there,
+    /// made a moment before.
+    competitor: bool,
+    log: Arc<Mutex<Vec<String>>>,
 }
 
 impl<F> Faults<F> {
@@ -2910,6 +2922,35 @@ impl<F> Faults<F> {
             fail_prev_read: false,
             fail_prev_keep: false,
             fail_prev_remove: false,
+            write_before_rename: None,
+            fail_lstat_after_rename: false,
+            renamed: false,
+            no_kept_links: false,
+            competitor: false,
+            log: Arc::default(),
+        }
+    }
+
+    fn note(&self, what: &str, path: &str) {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let name = match name.contains(".sopen-") {
+            true => name
+                .split(".sopen-")
+                .nth(1)
+                .unwrap_or(name)
+                .split('-')
+                .next()
+                .unwrap_or(name),
+            false => name,
+        };
+        self.log.lock().unwrap().push(format!("{what} {name}"));
+    }
+
+    /// The competitor's copy, once, at a kept version's name.
+    fn compete(&mut self, to: &str) {
+        if self.competitor && is_kept(to) {
+            self.competitor = false;
+            std::fs::write(to, b"COMPETITOR").unwrap();
         }
     }
 }
@@ -2918,11 +2959,21 @@ fn is_prev(path: &str) -> bool {
     path.contains(".sopen-prev-")
 }
 
+fn is_kept(path: &str) -> bool {
+    path.contains(".sopen-replaced-")
+}
+
+use std::sync::{Arc, Mutex};
+
 impl<F: RemoteFs + Send + 'static> RemoteFs for Faults<F> {
     fn stat_opt(&mut self, path: &str) -> Result<Option<Stat>> {
         self.inner.stat_opt(path)
     }
     fn lstat_opt(&mut self, path: &str) -> Result<Option<Stat>> {
+        if self.renamed && self.fail_lstat_after_rename && path.ends_with("/notes.txt") {
+            bail!("simulated: the stat after the rename failed");
+        }
+        self.note("lstat", path);
         self.inner.lstat_opt(path)
     }
     fn realpath(&mut self, path: &str) -> Result<String> {
@@ -2946,6 +2997,7 @@ impl<F: RemoteFs + Send + 'static> RemoteFs for Faults<F> {
         if self.fail_prev_read && is_prev(path) {
             bail!("simulated: the read of {path} failed");
         }
+        self.note("read", path);
         self.inner.read_to(path, out, progress)
     }
     fn create_from(
@@ -2963,7 +3015,14 @@ impl<F: RemoteFs + Send + 'static> RemoteFs for Faults<F> {
         if self.fail_prev_keep && is_prev(from) {
             bail!("simulated: the rename of {from} failed");
         }
-        self.inner.rename_over(from, to)
+        if let Some((path, body)) = self.write_before_rename.take() {
+            write_in_place(&path, &body);
+        }
+        self.compete(to);
+        self.note("rename", from);
+        self.inner.rename_over(from, to)?;
+        self.renamed = true;
+        Ok(())
     }
     fn link_new(&mut self, from: &str, to: &str) -> Result<()> {
         if self.refuse_prev_link && is_prev(to) {
@@ -2972,6 +3031,10 @@ impl<F: RemoteFs + Send + 'static> RemoteFs for Faults<F> {
         if self.fail_prev_keep && is_prev(from) {
             bail!("simulated: the link of {from} failed");
         }
+        if self.no_kept_links && is_kept(to) {
+            bail!("simulated: hard links are not supported here");
+        }
+        self.compete(to);
         self.inner.link_new(from, to)?;
         if self.lost_prev_link && is_prev(to) {
             return Err(unknown(
@@ -2999,13 +3062,22 @@ impl<F: RemoteFs + Send + 'static> RemoteFs for Faults<F> {
             (2, _) if self.fail_exchange_back => bail!("simulated: the exchange back failed"),
             _ => {}
         }
+        self.note("exchange", a);
         self.inner.exchange(a, b)
     }
     fn file_id(&mut self, path: &str) -> Result<Option<(FileId, u64)>> {
         self.inner.file_id(path)
     }
     fn sync_dir(&mut self, dir: &str) -> Result<()> {
+        self.log.lock().unwrap().push("sync dir".to_string());
         self.inner.sync_dir(dir)
+    }
+    fn move_new(&mut self, from: &str, to: &str) -> Result<()> {
+        if self.fail_prev_keep && is_prev(from) {
+            bail!("simulated: the move of {from} failed");
+        }
+        self.compete(to);
+        self.inner.move_new(from, to)
     }
 }
 
@@ -3371,11 +3443,8 @@ fn a_remote_change_is_caught_before_the_rename_or_kept_after_it() {
 
     let tmp = tempfile::tempdir().unwrap();
     let (target, staged, at, _) = guarded_rig(tmp.path(), b"before\n", b"after\n");
-    let (r, told) = guarded(&mut fs, &staged, &target, at, None, &mut |g| {
-        if matches!(g, Guard::Step(Step::Staged { .. })) {
-            write_in_place(&target, b"OTHER!\n");
-        }
-    });
+    fs.write_before_rename = Some((target.clone(), b"OTHER!\n".to_vec()));
+    let (r, told) = guarded(&mut fs, &staged, &target, at, None, &mut |_| {});
     let r = r.unwrap();
     let WriteOutcome::Written { notes, .. } = &r.outcome else {
         panic!("{r:?}")
@@ -3409,11 +3478,10 @@ fn a_remote_link_that_cannot_be_checked_moved_or_removed_is_named() {
         fs.fail_prev_remove = case == "remove";
         let tmp = tempfile::tempdir().unwrap();
         let (target, staged, at, _) = guarded_rig(tmp.path(), b"before\n", b"after\n");
-        let (r, _) = guarded(&mut fs, &staged, &target, at, None, &mut |g| {
-            if case == "keep" && matches!(g, Guard::Step(Step::Staged { .. })) {
-                write_in_place(&target, b"OTHER!\n");
-            }
-        });
+        if case == "keep" {
+            fs.write_before_rename = Some((target.clone(), b"OTHER!\n".to_vec()));
+        }
+        let (r, _) = guarded(&mut fs, &staged, &target, at, None, &mut |_| {});
         let r = r.unwrap();
         let WriteOutcome::Written { notes, .. } = &r.outcome else {
             panic!("{case}: {r:?}")
@@ -3481,4 +3549,231 @@ fn a_remote_link_refused_or_missing_takes_todays_route() {
     let left = sopen_names(tmp.path());
     assert_eq!(left.len(), 1, "the link stays: {left:?}");
     assert!(format!("{e:#}").contains(&left[0]), "{e:#}");
+}
+
+/// 12 §9.1 step 3, remote: today's check before the rename is the last thing before it — the
+/// staged step (recorded first) comes before the content re-read and the stat check, and no
+/// request or record comes between the check and the rename. A writer in place after the check
+/// is the link check's (kept, named); one that replaces the file by its own rename there is the
+/// residual E32 states.
+#[test]
+fn the_remote_recheck_comes_right_before_the_rename() {
+    let Some(mut fs) = sftp_faults() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, staged, at, _) = guarded_rig(tmp.path(), b"before\n", b"after\n");
+    let log = fs.log.clone();
+    let (r, _) = guarded(&mut fs, &staged, &target, at, None, &mut |g| {
+        if let Guard::Step(Step::Staged { .. }) = g {
+            log.lock().unwrap().push("STAGED recorded".into());
+        }
+    });
+    assert!(matches!(r.unwrap().outcome, WriteOutcome::Written { .. }));
+    let log: Vec<String> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|l| match l.starts_with("rename ") {
+            true => "rename tmp".to_string(),
+            false => l.clone(),
+        })
+        .collect();
+    let at = |what: &str| {
+        log.iter()
+            .position(|l| l == what)
+            .unwrap_or_else(|| panic!("{what}: {log:?}"))
+    };
+    let rename = at("rename tmp");
+    assert_eq!(
+        &log[at("STAGED recorded")..=rename],
+        [
+            "STAGED recorded",
+            "read notes.txt",
+            "lstat notes.txt",
+            "rename tmp"
+        ],
+        "{log:?}"
+    );
+}
+
+/// The kept version's name is never taken from another recovery copy: a copy made there a
+/// moment before the move — two Saves keeping a version in one second — is not replaced, even on
+/// a filesystem without hard links; the version goes to the next free name.
+#[test]
+fn keep_aside_never_replaces_another_recovery_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, _, _, _) = guarded_rig(tmp.path(), b"before\n", b"after\n");
+    let mut fs = Faults::over(LocalFs::new());
+    fs.no_kept_links = true;
+    fs.competitor = true;
+    let from = tmp.path().join(".notes.txt.sopen-0123456789abcdef");
+    std::fs::write(&from, b"THEIRS").unwrap();
+    let kept = keep_aside(&mut fs, p(&from), p(&target), &mut |_| Ok(())).unwrap();
+    let all = replaced_names(tmp.path());
+    assert_eq!(all.len(), 2, "{all:?}");
+    let competitor = all
+        .iter()
+        .find(|p| std::fs::read(p).unwrap() == b"COMPETITOR");
+    assert!(competitor.is_some(), "the other copy is untouched: {all:?}");
+    assert_eq!(std::fs::read(&kept).unwrap(), b"THEIRS");
+    assert!(kept.ends_with("-1"), "{kept}");
+    assert!(!from.exists());
+
+    // Two versions kept beside one file in one second: both stay.
+    let second = tmp.path().join(".notes.txt.sopen-fedcba9876543210");
+    std::fs::write(&second, b"MORE").unwrap();
+    let again = keep_aside(&mut fs, p(&second), p(&target), &mut |_| Ok(())).unwrap();
+    assert_ne!(again, kept);
+    assert_eq!(replaced_names(tmp.path()).len(), 3);
+}
+
+/// 12 §9.1: the folder is fsynced wherever a local replace changes its entries — today's rename
+/// where the exchange is not offered, an exchange back, a version kept after a failed exchange
+/// back. A record the guard cannot write stops the change it was for: no exchange back without
+/// `swapped back` recorded, no move without `kept` — the other version stays at the name it is
+/// known by, and is named.
+#[test]
+fn local_replaces_fsync_the_folder_and_record_before_they_move() {
+    let syncs_after = |log: &[String], what: &str| {
+        let i = log.iter().rposition(|l| l.starts_with(what)).unwrap();
+        log[i..].iter().any(|l| l == "sync dir")
+    };
+    // Today's rename.
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, staged, at, id) = guarded_rig(tmp.path(), b"before\n", b"after\n");
+    let mut fs = Faults::over(LocalFs::new());
+    fs.exchange_errno = Some(libc::ENOTSUP);
+    let (r, _) = guarded(&mut fs, &staged, &target, at, Some(id), &mut |_| {});
+    assert!(matches!(r.unwrap().outcome, WriteOutcome::Written { .. }));
+    assert!(
+        syncs_after(&fs.log.lock().unwrap(), "rename"),
+        "{:?}",
+        fs.log
+    );
+    // An exchange back.
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, staged, at, id) = guarded_rig(tmp.path(), b"before\n", b"after\n");
+    let mut fs = Faults::over(LocalFs::new());
+    let (r, _) = guarded(&mut fs, &staged, &target, at, Some(id), &mut |g| {
+        if matches!(g, Guard::Exchanging { .. }) {
+            write_in_place(&target, b"OTHER!\n");
+        }
+    });
+    assert!(matches!(r.unwrap().outcome, WriteOutcome::Conflict { .. }));
+    let log = fs.log.lock().unwrap().clone();
+    assert_eq!(log.iter().filter(|l| l.starts_with("exchange")).count(), 2);
+    assert!(syncs_after(&log, "exchange"), "{log:?}");
+    // A version kept after a failed exchange back.
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, staged, at, id) = guarded_rig(tmp.path(), b"before\n", b"after\n");
+    let mut fs = Faults::over(LocalFs::new());
+    fs.fail_exchange_back = true;
+    let (r, _) = guarded(&mut fs, &staged, &target, at, Some(id), &mut |g| {
+        if matches!(g, Guard::Exchanging { .. }) {
+            write_in_place(&target, b"OTHER!\n");
+        }
+    });
+    assert!(r.unwrap().kept.is_some());
+    assert!(
+        syncs_after(&fs.log.lock().unwrap(), "lstat replaced"),
+        "{:?}",
+        fs.log
+    );
+
+    // `swapped back` not recorded: no exchange back; sopen's version stays, the other one at
+    // the temp's name, named.
+    for refuse in ["swapped back", "kept"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (target, staged, at, id) = guarded_rig(tmp.path(), b"before\n", b"after\n");
+        let mut fs = Faults::over(LocalFs::new());
+        fs.fail_exchange_back = refuse == "kept";
+        let mut told = Vec::new();
+        let r = fs.replace_guarded(&staged, p(&target), at, Some(id), &mut |g| {
+            told.push(guard_word(&g));
+            if matches!(g, Guard::Exchanging { .. }) {
+                write_in_place(&target, b"OTHER!\n");
+            }
+            match guard_word(&g) == refuse {
+                true => bail!("simulated: the record could not be written"),
+                false => Ok(()),
+            }
+        });
+        let r = r.unwrap();
+        let WriteOutcome::Written { notes, .. } = &r.outcome else {
+            panic!("{refuse}: {r:?}")
+        };
+        assert_eq!(std::fs::read(&target).unwrap(), b"after\n", "{refuse}");
+        let temps: Vec<String> = sopen_names(tmp.path());
+        assert_eq!(temps.len(), 1, "{refuse}: {temps:?}");
+        let at = tmp.path().join(&temps[0]);
+        assert_eq!(std::fs::read(&at).unwrap(), b"OTHER!\n", "{refuse}");
+        assert_eq!(r.kept.as_deref(), Some(p(&at)), "{refuse}");
+        assert!(
+            notes.iter().any(|n| n.contains(p(&at))),
+            "{refuse}: {notes:?}"
+        );
+        assert!(replaced_names(tmp.path()).is_empty(), "{refuse}");
+        let backs = fs
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("exchange"))
+            .count();
+        // Refused at `swapped back`: never sent; refused at `kept`: sent and failed (a fault
+        // the log does not count). Either way the one exchange that landed.
+        assert_eq!(backs, 1, "{refuse}: only the exchange");
+    }
+}
+
+/// A replace that has committed is reported as landed whatever follows: the stat after the
+/// rename failing is a note, the staged stat the baseline, and the kept version still named.
+#[test]
+fn a_failure_after_the_commit_is_a_note_not_an_error() {
+    let Some(mut fs) = sftp_faults() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, staged, at, _) = guarded_rig(tmp.path(), b"before\n", b"after\n");
+    fs.write_before_rename = Some((target.clone(), b"OTHER!\n".to_vec()));
+    fs.fail_lstat_after_rename = true;
+    let (r, _) = guarded(&mut fs, &staged, &target, at, None, &mut |_| {});
+    let r = r.unwrap();
+    let WriteOutcome::Written { now, notes } = &r.outcome else {
+        panic!("{r:?}")
+    };
+    assert_eq!(now.sha256, Some(sha(b"after\n")));
+    assert!(r.kept.is_some(), "{r:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("the stat after the rename failed")),
+        "{notes:?}"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (target, staged, at, id) = guarded_rig(tmp.path(), b"before\n", b"after\n");
+    let mut fs = Faults::over(LocalFs::new());
+    fs.fail_lstat_after_rename = true;
+    fs.exchange_errno = Some(libc::ENOSYS);
+    let (r, _) = guarded(&mut fs, &staged, &target, at, Some(id), &mut |_| {});
+    assert!(matches!(r.unwrap().outcome, WriteOutcome::Written { .. }));
+}
+
+/// The guard's identity check rests on this (12 §9.1, measured where the tests run): an
+/// exchange moves the two inodes with their content — each name then holds the other's inode
+/// and bytes.
+#[test]
+fn the_exchange_moves_the_inodes_with_their_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+    std::fs::write(&a, b"AAAA").unwrap();
+    std::fs::write(&b, b"BB").unwrap();
+    let mut fs = LocalFs::new();
+    let (ia, ib) = (
+        fs.file_id(p(&a)).unwrap().unwrap().0,
+        fs.file_id(p(&b)).unwrap().unwrap().0,
+    );
+    fs.exchange(p(&a), p(&b)).unwrap();
+    assert_eq!(fs.file_id(p(&a)).unwrap().unwrap().0, ib);
+    assert_eq!(fs.file_id(p(&b)).unwrap().unwrap().0, ia);
+    assert_eq!(std::fs::read(&a).unwrap(), b"BB");
+    assert_eq!(std::fs::read(&b).unwrap(), b"AAAA");
 }
