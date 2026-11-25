@@ -198,18 +198,53 @@ fn cut_short(row: &str, room: usize) -> String {
 /// wraps, and looks loose.
 const WIDEST: usize = 76;
 
-/// The dialog titled `title` with `parts`, on `grid`: as wide as its widest part wants — `nominal`
-/// cells at least, at most [`WIDEST`] or `nominal` (the larger), and never more than the grid
-/// less eight (the box's border and margin, its shadow, a cell clear at either side) — and as
-/// tall as its parts; where the grid is too short, the rows that scroll give way first, then the
-/// tallest text loses its last rows ("…"). Centred with its shadow.
+/// How many cells wide a dialog's inside is on a grid `cols` wide when its texts want `wanted`:
+/// `nominal` at least, at most [`WIDEST`] or `nominal` (the larger), and never more than the grid
+/// less eight (the box's border and margin, its shadow, a cell clear at either side). The key
+/// help's box is as wide by the same rule (`gui::help`).
+pub fn inside_width(cols: u16, nominal: usize, wanted: usize) -> usize {
+    let room = usize::from(cols.saturating_sub(8)).max(1);
+    wanted
+        .max(nominal)
+        .min(nominal.max(WIDEST.min(room)))
+        .min(room)
+}
+
+/// A box `w` × `h` cells centred on `grid` with its shadow (two cells right, one down).
+pub fn centred(grid: Grid, w: u16, h: u16) -> Cells {
+    let x = grid.cols.saturating_sub(w.saturating_add(2)) / 2;
+    let y = grid.rows.saturating_sub(h.saturating_add(1)) / 2;
+    Cells::new(x, y, w, h)
+}
+
+/// The two strips of the shadow of the box `frame`: right of it from its second row, under it
+/// from its third column.
+pub fn shadow_of(frame: Cells) -> [Cells; 2] {
+    let f = frame;
+    [
+        Cells::new(f.right(), f.y + 1, 2, f.height),
+        Cells::new(f.x + 2, f.bottom(), f.width, 1),
+    ]
+}
+
+/// The shadow of the box `frame` in `buf`: black cells (see the module's header).
+pub fn shadow(buf: &mut Buffer, frame: Cells) {
+    let pen = Pen::new(cga::DARK_GRAY, cga::BLACK);
+    for strip in shadow_of(frame) {
+        cells::fill(buf, strip, pen);
+    }
+}
+
+/// The dialog titled `title` with `parts`, on `grid`: as wide as its widest part wants, by
+/// [`inside_width`]'s rule, and as tall as its parts; where the grid is too short, the rows that
+/// scroll give way first, then the tallest text loses its last rows ("…"). Centred with its
+/// shadow ([`centred`]).
 pub fn layout(grid: Grid, title: &str, nominal: usize, parts: &[Part]) -> Layout {
-    let room = usize::from(grid.cols.saturating_sub(8)).max(1);
     let wanted = (parts.iter().map(wants))
         .chain([nominal, cells::width(title) + 2])
         .max()
         .unwrap_or(nominal);
-    let width = wanted.min(nominal.max(WIDEST.min(room))).min(room);
+    let width = inside_width(grid.cols, nominal, wanted);
     // Each part's rows: texts wrapped, rows that scroll as many as they may show.
     let mut texts: Vec<Vec<String>> = (parts.iter())
         .map(|part| match part {
@@ -259,11 +294,8 @@ pub fn layout(grid: Grid, title: &str, nominal: usize, parts: &[Part]) -> Layout
         }
     }
     let inside = fixed(&texts) + shown;
-    let (w, h) = (width as u16 + 4, inside as u16 + 4);
-    let x = grid.cols.saturating_sub(w + 2) / 2;
-    let y = grid.rows.saturating_sub(h + 1) / 2;
-    let frame = Cells::new(x, y, w, h);
-    let (x0, mut y) = (x + 2, y + 2);
+    let frame = centred(grid, width as u16 + 4, inside as u16 + 4);
+    let (x0, mut y) = (frame.x + 2, frame.y + 2);
     let width = width as u16;
     let mut placed = vec![];
     for (part, rows) in parts.iter().zip(texts) {
@@ -336,12 +368,8 @@ impl Layout {
     /// The box, and its shadow's two strips: right of it from its second row, under it from its
     /// third column.
     fn rects(&self) -> [Cells; 3] {
-        let f = self.frame;
-        [
-            f,
-            Cells::new(f.right(), f.y + 1, 2, f.height),
-            Cells::new(f.x + 2, f.bottom(), f.width, 1),
-        ]
+        let [right, under] = shadow_of(self.frame);
+        [self.frame, right, under]
     }
 
     /// The box and its shadow, cut to the grid.
@@ -518,9 +546,7 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
             let [frame_cells, right, under] = layout.rects();
             let area = frame_cells.union(right).union(under);
             let mut buf = Buffer::empty(area.intersection(grid.all()));
-            let shadow = Pen::new(cga::DARK_GRAY, cga::BLACK);
-            cells::fill(&mut buf, right, shadow);
-            cells::fill(&mut buf, under, shadow);
+            shadow(&mut buf, frame_cells);
             frame(&mut buf, frame_cells, &layout.title);
             let mut field_at = None;
             // A control's cells on the grid: one with none there (a grid smaller than the dialog)

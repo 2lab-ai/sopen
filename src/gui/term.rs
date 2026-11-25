@@ -67,8 +67,6 @@ pub(crate) const IN_A_WINDOW: &str =
     "xtools is in a window now — close it, or press F12 there, to come back here.";
 /// What a hand-off box says (10 §11).
 pub(crate) const HAND_OFF: &str = "F12 shows it in the window";
-/// The status line for F1 in the terminal: its help is egui's, not yet cells.
-pub(crate) const F1_LINE: &str = "F1's help: F12 shows it in the window";
 /// The status line while a dialog egui draws (not yet cells) is open.
 pub(crate) const MODAL_LINE: &str =
     "a dialog the terminal does not draw yet: F12 shows it in the window, Esc closes it";
@@ -465,59 +463,10 @@ pub(crate) fn compose(ctx: &egui::Context, layers: &[Arc<Layer>], cols: u16, row
     let mut buf = Buffer::empty(all);
     cells::fill(&mut buf, all, Pen::new(p.text, p.back));
     let mut covered = vec![false; usize::from(cols) * usize::from(rows)];
-    let order: Vec<egui::LayerId> = ctx.memory(|m| m.layer_ids().collect());
-    let mut sorted: Vec<(usize, &Arc<Layer>)> = layers.iter().enumerate().collect();
-    sorted.sort_by_key(|&(call, l)| {
-        let area = order.iter().position(|o| *o == l.layer);
-        (l.layer.order, area.unwrap_or(usize::MAX), call)
-    });
-    let screen = Rect::from_min_size(
-        Pos2::ZERO,
-        Vec2::new(f32::from(cols) * CELL.x, f32::from(rows) * CELL.y),
-    );
     let mut caret = None;
-    for (_, l) in sorted {
-        let visible = l.clip.intersect(screen);
-        let (ox, oy) = cell_at(l.origin);
-        let on_screen = |x: u16, y: u16| {
-            let (sx, sy) = (ox + i32::from(x), oy + i32::from(y));
-            let inside = (0..i32::from(cols)).contains(&sx) && (0..i32::from(rows)).contains(&sy);
-            let seen = visible.contains(l.rect(Cells::new(x, y, 1, 1)).center());
-            (inside && seen).then_some((sx as u16, sy as u16))
-        };
-        let a = l.buf.area;
-        for y in a.top()..a.bottom() {
-            let mut x = a.left();
-            while x < a.right() {
-                let cell = &l.buf[(x, y)];
-                let width = (cells::width(cell.symbol()) as u16).clamp(1, 2);
-                let width = width.min(a.right() - x);
-                // A wide glyph with one of its cells outside the clip is a blank in the cell
-                // inside it (the window shows half a glyph there; a terminal cannot), never
-                // written past the clip.
-                let first = on_screen(x, y);
-                let second = (width == 2).then(|| on_screen(x + 1, y));
-                let (at, cell, width) = match (first, second) {
-                    (Some(at), None | Some(Some(_))) => (Some(at), cell.clone(), width),
-                    (Some(at), Some(None)) => (Some(at), blank_of(cell), 1),
-                    (None, Some(Some(at))) => (Some(at), blank_of(cell), 1),
-                    (None, _) => (None, cell.clone(), width),
-                };
-                if let Some((sx, sy)) = at {
-                    if lay(&mut buf, sx, sy, &cell, width) {
-                        for k in 0..width.min(cols - sx) {
-                            covered[usize::from(sy) * usize::from(cols) + usize::from(sx + k)] =
-                                true;
-                        }
-                    }
-                }
-                x += (cells::width(l.buf[(x, y)].symbol()) as u16)
-                    .clamp(1, 2)
-                    .min(a.right() - x);
-            }
-        }
-        if let Some((x, y)) = l.caret.and_then(|c| on_screen(c.x, c.y)) {
-            caret = Some(Position::new(x, y));
+    for l in painting_order(ctx, layers) {
+        if let Some(at) = lay_layer(&mut buf, &mut covered, l, cols, rows) {
+            caret = Some(at);
         }
     }
     let hand_offs = uncovered(&covered, cols, rows);
@@ -529,6 +478,81 @@ pub(crate) fn compose(ctx: &egui::Context, layers: &[Arc<Layer>], cols: u16, row
         caret,
         hand_offs,
     }
+}
+
+/// `layers` in egui's painting order: its layer order (the areas' order of `ctx`, back to
+/// front), then the order of the calls.
+fn painting_order<'a>(ctx: &egui::Context, layers: &'a [Arc<Layer>]) -> Vec<&'a Arc<Layer>> {
+    let place = area_place(ctx);
+    let mut sorted: Vec<(usize, &Arc<Layer>)> = layers.iter().enumerate().collect();
+    sorted.sort_by_key(|&(call, l)| (place(l.layer), call));
+    sorted.into_iter().map(|(_, l)| l).collect()
+}
+
+/// Where egui paints a layer: its order, then its area's place in the areas of `ctx` (back to
+/// front; one egui does not list goes last in its order).
+fn area_place(ctx: &egui::Context) -> impl Fn(egui::LayerId) -> (egui::Order, usize) {
+    let order: Vec<egui::LayerId> = ctx.memory(|m| m.layer_ids().collect());
+    move |layer| {
+        let area = order.iter().position(|o| *o == layer);
+        (layer.order, area.unwrap_or(usize::MAX))
+    }
+}
+
+/// Lays layer `l` onto `buf` (`cols` × `rows`, see [`compose`]): each cell whose centre is
+/// inside its clip, the cells it took marked in `covered`; its caret's cell on screen.
+fn lay_layer(
+    buf: &mut Buffer,
+    covered: &mut [bool],
+    l: &Layer,
+    cols: u16,
+    rows: u16,
+) -> Option<Position> {
+    let screen = Rect::from_min_size(
+        Pos2::ZERO,
+        Vec2::new(f32::from(cols) * CELL.x, f32::from(rows) * CELL.y),
+    );
+    let visible = l.clip.intersect(screen);
+    let (ox, oy) = cell_at(l.origin);
+    let on_screen = |x: u16, y: u16| {
+        let (sx, sy) = (ox + i32::from(x), oy + i32::from(y));
+        let inside = (0..i32::from(cols)).contains(&sx) && (0..i32::from(rows)).contains(&sy);
+        let seen = visible.contains(l.rect(Cells::new(x, y, 1, 1)).center());
+        (inside && seen).then_some((sx as u16, sy as u16))
+    };
+    let a = l.buf.area;
+    for y in a.top()..a.bottom() {
+        let mut x = a.left();
+        while x < a.right() {
+            let cell = &l.buf[(x, y)];
+            let width = (cells::width(cell.symbol()) as u16).clamp(1, 2);
+            let width = width.min(a.right() - x);
+            // A wide glyph with one of its cells outside the clip is a blank in the cell
+            // inside it (the window shows half a glyph there; a terminal cannot), never
+            // written past the clip.
+            let first = on_screen(x, y);
+            let second = (width == 2).then(|| on_screen(x + 1, y));
+            let (at, cell, width) = match (first, second) {
+                (Some(at), None | Some(Some(_))) => (Some(at), cell.clone(), width),
+                (Some(at), Some(None)) => (Some(at), blank_of(cell), 1),
+                (None, Some(Some(at))) => (Some(at), blank_of(cell), 1),
+                (None, _) => (None, cell.clone(), width),
+            };
+            if let Some((sx, sy)) = at {
+                if lay(buf, sx, sy, &cell, width) {
+                    for k in 0..width.min(cols - sx) {
+                        covered[usize::from(sy) * usize::from(cols) + usize::from(sx + k)] = true;
+                    }
+                }
+            }
+            x += (cells::width(l.buf[(x, y)].symbol()) as u16)
+                .clamp(1, 2)
+                .min(a.right() - x);
+        }
+    }
+    l.caret
+        .and_then(|c| on_screen(c.x, c.y))
+        .map(|(x, y)| Position::new(x, y))
 }
 
 /// Lays `cell` of a layer, `width` cells wide, at (`x`, `y`) of `buf`; false when it leaves
@@ -868,8 +892,6 @@ impl<T: Tty, O: Write> Backend<T, O> {
     pub fn new(tty: T, out: O, ctx: egui::Context, truecolor: bool) -> Self {
         cells::set_recording(&ctx, true);
         super::mark_terminal(&ctx);
-        // After the shell's own hook (added by `chrome::install`): it sees F1 after the aliases.
-        ctx.add_plugin(TermKeys);
         let asked: Arc<Mutex<Option<Instant>>> = Arc::default();
         let tell = asked.clone();
         ctx.set_request_repaint_callback(move |info| {
@@ -990,13 +1012,6 @@ impl<T: Tty, O: Write> Backend<T, O> {
             super::closing(ui.ctx(), win, false);
             win.ui(ui);
         });
-        if self
-            .ctx
-            .data_mut(|d| d.remove_temp::<HelpAsked>(help_asked_id()))
-            .is_some()
-        {
-            self.said = Some(F1_LINE.to_string());
-        }
         // No renderer: the textures stay in the context.
         out.textures_delta.clear();
         for command in std::mem::take(&mut out.platform_output.commands) {
@@ -1046,6 +1061,16 @@ impl<T: Tty, O: Write> Backend<T, O> {
             hand_off(&mut screen.buf, r, title_at(&self.titles, r));
             screen.hand_offs.push(r);
             screen.caret = screen.caret.filter(|c| !r.contains(*c));
+            // What is in cells above the dialog in egui's painting order — the key help, a
+            // later area of its own order — stays over its box.
+            let place = area_place(&self.ctx);
+            let above = egui_only.map(&place);
+            let mut covered = vec![false; usize::from(cols) * usize::from(rows)];
+            for l in painting_order(&self.ctx, &layers) {
+                if Some(place(l.layer)) > above {
+                    lay_layer(&mut screen.buf, &mut covered, l, cols, rows);
+                }
+            }
         }
         let line = self.said.as_deref().or(stands.map(|_| MODAL_LINE));
         if let Some(line) = line {
@@ -1074,7 +1099,9 @@ impl<T: Tty, O: Write> Backend<T, O> {
                 self.said = None;
                 let at = Position::new(m.column, m.row);
                 let left = m.kind == MouseEventKind::Down(MouseButton::Left);
-                if left && self.hand_offs.iter().any(|r| r.contains(at)) {
+                // While the key help is open every click is its own (`help::input_hook`).
+                let free = !super::help::is_open(&self.ctx);
+                if left && free && self.hand_offs.iter().any(|r| r.contains(at)) {
                     return (vec![], true);
                 }
             }
@@ -1162,48 +1189,6 @@ impl<T: Tty, O: Write> Drop for Backend<T, O> {
     }
 }
 
-/// The terminal's own input hook, after the shell's ([`super::FKeyInput`], whose aliases it
-/// sees): F1 — the key, Alt+1, a click on the F-key row's slot 1 — opens no help here, which is
-/// egui's and not yet cells (it would take every key, unseen); the pass says so instead
-/// ([`F1_LINE`]).
-struct TermKeys;
-
-/// F1 was pressed in this pass.
-#[derive(Debug, Clone, Copy, Default)]
-struct HelpAsked;
-
-fn help_asked_id() -> egui::Id {
-    egui::Id::unique("sopen-term-help-asked")
-}
-
-impl egui::Plugin for TermKeys {
-    fn debug_name(&self) -> &'static str {
-        "sopen-term-keys"
-    }
-
-    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
-        if !super::in_terminal(ctx) {
-            return;
-        }
-        let mut asked = false;
-        input.events.retain(|e| match e {
-            egui::Event::Key {
-                key: egui::Key::F1,
-                pressed,
-                repeat,
-                ..
-            } => {
-                asked |= *pressed && !*repeat;
-                false
-            }
-            _ => true,
-        });
-        if asked {
-            ctx.data_mut(|d| d.insert_temp(help_asked_id(), HelpAsked));
-        }
-    }
-}
-
 /// The cells `rect` (points) touches on a `cols` × `rows` grid; `None` when it is off it.
 fn cells_over(rect: Rect, cols: u16, rows: u16) -> Option<Cells> {
     let clamp = |v: f32, cell: f32, n: u16| (v / cell).clamp(0.0, f32::from(n));
@@ -1260,11 +1245,13 @@ impl Destination {
 
 /// What moves with the browser between the terminal's context and the window's: what has the
 /// keyboard, and the edit state (cursor, selection) of the field that has it — a context's own,
-/// so a dialog's caret would be lost on the way.
+/// so a dialog's caret would be lost on the way — and F1's help, open where it was scrolled to
+/// or closed (the context's too).
 #[derive(Clone, Default)]
 pub(crate) struct Carry {
     focus: Option<egui::Id>,
     edit: Option<egui::text_edit::TextEditState>,
+    help: super::help::Carried,
 }
 
 impl Carry {
@@ -1273,10 +1260,12 @@ impl Carry {
         Carry {
             focus,
             edit: focus.and_then(|id| egui::text_edit::TextEditState::load(ctx, id)),
+            help: super::help::carried(ctx),
         }
     }
 
     pub fn apply(&self, ctx: &egui::Context) {
+        super::help::carry_into(ctx, &self.help);
         match self.focus {
             Some(id) => {
                 if let Some(edit) = self.edit.clone() {

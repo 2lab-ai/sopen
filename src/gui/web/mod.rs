@@ -2,8 +2,9 @@
 //! through the view's own `sopen-page` scheme ([`crate::scheme`]), or an address's — and the
 //! [`Engine`] trait its two backends implement: WKWebView on macOS, a native view over the window
 //! (WV-A), and WebKitGTK on Linux, offscreen and painted as a texture (WV-B). Everything here is
-//! engine-independent and runs on the test kit with a recording fake engine (`fake`). No screen
-//! hosts a `Web` yet (WV-D, WV-E2).
+//! engine-independent and runs on the test kit with a recording fake engine (`fake`). The file
+//! browser hosts one for a page file's preview and viewer ([`page`], WV-D); the address window is
+//! WV-E2's.
 //!
 //! - **The engine** is picked at the first [`Web::new`] of the windows' thread — the process's
 //!   main thread, so its pick is the process's; without one `Web::new` returns why
@@ -37,6 +38,7 @@
 pub(crate) mod fake;
 #[cfg(target_os = "macos")]
 mod mac;
+pub(crate) mod page;
 #[cfg(test)]
 mod tests;
 

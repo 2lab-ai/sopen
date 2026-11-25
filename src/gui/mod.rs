@@ -898,9 +898,10 @@ pub fn own_keys(ui: &mut egui::Ui, keys: &[chrome::FKey]) {
 /// a text field has the typing (04 §3 rule 4). F12 is the switch (10 §9, T4): taken in every
 /// context, a field's included, and said to the pass ([`switch_asked`]). In the terminal
 /// backend's context only ([`mark_terminal`]) Alt+1…0 are F1…F10 too and Alt+G is the switch
-/// (10 §9, T7, T33): in a window Option+digit and Option+G type characters on macOS. Then, while
-/// the file browser's viewer is open, its view keys are taken (08 §8, [`route_view_keys`]). Then
-/// [`help::begin_pass`] before the window's pass and [`help::end_pass`] after it, and last the
+/// (10 §9, T7, T33): in a window Option+digit and Option+G type characters on macOS. While the
+/// key help is open, the pointer is its own after the mode button's ([`help::input_hook`]).
+/// Then, while the file browser's viewer is open, its view keys are taken (08 §8,
+/// [`route_view_keys`]). Then [`help::begin_pass`] before the window's pass and [`help::end_pass`] after it, and last the
 /// page views' after-frame step ([`web::after_pass`], 09 §2.2), so that a view under the help or
 /// anything else painted above it is hidden in the same frame.
 #[derive(Debug, Default)]
@@ -956,6 +957,7 @@ impl egui::Plugin for FKeyInput {
             &mut self.mode,
             chrome::mode_button_rect(ctx),
         );
+        help::input_hook(ctx, &mut input.events);
         // The viewer's view keys (08 §8), once the digits that are F-keys are F-keys.
         route_view_keys(ctx, &mut input.events);
         // This pass's word only: a switch nothing took is not left for a later pass.
@@ -1646,8 +1648,9 @@ fn attempt<A: eframe::App + 'static>(
                 "sopen",
                 options,
                 Box::new(|cc| {
-                    // The look, before the first frame.
+                    // The look, before the first frame; `⌘` in one face (fonts.rs).
                     chrome::install(&cc.egui_ctx);
+                    fonts::pin_symbols(&cc.egui_ctx);
                     let app = slot
                         .borrow_mut()
                         .take()
@@ -1857,6 +1860,9 @@ pub fn run_window_sized<W: Window + 'static>(
     hooks: &Hooks,
 ) -> Result<()> {
     let choice = renderer_choice()?;
+    // The installed fonts are enumerated while the window starts: its first frame pins `⌘`'s
+    // face (`fonts::pin_symbols`).
+    fonts::prefetch();
     let shot_done = Arc::new(AtomicBool::new(false));
     // The watchdog's word: set once the window is gone too, however it went (a window that
     // closed or did not start stalls nothing), so it never ends a process that goes on — the

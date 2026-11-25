@@ -516,8 +516,13 @@ own act: copying a link the row showed (F5) and opening it themselves.
 
 - macOS always has WebKit. Linux without `libwebkit2gtk-4.1.so.0`, or with one that fails to load or
   start (a missing symbol, `gtk_init_check` false): sopen starts and every other window works.
-  - A page view → the file's highlighted source (the text viewer, as before 09), first row `no web
-    engine here (<reason>): showing the source`.
+  - A page view → the file's highlighted source (the text viewer, as before 09, on 1 Text · 2 Hex ·
+    3 Raw), its notice area — the line under its rows where a viewer says what it has to — saying
+    `no web engine here (<reason>): showing the source`. A preview shows the source with no line
+    (02 §4.2: a preview has no rows); an engine that refuses a view it was asked for gives way the
+    same way where it stands — the viewer to its source view with that line, the preview to its
+    source at once with the line on the status row — and the window opens page files as their
+    source from then on (WV-D).
   - An address → the system browser (`url::open`), as `--browser`, after one stderr line `sopen: no
     web engine here (<reason>); opening <shown> in the system browser`.
 - A backend whose scripts-off containment WV-S2 did not show (§3.3): page views show the source the
@@ -557,9 +562,12 @@ own act: copying a link the row showed (F5) and opening it themselves.
   requests blocked, and a link not followed (§3.4). F-key row `1Help 2JS on 3Exit 4Edit`, plus `5Link`
   while a not-followed link is on the row (F4 = 01 A2's editor on the file, as now;
   keys.rs:499-503). Cmd/Ctrl+R reloads; Esc leaves (§2.4).
-- **Until WV-F, the gap**: in xtools a page file shows only as the page; its source and hex are
-  reached through F4 (the editor), not inside sopen. The view keys are 08's (§4, D3–D4) and reach the
-  GUI with its binding VM-7; binding digits here first would pre-empt them.
+- **The views in the viewer** are 08's keys (§4, D3–D4) on VM-7's binding, landed before WV-D: 1, 2
+  and 3 by the table below. Which row a file takes is decided once, by the preparation, from the
+  file opened — its resolved name and its head — never from the name the list shows (a link
+  `x.html` to plain XML is `1 Text · 2 Hex · 3 Page`; one to text has no page); the preview hands
+  its decision over with its view. What WV-F adds is the hidden page view's session given back
+  and the pixel region per 10.
 - **The views, settled here** (they supersede 08's D7 for these files; 08 already carries this table
   as its D40, and WV-F retires 08's D30 when the page view lands):
 
@@ -644,6 +652,13 @@ like an image or a video, is GUI-only content: the GUI backend hosts the page vi
 at its cell rectangle, and in a terminal a page file shows its source (the source is view 1 there).
 Whether a picture-capable terminal (kitty, iTerm2, sixel) shows a snapshot of the page, and the
 terminal form of every key here, are 10's. `sopen URL` with only a terminal: §4's no-display rule.
+
+**The interim, until 10's X3** (WV-D): in `sopen --tui` a page file keeps 08's slots and opens on
+its page, which the terminal shows as a hand-off box (10 §11) — its frame and rows are cells; no
+engine is asked in a terminal — and F12's window makes the view there; a window that goes takes
+its view down and the next one makes it again (a remote page on the connection its server gave
+back, else connected again). Opening on 3, the source, with view 1 a one-row hand-off, is X3's
+(10 T21, TP-5).
 
 ## 9. Decisions
 
@@ -818,8 +833,9 @@ handle; §3.1's ~4 and ~2 RTT. Its result goes into §3.1.
 
 **Order**: X-W1 → WV-0 (trait first) ∥ WV-C → WV-A ∥ WV-B → WV-D ∥ WV-E2 → WV-F; WV-E1 from the
 start. **Only WV-F waits on 08's model** (VM-5 the view set, VM-6 the keys, VM-7 the binding) and on
-10: WV-D ships before them with the page as the default view and Esc back (§6 names the gap), and
-WV-F plugs it into the set and the GUI backend's pixel regions. **Shared files are sequenced**:
+10: WV-D shipped with VM-7's binding already landed, so a page file's views 1, 2 and 3 are §6's table
+from WV-D on (§6, "The views in the viewer"); WV-F adds the hidden page view's session given back
+and the GUI backend's pixel regions. **Shared files are sequenced**:
 `src/gui/web/mod.rs` gets one `mod` line each from WV-A (with `platform()`), WV-D and WV-E2;
 `src/lib.rs` one from WV-0 beside
 08's VM-1/5/6 lines; `src/gui/mod.rs` (WV-0) is shared with 08's VM-2 and VM-7 and the browser
@@ -832,9 +848,10 @@ looked at (06 §13).
 
 ## Tensions
 
-- **08 D30 vs WV-D before WV-F.** D30 shows HTML/HTM/XML as 1 Text, 3 Raw until 09's page view
-  lands; WV-D makes the page view 1 before 08's keys reach the GUI, so the in-sopen source waits for
-  WV-F (§6's gap). (08's D40 already carries §6's table.)
+- **08 D30 vs WV-D.** D30 shows HTML/HTM/XML as 1 Text, 3 Raw until 09's page view lands; WV-D
+  landed it with VM-7's keys already in the GUI, so §6's table holds from WV-D on (§6, "The views
+  in the viewer") and D30 stays only where file pages show their source (§4: no engine here, or
+  one not contained; `Screen::NO_ENGINE`). (08's D40 already carries §6's table.)
 - ***web* §8-6 and decision 4.** The research defaulted to blocking outside subresources; the first
   round allowed them with scripts off; the review round (decision 4 revised) blocks them in every file
   view, for XSLT's sake. Outside CSS and fonts therefore never style a file page.

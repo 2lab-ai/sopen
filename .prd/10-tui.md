@@ -6,8 +6,8 @@ tags: [sopen, spec, xtools, tui]
 
 # 10 — xtools: the terminal UI first, the window the same screen
 
-Status: planned (2026-11-24; review round 1 applied). Nothing here is built; the work units wait for
-a spike in the real repo (§17).
+Status: building (2026-11-25; planned 2026-11-24, review round 1 applied). X1a (the window's list
+in cells, #119) and X1b (`sopen --tui`, #129) have shipped; X2 and X3 are cut into units (§17).
 
 Answers item 2 of [`xtools/ssot.md`](xtools/ssot.md) (owner message 23). Items 1, 3, 4 and 5 (the
 name, the editor, the viewer's views, web pages) land on this architecture: their screens are written
@@ -273,13 +273,16 @@ As the list's dialogs were built (XW-dialogs, 2026-11-25):
 | 128 + n | `sopen on HOST ended by signal n` |
 | 127 | `sopen is not installed on HOST (brew install 2lab-ai/tap/sopen-preview)` |
 | 255 | `could not reach HOST: <ssh's line> — run ssh HOST once in a shell to answer its questions` |
-| no exit code (ssh killed by a signal) | `ssh to HOST ended without an exit code (<status>)`, as `forward.rs:1016` says it |
+| no exit code (ssh killed by a signal) | `ssh to HOST ended without an exit code (<status>)`, as `forward.rs:1141` says it |
 
 - **Paths** go out rewritten as §4a's SOURCE (local → `<this machine>:<abs>`, HOST's own → local) and
   come back with `<this machine>:<abs>` local again. HOST reads this machine's files by its own ssh
   (§4a); a HOST that cannot is the origin workstream's.
 - **Every forwarded window run passes `--gui`** (T35), the switch's and `--target`'s alike, from X2
-  on: after the flip a forward with `-t` would otherwise start a TUI inside ssh on HOST.
+  on: after the flip a forward with `-t` would otherwise start a TUI inside ssh on HOST. A
+  `--target` run passes it when the owner gave it or the kind the sender sees needs a window; a
+  text file, or a kind the sender cannot see, goes without it, and an older HOST that refuses it
+  gets the run again without it (decided 2026-11-25, Tensions; X2-gui).
 
 ### 7.4 What the state carries (T32); unsaved edits (T4)
 
@@ -457,11 +460,11 @@ As the list's dialogs were built (XW-dialogs, 2026-11-25):
 | 04 §6.1 | Cmd/Ctrl+1…0 | plus Alt+1…0 in the TUI; Cmd/Ctrl+1…0 in the TUI under the kitty protocol | X1b |
 | 04 §10, KL-W4 | "if X1 already owns the winit handler…"; KL-W4's run is `create_native` | X1b owns `create_native` and the one event loop (T34); KL-W4 adds only its wrapper | X1b |
 | `src/gui/help.rs` (`aliases()`, `describe`, `:139-146`); `keys.rs` `Mods::prefix` (`:309-351`) | this machine's command key (`Cmd+R` on macOS, `Ctrl+R` elsewhere) | `Ctrl/⌘+R` on every row, one line on where ⌘ applies, each alias with where it works (T27) | X1a |
-| 08 §8–§9, VM-7, VM-8 | provisional; "if XR-T keeps egui windows" | VM-8 (cells) replaces VM-7's screen half in X3; VM-7's input half (the window's key and text, `Driver::press`) stays for the window; §9's "Alt+digit is none either" gains "except as the TUI's F-key aliases"; its "opens on Hex" becomes §8's: an image and a video open on 1 | X3 |
+| 08 §8–§9, VM-7, VM-8 | provisional; "if XR-T keeps egui windows" | VM-7's screen half is cells already (the strip, F8's list: #128); VM-8 keeps 08 §3's slots in the terminal in X3 (T21); VM-7's input half (the window's key and text, `Driver::press`) stays for the window; §9's "Alt+digit is none either" gains "except as the TUI's F-key aliases"; its "opens on Hex" becomes §8's: an image and a video open on 1 | X3 |
 | 09 §8 | "the source is view 1 there" (`09-web-view.md:433`) | 08's slots kept: HTML and styled XML open on 3, plain XML and RSS on 1; F12; no snapshot | X3 |
 | 09 WV-D, WV-E chrome | egui | cells if X1a has landed, else egui moved in X6 (T23) | X1a, X6 |
 | README | line 9 (folder → window); "Requirements" (a desktop session); "Open on another machine's screen" | `--tui`, F12, Alt+G (X1b); the switch to a target (X2); folder → TUI, target = the window's place, a section "In the terminal" (XF) | X1b, X2, XF |
-| AGENTS.md "Receipts" | — | rows for `--tui`, `--gui`, `SOPEN_CELLS` (a local path, not forwarded), `SOPEN_REQUIRE_TMUX`, `SOPEN_SCREEN`, `SOPEN_PICTURES` | X1a, X1b, X7 |
+| AGENTS.md "Receipts" | — | rows for `--tui`, `--gui`, `SOPEN_CELLS` (a local path, not forwarded), `SOPEN_REQUIRE_TMUX`, `SOPEN_SCREEN`, `SOPEN_PICTURES` | X1b (`--tui`, `SOPEN_REQUIRE_TMUX`), X2 (`--gui`), X3 (`SOPEN_CELLS`), X7 |
 
 **Frozen meanwhile** (*tui* §12): new egui screens — 08's screens and the editor are written in cells
 — and egui widget work on screens about to move; bug fixes continue. 09's chrome follows T23, so
@@ -505,7 +508,7 @@ WV-D still ships without waiting (09 §12).
 | T32 | A reader accepts its own and every older state version; a newer one is refused with a line; each step that moves a screen adds its fields and bumps `v`; every running writing job makes the switch wait | the two ends update at different times; skew must say so; a writing job cannot be carried |
 | T33 | Alt+G is the switch's keyboard alias in the TUI | it arrives under legacy encoding as `ESC g`; the table binds no Alt+letter, and with no text it never reaches a letter jump |
 | T34 | Route B: the window backend owns winit's handler through `eframe::create_native`, one event loop per process; X1b measures the switch again | 04 §6.4.3 already needs it; XR-T measured `run_native` |
-| T35 | Every forwarded window run passes `--gui`, from X2 | after the flip a forward with `-t` would start a TUI inside ssh on HOST |
+| T35 | Every forwarded window run passes `--gui`, from X2: the switch's always, `--target`'s when asked or when the kind the sender sees needs a window; an older HOST gets the run again without it (2026-11-25) | after the flip a forward with `-t` would start a TUI inside ssh on HOST |
 | T36 | One routing table (§11), first match in the rows' order: explicit mode, kinds routed elsewhere, terminals, a folder, destination, display | overlapping rules gave no answer for, e.g., an image on a terminal with no display and no target |
 | T37 | 1:1 is defined under truecolor; a 256-colour terminal goes through one fixed table; the cell API has no modifiers | the oracle needs one answer per colour; modifiers would be a second, unchecked channel |
 | T38 | In an ambiguous-wide terminal every ambiguous glyph from sopen's tables is substituted (§10); file content is laid in 2 cells | frames and cut names must hold; content must not change |
@@ -530,7 +533,7 @@ or hands (*tui* §13's probe, extended by these items).
   each dump = the window's at that size. TS-7 [X1a]: the projector lint stays within *tui* §1.3.
 - TS-4 [each step]. Every moved screen passes TS-1 (a) and (c) — X3: text and hex viewers, a UTF-16
   Hangul file in view 1, the encoding list open; X4: lanes, the tree; X6: the chrome around regions.
-- TS-6 [X1b]. A pty emulator advancing ambiguous glyphs by 2, the list holding a name cut with "…" and
+- TS-6 [X3]. A pty emulator advancing ambiguous glyphs by 2, the list holding a name cut with "…" and
   a name with `é` → every §10 glyph substituted (`~` for the cut), no row broken, the oracle equal
   through the table; [owner] the probe's advances in each owner terminal. TC-1 [X1b]: `한글 문서
   초안.txt` takes the same cells in both (its 6 Hangul in 12); an emoji 2 cells, no ink outside them.
@@ -588,7 +591,7 @@ or hands (*tui* §13's probe, extended by these items).
   `--tui` with output to a pipe (exit 2), an address, a text file, a pipe (`SOPEN_LIST` prints, a
   `while read` loop is not eaten), a folder with and without a target, an image with a target, with a
   display, and **on a terminal with no display and no target** → the TUI's picture.
-- TL-1 [X1b]. Exit, a test-hook panic, SIGTERM, SIGHUP and the in-process switch → the alternate screen
+- TL-1 [X1b; the remote switch X2]. Exit, a test-hook panic, SIGTERM, SIGHUP and the in-process switch → the alternate screen
   left, modes reset, kitty flags popped, pictures deleted; the remote switch → still in raw mode and
   the alternate screen, pictures deleted, only Ctrl+C read (bytes checked).
 
@@ -639,8 +642,9 @@ once, by the kit (§15).
    (`src/gui/term_input.rs`) is built in parallel from the start. Viewers, tree and git panel are
    hand-off boxes in the TUI.
 3. **X2 — the switch across machines** (HOST's half, the state and cues, `--gui` on every forward).
-4. **X3 — the text and hex viewers, their previews and the binary dialog in cells**: 08's views and
-   encodings (VM-8).
+4. **X3 — the text and hex viewers, their previews, the hex window's questions and the binary
+   dialog in cells**: 08's views in the terminal (VM-8; its encodings are cells since VM-7); the
+   receipts `SOPEN_CELLS` and TS-6 (XW-receipts).
 5. **X4 — the tree and the git panel in cells**: lanes as glyphs, details, dialogs, the planner.
 6. **X5 — the editor (XR-E)**, cell-native; its left-panel directory/git tabs need X4.
 7. **X6 — the image and media chrome in cells; pictures, video and the web view as regions.**
@@ -672,9 +676,58 @@ passes from one to the next in the order given. The gate is §15's.
 - **Order**: XW-0 → XW-cells → XW-kit → XW-grid → XW-list, with XW-help, XW-input and XW-shell
   in parallel from XW-0; XW-dialogs after XW-list; XW-term last. X1a ships with XW-list (and
   XW-help); X1b with XW-term.
-- **Steps X2–XF** are cut into units when X1b has merged: the spike measured the list, a low-query
-  screen, and says dialogs, the F-key and status rows and the terminal backend carry the rest of the
-  cost [추정 beyond the list].
+
+X2 and X3 were cut on 2026-11-25, once X1b had merged (#129), from the code each unit touches.
+Their sizes are product lines, all [추정], against what X1 cost **[M]** (the merges'
+`git diff --numstat`). A unit that moves a screen to cells is sized at 1.4× the lines of today's
+code it replaces **[S]**: XW-list's ratio (+384 product lines against −272, #119), with XW-dialogs's
+dialog engine (774 lines, #125) reused, not built again. A unit of new code (X2's, XW-receipts,
+VM-8) is sized from the nearest code that does the same [S]; XW-term came to 1,495 lines against
+≈300 estimated (#129), so read those as floors. Tests came to 0.5–1.7 times the product lines
+(#119, #125, #128, #129). X2 and X3 wait for no unit of each other and may run side by side; where
+they meet in a file (`src/gui/term.rs`, `src/gui/mod.rs`, `src/gui/text.rs`, `AGENTS.md`),
+whichever merges second rebases, as 08 §13's units do. A unit's few lines in `src/gui/mod.rs`
+follow the same rule with 04's KL-W4, which holds that file after XW-shell.
+
+**X2 — the switch across machines.**
+
+| ID | Unit | Owns | Size | After | Ships alone as |
+|---|---|---|---|---|---|
+| X2-gui | `--gui` (§11 row 2, T35, as decided 2026-11-25 in Tensions): the flag — the window on the destination: here today's window, or with no display §7.1's `no display here …` and exit 1. A forward passes it only when the owner gave `--gui` or the file's kind needs a window (a folder, an image, video or audio, a binary, `--hex`), as the sender sees the kind: a text file is forwarded without it and keeps the editor (row 5; `main.rs:726`); where the sender cannot see the kind before forwarding (it forwards before any stat today: `main.rs:567-585`), it forwards without it and HOST picks by kind. The switch's forward always passes it (X2-switch); never `--app` (row 1) nor an address (row 4: `main.rs:633`, the tunnel). HOST's exit 2 with clap's unknown-argument line for `--gui` → the sender runs the forward once more without it and says on stderr that HOST's sopen is older, so a plain `--target` never breaks on an old HOST. Its sentences in 01 §4a, the README and AGENTS.md | `src/main.rs` (`Cli`, `run_source`'s forward); `src/forward.rs` (`remote_words`, the retry, their tests); `README.md`, `AGENTS.md` (`--gui`) | ≈150 | — | `sopen --target HOST DIR` runs `sopen --here --gui -- DIR` there, a text file `sopen --here -- FILE` as today; an older HOST still opens it, with a line on stderr; `sopen --gui` with no display exits 1 with its line |
+| X2-state | The switch's state, `"v": 1` (§7.4, T32): both panels' folders, bars, selections and scroll, the active side, the mode, each side's content (the tree open, a git pin), an open dialog with its typed text, caret and error, the open viewer (file, 08's view, place, encoding, wrap), the source host — taken from one `Browser` and given to a new one, as `SOPEN_STATE`'s `open=`, `at=` and `enc=` are handed on today (`browser.rs:794-805`); one JSON line; its own and every older `v` read, a newer one refused with §7.4's line; paths rewritten out and back (§7.3), as `forward::source_for` rewrites SOURCE (`forward.rs:205`) | `src/gui/browser/switch_state.rs`, `src/gui/browser/switch_state/tests.rs` (new); `src/gui/browser.rs` (taking and giving the state only); `src/gui/browser/ops.rs` (the open dialog's part only); `src/gui/mod.rs` and `src/gui/text.rs` (a `Window` getter for wrap only) | ≈500 | — | no change: nothing sends it yet (a round trip in its tests) |
+| X2-host | HOST's half (§7.2, §7.3, T30): `--state-stdin` (hidden, with `--here --gui`) reads the state's line from its input and opens the browser at it in a switched window — F12, `[TUI]`, the close button, Cmd/Ctrl+Q and +W return; unsaved edits first ask that window's close prompt (Cancel keeps the window); a writing job makes the return wait — then prints `sopen-xtools-state <json>` and exits 0. The input ending closes the window only when it has nothing to lose (09 §7's rule, not built yet: the input watched as `--hold-until-eof` watches it, `main.rs:655`); else `sopen-xtools-kept`, the session no longer read or written, the window kept until it is closed there — checking §7.3's [추정] that a session without a pty sends its command no SIGHUP. The cues are fixed lines, as `sopen-tunnel-open` is (`url.rs:288`). Its sentences in 01 §4a | `src/main.rs` (`--state-stdin`; after X2-gui); `src/gui/switch_host.rs`, `src/gui/switch_host/tests.rs` (new) | ≈350 | X2-gui, X2-state | `sopen --here --gui --state-stdin -- FOLDER` with a state line on its input opens the window at that state and prints the cue when it closes: TW-4's HOST half |
+| X2-switch | The TUI's half (§7.1's HOST, §7.3, T28, T29): `Place::Host`, a status line today (`term.rs:1368-1373`), runs HOST's half over 01 §4a's forward (its master, options, bare `exec` and quoting) with `-T`, `-o BatchMode=yes` and `SSH_ASKPASS_REQUIRE=never` (as the ssh exec layer and git's runner set them: `remote/exec.rs:23`, `git/runner.rs:140-141`), the state out on its input and the cue read from its output. Meanwhile raw mode and the alternate screen stay, the screen dimmed under §7.3's line, only Ctrl+C read; HOST's last stderr line is on the status row; each of §7.3's outcomes is its line, with the state from before unless a cue came. Before it switches: `waiting for <it>…` while a writing job runs, and with unsaved edits `Save the changes to host:/abs before switching to HOST?` in a cell dialog, 07 §10's four choices. TW-2 against a stand-in ssh; TW-4's TUI half; TL-1's remote-switch half. Its sentences in 01 A9, A10 and §4a and the README's "Open on another machine's screen" | `src/gui/term.rs` (the HOST arm of `to_window`); `src/gui/term/remote.rs`, `src/gui/term/remote/tests.rs` (new); `src/forward.rs` (the switch's words and its ssh run; after X2-gui); `src/gui/browser.rs` (the question and the wait only; after X2-state); `README.md` | ≈600 (the tunnel's run with its cues is 320 lines, `forward.rs:576-895` [S]) | X2-host | **X2**: F12 in `sopen --tui` with a target opens the window on HOST, and its close brings the TUI back with HOST's state; TW-3 is the owner's |
+
+- **Order**: X2-gui and X2-state from the start, side by side (disjoint files); X2-host after both
+  (`src/main.rs` passes to it from X2-gui); X2-switch last (`src/forward.rs` passes to it from
+  X2-gui, `src/gui/browser.rs` from X2-state). X2 ships with X2-switch; TW-3 is the owner's receipt
+  after it.
+
+**X3 — the text and hex viewers, their previews, the hex window's questions and the binary dialog in
+cells; 08's views in the terminal.** 08's screen half is cells already: VM-7 drew the views' strip
+on the title row (`chrome.rs:805-832`) and F8's list of encodings as a cell dialog
+(`view_set.rs:963-980`, #128). Each screen unit brings §6's look to its screens (§12's skin row).
+
+| ID | Unit | Owns | Size | After | Ships alone as |
+|---|---|---|---|---|---|
+| XW-receipts | §15's receipts, which XW-term left out by decision: `SOPEN_CELLS=<path>` writes the grid — a row per line and an attribute table — once `SOPEN_KEYS` have settled, then ends, in both backends (the window's layers laid as `term::compose` lays them); a local path, so not forwarded. TS-6: at start the TUI writes `─` and reads the cursor report; two cells → §10's table, substituted as it prints, the oracle mapping through it | `src/gui/term.rs` (the probe, the substitution, the dump); `src/gui/term/tests.rs`; `src/gui/mod.rs` (`Hooks`' `SOPEN_CELLS` and the window's dump only); `AGENTS.md` (its row) | ≈300 | XW-help2 (it rewrites ≈200 lines of `term.rs`) | `SOPEN_CELLS=<path>` writes either backend's screen as text, the receipt of every X3 screen; an ambiguous-wide terminal draws `+ - \|` frames, no row broken |
+| X3-text | The text viewer in cells (§4, §6, T6, T38): the bar (the stats, the encoding whole, the title cut from the left); the rows — line numbers, highlighting a colour per cell, placeholder marks and C1's `·` dim (08 D28, D32), a right-to-left run reversed into the cells' order, which `directed_job` (`text.rs:6048`) asks egui to shape today [추정: Arabic loses its joined forms, as in a terminal]; wrap and the sideways scroll by cells (unicode-width in `wrap.rs`'s measure, no egui layout, no `glyph_width`: `text.rs:5681`); the scroll bar on the frame; the status row, Go to a cell field (`ops::dialog`'s); the notes; a preview's rows and its `preview of the first …` row. TK-3's `W` wraps and unwraps through the translator; TS-4 with a UTF-16 Hangul file in view 1, and with F8's list open | `src/gui/text.rs` (its screen, `bar` to `ui`: `text.rs:5392-6155`); `src/gui/text/wrap.rs` (the measure and the row cut: `wrap.rs:98-463`); `src/gui/text/tests.rs`, `src/gui/text/preview_tests.rs`, `src/gui/text/stream_tests.rs` (geometry asserts only) | ≈1,100 (it replaces 763 lines of screen and wrap's 51-line `Measure` [S]) | XW-receipts, VM-7b (its text-window hook) | Enter on a text file: the viewer in cells in the window, and in the TUI where a hand-off box stood; its preview's rows are cells, framed in the TUI once X3-preview lands |
+| X3-hex | The hex viewer in cells: the Go to row (a cell field), the grid — offsets, the hex and ASCII columns, the cursor in its pane, changed bytes, rows the file does not reach, bytes still loading — the status row, the preview's rows; `own_keys`' F-key row in cells for a window on its own (`--hex`; the image and media windows get it too). Carried from #108's review: point the hex tests' `drawn()` (`hex/tests.rs:3612-3615`) at `texts()` once hex paints cells (`galleys()` then holds one-character glyphs), and note that `rects()` will list cell backgrounds and the caret. TS-4 with the hex view of a Hangul file | `src/gui/hex.rs` (`toolbar`, `status_bar`, `grid`, `ui`: `hex.rs:3730-3878, 3918-4268, 4528-4641`); `src/gui/hex/tests.rs`, `src/gui/hex/preview_tests.rs`; `src/gui/mod.rs` (`own_keys` only) | ≈850 (it replaces ≈615 lines [S]) | XW-receipts | view 2 of any file (1 of a binary) and `sopen --hex FILE` in cells; in the TUI the hex view where a hand-off box stood (its preview as X3-text's) |
+| X3-questions | The hex window's questions and rows in cells, through `ops::dialog`: the close prompt (07 §10's Save · Save As… · Discard · Cancel), Save, Write in place; the rows below the grid (the notes, the keep row, the offer, left and recovery rows); Save As's modal, which the image and media windows share | `src/gui/hex.rs` (`recovery_rows`, `keep_row`, `close_prompt` to `offer_row`: `hex.rs:3270-3352, 3545-3572, 4269-4497`; after X3-hex); `src/gui/hex/tests.rs` (after X3-hex); `src/gui/save_as.rs` (`show`, `save_as.rs:652-756`), `src/gui/save_as/tests.rs` | ≈600 (it replaces ≈420 lines [S]) | X3-hex | the hex window's questions and every Save As in cells, in the window and in the TUI, where they were a hand-off box with its line |
+| X3-preview | The preview side in cells: its frame titled with the file, and its `reading … %`, `…` and failure lines (`Host::ui`, `say`: `preview.rs:383-468`), for a preview that paints cells (text, hex); an image, media or page preview leaves its side to the hand-off box until X6, so the TUI never shows a box inside a frame. Until it lands, the egui frame's one-cell ring around a text or hex preview's cells is hand-off strips in the TUI (F-handoff-cover's symptom) | `src/gui/browser/preview.rs` | ≈120 (it replaces 86 lines [S]) | X3-text, X3-hex, 09's WV-D (+64 lines in `preview.rs`) | in the TUI a text or hex file under the bar previews in cells in its frame, its progress line too |
+| X3-binary | The binary dialog in cells, through `ops::dialog`: the file's line, `[ Hex ]` and `[ Save to… ]`, the path field, the progress, the clash note; the window fitted to its rows | `src/gui/binary.rs` (`dialog`, `fit`, `ui`: `binary.rs:2164-2433`); `src/gui/binary/tests.rs` (geometry asserts only) | ≈380 (it replaces ≈270 lines [S]) | XW-receipts | `sopen file.zip`'s dialog in cells, in its window; a terminal reaches it only from XF (§11 row 10): its one caller is `main.rs:990-1023` |
+| VM-8 | 08's views in the terminal (08 §9, T21; 08 §13's row): the view set opened for its backend (`view_set.rs:134` opens `Screen::GUI` in both today), keeping 08 §3's slots in both. Carried from the cut: VM-8 makes `Screen::TERMINAL` follow T21 — today it opens an image or a video on Hex, 08 §9's rule (`views.rs:186-190, 481-496`). The slots: an image and a video on 1, HTML, HTM and styled XML on 3 where 1 is Page (view 1 the hand-off box until X6 draws §8's one-row hand-off), plain XML and RSS on 1. The view keys through the translator, already given made releases (`view_set.rs:136`: `term_input::RELEASES`, which `view_keys.rs`'s module doc names): TK-3's `1` → view 1, F9 then `2` → Hex, `1` typed in an editing hex view; TP-5. 08 §8–§9's and 09 §8's sentences (§12) | `src/views.rs`, `src/views/tests.rs`; `src/gui/browser/view_set.rs` (the screen at open); `src/gui/browser/tests/vm8.rs` (new) | ≈80 | VM-7b, 09's WV-D (both change `view_set.rs`; WV-D changes `views.rs`'s `Screen`) | in the TUI `index.html` opens on its source (3), where the window opens its page (1); an image opens on 1 in both; the view keys as in the window |
+
+- **Order**: XW-receipts from the start (after XW-help2, which also makes `ops::dialog` reachable
+  from the viewers), and VM-8 once VM-7b and WV-D have merged; X3-text, X3-hex and X3-binary after
+  XW-receipts, side by side (disjoint files); X3-questions after X3-hex (`src/gui/hex.rs` and its
+  tests pass to it); X3-preview after X3-text and X3-hex. `src/gui/browser/ops/dialog.rs`, the
+  engine, is the one file they share: a unit that needs a part it lacks adds it there, and whichever
+  of X3-text, X3-hex and X3-binary merges second rebases. Each ships alone; X3 is whole when the
+  last of them has merged. X3 does not wait for F-list-perf: each screen unit records its release
+  frame cost as #119 did (the list's 0.71 ms), and F-list-perf's paint (`cells.rs`) lowers them all
+  at once.
+- **Steps X4–XF** are cut into units when X3 has merged.
 
 ## Tensions
 
@@ -700,3 +753,13 @@ passes from one to the next in the order given. The gate is §15's.
   *tui* §14.5 (video across machines) is settled by T8.
 - ***tui* §5's ambiguous list.** It names `░` as ambiguous; python3's `unicodedata` gives it N, so §10
   keeps it and substitutes the rest.
+- **T35 vs a HOST with an older sopen, and vs a text file** (found cutting X2). `--gui` on every
+  forward would break a plain `sopen --target HOST FILE` on a HOST whose sopen predates it (exit 2,
+  clap's line; `--browser` has that reach by design, `forward.rs:387-389`, but is asked for), and
+  §11 matching row 2 before row 5 would take a forwarded text file off 01 A2's editor
+  (`main.rs:726`); the sender forwards before it knows the kind (`main.rs:567-585`). **Decided
+  2026-11-25:** a forward passes `--gui` only when the owner gave it or the kind the sender sees
+  needs a window; a text file is forwarded without it and keeps the editor; a kind the sender
+  cannot see is forwarded without it and HOST picks by kind; HOST's exit 2 for an unknown `--gui`
+  makes the sender retry once without it and say on stderr that HOST's sopen is older (X2-gui).
+  T35 still guards a HOST past the flip for every window kind the sender sees.

@@ -419,14 +419,16 @@ window on that host shares that one budget.
   as the opening did, and keeps it while it is hidden; one that saves adds its `Origin` from its
   first Save. A file has at most two documents among its views (§3 of 08: Raw is Text's), so a
   viewer holds 2 sessions after its second view, and at worst 4 — an image and its Hex view both
-  saved. A view the image gives way to by `H` reads the image's stream (no session more).
+  saved; a page file has three (09 §6: Page, Hex, Text; WV-D), 3 sessions once all are made, 4
+  with its Hex view saved. A view the image gives way to by `H` reads the image's stream (no session more).
 
 | Holder | Channels while it lives |
 |---|---|
 | a standalone viewer (hex, image, media) | 1; 2 from its first Save, Save copy, Save As or Export (hex: or from an open that recovers a journal) |
 | the browser's listing | 1 |
-| a browser viewer | 1 per view made (at most 2), each +1 from its first Save, Save copy, Save As or Export (hex: or from an open that recovers a journal): 1–4 (08 §8; VM-7b brings it back to 1–2) |
+| a browser viewer | 1 per view made (at most 2; a page file's 3), each +1 from its first Save, Save copy, Save As or Export (hex: or from an open that recovers a journal): 1–4 (08 §8; VM-7b brings it back to 1–2) |
 | the browser's preview session (02 §4.4, one per window) | 1 |
+| a remote page view (09 §3.1 "Channels", WV-D) | 1: its page server's one connection — in the preview the window's preview session (no more; it comes back to the window when the preview's server ends), in the viewer the connection that opened the file or the preview's carried over at the hand-over. Among a viewer's views it counts as one of them (a page file's Page, Hex and Text: 1–3, Hex +1 from its first Save); hidden, it keeps its session until WV-F gives it back |
 | the directory tree (browser 05) | 1 |
 | a file operation (browser 04) | 1 each |
 | git commands (browser 03) | up to 3 exec sessions |
