@@ -1728,6 +1728,139 @@ fn the_help_stays_over_a_dialogs_hand_off_box() {
     assert!(differ.is_empty(), "the help covered: {differ:?}");
 }
 
+/// A layer of cells in the egui dialog's own order (Foreground) that egui paints after it —
+/// over it in the window — stays over the dialog's hand-off box in the terminal: "above the
+/// dialog" is egui's painting order, not its order alone.
+#[test]
+fn a_later_overlay_in_the_dialogs_order_stays_over_its_hand_off_box() {
+    struct Overlaid(Asks);
+    impl super::Window for Overlaid {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            self.0.ui(ui);
+            if self.0.open {
+                let ctx = ui.ctx().clone();
+                let grid = cells::Grid::over(ctx.content_rect());
+                egui::Area::new(egui::Id::unique("sopen-term-test-overlay"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(Pos2::ZERO)
+                    .show(&ctx, |ui| {
+                        let at = Cells::new(40, 14, 20, 1);
+                        let mut buf = Buffer::empty(at);
+                        let pen = Pen::new(chrome::PALETTE.text, chrome::PALETTE.back);
+                        cells::fill(&mut buf, at, pen);
+                        cells::put(&mut buf, 42, 14, "OVER THE DIALOG", 16, pen);
+                        let painter = ui.painter().with_clip_rect(grid.rect(grid.all()));
+                        cells::paint(&painter, grid.origin, &buf, None);
+                    });
+            }
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+    let tape = Tape::default();
+    {
+        let mut s = tape.0.borrow_mut();
+        s.size = (100, 30);
+        s.events.extend(typed("d"));
+        s.stop = Some(libc::SIGTERM);
+    }
+    let bytes = Bytes::default();
+    let mut b = Backend::new(tape.clone(), bytes.clone(), skin(), true);
+    let mut no_switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> { Ok(None) };
+    let mut win = Overlaid(Asks { open: false });
+    let end = b.run(&mut win, &mut no_switch).unwrap();
+    assert_eq!(end, End::Signal(libc::SIGTERM));
+    assert!(win.0.open);
+    // In the window: the overlay's area after the dialog's, in its order.
+    let modal = b.ctx.memory(|m| m.top_modal_layer()).expect("the dialog");
+    let ids: Vec<egui::LayerId> = b.ctx.memory(|m| m.layer_ids().collect());
+    let overlay = (cells::layers(&b.ctx).iter())
+        .find(|l| l.layer.order == egui::Order::Foreground)
+        .map(|l| l.layer)
+        .expect("the overlay's cells");
+    let place = |l: egui::LayerId| ids.iter().position(|i| *i == l);
+    assert_eq!(modal.order, overlay.order);
+    assert!(
+        place(overlay) > place(modal),
+        "the control: painted after the dialog"
+    );
+    let screen = b.screen();
+    let r = *screen.hand_offs.last().expect("the dialog's box");
+    assert!(
+        r.contains(Position::new(45, 14)),
+        "under the overlay: {r:?}"
+    );
+    let row = cells::row_text(&screen.buf, 14).0;
+    assert!(row.contains("OVER THE DIALOG"), "{row:?}");
+}
+
+/// Whether the list's bar is on the row `name` stands in (its cells in the bar's colour).
+fn bar_on(drv: &Driver, name: &str) -> bool {
+    let layers = cells::layers(&drv.ctx);
+    cells::find(&layers, name).into_iter().any(|hit| {
+        let l = &layers[hit.layer];
+        let (a, at) = (l.buf.area, hit.cells);
+        let seen = l.seen();
+        seen[usize::from(at.y - a.y)][usize::from(at.x - a.x)].bg == Some(chrome::PALETTE.bar)
+    })
+}
+
+/// A click on the Help slot closes the help, and a key or typed text that came in the same
+/// batch of input as the click — before its release — is the help's too: the list does not
+/// get it (Enter would open the folder under the bar, `b` would jump to `beta`).
+#[test]
+fn a_key_with_the_click_that_closes_the_help_is_the_helps() {
+    let enter = [
+        egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        },
+        egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        },
+    ];
+    let typed = [egui::Event::Text("b".into())];
+    for (what, between) in [("Enter", enter.to_vec()), ("typed b", typed.to_vec())] {
+        let fx = fixture(0);
+        let (mut drv, mut win) = window(&fx, 100, 30);
+        drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
+        drv.until(&mut win, 20, |w| w.ready());
+        drv.idle(&mut win, 2);
+        assert!(bar_on(&drv, "alpha"), "the control: the bar on alpha");
+        drv.key(&mut win, Key::F1, Modifiers::NONE);
+        drv.idle(&mut win, 2);
+        assert!(crate::gui::help::is_open(&drv.ctx));
+        // Slot 1: the last row's first cell.
+        let slot = Pos2::new(4.0, 29.5 * CELL.y);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: slot,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let mut batch = vec![egui::Event::PointerMoved(slot), button(true)];
+        batch.extend(between);
+        batch.push(button(false));
+        drv.frame(&mut win, batch, Modifiers::NONE);
+        drv.until(&mut win, 20, |w| w.ready());
+        drv.idle(&mut win, 2);
+        assert!(
+            !crate::gui::help::is_open(&drv.ctx),
+            "{what}: the click closed it"
+        );
+        assert!(drv.find_text("beta").is_some(), "{what}: still the folder");
+        assert!(bar_on(&drv, "alpha"), "{what}: the bar where it was");
+    }
+}
+
 /// Under F1's help the browser's F-key row is in sight but its slots are the help's: a click on
 /// Copy opens no Copy dialog and leaves the help; the control: without the help it does.
 #[test]

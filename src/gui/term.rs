@@ -483,13 +483,20 @@ pub(crate) fn compose(ctx: &egui::Context, layers: &[Arc<Layer>], cols: u16, row
 /// `layers` in egui's painting order: its layer order (the areas' order of `ctx`, back to
 /// front), then the order of the calls.
 fn painting_order<'a>(ctx: &egui::Context, layers: &'a [Arc<Layer>]) -> Vec<&'a Arc<Layer>> {
-    let order: Vec<egui::LayerId> = ctx.memory(|m| m.layer_ids().collect());
+    let place = area_place(ctx);
     let mut sorted: Vec<(usize, &Arc<Layer>)> = layers.iter().enumerate().collect();
-    sorted.sort_by_key(|&(call, l)| {
-        let area = order.iter().position(|o| *o == l.layer);
-        (l.layer.order, area.unwrap_or(usize::MAX), call)
-    });
+    sorted.sort_by_key(|&(call, l)| (place(l.layer), call));
     sorted.into_iter().map(|(_, l)| l).collect()
+}
+
+/// Where egui paints a layer: its order, then its area's place in the areas of `ctx` (back to
+/// front; one egui does not list goes last in its order).
+fn area_place(ctx: &egui::Context) -> impl Fn(egui::LayerId) -> (egui::Order, usize) {
+    let order: Vec<egui::LayerId> = ctx.memory(|m| m.layer_ids().collect());
+    move |layer| {
+        let area = order.iter().position(|o| *o == layer);
+        (layer.order, area.unwrap_or(usize::MAX))
+    }
 }
 
 /// Lays layer `l` onto `buf` (`cols` × `rows`, see [`compose`]): each cell whose centre is
@@ -1054,11 +1061,13 @@ impl<T: Tty, O: Write> Backend<T, O> {
             hand_off(&mut screen.buf, r, title_at(&self.titles, r));
             screen.hand_offs.push(r);
             screen.caret = screen.caret.filter(|c| !r.contains(*c));
-            // What is in cells above the dialog — the key help — stays over its box.
-            let above = egui_only.map(|m| m.order);
+            // What is in cells above the dialog in egui's painting order — the key help, a
+            // later area of its own order — stays over its box.
+            let place = area_place(&self.ctx);
+            let above = egui_only.map(&place);
             let mut covered = vec![false; usize::from(cols) * usize::from(rows)];
             for l in painting_order(&self.ctx, &layers) {
-                if Some(l.layer.order) > above {
+                if Some(place(l.layer)) > above {
                     lay_layer(&mut screen.buf, &mut covered, l, cols, rows);
                 }
             }

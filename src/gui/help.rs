@@ -572,6 +572,11 @@ pub(crate) fn input_hook(ctx: &egui::Context, events: &mut Vec<Event>) {
         _ => true,
     });
     open.top = (open.top as f32 + lines).round().clamp(0.0, last as f32) as usize;
+    // A click that closes it: the keys and the text that came with it are still the help's —
+    // [`begin_pass`] will not see them, the help being gone.
+    if closed {
+        events.retain(|e| !withheld(e));
+    }
     ctx.data_mut(|d| {
         if closed {
             d.remove_temp::<Open>(open_id());
@@ -579,6 +584,19 @@ pub(crate) fn input_hook(ctx: &egui::Context, events: &mut Vec<Event>) {
             d.insert_temp(open_id(), open);
         }
     });
+}
+
+/// What the help keeps from the window while it is open, the pointer apart: every key but
+/// Cmd/Ctrl+Q and +W (they close it as ever and go on to the window), the typed text, the
+/// clipboard's and the input method's events.
+fn withheld(e: &Event) -> bool {
+    match e {
+        Event::Key { key, modifiers, .. } => {
+            !(matches!(key, Key::Q | Key::W) && Mods::Command.matches(*modifiers))
+        }
+        Event::Text(_) | Event::Paste(_) | Event::Copy | Event::Cut | Event::Ime(_) => true,
+        _ => false,
+    }
 }
 
 /// Before the window's pass: the screen's own keys, then the rest of the frame's input withheld
