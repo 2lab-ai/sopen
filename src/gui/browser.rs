@@ -34,6 +34,8 @@ mod git_panel;
 pub(crate) mod keys;
 mod list_cells;
 mod ops;
+#[cfg(test)]
+pub(crate) use ops::shown_wrapped;
 mod panel;
 mod prepare;
 mod preview;
@@ -2608,9 +2610,16 @@ impl Window for Browser {
         self.fkeys_line = super::fkeys_status(&ctx);
         let status = self.status_line();
         chrome::status_panel_cells(ui, "sopen-browser-status", &status);
+        // A running file operation is heard on every pass, whatever the window shows — before the
+        // panels, so a question or a report that arrives in this pass is a dialog the list
+        // blanks its cells under (`Ops::covered`) in this pass too.
+        let changed = self.ops.poll(&mut self.panels[self.active]);
+        // The area between the title and status rows: the list's grid, where its dialogs stand.
+        let mut area = ui.available_rect_before_wrap();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
+                area = ui.max_rect();
                 if self.viewer.is_some() {
                     // The viewer over both sides: at all of the area's cells (10 §4).
                     let grid = Grid::over(ui.max_rect());
@@ -2623,12 +2632,9 @@ impl Window for Browser {
                     self.panels_ui(ui);
                 }
             });
-        // A running file operation is heard on every pass, whatever the window shows; its
-        // dialogs — a question, the report — are the list's, over the panels.
-        let active = &mut self.panels[self.active];
-        let changed = self.ops.poll(active);
+        // The operations' dialogs — a question, the report — are the list's, over the panels.
         if self.viewer.is_none() {
-            self.ops.dialogs(&ctx, active);
+            self.ops.dialogs(&ctx, area, &mut self.panels[self.active]);
         }
         if let Some(changed) = changed {
             self.after_operation(&ctx, changed);

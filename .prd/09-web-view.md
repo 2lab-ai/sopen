@@ -183,34 +183,57 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   `realpath` on that host. The page's URL is the file's path relative to the root.
 - **A new request** — the steps run on the page's connection as a `RemoteFs`, never while it is a
   `Ranged` (a `Ranged` resolves and stats nothing but its own file):
-  1. percent-decode, refuse a NUL; join under the root;
+  1. percent-decode; `..` in any spelling (`..`, `%2e%2e`, `.%2E`, `..%2f` — an encoded `/`
+     splits too) and a NUL are 403, counted on the row, with **no filesystem call**, so nothing
+     outside the root is even resolved; a path that is not UTF-8 names nothing (404); `.` and empty
+     components are nothing; join under the root (`stream::page::join`) **[decision]**;
   2. the connection back from its last file (`into_connection`); `realpath`, so a link counts by what
-     it points at; served only when the result is the root or below — else 403, counted on the row;
-  3. `stat`: a regular file goes to step 4. A folder selects its `index.html`, and **that final path
-     goes through step 2 and this step again** — `realpath`, root containment, regular file — before
-     anything opens (an `index.html` that links out of the root is 403) **[decision]**. Anything
-     else is 404;
+     it points at; served only when the result is the root or below (the root-prefix check,
+     `stream::page::inside`) — else 403, counted on the row; a path that does not resolve is 404
+     when `stat_opt` finds nothing there, else the request fails;
+  3. `stat`: a regular file goes to step 4. A folder asked with its `/` selects its `index.html`,
+     and **that final path goes through step 2 and this step again** — `realpath`, root
+     containment, regular file — before anything opens (an `index.html` that links out of the root
+     is 403) **[decision]**. A folder asked without its `/` is not served its index at that address
+     (its relative links would resolve one level up) but a 200 `text/html; charset=utf-8` page
+     sending the engine to `NAME/` — a meta refresh and a link, NAME the last segment as the request
+     had it (`stream::page::folder_page`) — as the scheme has no redirect status; the query does not
+     reach the server (`scheme::Host::path_of` drops it), so the link carries none **[decision]**.
+     Anything else is 404;
   4. `into_ranged(resolved)` on the checked path: the handle's `fstat` is the request's
      fingerprint (06 §5).
   That is ~4 RTT (realpath, stat, open, fstat): 48–160 ms at the reference rig's 12–40 ms
   **[추정; X-W1 measures]**.
-- **Served in turn** **[decision]**: open requests take turns, one piece (≤ 1 MiB, ≤ 4 MiB in flight)
-  each, so a long response (a large image, an open-ended `bytes=0-`) never holds back the CSS behind
-  it. Consecutive turns on one file (a `<video>`'s ranges) keep its handle. A later turn of a checked
-  request on another file is `reopen(resolved)` — `into_connection().into_ranged(path)`
+- **Served in turn** **[decision]**: open requests take turns, one piece each — at most the scheme's
+  `WINDOW` (1 MiB) in flight, the request's credit (`scheme::Body::room`), read as 64 KiB reads sent
+  together — so a long response (a large image, an open-ended `bytes=0-`) never holds back the CSS
+  behind it. Consecutive turns on one file (a `<video>`'s ranges) keep its handle. A later turn of a
+  checked request on another file is `reopen(resolved)` — `into_connection().into_ranged(path)`
   (sftp/ranged.rs:392-393), ~2 RTT, no new checks — and the fingerprint is compared at every reopen:
-  a file whose size or mtime moved fails that request (a network error to the engine), never padded.
+  a file whose size or mtime moved fails a request under way (a network error to the engine), never
+  padded. A new request has sent nothing, so a checked file that moved — or will not open, being
+  gone — is forgotten and the request runs its steps afresh (served as the file is now, or 404);
+  a new whole-file request on a checked path (a reload) is always a reopen, before anything is
+  answered from its check — the kept handle and the block cache are for ranges (change 1); and a
+  read that fails or ends early forgets the file, its charset and its kept blocks **[decision]**.
 - **Transport**: 06's `remote::Ranged`, each piece handed to the engine as it arrives
   (`didReceiveData:`, the request's input stream on Linux), wrapped in `stream::Throttled`
   (stream/mod.rs:263) under `SOPEN_STREAM_THROTTLE`, as every stream is. A local page goes the same
-  way over `LocalFs` (`into_ranged`, local.rs:251), in place (06 §1). A short reply or an early end
-  fails the request.
+  way, in place (06 §1), over `stream::page::serve_local`'s own reader — `LocalFs::into_ranged` is
+  test-only. A short reply's rest is read at its own offset (`remote::Ranged`'s contract: a server
+  may clip its replies); an empty reply inside the file is an early end and fails the request, as
+  does a body short of its head's length **[decision]**.
 - **Range** `bytes=a-b` → 206 with `Content-Range` and `Accept-Ranges: bytes`; unsatisfiable → 416;
   else 200 with `Content-Length` (measured on both engines, `<video>` seeking on macOS, *web* §4).
-- **Type** by extension, a fixed table (html/htm `text/html`, xml `application/xml`, xsl/xslt
-  `text/xsl`, and css, js, json, svg, png, jpeg, gif, webp, woff/woff2, ttf/otf, mp4/webm, mp3/ogg/wav,
-  pdf); anything else `application/octet-stream`. A text type that names no charset itself (`<meta
-  charset`, `http-equiv`, `encoding=`) gets the one `crate::encoding::pick` gives for its first 8 KiB
+- **Type** by the extension of the name asked (`index.html` for a folder), a fixed table
+  (`stream::page::mime`: html/htm `text/html`, xml `application/xml`, xsl/xslt `text/xsl`, and css,
+  js/mjs, json, svg, png, jpg/jpeg, gif, webp, woff/woff2, ttf/otf, mp4/webm, mp3/ogg/wav, pdf);
+  anything else `application/octet-stream`. A text type that names no charset itself — by its own
+  rule, only a label of a real encoding (the Encoding Standard's) counting: HTML by WHATWG's
+  prescan of its first 1024 bytes (comments and other markup skipped; a `<meta>`'s `charset`, or
+  `http-equiv=content-type` with a `content` naming one), XML by its declaration's `encoding` only
+  at the very start (after a BOM), CSS by `@charset "…";` only as its first bytes
+  (`stream::page::charset`) — gets the one `crate::encoding::pick` gives for its first 8 KiB
   (`kind::SNIFF_BYTES`) — the text view's default (08 §7.2), so the page and its source agree:
   `; charset=utf-8` for UTF-8 by its BOM, or by step 4 when the sample is valid UTF-8 — a character
   cut at the 8 KiB edge accepted: `kind::utf8_text`, never `kind::looks_like_text` (UTF-16/32 too)
@@ -218,18 +241,25 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   its BOM or the NUL pattern (a BOM decides before the header anyway: the Encoding Standard's
   *decode*); `utf-32le` / `utf-32be` for UTF-32, though the Encoding Standard defines no UTF-32
   label, so WebKit is expected to ignore it and not render the page as UTF-32 text **[추정: not
-  measured]** — 08's text view reads it; anything else (CP949, once VM-4 fills step 3) none, and the
+  measured]** — 08's text view reads it; anything else (CP949, step 3's guess) none, and the
   engine decides as a browser does **[decision; that the engine honours the header 추정]**.
-- **Cancel**: the engine's stop (`webView:stopURLSchemeTask:`; the request's cancellable on Linux)
-  ends the request after the piece in flight; nothing is sent to a stopped task (WebKit throws on
-  that **[추정]**); closing the view stops all.
+- **Cancel**: the engine's stop (`webView:stopURLSchemeTask:`; the request's cancellable on Linux):
+  the server ends a stopped request where the stop finds it — in its steps, after the step in
+  progress (its file never opened); waiting between turns, at once (nothing more is read for it); in
+  a piece, after the 64 KiB read in flight: nothing more of it reaches the engine and no further
+  read is sent, and the piece's other reads, already sent (at most one window), are waited for and
+  dropped, so the handle is clean for the next request **[decision]**. Nothing is sent to a stopped
+  task (WebKit throws on that, X-W1); closing the view stops all.
 - **Channels** (06 §6) **[decision]**: a shown remote page view holds **one** SFTP channel, as a text
   viewer does — in the preview the window's preview session, given back when the bar moves on (06 §13
   item 3, `streamed::Lease`); in the viewer the connection that opened the file (prepare.rs:188-203),
   or the preview's, carried over. A page view hidden in 08's set (WV-F) gives its session back, as 08
   D14 does a save connection, and connects again at its next request. WV-D adds the row to 06 §6.
-- **Preview budget** **[decision]**: a preview's page is served at most 32 MiB in all (02 §4.3's bound
-  for an image read whole); later requests fail. **The hand-over lifts it**, as Enter lifts a
+- **Preview budget** **[decision]**: a preview's page reads at most 32 MiB in all (02 §4.3's bound
+  for an image read whole), counted as bytes read — a small range's block and a charset's sample
+  included: each request reserves what it will read before its head, one that would pass the bound
+  fails before its head (`stream::page::Control::cut`), and a stopped request gives back what it
+  never read. **The hand-over lifts it** (`Control::lift`), as Enter lifts a
   preparation's budget (preview.rs:50); a view whose budget refused anything reloads once at the
   hand-over, so the viewer shows the whole page. The viewer has no byte budget.
 
@@ -334,18 +364,22 @@ ms on Linux.
 
 **Changes this section takes [decision]:**
 1. **A path checked once in a view is not checked again**, and small ranges come from a block cache:
-   the view keeps each checked file's resolved path and fingerprint; a request on the file whose
+   the view keeps each checked file's resolved path and fingerprint; a range on the file whose
    handle is open is served from that handle with no steps, on another file it is a `reopen` with the
-   fingerprint compare (2 RTT); a small request reads its aligned block (256 KiB here) and later ranges
-   inside a kept block are answered from memory, for the view's life and within its budget (06's
-   block cache is the candidate **[추정]**). Without the first a `<video>` costs 4 RTT per range;
-   without the second it plays late or not at all.
+   fingerprint compare (2 RTT) — a whole file asked again is always a reopen (§3.1 "Served in
+   turn"); a range inside one aligned block (256 KiB here) reads that block, and later ranges inside
+   a kept block are answered from memory, for the view's life and within its budget. Built as the
+   page server's own cache (`stream::page`, not 06's): blocks keyed by the file's fingerprint, 16 MiB
+   a view at most, the least recently used going first; one version of a file per view
+   **[decision]**. Without the first a `<video>` costs 4 RTT per range; without the second it plays
+   late or not at all.
 2. A new request's first turn is its steps and its first piece.
 3. **Stop, per engine**: Mac `stopURLSchemeTask` — before the head, mid-body, or after the last byte
    before `didFinish`; Linux the read's `GCancellable` mid-body and, before the head, the view's
    `WebKitWebResource::failed` matched to the request by URI (the request has no signal of its own).
    The glue keeps a tombstone per request and drops late messages; the server ends a stopped request
-   after the 64 KiB read in flight, or after the steps in progress.
+   as §3.1's Cancel says: after the step in progress, at once between turns, or after the 64 KiB
+   read in flight (the piece's reads already sent drained, not delivered).
 4. **The scheme trait (WV-0)**: in `start(id, path, range)`, `stop(id)`; out a complete `head`, then
    `data`*, then `done` or `fail` (a sniffed text type's head waits for its first read, above), each
    delivered by the engine glue on the engine's thread (Mac main queue, Linux GTK context by idle).
@@ -356,14 +390,17 @@ ms on Linux.
    the channel (open, fstat, read pipelined), would bring a page to ~5 RTT plus transfer **[추정: not
    built]** — it needs a batched `RemoteFs` call and a several-handle `Ranged`. A turn makes the
    request behind it wait one piece (0.52 s at 2 MB/s); pieces sized by link time (~100 ms) would cut
-   that **[추정]**.
+   that **[추정]**. WV-C built the second: while another request waits, a piece is what the link
+   carries in `stream::page::LINK_TIME` at its rate measured from the last pieces, in whole 64 KiB
+   reads; the first is WV-C2's (§12) **[decision]**.
 
-Per unit: WV-C takes 1, 2, 3's server half and 5; WV-0 takes 4; WV-A retains each task, calls it only
-from the main queue behind the tombstone, and expects the after-the-last-byte stop; WV-B builds the
-`GInputStream` subclass with its layout asserted at start, completes reads outside the cancel
-emission, never holds its own state across a call into GLib or WebKit (a completion can re-enter
-`read_async`) **[추정: designed around, not provoked]**, watches `resource-load-started`/`failed`
-for the stop before the head, and reads Range from the request's headers.
+Per unit: WV-C takes 1, 2, 3's server half and 5's piece sizing; WV-C2 takes 5's pipelining; WV-0
+takes 4; WV-A retains each task, calls it only from the main queue behind the tombstone, and expects
+the after-the-last-byte stop; WV-B builds the `GInputStream` subclass with its layout asserted at
+start, completes reads outside the cancel emission, never holds its own state across a call into
+GLib or WebKit (a completion can re-enter `read_async`) **[추정: designed around, not provoked]**,
+watches `resource-load-started`/`failed` for the stop before the head, and reads Range from the
+request's headers.
 
 ### 3.2 Engine settings, every view
 
@@ -747,6 +784,7 @@ handle; §3.1's ~4 and ~2 RTT. Its result goes into §3.1.
 | ID | Unit | Owns | After |
 |---|---|---|---|
 | WV-C | **Page server**: root, request steps (index included), turns, `reopen`, fingerprint, Range, type and charset tables, cancel, budget and its lift | `src/stream/page.rs`, `src/stream/page/tests.rs` (new); `src/stream/mod.rs` (the `mod` line) | X-W1; WV-0's `src/scheme.rs` (the trait) |
+| WV-C2 | **Pipelined steps** (X-W1 change 5): batched realpath/stat in `RemoteFs` and a `Ranged` with several open handles, in `src/remote/`, so a page of R files would cost ~5 RTT plus transfer **[추정]**. WV-C built the link-time piece sizing and pins today's R × (realpath, stat, open) cost (`change5_a_page_of_r_files_costs_r_times_the_steps`) | `src/remote/` (the batched call, the several-handle `Ranged`); `src/stream/page.rs` (their use) | WV-C |
 | WV-0 | **Component core**: `Web`, `Engine`, the scheme trait, placement, the after-frame hide check, key states, scripts and F2's availability, `SOPEN_WEB`, `FakeEngine`, the compose call; the shell's part (§2.1) | `src/scheme.rs`, `src/gui/web/mod.rs`, `src/gui/web/fake.rs`, `src/gui/web/tests.rs` (new); `src/lib.rs` (the `mod` line); `src/gui/mod.rs` (`mod web`, `Shell`'s handle, after-frame check, teardown, monitor install, the compose call); AGENTS.md's `SOPEN_WEB` row | X-W1 (the trait first, so WV-C builds beside it) |
 | WV-A | **macOS engine**: WKWebView, a non-persistent data store per view (no per-view process pool: §2.5, R12), monitor, shield, `takeSnapshot`, scheme glue, rule list in the temp store, ATS measurement | `src/gui/web/mac.rs`, `src/gui/web/mac/tests.rs` (new); `src/gui/web/mod.rs` (the `mod mac` line and `platform()`); `Cargo.toml`, `Cargo.lock` (objc2-web-kit; objc2-app-kit features); `.github/workflows/ci.yml` (one macOS-only line: `SOPEN_REQUIRE_WEBKIT=1`); AGENTS.md's `SOPEN_REQUIRE_WEBKIT` row | WV-0, X-W1 |
 | WV-B | **Linux engine**: loader, GTK thread, context per view, offscreen copy, input, HiDPI, scheme glue, rules, settings | `src/gui/web/gtk.rs`, `src/gui/web/gtk/api.rs`, `src/gui/web/gtk/tests.rs` (new); `.github/workflows/ci.yml` (the Linux steps) | WV-0, X-W1 |
@@ -779,6 +817,11 @@ looked at (06 §13).
   view, for XSLT's sake. Outside CSS and fonts therefore never style a file page.
 - ***web* §1.4 vs decision 12.** The prototype's monitor passed Esc on after taking the keyboard back;
   09 consumes it — one Esc returns the keyboard, a second leaves.
+- **Change 1's kept handle vs a changed file.** During a run of ranges on one open handle, a file
+  rewritten in place goes unseen until the next reopen (a file renamed over it keeps reading the old
+  one, as 06 §5's "replaced"), and ranges answered from kept blocks never see a change for the view's
+  life; a whole file asked again is a reopen, so a reload does see it. No reconnect: a connection that
+  stops replying fails the view's later requests until WV-F's reconnect (§3.1 "Channels") covers it.
 - **01 A10a vs §7 route 1.** A10a: `sopen URL` opens the default browser and exits 0; from 09 it lasts
   until its window closes. WV-E2 rewrites A10a.
 - **libtest vs AppKit's main thread (WV-A).** AppKit and WebKit run only on a process's main thread,
