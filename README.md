@@ -9,7 +9,9 @@ viewers, the image, video, audio and hex editors, the git panel and the director
   <a href="#folders-the-file-browser-with-git">folders</a> · <a href="#images-crop-pixelize-paste-save-back">images</a> · <a href="#video-and-audio-cut-on-the-timeline-save-back">video and audio</a> · <a href="#big-and-binary-files">big files</a> · <a href="#in-the-terminal---tui">--tui</a> · <a href="#on-another-machines-screen---target">--target</a> · <a href="#from-the-command-line-sopen-cut-sopen-stems">cut and stems</a> · <a href="#install">install</a> · <a href="docs/README.md">docs</a>
 </p>
 
-<!-- film -->
+[![sopen: the tutorial and ten short demos at 2lab.ai/sopen — the file browser and its git panel, huge logs, image, video and audio editing saved back, a 24 GB file in the hex editor, --tui, sopen cut and sopen stems](screenshots/sopen-film-poster.png)](https://www.2lab.ai/sopen)
+
+<p align="center"><sub>▶ <a href="https://www.2lab.ai/sopen">The tutorial and ten short demos</a>, recorded on the real sopen with demo data, with English and Korean captions.</sub></p>
 
 ```sh
 sopen myserver:~/project           # folder → the xtools file browser: two panels, Enter views any file
