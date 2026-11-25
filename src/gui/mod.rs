@@ -806,6 +806,14 @@ impl egui::Plugin for FKeyInput {
     }
 
     fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        // A switch between backends ended every gesture under way: their releases went to the
+        // other backend, or were dropped with the terminal's unread input (10 §7.2).
+        if ctx
+            .data_mut(|d| d.remove_temp::<GesturesEnded>(gestures_id()))
+            .is_some()
+        {
+            self.mode = false;
+        }
         // The focus as the last pass left it: what has the typing now.
         let typing = ctx.text_edit_focused();
         let clicked = chrome::take_clicked(ctx);
@@ -978,7 +986,9 @@ fn key_aliases(
 /// The title row's mode button (10 §7, T4; `chrome::mode_button_rect`, where the last pass drew
 /// it): a press of the primary button there is the switch and is taken, with its release, before
 /// anything sees them — a modal's backdrop would close its dialog on that click (§9: the button
-/// always works). Whether this pass asked.
+/// always works). The press's release is the next primary release only: a primary press elsewhere
+/// or the focus lost ends the gesture (as a switch does, [`gestures_ended`]), so a release it
+/// never got does not take another click's. Whether this pass asked.
 fn mode_button(events: &mut Vec<egui::Event>, down: &mut bool, at: Option<egui::Rect>) -> bool {
     let mut asked = false;
     events.retain(|e| match e {
@@ -987,9 +997,11 @@ fn mode_button(events: &mut Vec<egui::Event>, down: &mut bool, at: Option<egui::
             button: egui::PointerButton::Primary,
             pressed: true,
             ..
-        } if at.is_some_and(|r| r.contains(*pos)) => {
-            (*down, asked) = (true, true);
-            false
+        } => {
+            let on = at.is_some_and(|r| r.contains(*pos));
+            *down = on;
+            asked |= on;
+            !on
         }
         egui::Event::PointerButton {
             button: egui::PointerButton::Primary,
@@ -999,9 +1011,28 @@ fn mode_button(events: &mut Vec<egui::Event>, down: &mut bool, at: Option<egui::
             *down = false;
             false
         }
+        egui::Event::WindowFocused(false) => {
+            *down = false;
+            true
+        }
         _ => true,
     });
     asked
+}
+
+/// The backend switched ([`gestures_ended`]): the next pass's hook forgets the gestures under way.
+#[derive(Debug, Clone, Copy, Default)]
+struct GesturesEnded;
+
+fn gestures_id() -> egui::Id {
+    egui::Id::unique("sopen-gestures-ended")
+}
+
+/// `ctx`'s backend gives the screen to the other, or takes it back (10 §7.2): a press under way
+/// there — the mode button's, whose release the other backend got or the terminal's dropped
+/// input took — is over; the shell's input hook forgets it at the next pass ([`FKeyInput`]).
+pub fn gestures_ended(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(gestures_id(), GesturesEnded));
 }
 
 /// A pass asked for the switch ([`switch_asked`]).

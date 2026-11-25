@@ -239,16 +239,30 @@ pub(crate) fn wait_input(fd: libc::c_int, wait: Duration) -> io::Result<Input> {
     })
 }
 
+/// The most of the standard error kept while the terminal is held ([`Stderr`]): the last bytes.
+pub(crate) const STDERR_KEPT: usize = 1024 * 1024;
+
 /// The standard error held while the terminal is (10 §4): what is written to it — a worker's
 /// line, a panic on another thread, a child's message — would land on the screen sopen draws and
-/// stay there; it goes to a pipe instead, is kept, and is written to the real standard error when
-/// the terminal is let go (after the alternate screen is left). A child started meanwhile keeps
-/// the pipe as its standard error: what it writes later goes straight to the real one.
+/// stay there; it goes to a pipe instead, its last [`STDERR_KEPT`] bytes are kept, and they are
+/// written to the real standard error when the terminal is let go (after the alternate screen
+/// is left), after a line saying how many went before them. A child started meanwhile keeps the
+/// pipe as its standard error: what it writes later goes straight to the real one.
 pub(crate) struct Stderr {
     /// The real standard error, put back on release.
     saved: libc::c_int,
-    /// What was kept, and whether the hold is over (then the reader passes bytes on).
-    kept: Arc<Mutex<(Vec<u8>, bool)>>,
+    held: Arc<Mutex<Held>>,
+    /// The reader read the pipe's end.
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+/// What the reader of a held standard error has: the last bytes, how many went before them, and
+/// whether the hold is over (then it passes bytes on).
+#[derive(Default)]
+struct Held {
+    kept: std::collections::VecDeque<u8>,
+    dropped: usize,
+    released: bool,
 }
 
 impl Stderr {
@@ -280,23 +294,28 @@ impl Stderr {
         };
         // SAFETY: the read end is this process's, owned by the File from here on.
         let mut from = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(read) };
-        let kept: Arc<Mutex<(Vec<u8>, bool)>> = Arc::default();
-        let into = kept.clone();
+        let held: Arc<Mutex<Held>> = Arc::default();
+        let into = held.clone();
+        let (end, done) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("sopen-stderr".into())
             .spawn(move || {
-                let mut chunk = [0u8; 4096];
+                let mut chunk = [0u8; 8192];
                 while let Ok(n) = std::io::Read::read(&mut from, &mut chunk) {
                     if n == 0 {
                         break;
                     }
-                    let mut kept = into.lock().unwrap_or_else(|p| p.into_inner());
-                    if kept.1 {
+                    let mut held = into.lock().unwrap_or_else(|p| p.into_inner());
+                    if held.released {
                         let _ = io::stderr().write_all(&chunk[..n]);
-                    } else {
-                        kept.0.extend_from_slice(&chunk[..n]);
+                        continue;
                     }
+                    held.kept.extend(&chunk[..n]);
+                    let over = held.kept.len().saturating_sub(STDERR_KEPT);
+                    held.kept.drain(..over);
+                    held.dropped += over;
                 }
+                let _ = end.send(());
             });
         if let Err(e) = spawned {
             // SAFETY: puts the real standard error back and closes the copy.
@@ -306,25 +325,30 @@ impl Stderr {
             }
             return Err(e);
         }
-        Ok(Stderr { saved, kept })
+        Ok(Stderr { saved, held, done })
     }
 
-    /// Fd 2 is the real standard error again and what was kept is written there; what comes
-    /// later through the pipe is passed straight on. What was kept.
+    /// Fd 2 is the real standard error again and what was kept is written there (after how much
+    /// went before it); what comes later through the pipe is passed straight on, after it. What
+    /// was kept.
     pub fn release(self) -> Vec<u8> {
         // SAFETY: dup2 and close of fds this process owns.
         unsafe {
             libc::dup2(self.saved, 2);
             libc::close(self.saved);
         }
-        // What the reader has not taken yet: a moment for it.
-        std::thread::sleep(Duration::from_millis(20));
-        let kept = {
-            let mut kept = self.kept.lock().unwrap_or_else(|p| p.into_inner());
-            kept.1 = true;
-            std::mem::take(&mut kept.0)
-        };
-        let _ = io::stderr().write_all(&kept);
+        // The pipe's last write end is closed now — unless a child started meanwhile holds one:
+        // its end is not waited for long.
+        let _ = self.done.recv_timeout(Duration::from_millis(200));
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        held.released = true;
+        let kept: Vec<u8> = std::mem::take(&mut held.kept).into();
+        let mut err = io::stderr();
+        if held.dropped > 0 {
+            let _ = writeln!(err, "… {} bytes of stderr dropped", held.dropped);
+        }
+        // Under the lock: the reader passes later bytes on only after these.
+        let _ = err.write_all(&kept);
         kept
     }
 }
@@ -849,7 +873,10 @@ impl<T: Tty, O: Write> Backend<T, O> {
         let asked: Arc<Mutex<Option<Instant>>> = Arc::default();
         let tell = asked.clone();
         ctx.set_request_repaint_callback(move |info| {
-            let at = Instant::now() + info.delay.max(IDLE_FLOOR);
+            // A delay past what an `Instant` holds is no deadline.
+            let Some(at) = Instant::now().checked_add(info.delay.max(IDLE_FLOOR)) else {
+                return;
+            };
             let mut asked = tell.lock().unwrap_or_else(|p| p.into_inner());
             *asked = Some(asked.map_or(at, |was| was.min(at)));
         });
@@ -1303,6 +1330,7 @@ impl Window for Switched {
         let ctx = ui.ctx().clone();
         if std::mem::take(&mut self.first) {
             self.carry.borrow().apply(&ctx);
+            super::gestures_ended(&ctx);
         }
         chrome::set_mode_button(&ctx, "[TUI]");
         self.browser.borrow_mut().ui(ui);
@@ -1357,6 +1385,7 @@ pub(crate) fn to_window<T: Tty, O: Write>(
     });
     b.enter()?;
     carry.borrow().apply(&b.ctx);
+    super::gestures_ended(&b.ctx);
     Ok(ran
         .err()
         .map(|e| match e.downcast_ref::<super::NotStarted>() {

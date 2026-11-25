@@ -1956,15 +1956,87 @@ fn a_hand_off_box_has_the_panes_title() {
 
 /// What is written to the standard error while the terminal is held does not land on its
 /// screen: it is kept, and written when the terminal is let go.
+/// Set in the child [`stderr_child`] runs.
+const STDERR_CHILD: &str = "SOPEN_TEST_TERM_STDERR_CHILD";
+const STDERR_CHILD_TEST: &str = "gui::term::tests::stderr_child";
+/// How much the child writes while its standard error is held: past [`STDERR_KEPT`].
+const STDERR_WRITTEN: usize = STDERR_KEPT + 300_000;
+
+/// Not a test of its own (it returns at once): [`held_stderr_is_kept_bounded_and_written_after`]'s
+/// child — fd 2 redirected in a process of its own, never this test binary's. A line before the
+/// hold goes straight out; past the bound while held; a line after the release straight out.
 #[test]
-fn stderr_while_the_terminal_is_held_is_kept_for_after() {
+fn stderr_child() {
+    if std::env::var_os(STDERR_CHILD).is_none() {
+        return;
+    }
+    let write = |bytes: &[u8]| {
+        let mut at = 0;
+        while at < bytes.len() {
+            // SAFETY: a plain write of a live buffer to fd 2.
+            let n = unsafe { libc::write(2, bytes[at..].as_ptr().cast(), bytes.len() - at) };
+            assert!(n > 0, "write to fd 2");
+            at += n as usize;
+        }
+    };
+    write(b"BEFORE THE HOLD\n");
     let held = Stderr::hold().expect("stderr held");
-    let line = b"written while the terminal is held\n";
-    // SAFETY: a plain write of a live buffer to fd 2.
-    let n = unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
-    assert_eq!(n, line.len() as isize);
+    let mut bytes = b"FIRST HELD\n".to_vec();
+    let tail = b"\nLAST HELD\n";
+    bytes.resize(STDERR_WRITTEN - tail.len(), b'x');
+    bytes.extend_from_slice(tail);
+    assert_eq!(bytes.len(), STDERR_WRITTEN);
+    write(&bytes);
     let kept = held.release();
-    assert_eq!(kept, line, "kept, then written to the real stderr");
+    write(b"AFTER THE RELEASE\n");
+    assert!(kept.ends_with(b"LAST HELD\n"));
+}
+
+/// What is written to the standard error while the terminal is held does not land on its
+/// screen: it is kept — the last [`STDERR_KEPT`] bytes, a line saying how many went before them —
+/// and written when the terminal is let go, between what came before and after.
+#[test]
+fn held_stderr_is_kept_bounded_and_written_after() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            STDERR_CHILD_TEST,
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(STDERR_CHILD, "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the child: {out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let dropped = STDERR_WRITTEN - STDERR_KEPT;
+    let said = format!("… {dropped} bytes of stderr dropped\n");
+    let at = |what: &str| {
+        err.find(what)
+            .unwrap_or_else(|| panic!("{what:?} in the child's stderr"))
+    };
+    let (before, line, last, after) = (
+        at("BEFORE THE HOLD"),
+        at(&said),
+        at("LAST HELD"),
+        at("AFTER THE RELEASE"),
+    );
+    assert!(before < line && line < last && last < after, "in order");
+    assert!(!err.contains("FIRST HELD"), "the start went past the bound");
+    let kept = &err.as_bytes()[line + said.len()..after];
+    assert_eq!(kept.len(), STDERR_KEPT, "the last {STDERR_KEPT} bytes");
+}
+
+/// A repaint asked for after a delay longer than an `Instant` can reach (on every OS; short of
+/// `Duration::MAX`, which egui never passes on) is no deadline, not a panic in egui's callback.
+#[test]
+fn a_repaint_asked_for_ages_away_is_no_deadline() {
+    let tape = Tape::default();
+    tape.0.borrow_mut().size = (40, 10);
+    let b = Backend::new(tape, Bytes::default(), skin(), true);
+    b.ctx.request_repaint_after(Duration::from_secs(u64::MAX));
+    assert_eq!(*b.asked.lock().unwrap(), None);
 }
 
 /// The terminal's input on a pty this test owns: quiet, then ready with a key, then — the
@@ -2011,5 +2083,178 @@ fn a_terminal_that_hung_up_is_an_error_at_once() {
         at.elapsed() < Duration::from_secs(1),
         "at once: {:?}",
         at.elapsed()
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix-check (2026-11-25): a press on the mode button whose release the switch swallowed.
+
+/// `[GUI]` pressed: the switch runs in the press's pass; the release, sent by the terminal
+/// meanwhile, is dropped with the rest of its unread input when the terminal is taken again
+/// (mouse reporting was off). Back in the terminal the button's gesture is over: the next click's
+/// release is not taken for it.
+fn gui_press_then_back(
+    fx: &Fx,
+    tape: &Tape,
+    also: impl Fn(&mut Backend<Tape, Bytes>) + 'static,
+) -> impl FnMut(&mut Backend<Tape, Bytes>) -> io::Result<Option<String>> {
+    let browser = fx.b.clone();
+    let typing = tape.clone();
+    move |b: &mut Backend<Tape, Bytes>| {
+        let ran = to_window(b, &browser, Ok(Place::Here), |mut switched| {
+            // The release of the press on [GUI], sent while the window runs.
+            let up = mouse(MouseEventKind::Up(MouseButton::Left), 87, 0);
+            typing.0.borrow_mut().unread.push_back(up);
+            let mut drv = Driver::new(800.0, 480.0);
+            drv.as_shell();
+            drv.until(&mut switched, 20, |w| w.ready());
+            drv.key(&mut switched, Key::F12, Modifiers::NONE);
+            drv.idle(&mut switched, 1);
+            assert!(drv.window_closed, "F12 there");
+            Ok(())
+        });
+        also(b);
+        ran
+    }
+}
+
+#[test]
+fn after_the_mode_button_switched_a_click_on_a_row_moves_the_bar() {
+    let fx = fixture(0);
+    let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+    {
+        let mut s = tape.0.borrow_mut();
+        // The press alone: its release comes during the window.
+        s.events
+            .push_back(mouse(MouseEventKind::Down(MouseButton::Left), 87, 0));
+        // Back: one click on `beta` (title 0, frame 1, heads 2, `..` 3, alpha 4).
+        s.events.extend(click(5, 5));
+        s.stop = Some(libc::SIGTERM);
+    }
+    let mut switch = gui_press_then_back(&fx, &tape, |_| {});
+    let mut win = Shared(fx.b.clone());
+    assert_eq!(
+        b.run(&mut win, &mut switch).unwrap(),
+        End::Signal(libc::SIGTERM)
+    );
+    let vt = bytes.last_screen(100, 30);
+    let bar = Ink::Rgb(chrome::PALETTE.bar);
+    assert_eq!(
+        vt.cell(3, 5).bg,
+        bar,
+        "the bar on the clicked row:\n{}",
+        vt.text()
+    );
+}
+
+#[test]
+fn after_the_mode_button_switched_a_click_on_make_works() {
+    let fx = fixture(0);
+    let (mut b, tape, _bytes) = backend(&fx, 100, 30, false);
+    {
+        let mut s = tape.0.borrow_mut();
+        s.events.push_back(plain(KeyCode::F(7)));
+        s.events.extend(typed("made"));
+        s.events
+            .push_back(mouse(MouseEventKind::Down(MouseButton::Left), 87, 0));
+        s.stop = Some(libc::SIGTERM);
+    }
+    // Back in the terminal: a click on the dialog's `[ Make ]`, where its last screen had it.
+    let clicks = tape.clone();
+    let mut switch = gui_press_then_back(&fx, &tape, move |b| {
+        let screen = b.screen();
+        let a = screen.buf.area;
+        let found = (a.top()..a.bottom()).find_map(|y| {
+            let (text, at) = cells::row_text(&screen.buf, y);
+            let i = text.find("[ Make ]")?;
+            Some((at[text[..i].chars().count()] + 3, y))
+        });
+        let (x, y) = found.expect("[ Make ] on the terminal's screen");
+        clicks.0.borrow_mut().events.extend(click(x, y));
+    });
+    let mut win = Shared(fx.b.clone());
+    assert_eq!(
+        b.run(&mut win, &mut switch).unwrap(),
+        End::Signal(libc::SIGTERM)
+    );
+    assert!(
+        std::path::Path::new(&fx.root).join("made").is_dir(),
+        "the click on [ Make ] made the folder"
+    );
+}
+
+/// The mode button's gesture on its own: a press on it is taken and its release with it; a
+/// primary press elsewhere, or the focus lost, ends the gesture, so the next release is the
+/// screen's.
+#[test]
+fn the_mode_buttons_gesture_ends_with_a_press_elsewhere_or_the_focus_lost() {
+    let at = Some(Rect::from_min_size(
+        Pos2::new(680.0, 0.0),
+        Vec2::new(40.0, 16.0),
+    ));
+    let press = |x: f32, pressed: bool| egui::Event::PointerButton {
+        pos: Pos2::new(x, 8.0),
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    for ender in [press(10.0, true), egui::Event::WindowFocused(false)] {
+        let mut down = false;
+        let mut events = vec![press(700.0, true)];
+        assert!(
+            crate::gui::mode_button(&mut events, &mut down, at),
+            "the switch"
+        );
+        assert!(events.is_empty() && down, "the press taken");
+        // The release never came (it went to the other backend); then:
+        let mut events = vec![ender.clone(), press(10.0, false)];
+        assert!(!crate::gui::mode_button(&mut events, &mut down, at));
+        assert_eq!(
+            events,
+            [ender.clone(), press(10.0, false)],
+            "{ender:?}: the screen's"
+        );
+        assert!(!down);
+    }
+}
+
+/// A switch ends the gesture in the backend it left and in the one it comes back to: a release
+/// after it is the screen's, though no press came in between.
+#[test]
+fn a_switch_ends_the_mode_buttons_gesture() {
+    let ctx = skin();
+    let pass = |events: Vec<egui::Event>| {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 480.0))),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let mut released = false;
+        let mut out = ctx.run_ui(raw, |ui| {
+            chrome::set_mode_button(ui.ctx(), "[GUI]");
+            chrome::title_panel(ui, "sopen-test-title", "/somewhere");
+            released |= ui.input(|i| i.pointer.any_released());
+        });
+        out.textures_delta.clear();
+        released
+    };
+    pass(vec![]);
+    let button = chrome::mode_button_rect(&ctx).expect("drawn");
+    let primary = |pressed: bool| egui::Event::PointerButton {
+        pos: button.center(),
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    pass(vec![
+        egui::Event::PointerMoved(button.center()),
+        primary(true),
+    ]);
+    assert!(crate::gui::switch_asked(&ctx), "the press switched");
+    crate::gui::gestures_ended(&ctx);
+    assert!(
+        pass(vec![primary(false)]),
+        "a release after the switch reaches the screen"
     );
 }
