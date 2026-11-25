@@ -487,6 +487,10 @@ struct Script {
     /// The signal that comes once the events are all given.
     stop: Option<i32>,
     stopped: bool,
+    /// The signal comes with the last event (during its pass), not after it.
+    stop_with_last: bool,
+    /// The signal comes at this time, whatever the events.
+    stop_at: Option<Instant>,
     /// Waits for input since the last event, to fail a script that never ends.
     idle: usize,
 }
@@ -525,9 +529,13 @@ impl Tty for Tape {
         if open {
             if let Some(ev) = s.events.pop_front() {
                 s.idle = 0;
+                if s.events.is_empty() && s.stop_with_last {
+                    s.stopped = true;
+                }
                 return Ok(Some(ev));
             }
-            if s.stop.is_some() {
+            // A signal at a set time comes then, not when the events run out.
+            if s.stop.is_some() && s.stop_at.is_none() {
                 s.stopped = true;
             }
         }
@@ -544,7 +552,8 @@ impl Tty for Tape {
 
     fn stopped(&self) -> Option<i32> {
         let s = self.0.borrow();
-        s.stop.filter(|_| s.stopped)
+        let at = s.stop_at.is_some_and(|at| Instant::now() >= at);
+        s.stop.filter(|_| s.stopped || at)
     }
 }
 
@@ -994,26 +1003,46 @@ fn f12_and_alt_g_ask_for_the_switch_and_a_copy_goes_out_as_osc_52() {
     let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
     let mut events = vec![plain(KeyCode::F(7))];
     events.extend(typed("abc"));
+    // Alt+G with the caret after `abc` and nothing selected: a `g` it typed would show.
+    events.push(key(KeyCode::Char('g'), KeyModifiers::ALT));
     // Ctrl+A selects the field's text, Ctrl+C copies it (Ctrl is egui's command, T26).
     events.push(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
     events.push(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     events.push(plain(KeyCode::F(12)));
-    events.push(key(KeyCode::Char('g'), KeyModifiers::ALT));
     events.push(plain(KeyCode::Esc));
     events.push(ctrl_q());
     tape.0.borrow_mut().events.extend(events);
     let asked = Rc::new(RefCell::new(0));
     let count = asked.clone();
-    let mut switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
+    let first = Rc::new(RefCell::new(String::new()));
+    let seen = first.clone();
+    let mut switch = |b: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
         *count.borrow_mut() += 1;
+        if *count.borrow() == 1 {
+            // The screen of the pass Alt+G was in.
+            let screen = b.screen();
+            let a = screen.buf.area;
+            *seen.borrow_mut() = (a.top()..a.bottom())
+                .map(|y| cells::row_text(&screen.buf, y).0)
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
         Ok(Some("not now".into()))
     };
     let mut win = Shared(fx.b.clone());
     assert_eq!(b.run(&mut win, &mut switch).unwrap(), End::Closed);
-    assert_eq!(*asked.borrow(), 2, "F12 and Alt+G, each once");
+    assert_eq!(*asked.borrow(), 2, "Alt+G and F12, each once");
+    let at_alt_g = first.borrow();
+    assert!(
+        at_alt_g.contains("name abc"),
+        "the field after Alt+G:\n{at_alt_g}"
+    );
+    assert!(
+        !at_alt_g.contains("abcg"),
+        "Alt+G typed nothing:\n{at_alt_g}"
+    );
     let vt = bytes.vt(100, 30);
     assert_eq!(vt.copied, ["abc"], "OSC 52");
-    assert!(!vt.text().contains("abcg"), "Alt+G typed nothing");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1625,4 +1654,362 @@ fn a_video_frame_made_in_one_context_is_made_again_in_the_other() {
     );
     let (n, known) = all_known(&a.ctx, &window_pass(&a.ctx, &mut win, 100, 30));
     assert!(n > 0 && known, "and back: the first context's again ({n})");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round (2026-11-25).
+
+/// `[GUI]` clicked while a dialog in cells is open — an egui modal, whose backdrop takes a click
+/// outside it — is the switch and leaves the dialog and its text as they were; `[TUI]` clicked in
+/// the switched window the same way back (§9: the button always works).
+#[test]
+fn the_mode_button_works_over_an_open_dialog_both_ways() {
+    let fx = fixture(0);
+    let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+    let mut events = vec![plain(KeyCode::F(7))];
+    events.extend(typed("abc"));
+    events.extend(click(87, 0));
+    {
+        let mut s = tape.0.borrow_mut();
+        s.events.extend(events);
+        s.stop = Some(libc::SIGTERM);
+    }
+    let browser = fx.b.clone();
+    let mut in_window = 0;
+    let mut switch = |b: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
+        in_window += 1;
+        let screen = b.screen();
+        let text: String = (0..30).map(|y| cells::row_text(&screen.buf, y).0).collect();
+        assert!(
+            text.contains("name abc"),
+            "the dialog open when [GUI] switched:\n{text}"
+        );
+        to_window(b, &browser, Ok(Place::Here), |mut switched| {
+            let mut drv = Driver::new(800.0, 480.0);
+            drv.as_shell();
+            drv.until(&mut switched, 20, |w| w.ready());
+            drv.idle(&mut switched, 2);
+            let layers = cells::layers(&drv.ctx);
+            assert!(
+                !cells::find(&layers, "name abc").is_empty(),
+                "the dialog in the window"
+            );
+            let hit = cells::find(&layers, "[TUI]");
+            let hit = hit.first().expect("the switched window's [TUI]");
+            let at = layers[hit.layer].rect(hit.cells).center();
+            drv.click(&mut switched, at);
+            drv.idle(&mut switched, 1);
+            assert!(
+                drv.window_closed,
+                "a click on [TUI] over the dialog brings the terminal back"
+            );
+            Ok(())
+        })
+    };
+    let mut win = Shared(fx.b.clone());
+    assert_eq!(
+        b.run(&mut win, &mut switch).unwrap(),
+        End::Signal(libc::SIGTERM)
+    );
+    assert_eq!(
+        in_window, 1,
+        "a click on [GUI] over the dialog is the switch"
+    );
+    let screen = bytes.last_screen(100, 30).text();
+    assert!(
+        screen.contains("Make folder") && screen.contains("name abc"),
+        "kept:\n{screen}"
+    );
+}
+
+/// A screen that counts its passes.
+struct Counted(Arc<std::sync::atomic::AtomicUsize>);
+
+impl super::Window for Counted {
+    fn ui(&mut self, _ui: &mut egui::Ui) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// A repaint asked for from another thread while the terminal is idle (a worker done) is a pass
+/// within a tick, no key needed.
+#[test]
+fn a_repaint_asked_for_while_idle_is_a_pass_within_a_tick() {
+    let tape = Tape::default();
+    {
+        let mut s = tape.0.borrow_mut();
+        s.size = (40, 10);
+        s.stop = Some(libc::SIGTERM);
+        s.stop_at = Some(Instant::now() + Duration::from_millis(900));
+    }
+    let bytes = Bytes::default();
+    let mut b = Backend::new(tape.clone(), bytes, skin(), true);
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ctx = b.ctx.clone();
+    let count = passes.clone();
+    let asked = std::thread::spawn(move || {
+        // Idle first: no pass between these two looks.
+        std::thread::sleep(Duration::from_millis(200));
+        let idle = count.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        let before = count.load(Ordering::SeqCst);
+        ctx.request_repaint();
+        std::thread::sleep(TICK * 3);
+        (idle, before, count.load(Ordering::SeqCst))
+    });
+    let mut no_switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> { Ok(None) };
+    let mut win = Counted(passes);
+    assert_eq!(
+        b.run(&mut win, &mut no_switch).unwrap(),
+        End::Signal(libc::SIGTERM)
+    );
+    let (idle, before, after) = asked.join().unwrap();
+    assert!(before > 0, "the first passes ran");
+    assert_eq!(idle, before, "idle before the request");
+    assert!(
+        after > before,
+        "a pass after the request ({before} → {after})"
+    );
+}
+
+/// Where the keyboard is moves with the browser both ways — its absence too: a field that had it
+/// in the terminal, none in the window, none back in the terminal.
+#[test]
+fn no_focus_in_one_context_is_no_focus_in_the_other() {
+    let field = egui::Id::unique("sopen-term-test-field");
+    let terminal = skin();
+    terminal.memory_mut(|m| m.request_focus(field));
+    assert_eq!(terminal.memory(|m| m.focused()), Some(field));
+    let window = skin();
+    Carry::of(&terminal).apply(&window);
+    assert_eq!(window.memory(|m| m.focused()), Some(field), "Some across");
+    window.memory_mut(|m| m.surrender_focus(field));
+    assert_eq!(window.memory(|m| m.focused()), None);
+    Carry::of(&window).apply(&terminal);
+    assert_eq!(terminal.memory(|m| m.focused()), None, "None back across");
+}
+
+/// A signal that comes during the pass that asks for the switch ends the run: the switch is not
+/// made, and the signal is not lost.
+#[test]
+fn a_signal_during_the_switch_pass_ends_the_run_without_switching() {
+    let fx = fixture(0);
+    let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+    {
+        let mut s = tape.0.borrow_mut();
+        s.events.push_back(plain(KeyCode::F(12)));
+        s.stop = Some(libc::SIGTERM);
+        s.stop_with_last = true;
+    }
+    let mut switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
+        panic!("switched after the signal came")
+    };
+    let mut win = Shared(fx.b.clone());
+    assert_eq!(
+        b.run(&mut win, &mut switch).unwrap(),
+        End::Signal(libc::SIGTERM)
+    );
+    left_as_found(&bytes, &tape);
+}
+
+/// Taking the terminal again (after a switch) keeps a signal that came meanwhile: it is the run's
+/// to end, set once per run.
+#[test]
+fn watching_the_signals_again_keeps_one_that_came() {
+    STOP.store(libc::SIGTERM, Ordering::SeqCst);
+    let watch = Signals::watch();
+    let kept = STOP.load(Ordering::SeqCst);
+    drop(watch);
+    STOP.store(0, Ordering::SeqCst);
+    assert_eq!(kept, libc::SIGTERM);
+}
+
+/// A wide glyph whose second cell is outside its layer's clip is not written past the clip: its
+/// first cell a blank in its colours, the second what the layer below shows there.
+#[test]
+fn a_wide_glyph_half_outside_its_clip_is_a_blank_not_written_past_it() {
+    let ctx = skin();
+    cells::set_recording(&ctx, true);
+    let p = chrome::PALETTE;
+    let mut below = Buffer::empty(Cells::new(0, 0, 4, 1));
+    cells::put(&mut below, 0, 0, "abcd", 4, Pen::new(p.text, p.back));
+    let mut above = Buffer::empty(Cells::new(0, 0, 4, 1));
+    let pen = Pen::new(p.bar_text, p.bar);
+    cells::put(&mut above, 1, 0, "한", 2, pen);
+    let raw = egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(80.0, 32.0))),
+        ..Default::default()
+    };
+    let mut out = ctx.run_ui(raw, |ui| {
+        cells::clear(ui.ctx());
+        cells::paint(ui.painter(), Pos2::ZERO, &below, None);
+        // The clip ends between 한's two cells (x 16 points).
+        let over = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("over"));
+        let clip = Rect::from_min_max(Pos2::ZERO, Pos2::new(16.0, 16.0));
+        let painter = ui.ctx().layer_painter(over).with_clip_rect(clip);
+        cells::paint(&painter, Pos2::ZERO, &above, None);
+    });
+    out.textures_delta.clear();
+    let screen = compose(&ctx, &cells::layers(&ctx), 10, 2);
+    let row: Vec<&str> = (0..4).map(|x| screen.buf[(x, 0)].symbol()).collect();
+    assert_eq!(row, ["a", " ", "c", "d"], "{row:?}");
+    assert_eq!(
+        screen.buf[(1, 0)].bg,
+        Color::Rgb(p.bar.r(), p.bar.g(), p.bar.b())
+    );
+    assert_eq!(
+        screen.buf[(2, 0)].bg,
+        Color::Rgb(p.back.r(), p.back.g(), p.back.b())
+    );
+}
+
+/// A screen that copies `0` bytes of text to the clipboard on C.
+struct Copies(usize);
+
+impl super::Window for Copies {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let p = chrome::PALETTE;
+        let grid = cells::Grid::over(ui.max_rect());
+        let mut buf = Buffer::empty(grid.all());
+        cells::fill(&mut buf, grid.all(), Pen::new(p.text, p.back));
+        cells::paint(ui.painter(), grid.origin, &buf, None);
+        if ui.input(|i| i.key_pressed(Key::C)) {
+            ui.ctx().copy_text("x".repeat(self.0));
+        }
+    }
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// A copy above 256 KiB is not sent through the terminal (OSC 52 there is refused or cut by
+/// many): the status row says so; one at the limit is sent.
+#[test]
+fn a_copy_too_large_for_osc_52_is_said_not_sent() {
+    for (size, sent) in [(256 * 1024, true), (256 * 1024 + 1, false)] {
+        let tape = Tape::default();
+        {
+            let mut s = tape.0.borrow_mut();
+            s.size = (100, 30);
+            s.events.extend(typed("c"));
+            s.stop = Some(libc::SIGTERM);
+        }
+        let bytes = Bytes::default();
+        let mut b = Backend::new(tape.clone(), bytes.clone(), skin(), true);
+        let mut no_switch =
+            |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> { Ok(None) };
+        let end = b.run(&mut Copies(size), &mut no_switch).unwrap();
+        assert_eq!(end, End::Signal(libc::SIGTERM));
+        let vt = bytes.vt(100, 30);
+        assert_eq!(vt.copied.len(), usize::from(sent), "{size} bytes");
+        if !sent {
+            let line = format!(
+                "too large to copy through the terminal ({} KiB)",
+                size.div_ceil(1024)
+            );
+            assert_eq!(vt.row(28).trim(), line, "{}", vt.text());
+        }
+    }
+}
+
+/// A status line with control characters in it (a file name, a host's message) prints none of
+/// them: no escape, BEL or C1 reaches the terminal.
+#[test]
+fn a_status_line_prints_no_control_characters() {
+    let tape = Tape::default();
+    tape.0.borrow_mut().size = (60, 5);
+    let bytes = Bytes::default();
+    let mut b = Backend::new(tape, bytes.clone(), skin(), true);
+    b.said = Some("bad\x1b[31mred\x07bell\u{9b}2Jc1\x1b]52;c;eA==\x07end".to_string());
+    b.enter().unwrap();
+    b.pass(&mut Copies(0), vec![]).unwrap();
+    b.draw().unwrap();
+    // The strict model panics on any escape or control character the backend does not send.
+    let vt = bytes.vt(60, 5);
+    let row = vt.row(3);
+    assert!(row.contains("bad") && row.contains("end"), "{row:?}");
+    assert!(!row.chars().any(char::is_control), "{row:?}");
+    assert!(vt.copied.is_empty(), "no OSC 52 smuggled in");
+}
+
+/// A hand-off box says what is there: the pane's own title (the preview's path).
+#[test]
+fn a_hand_off_box_has_the_panes_title() {
+    let fx = fixture(0);
+    let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+    let mut events: Vec<CEvent> = (0..4).map(|_| plain(KeyCode::Down)).collect();
+    events.push(ctrl_q());
+    tape.0.borrow_mut().events.extend(events);
+    let mut no_switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> { Ok(None) };
+    let mut win = Shared(fx.b.clone());
+    assert_eq!(b.run(&mut win, &mut no_switch).unwrap(), End::Closed);
+    let vt = bytes.vt(100, 30);
+    assert!(
+        vt.part(1, 50, 100).contains("readme.md"),
+        "the box's title:\n{}",
+        vt.text()
+    );
+}
+
+/// What is written to the standard error while the terminal is held does not land on its
+/// screen: it is kept, and written when the terminal is let go.
+#[test]
+fn stderr_while_the_terminal_is_held_is_kept_for_after() {
+    let held = Stderr::hold().expect("stderr held");
+    let line = b"written while the terminal is held\n";
+    // SAFETY: a plain write of a live buffer to fd 2.
+    let n = unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+    assert_eq!(n, line.len() as isize);
+    let kept = held.release();
+    assert_eq!(kept, line, "kept, then written to the real stderr");
+}
+
+/// The terminal's input on a pty this test owns: quiet, then ready with a key, then — the
+/// terminal's side closed, as a hang-up — an error at once, never a wait or a spin (crossterm's
+/// own reader loops on a hung-up terminal's empty reads without returning).
+#[test]
+fn a_terminal_that_hung_up_is_an_error_at_once() {
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: two out-pointers to live ints; no name, termios or size asked for.
+    let made = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(made, 0, "openpty");
+    let quiet = wait_input(slave, Duration::from_millis(50)).unwrap();
+    assert_eq!(quiet, Input::Quiet);
+    // SAFETY: writes from a live buffer to the master this test opened (a line: the pty reads
+    // in lines until raw mode).
+    unsafe { libc::write(master, b"x\n".as_ptr().cast(), 2) };
+    assert_eq!(
+        wait_input(slave, Duration::from_secs(5)).unwrap(),
+        Input::Ready
+    );
+    let mut byte = [0u8; 8];
+    // SAFETY: reads into a live buffer from the slave this test opened.
+    unsafe { libc::read(slave, byte.as_mut_ptr().cast(), byte.len()) };
+    // SAFETY: closes the master this test opened: the terminal's side is gone.
+    unsafe { libc::close(master) };
+    let at = Instant::now();
+    let gone = wait_input(slave, Duration::from_secs(5));
+    // SAFETY: closes the slave this test opened.
+    unsafe { libc::close(slave) };
+    assert!(
+        gone.as_ref()
+            .is_err_and(|e| e.kind() == io::ErrorKind::BrokenPipe),
+        "{gone:?}"
+    );
+    assert!(
+        at.elapsed() < Duration::from_secs(1),
+        "at once: {:?}",
+        at.elapsed()
+    );
 }

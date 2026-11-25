@@ -316,10 +316,13 @@ changes: a folder still opens in a window.
 - **Mouse**: clicks and the wheel act on the rows and the F-key row; to select text with the
   terminal itself, hold Shift while dragging (in most terminals).
 - **Copy** goes to the clipboard through the terminal (OSC 52; some terminals ask first, or need it
-  turned on); paste with the terminal's own paste.
+  turned on), up to 256 KiB — a larger copy says so on the status row instead; paste with the
+  terminal's own paste.
 - **Colours** are 24-bit where `COLORTERM` says `truecolor` or `24bit`, else the nearest of the
   256-colour palette.
-- The terminal is left as it was found however xtools ends — quit, a crash, SIGTERM, SIGHUP.
+- The terminal is left as it was found however xtools ends — quit, a crash, SIGTERM, SIGHUP; when
+  the terminal itself goes away, sopen ends too (exit 129). Messages written to the standard error
+  while xtools holds the terminal are printed once it has let go.
 
 ## Images
 

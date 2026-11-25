@@ -783,6 +783,8 @@ pub(crate) struct FKeyInput {
     digits: [Digit; 10],
     /// G is down as Alt+G, the terminal's switch: its repeats and release are taken too.
     g: bool,
+    /// The primary button went down on the title row's mode button: its release is taken too.
+    mode: bool,
 }
 
 /// A digit key between its press and its release: the shell decides at the press what it is,
@@ -815,6 +817,10 @@ impl egui::Plugin for FKeyInput {
             typing,
             input.focused,
             clicked,
+        ) | mode_button(
+            &mut input.events,
+            &mut self.mode,
+            chrome::mode_button_rect(ctx),
         );
         // This pass's word only: a switch nothing took is not left for a later pass.
         ctx.data_mut(|d| {
@@ -967,6 +973,35 @@ fn key_aliases(
     }
     *events = out;
     switch
+}
+
+/// The title row's mode button (10 §7, T4; `chrome::mode_button_rect`, where the last pass drew
+/// it): a press of the primary button there is the switch and is taken, with its release, before
+/// anything sees them — a modal's backdrop would close its dialog on that click (§9: the button
+/// always works). Whether this pass asked.
+fn mode_button(events: &mut Vec<egui::Event>, down: &mut bool, at: Option<egui::Rect>) -> bool {
+    let mut asked = false;
+    events.retain(|e| match e {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            ..
+        } if at.is_some_and(|r| r.contains(*pos)) => {
+            (*down, asked) = (true, true);
+            false
+        }
+        egui::Event::PointerButton {
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            ..
+        } if *down => {
+            *down = false;
+            false
+        }
+        _ => true,
+    });
+    asked
 }
 
 /// A pass asked for the switch ([`switch_asked`]).
@@ -1664,6 +1699,10 @@ pub fn run_window_sized<W: Window + 'static>(
 ) -> Result<()> {
     let choice = renderer_choice()?;
     let shot_done = Arc::new(AtomicBool::new(false));
+    // The watchdog's word: set once the window is gone too, however it went (a window that
+    // closed or did not start stalls nothing), so it never ends a process that goes on — the
+    // terminal backend's, which still holds its terminal.
+    let disarm = shot_done.clone();
     let shot_result: Arc<Mutex<Option<Result<String, String>>>> = Arc::default();
     let closed = Arc::new(AtomicBool::new(false));
     if hooks.screenshot.is_some() {
@@ -1717,7 +1756,7 @@ pub fn run_window_sized<W: Window + 'static>(
                 .map_or(min, |[w, h]| [w.min(min[0]), h.min(min[1])]),
         )
         .with_active(true);
-    start(choice, &slot, |renderer| {
+    let started = start(choice, &slot, |renderer| {
         let options = eframe::NativeOptions {
             viewport: viewport.clone(),
             renderer,
@@ -1728,7 +1767,9 @@ pub fn run_window_sized<W: Window + 'static>(
             error,
             closed: closed.load(Ordering::SeqCst),
         })
-    })?;
+    });
+    disarm.store(true, Ordering::SeqCst);
+    started?;
     if hooks.screenshot.is_some() {
         match shot_result.lock().unwrap().take() {
             Some(Ok(line)) => println!("{line}"),

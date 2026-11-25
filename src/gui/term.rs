@@ -76,6 +76,9 @@ pub(crate) const MODAL_LINE: &str =
 pub(crate) const NO_DISPLAY: &str =
     "no display here — sopen config target <host>, or --target, opens the window on another machine";
 
+/// The most text sent to the terminal's clipboard (OSC 52): many terminals refuse or cut more.
+pub(crate) const OSC52_MAX: usize = 256 * 1024;
+
 /// The longest a wait for input lasts before a signal is looked for again.
 const TICK: Duration = Duration::from_millis(100);
 /// The shortest time between two passes no input asked for (an animation asking for every
@@ -104,21 +107,52 @@ pub(crate) trait Tty {
     fn stopped(&self) -> Option<i32>;
 }
 
-/// The terminal sopen runs in: crossterm's raw mode, size, keyboard query and events; the
-/// system's input queue; SIGTERM, SIGHUP and SIGINT caught while raw mode is on ([`Signals`]).
+/// The terminal sopen runs in: crossterm's raw mode, size, keyboard query and events, each read
+/// only once the input is known not to have hung up ([`wait_input`]); the system's input queue;
+/// SIGTERM, SIGHUP and SIGINT caught around raw mode ([`Signals`]); the standard error held
+/// while the terminal is ([`Stderr`]).
 #[derive(Default)]
 struct Real {
     signals: Option<Signals>,
+    stderr: Option<Stderr>,
+}
+
+impl Real {
+    /// The input hung up (a terminal closed): the run ends as SIGHUP would end it.
+    fn hung_up(e: io::Error) -> io::Error {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            let _ = STOP.compare_exchange(0, libc::SIGHUP, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        e
+    }
+
+    /// Whether an event can be read without waiting: crossterm's own queue (it may hold events
+    /// parsed from one read), else input waiting — never asked of crossterm on a hung-up input.
+    fn ready(&mut self) -> io::Result<bool> {
+        wait_input(libc::STDIN_FILENO, Duration::ZERO).map_err(Self::hung_up)?;
+        crossterm::event::poll(Duration::ZERO)
+    }
 }
 
 impl Tty for Real {
+    /// The signal handlers enclose raw mode: on before it, off after it — so a signal never finds
+    /// raw mode on without them — and off again when raw mode does not come on.
     fn raw(&mut self, on: bool) -> io::Result<()> {
         if on {
-            crossterm::terminal::enable_raw_mode()?;
             self.signals = Some(Signals::watch());
+            if let Err(e) = crossterm::terminal::enable_raw_mode() {
+                self.signals = None;
+                return Err(e);
+            }
+            self.stderr = Stderr::hold().ok();
         } else {
+            // Raw mode off first: what was kept prints with its line ends as written.
+            let off = crossterm::terminal::disable_raw_mode();
+            if let Some(held) = self.stderr.take() {
+                held.release();
+            }
             self.signals = None;
-            crossterm::terminal::disable_raw_mode()?;
+            off?;
         }
         Ok(())
     }
@@ -136,7 +170,7 @@ impl Tty for Real {
         unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
         // And what crossterm already read: bounded, as a key held down keeps sending.
         for _ in 0..4096 {
-            match crossterm::event::poll(Duration::ZERO) {
+            match self.ready() {
                 Ok(true) if crossterm::event::read().is_ok() => {}
                 _ => break,
             }
@@ -144,20 +178,154 @@ impl Tty for Real {
     }
 
     fn next(&mut self, wait: Duration) -> io::Result<Option<CEvent>> {
-        if crossterm::event::poll(wait)? {
-            crossterm::event::read().map(Some)
-        } else {
-            Ok(None)
+        if self.ready()? {
+            return crossterm::event::read().map(Some);
+        }
+        // Input, a hang-up or a signal (a resize: crossterm's SIGWINCH) ends the wait.
+        match wait_input(libc::STDIN_FILENO, wait).map_err(Self::hung_up)? {
+            Input::Ready if self.ready()? => crossterm::event::read().map(Some),
+            _ => Ok(None),
         }
     }
 
     fn pending(&mut self) -> io::Result<bool> {
-        crossterm::event::poll(Duration::ZERO)
+        self.ready()
     }
 
     fn stopped(&self) -> Option<i32> {
         let signal = STOP.load(Ordering::SeqCst);
         (signal != 0).then_some(signal)
+    }
+}
+
+/// What the terminal's input says ([`wait_input`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Input {
+    /// Something to read.
+    Ready,
+    /// Nothing within the wait (or a signal ended it).
+    Quiet,
+}
+
+/// Waits at most `wait` for input on `fd`, a terminal: a hang-up, an error on it or a closed fd
+/// is an error (`BrokenPipe`) at once — crossterm's reader would read its empty reads in a loop
+/// for ever, never back to look at the time or a signal (crossterm 0.29's `mio` source).
+pub(crate) fn wait_input(fd: libc::c_int, wait: Duration) -> io::Result<Input> {
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: one live pollfd.
+    let n = unsafe { libc::poll(&mut poll, 1, ms) };
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        return match e.kind() {
+            io::ErrorKind::Interrupted => Ok(Input::Quiet),
+            _ => Err(e),
+        };
+    }
+    if poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "the terminal hung up",
+        ));
+    }
+    Ok(if poll.revents & libc::POLLIN != 0 {
+        Input::Ready
+    } else {
+        Input::Quiet
+    })
+}
+
+/// The standard error held while the terminal is (10 §4): what is written to it — a worker's
+/// line, a panic on another thread, a child's message — would land on the screen sopen draws and
+/// stay there; it goes to a pipe instead, is kept, and is written to the real standard error when
+/// the terminal is let go (after the alternate screen is left). A child started meanwhile keeps
+/// the pipe as its standard error: what it writes later goes straight to the real one.
+pub(crate) struct Stderr {
+    /// The real standard error, put back on release.
+    saved: libc::c_int,
+    /// What was kept, and whether the hold is over (then the reader passes bytes on).
+    kept: Arc<Mutex<(Vec<u8>, bool)>>,
+}
+
+impl Stderr {
+    /// Fd 2 becomes a pipe's end; a thread reads the other.
+    pub fn hold() -> io::Result<Stderr> {
+        let mut ends = [-1; 2];
+        // SAFETY: two out-ints for the pipe; dup, dup2, fcntl and close on fds this process
+        // owns.
+        let (read, saved) = unsafe {
+            if libc::pipe(ends.as_mut_ptr()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let saved = libc::dup(2);
+            if saved < 0 || libc::dup2(ends[1], 2) < 0 {
+                let e = io::Error::last_os_error();
+                for fd in [ends[0], ends[1], saved] {
+                    if fd >= 0 {
+                        libc::close(fd);
+                    }
+                }
+                return Err(e);
+            }
+            libc::close(ends[1]);
+            // Children inherit fd 2 (the pipe), never these two.
+            for fd in [ends[0], saved] {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            (ends[0], saved)
+        };
+        // SAFETY: the read end is this process's, owned by the File from here on.
+        let mut from = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(read) };
+        let kept: Arc<Mutex<(Vec<u8>, bool)>> = Arc::default();
+        let into = kept.clone();
+        let spawned = std::thread::Builder::new()
+            .name("sopen-stderr".into())
+            .spawn(move || {
+                let mut chunk = [0u8; 4096];
+                while let Ok(n) = std::io::Read::read(&mut from, &mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    let mut kept = into.lock().unwrap_or_else(|p| p.into_inner());
+                    if kept.1 {
+                        let _ = io::stderr().write_all(&chunk[..n]);
+                    } else {
+                        kept.0.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            // SAFETY: puts the real standard error back and closes the copy.
+            unsafe {
+                libc::dup2(saved, 2);
+                libc::close(saved);
+            }
+            return Err(e);
+        }
+        Ok(Stderr { saved, kept })
+    }
+
+    /// Fd 2 is the real standard error again and what was kept is written there; what comes
+    /// later through the pipe is passed straight on. What was kept.
+    pub fn release(self) -> Vec<u8> {
+        // SAFETY: dup2 and close of fds this process owns.
+        unsafe {
+            libc::dup2(self.saved, 2);
+            libc::close(self.saved);
+        }
+        // What the reader has not taken yet: a moment for it.
+        std::thread::sleep(Duration::from_millis(20));
+        let kept = {
+            let mut kept = self.kept.lock().unwrap_or_else(|p| p.into_inner());
+            kept.1 = true;
+            std::mem::take(&mut kept.0)
+        };
+        let _ = io::stderr().write_all(&kept);
+        kept
     }
 }
 
@@ -181,7 +349,6 @@ struct Signals {
 
 impl Signals {
     fn watch() -> Signals {
-        STOP.store(0, Ordering::SeqCst);
         let mut before = [None; 3];
         for (signal, before) in STOPS.into_iter().zip(&mut before) {
             // SAFETY: whole `sigaction`s; the handler only stores into an atomic.
@@ -301,15 +468,28 @@ pub(crate) fn compose(ctx: &egui::Context, layers: &[Arc<Layer>], cols: u16, row
                 let cell = &l.buf[(x, y)];
                 let width = (cells::width(cell.symbol()) as u16).clamp(1, 2);
                 let width = width.min(a.right() - x);
-                if let Some((sx, sy)) = on_screen(x, y) {
-                    if lay(&mut buf, sx, sy, cell, width) {
+                // A wide glyph with one of its cells outside the clip is a blank in the cell
+                // inside it (the window shows half a glyph there; a terminal cannot), never
+                // written past the clip.
+                let first = on_screen(x, y);
+                let second = (width == 2).then(|| on_screen(x + 1, y));
+                let (at, cell, width) = match (first, second) {
+                    (Some(at), None | Some(Some(_))) => (Some(at), cell.clone(), width),
+                    (Some(at), Some(None)) => (Some(at), blank_of(cell), 1),
+                    (None, Some(Some(at))) => (Some(at), blank_of(cell), 1),
+                    (None, _) => (None, cell.clone(), width),
+                };
+                if let Some((sx, sy)) = at {
+                    if lay(&mut buf, sx, sy, &cell, width) {
                         for k in 0..width.min(cols - sx) {
                             covered[usize::from(sy) * usize::from(cols) + usize::from(sx + k)] =
                                 true;
                         }
                     }
                 }
-                x += width;
+                x += (cells::width(l.buf[(x, y)].symbol()) as u16)
+                    .clamp(1, 2)
+                    .min(a.right() - x);
             }
         }
         if let Some((x, y)) = l.caret.and_then(|c| on_screen(c.x, c.y)) {
@@ -318,7 +498,7 @@ pub(crate) fn compose(ctx: &egui::Context, layers: &[Arc<Layer>], cols: u16, row
     }
     let hand_offs = uncovered(&covered, cols, rows);
     for &r in &hand_offs {
-        hand_off(&mut buf, r);
+        hand_off(&mut buf, r, "");
     }
     Screen {
         buf,
@@ -364,6 +544,13 @@ fn lay(buf: &mut Buffer, x: u16, y: u16, cell: &ratatui_core::buffer::Cell, widt
     true
 }
 
+/// `cell` with a blank in place of its glyph (its colours kept).
+fn blank_of(cell: &ratatui_core::buffer::Cell) -> ratatui_core::buffer::Cell {
+    let mut blank = cell.clone();
+    blank.set_symbol(" ");
+    blank
+}
+
 fn rgb(c: egui::Color32) -> Color {
     Color::Rgb(c.r(), c.g(), c.b())
 }
@@ -393,10 +580,11 @@ fn uncovered(covered: &[bool], cols: u16, rows: u16) -> Vec<Cells> {
     out
 }
 
-/// A hand-off box in `r` (10 §11): a single-line frame, and in its middle [`HAND_OFF`].
-fn hand_off(buf: &mut Buffer, r: Cells) {
+/// A hand-off box in `r` (10 §11): a single-line frame with `title` (what is there) in its top
+/// line, and in its middle [`HAND_OFF`].
+fn hand_off(buf: &mut Buffer, r: Cells, title: &str) {
     let p = chrome::PALETTE;
-    let inner = cells::frame(buf, r, "", false);
+    let inner = cells::frame(buf, r, title, false);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -405,6 +593,41 @@ fn hand_off(buf: &mut Buffer, r: Cells) {
     let x = inner.x + (inner.width - w) / 2;
     let y = inner.y + (inner.height - 1) / 2;
     cells::put(buf, x, y, &shown, w.into(), Pen::new(p.text, p.back));
+}
+
+/// The texts egui itself drew in `shapes` (a cell's glyph is one grapheme a shape), where they
+/// start.
+fn titles(shapes: &[egui::epaint::ClippedShape]) -> Vec<(Pos2, String)> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<(Pos2, String)>) {
+        match shape {
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            egui::Shape::Text(t) => {
+                let text = t.galley.text().trim();
+                if unicode_segmentation::UnicodeSegmentation::graphemes(text, true)
+                    .nth(1)
+                    .is_some()
+                {
+                    out.push((t.pos, text.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    for c in shapes {
+        walk(&c.shape, &mut out);
+    }
+    out
+}
+
+/// The title of what stands at cells `r`: the first text egui drew in its top line (a pane's
+/// frame title, a dialog's), else none.
+fn title_at(titles: &[(Pos2, String)], r: Cells) -> &str {
+    let top = f32::from(r.y) * CELL.y;
+    let (left, right) = (f32::from(r.x) * CELL.x, f32::from(r.right()) * CELL.x);
+    (titles.iter())
+        .find(|(p, _)| p.y >= top && p.y < top + 1.5 * CELL.y && p.x >= left && p.x < right)
+        .map_or("", |(_, t)| t.as_str())
 }
 
 /// `line` on the status row — the row above the F-key row — in the error colour, from its
@@ -603,6 +826,12 @@ pub(crate) struct Backend<T: Tty, O: Write> {
     said: Option<String>,
     /// The hand-off boxes the last screen showed.
     hand_offs: Vec<Cells>,
+    /// The texts egui itself drew in the last pass (not a cell's glyph), where: a hand-off box's
+    /// title is the pane's or the dialog's own.
+    titles: Vec<(Pos2, String)>,
+    /// When a repaint asked for since the last look wants its pass — from any thread
+    /// (`Context::set_request_repaint_callback`): a worker done while the terminal is idle.
+    asked: Arc<Mutex<Option<Instant>>>,
     /// The passes' clock: `offset` + the time since the backend was made.
     started: Instant,
     pub offset: f64,
@@ -617,6 +846,13 @@ impl<T: Tty, O: Write> Backend<T, O> {
         super::mark_terminal(&ctx);
         // After the shell's own hook (added by `chrome::install`): it sees F1 after the aliases.
         ctx.add_plugin(TermKeys);
+        let asked: Arc<Mutex<Option<Instant>>> = Arc::default();
+        let tell = asked.clone();
+        ctx.set_request_repaint_callback(move |info| {
+            let at = Instant::now() + info.delay.max(IDLE_FLOOR);
+            let mut asked = tell.lock().unwrap_or_else(|p| p.into_inner());
+            *asked = Some(asked.map_or(at, |was| was.min(at)));
+        });
         Backend {
             tty,
             term: Term::new(out, truecolor),
@@ -629,6 +865,8 @@ impl<T: Tty, O: Write> Backend<T, O> {
             close_pending: false,
             said: None,
             hand_offs: vec![],
+            titles: vec![],
+            asked,
             started: Instant::now(),
             offset: 0.0,
         }
@@ -698,14 +936,14 @@ impl<T: Tty, O: Write> Backend<T, O> {
     ) -> io::Result<Passed> {
         let (cols, rows) = self.size;
         let size = Vec2::new(f32::from(cols) * CELL.x, f32::from(rows) * CELL.y);
-        let modifiers = self.input.modifiers();
-        let mut all = vec![egui::Event::ModifiersChanged(modifiers)];
-        all.extend(events);
+        // The modifiers come as the translator reports their changes (`ModifiersChanged`), never
+        // with every pass: a pass with any event makes egui ask for another at once, and an idle
+        // terminal would run one every few milliseconds.
         let mut raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
             time: Some(self.now()),
             max_texture_side: Some(8192),
-            events: all,
+            events,
             focused: self.input.focused(),
             ..Default::default()
         };
@@ -736,9 +974,17 @@ impl<T: Tty, O: Write> Backend<T, O> {
         out.textures_delta.clear();
         for command in std::mem::take(&mut out.platform_output.commands) {
             if let egui::OutputCommand::CopyText(text) = command {
-                self.term.copy(&text)?;
+                if text.len() > OSC52_MAX {
+                    let kib = text.len().div_ceil(1024);
+                    self.said = Some(format!(
+                        "too large to copy through the terminal ({kib} KiB)"
+                    ));
+                } else {
+                    self.term.copy(&text)?;
+                }
             }
         }
+        self.titles = titles(&out.shapes);
         let mut sent = vec![];
         let mut repaint = Duration::MAX;
         for (id, viewport) in std::mem::take(&mut out.viewport_output) {
@@ -751,7 +997,7 @@ impl<T: Tty, O: Write> Backend<T, O> {
         self.close_pending = sent.contains(&egui::ViewportCommand::Close);
         Ok(Passed {
             closed: delivered && !cancelled,
-            switch: super::switch_asked(&self.ctx) || chrome::take_mode_click(&self.ctx),
+            switch: super::switch_asked(&self.ctx),
             repaint,
         })
     }
@@ -766,8 +1012,11 @@ impl<T: Tty, O: Write> Backend<T, O> {
         let modal = self.ctx.memory(|m| m.top_modal_layer());
         let egui_only = modal.filter(|m| !layers.iter().any(|l| l.layer == *m));
         let stands = egui_only.and_then(|m| self.ctx.memory(|mem| mem.area_rect(m.id)));
+        for &r in &screen.hand_offs {
+            hand_off(&mut screen.buf, r, title_at(&self.titles, r));
+        }
         if let Some(r) = stands.and_then(|rect| cells_over(rect, cols, rows)) {
-            hand_off(&mut screen.buf, r);
+            hand_off(&mut screen.buf, r, title_at(&self.titles, r));
             screen.hand_offs.push(r);
             screen.caret = screen.caret.filter(|c| !r.contains(*c));
         }
@@ -840,7 +1089,12 @@ impl<T: Tty, O: Write> Backend<T, O> {
                 return Ok(End::Signal(signal));
             }
             let wait = due.map_or(TICK, |d| d.saturating_duration_since(Instant::now()));
-            let (events, hand_off) = match self.tty.next(wait.min(TICK))? {
+            let next = self.tty.next(wait.min(TICK))?;
+            // A repaint asked for meanwhile, from any thread.
+            if let Some(at) = self.asked.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                due = Some(due.map_or(at, |d| d.min(at)));
+            }
+            let (events, hand_off) = match next {
                 Some(ev) => self.take(&ev),
                 None if due.is_some_and(|d| Instant::now() >= d) => (vec![], false),
                 None => continue,
@@ -850,6 +1104,10 @@ impl<T: Tty, O: Write> Backend<T, O> {
                 return Ok(End::Closed);
             }
             if passed.switch || hand_off {
+                // A signal that came during this pass ends the run: no window for it.
+                if let Some(signal) = self.tty.stopped() {
+                    return Ok(End::Signal(signal));
+                }
                 self.said = switch(self)?;
                 due = Some(Instant::now());
                 continue;
@@ -864,6 +1122,9 @@ impl<T: Tty, O: Write> Backend<T, O> {
                 passed.repaint.max(IDLE_FLOOR)
             };
             due = Instant::now().checked_add(repaint);
+            if let Some(at) = self.asked.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                due = Some(due.map_or(at, |d| d.min(at)));
+            }
         }
     }
 }
@@ -989,11 +1250,19 @@ impl Carry {
     }
 
     pub fn apply(&self, ctx: &egui::Context) {
-        if let Some(id) = self.focus {
-            if let Some(edit) = self.edit.clone() {
-                edit.store(ctx, id);
+        match self.focus {
+            Some(id) => {
+                if let Some(edit) = self.edit.clone() {
+                    edit.store(ctx, id);
+                }
+                ctx.memory_mut(|m| m.request_focus(id));
             }
-            ctx.memory_mut(|m| m.request_focus(id));
+            // Nothing had the keyboard there: nothing has it here either.
+            None => ctx.memory_mut(|m| {
+                if let Some(had) = m.focused() {
+                    m.surrender_focus(had);
+                }
+            }),
         }
     }
 }
@@ -1038,7 +1307,7 @@ impl Window for Switched {
         chrome::set_mode_button(&ctx, "[TUI]");
         self.browser.borrow_mut().ui(ui);
         *self.carry.borrow_mut() = Carry::of(&ctx);
-        if super::switch_asked(&ctx) || chrome::take_mode_click(&ctx) {
+        if super::switch_asked(&ctx) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
@@ -1169,6 +1438,9 @@ fn here(
         })
     };
     keep_panics();
+    // Once per run: a signal caught while a switch's window runs (its handlers off then) or
+    // between two holds of the terminal is still the run's.
+    STOP.store(0, Ordering::SeqCst);
     *HELD_BY.lock().unwrap_or_else(|p| p.into_inner()) = Some((std::thread::current().id(), None));
     let mut tui = Shared(shared.clone());
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
