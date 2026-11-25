@@ -463,59 +463,10 @@ pub(crate) fn compose(ctx: &egui::Context, layers: &[Arc<Layer>], cols: u16, row
     let mut buf = Buffer::empty(all);
     cells::fill(&mut buf, all, Pen::new(p.text, p.back));
     let mut covered = vec![false; usize::from(cols) * usize::from(rows)];
-    let order: Vec<egui::LayerId> = ctx.memory(|m| m.layer_ids().collect());
-    let mut sorted: Vec<(usize, &Arc<Layer>)> = layers.iter().enumerate().collect();
-    sorted.sort_by_key(|&(call, l)| {
-        let area = order.iter().position(|o| *o == l.layer);
-        (l.layer.order, area.unwrap_or(usize::MAX), call)
-    });
-    let screen = Rect::from_min_size(
-        Pos2::ZERO,
-        Vec2::new(f32::from(cols) * CELL.x, f32::from(rows) * CELL.y),
-    );
     let mut caret = None;
-    for (_, l) in sorted {
-        let visible = l.clip.intersect(screen);
-        let (ox, oy) = cell_at(l.origin);
-        let on_screen = |x: u16, y: u16| {
-            let (sx, sy) = (ox + i32::from(x), oy + i32::from(y));
-            let inside = (0..i32::from(cols)).contains(&sx) && (0..i32::from(rows)).contains(&sy);
-            let seen = visible.contains(l.rect(Cells::new(x, y, 1, 1)).center());
-            (inside && seen).then_some((sx as u16, sy as u16))
-        };
-        let a = l.buf.area;
-        for y in a.top()..a.bottom() {
-            let mut x = a.left();
-            while x < a.right() {
-                let cell = &l.buf[(x, y)];
-                let width = (cells::width(cell.symbol()) as u16).clamp(1, 2);
-                let width = width.min(a.right() - x);
-                // A wide glyph with one of its cells outside the clip is a blank in the cell
-                // inside it (the window shows half a glyph there; a terminal cannot), never
-                // written past the clip.
-                let first = on_screen(x, y);
-                let second = (width == 2).then(|| on_screen(x + 1, y));
-                let (at, cell, width) = match (first, second) {
-                    (Some(at), None | Some(Some(_))) => (Some(at), cell.clone(), width),
-                    (Some(at), Some(None)) => (Some(at), blank_of(cell), 1),
-                    (None, Some(Some(at))) => (Some(at), blank_of(cell), 1),
-                    (None, _) => (None, cell.clone(), width),
-                };
-                if let Some((sx, sy)) = at {
-                    if lay(&mut buf, sx, sy, &cell, width) {
-                        for k in 0..width.min(cols - sx) {
-                            covered[usize::from(sy) * usize::from(cols) + usize::from(sx + k)] =
-                                true;
-                        }
-                    }
-                }
-                x += (cells::width(l.buf[(x, y)].symbol()) as u16)
-                    .clamp(1, 2)
-                    .min(a.right() - x);
-            }
-        }
-        if let Some((x, y)) = l.caret.and_then(|c| on_screen(c.x, c.y)) {
-            caret = Some(Position::new(x, y));
+    for l in painting_order(ctx, layers) {
+        if let Some(at) = lay_layer(&mut buf, &mut covered, l, cols, rows) {
+            caret = Some(at);
         }
     }
     let hand_offs = uncovered(&covered, cols, rows);
@@ -527,6 +478,74 @@ pub(crate) fn compose(ctx: &egui::Context, layers: &[Arc<Layer>], cols: u16, row
         caret,
         hand_offs,
     }
+}
+
+/// `layers` in egui's painting order: its layer order (the areas' order of `ctx`, back to
+/// front), then the order of the calls.
+fn painting_order<'a>(ctx: &egui::Context, layers: &'a [Arc<Layer>]) -> Vec<&'a Arc<Layer>> {
+    let order: Vec<egui::LayerId> = ctx.memory(|m| m.layer_ids().collect());
+    let mut sorted: Vec<(usize, &Arc<Layer>)> = layers.iter().enumerate().collect();
+    sorted.sort_by_key(|&(call, l)| {
+        let area = order.iter().position(|o| *o == l.layer);
+        (l.layer.order, area.unwrap_or(usize::MAX), call)
+    });
+    sorted.into_iter().map(|(_, l)| l).collect()
+}
+
+/// Lays layer `l` onto `buf` (`cols` × `rows`, see [`compose`]): each cell whose centre is
+/// inside its clip, the cells it took marked in `covered`; its caret's cell on screen.
+fn lay_layer(
+    buf: &mut Buffer,
+    covered: &mut [bool],
+    l: &Layer,
+    cols: u16,
+    rows: u16,
+) -> Option<Position> {
+    let screen = Rect::from_min_size(
+        Pos2::ZERO,
+        Vec2::new(f32::from(cols) * CELL.x, f32::from(rows) * CELL.y),
+    );
+    let visible = l.clip.intersect(screen);
+    let (ox, oy) = cell_at(l.origin);
+    let on_screen = |x: u16, y: u16| {
+        let (sx, sy) = (ox + i32::from(x), oy + i32::from(y));
+        let inside = (0..i32::from(cols)).contains(&sx) && (0..i32::from(rows)).contains(&sy);
+        let seen = visible.contains(l.rect(Cells::new(x, y, 1, 1)).center());
+        (inside && seen).then_some((sx as u16, sy as u16))
+    };
+    let a = l.buf.area;
+    for y in a.top()..a.bottom() {
+        let mut x = a.left();
+        while x < a.right() {
+            let cell = &l.buf[(x, y)];
+            let width = (cells::width(cell.symbol()) as u16).clamp(1, 2);
+            let width = width.min(a.right() - x);
+            // A wide glyph with one of its cells outside the clip is a blank in the cell
+            // inside it (the window shows half a glyph there; a terminal cannot), never
+            // written past the clip.
+            let first = on_screen(x, y);
+            let second = (width == 2).then(|| on_screen(x + 1, y));
+            let (at, cell, width) = match (first, second) {
+                (Some(at), None | Some(Some(_))) => (Some(at), cell.clone(), width),
+                (Some(at), Some(None)) => (Some(at), blank_of(cell), 1),
+                (None, Some(Some(at))) => (Some(at), blank_of(cell), 1),
+                (None, _) => (None, cell.clone(), width),
+            };
+            if let Some((sx, sy)) = at {
+                if lay(buf, sx, sy, &cell, width) {
+                    for k in 0..width.min(cols - sx) {
+                        covered[usize::from(sy) * usize::from(cols) + usize::from(sx + k)] = true;
+                    }
+                }
+            }
+            x += (cells::width(l.buf[(x, y)].symbol()) as u16)
+                .clamp(1, 2)
+                .min(a.right() - x);
+        }
+    }
+    l.caret
+        .and_then(|c| on_screen(c.x, c.y))
+        .map(|(x, y)| Position::new(x, y))
 }
 
 /// Lays `cell` of a layer, `width` cells wide, at (`x`, `y`) of `buf`; false when it leaves
@@ -1035,6 +1054,14 @@ impl<T: Tty, O: Write> Backend<T, O> {
             hand_off(&mut screen.buf, r, title_at(&self.titles, r));
             screen.hand_offs.push(r);
             screen.caret = screen.caret.filter(|c| !r.contains(*c));
+            // What is in cells above the dialog — the key help — stays over its box.
+            let above = egui_only.map(|m| m.order);
+            let mut covered = vec![false; usize::from(cols) * usize::from(rows)];
+            for l in painting_order(&self.ctx, &layers) {
+                if Some(l.layer.order) > above {
+                    lay_layer(&mut screen.buf, &mut covered, l, cols, rows);
+                }
+            }
         }
         let line = self.said.as_deref().or(stands.map(|_| MODAL_LINE));
         if let Some(line) = line {
@@ -1063,7 +1090,9 @@ impl<T: Tty, O: Write> Backend<T, O> {
                 self.said = None;
                 let at = Position::new(m.column, m.row);
                 let left = m.kind == MouseEventKind::Down(MouseButton::Left);
-                if left && self.hand_offs.iter().any(|r| r.contains(at)) {
+                // While the key help is open every click is its own (`help::input_hook`).
+                let free = !super::help::is_open(&self.ctx);
+                if left && free && self.hand_offs.iter().any(|r| r.contains(at)) {
                     return (vec![], true);
                 }
             }

@@ -16,24 +16,27 @@
 //!   two), centred with its shadow of black cells, laid out as a dialog is (`ops::dialog`'s
 //!   width, centring and shadow; at most 76 cells inside) — in the window's body colours, its
 //!   frame a double line with the page's title in it, a column of keys in the key colour and one
-//!   of words beside it, each wrapped by cells; then a blank row and how to leave it. Lines that
-//!   do not all fit scroll inside the box, the scroll bar on its frame's right line. Where the
-//!   area is too short the box is cut to it, never drawn over the rows around it. The list
-//!   blanks its cells under the box first ([`covered`]), so a wide glyph half under its edge
-//!   goes in the window as a terminal erases it.
+//!   of words beside it (under the keys, two cells in, on a box that leaves the words fewer than
+//!   12 cells), each wrapped by cells inside the box; then a blank row and how to leave it.
+//!   Lines that do not all fit scroll inside the box, the scroll bar on its frame's right line.
+//!   Where the area is too short the box is cut to it, never drawn over the rows around it. The
+//!   list blanks its cells under the box first ([`covered`]), so a wide glyph half under its
+//!   edge goes in the window as a terminal erases it.
 //! - **While it is open** it takes the keyboard and the pointer of the whole window: Esc, F1 or
 //!   F3 close it, ↑ ↓ PgUp PgDn Home End and the wheel scroll it, a row at a time; on its scroll
-//!   bar ↑ and ↓ a row, a click on the track a page towards it, the thumb dragged (10 §6). The
-//!   window's pass sees no key, typed text, wheel or pointer (Cmd/Ctrl+Q and +W close the help
-//!   and go on to close the window, through its unsaved-changes prompt) but the pointer on its
-//!   F-key row, whose slots stay its keys (a click on 1 or 3 closes the help), and a page view's
-//!   native view hides under it anywhere (its layer covers the window, as a modal's backdrop).
-//!   The switch carries it to the other backend as it is ([`carried`]).
-//!   The shell's input plugin (`super::FKeyInput`) runs [`begin_pass`] before every window's pass
-//!   and [`end_pass`] after it. The screen is painted, not laid out: a plugin's pass must not
-//!   make widgets (egui's debug build asks every plugin about the widget under the pointer,
-//!   the one running included, and waits on its lock for ever) — so its scroll bar reads the
-//!   pointer's events itself.
+//!   bar ↑ and ↓ a row, a click on the track a page towards it, the thumb dragged (10 §6); a
+//!   click on the F-key row's slot 1 or 3 closes it as F1 or F3 does, another slot does nothing.
+//!   The window's pass sees no key, typed text, wheel or pointer (Cmd/Ctrl+Q and +W close the
+//!   help and go on to close the window, through its unsaved-changes prompt) — egui gets no
+//!   pointer event at all, so nothing under it, a modal's backdrop included, is clicked — and a
+//!   page view's native view hides under it anywhere (its layer covers the window, as a modal's
+//!   backdrop). The switch carries it to the other backend as it is ([`carried`]).
+//!   The shell's input plugin (`super::FKeyInput`) runs [`input_hook`] on the raw input (the
+//!   pointer), [`begin_pass`] before every window's pass (the keys) and [`end_pass`] after it.
+//!   The screen is painted, not laid out: a plugin's pass must not make widgets (egui's debug
+//!   build asks every plugin about the widget under the pointer, the one running included, and
+//!   waits on its lock for ever) — so its scroll bar and the slots read the pointer's events
+//!   themselves.
 
 use super::browser::keys::{self, Context, Mods, Trigger};
 use super::browser::ops::dialog;
@@ -158,15 +161,23 @@ fn own_line(key: FKey) -> Line {
     }
 }
 
-/// The last lines of every page (10 T27): the F-key aliases, each with where it works —
-/// Cmd/Ctrl+digits and the row's slots everywhere (04 §6.1), Alt+digits in a terminal (10 §9) —
-/// then which of ⌘ and Ctrl a `Ctrl/⌘` key is.
-fn aliases() -> [Line; 2] {
+/// The last lines of every page (10 T27, §9): the aliases, each with where it works —
+/// Cmd/Ctrl+digits and the row's slots everywhere (04 §6.1), Alt+digits in a terminal; the
+/// switch's F12, Alt+G in a terminal (T33) and the mode button — then which of ⌘ and Ctrl a
+/// `Ctrl/⌘` key is.
+fn aliases() -> [Line; 3] {
     let (cmd, alt) = (Mods::Command.prefix(), Mods::Alt.prefix());
     [
         Line {
             keys: format!("{cmd}1…0 · {alt}1…0"),
             what: format!("F1…F10 ({alt}1…0 in a terminal); so does a click on a slot"),
+        },
+        Line {
+            keys: format!("F12 · {alt}G"),
+            what: format!(
+                "Between the terminal and a window, under sopen --tui ({alt}G in a terminal); so \
+                 does a click on [GUI] or [TUI]"
+            ),
         },
         Line {
             keys: cmd.trim_end_matches('+').to_string(),
@@ -194,6 +205,9 @@ fn describe(key: FKey) -> String {
 
 /// The widest the key column gets; longer keys wrap in it.
 const KEYS: usize = 28;
+/// The fewest cells the words column takes beside the keys; on a box narrower than that, each
+/// line's words go under its keys.
+const WORDS: usize = 12;
 /// The last row: how to leave the screen; with more rows than fit, how to see them.
 const BACK: &str = "Esc, F1 or F3: back";
 const MORE: &str = "Esc, F1 or F3: back · ↑ ↓ PgUp PgDn: more";
@@ -206,11 +220,16 @@ struct Laid {
     area: Grid,
     /// The box, in the area's cells.
     frame: Cells,
-    /// The cells of the key column and of the words column, two blank cells between them.
+    /// The box's inside, in cells: the rows' width.
+    width: usize,
+    /// The cells of the key column; where the words column starts (two blank cells after the
+    /// keys, or two in from the left under them) and its cells.
     keys: usize,
+    words_x: usize,
     words: usize,
-    /// Every row: a line's keys and its words, each wrapped by cells in its column — a line
-    /// takes as many rows as the taller of the two.
+    /// Every row: a line's keys and its words, each wrapped by cells in its column — beside
+    /// each other a line takes as many rows as the taller of the two; under each other, its
+    /// keys' rows then its words'.
     rows: Vec<(String, String)>,
     /// How many rows show at once.
     shown: usize,
@@ -221,8 +240,8 @@ struct Laid {
 impl Laid {
     /// The rows' cells: the box's inside less its margin, as tall as the rows shown.
     fn list(&self) -> Cells {
-        let width = (self.keys + 2 + self.words) as u16;
-        Cells::new(self.frame.x + 2, self.frame.y + 2, width, self.shown as u16)
+        let (x, y) = (self.frame.x + 2, self.frame.y + 2);
+        Cells::new(x, y, self.width as u16, self.shown as u16)
     }
 
     /// The first row shown at the end.
@@ -240,8 +259,10 @@ impl Laid {
 
 /// `page` on `screen`, a window's whole grid: its rows in a box as wide as they want by a
 /// dialog's rule ([`dialog::inside_width`]) — the key column as wide as the widest keys, at most
-/// [`KEYS`] and half the box — and as tall as they are; on a short area as many rows as fit,
-/// one at least. Centred in the area with its shadow ([`dialog::centred`]).
+/// [`KEYS`] and half the box, the words beside it when that leaves them [`WORDS`] cells, else
+/// under the keys two cells in, every column inside the box — and as tall as they are; on a
+/// short area as many rows as fit, one at least. Centred in the area with its shadow
+/// ([`dialog::centred`]).
 fn lay(page: &Page, screen: Grid) -> Laid {
     let area = Grid {
         origin: screen.origin + Vec2::new(0.0, CELL.y),
@@ -257,19 +278,27 @@ fn lay(page: &Page, screen: Grid) -> Laid {
         .chain([w(MORE), w(&page.title) + 2])
         .max()
         .unwrap_or(0);
-    let width = dialog::inside_width(area.cols, 0, wanted);
+    // At least a cell: the grid less eight cells, never below one.
+    let width = dialog::inside_width(area.cols, 0, wanted).max(1);
     let keys = widest.min(width.saturating_sub(2) / 2).max(1);
-    let words = width.saturating_sub(keys + 2).max(1);
-    let rows: Vec<(String, String)> = (page.lines.iter())
-        .flat_map(|l| {
-            let (k, said) = (dialog::wrap(&l.keys, keys), dialog::wrap(&l.what, words));
+    let beside = width >= keys + 2 + WORDS;
+    let (keys, words_x) = match beside {
+        true => (keys, keys + 2),
+        false => (width, 2.min(width - 1)),
+    };
+    let words = width - words_x;
+    let mut rows: Vec<(String, String)> = vec![];
+    for l in &page.lines {
+        let (k, said) = (dialog::wrap(&l.keys, keys), dialog::wrap(&l.what, words));
+        if beside {
             let n = k.len().max(said.len());
-            (0..n).map(move |i| {
-                let row = |v: &[String]| v.get(i).cloned().unwrap_or_default();
-                (row(&k), row(&said))
-            })
-        })
-        .collect();
+            let row = |v: &[String], i: usize| v.get(i).cloned().unwrap_or_default();
+            rows.extend((0..n).map(|i| (row(&k, i), row(&said, i))));
+        } else {
+            rows.extend(k.into_iter().map(|k| (k, String::new())));
+            rows.extend(said.into_iter().map(|w| (String::new(), w)));
+        }
+    }
     // The box: its rows, a blank, the foot, two border rows and two margin rows; its shadow one
     // more.
     let fits = usize::from(area.rows).saturating_sub(5);
@@ -284,7 +313,9 @@ fn lay(page: &Page, screen: Grid) -> Laid {
     Laid {
         area,
         frame,
+        width,
         keys,
+        words_x,
         words,
         rows,
         shown,
@@ -303,7 +334,7 @@ fn draw(laid: &Laid, title: &str, top: usize) -> Buffer {
     cells::frame(&mut buf, f, title, true);
     let list = laid.list();
     let (key_pen, word_pen) = (Pen::new(p.help_key, p.back), Pen::new(p.text, p.back));
-    let words_x = list.x + laid.keys as u16 + 2;
+    let words_x = list.x + laid.words_x as u16;
     for (k, (keys, words)) in laid.rows.iter().skip(top).take(laid.shown).enumerate() {
         let y = list.y + k as u16;
         cells::put(&mut buf, list.x, y, keys, laid.keys, key_pen);
@@ -340,6 +371,8 @@ struct Open {
     bar: Option<Rect>,
     /// The scroll bar's thumb is being dragged.
     drag: bool,
+    /// The F-key row's slot 1 or 3 pressed, waiting for its release there.
+    slot: Option<u8>,
 }
 
 fn open_id() -> egui::Id {
@@ -374,6 +407,7 @@ pub(crate) fn carried(ctx: &egui::Context) -> Carried {
     let open = ctx.data(|d| d.get_temp::<Open>(open_id()));
     Carried(open.map(|open| Open {
         drag: false,
+        slot: None,
         ..open
     }))
 }
@@ -455,21 +489,108 @@ fn dragged(bar: Rect, pos: Pos2, last: usize) -> usize {
     (r / room * last as f32).round() as usize
 }
 
-/// Before the window's pass: the screen's own keys and its scroll bar, then the rest of the
-/// frame's input withheld from the window — every key but Cmd/Ctrl+Q and +W (they close it as
-/// ever), the typed text, the wheel and the pointer (egui has already worked out the pointer's
-/// state for this pass from its events, so that state goes too, and nothing under the screen is
-/// hovered or clicked) — but the pointer on the F-key row, the window's last row: its slots stay
-/// its keys (04 §6.1), so a click on 1 or 3 closes the help as F1 or F3 does, and another slot's
-/// F-key is withheld in its turn.
-pub(crate) fn begin_pass(ctx: &egui::Context) {
+/// The F-key slot (1–10) of the window's last row under `p`, as the F-key row lays its slots
+/// on whole cells ([`chrome::key_cells`]); none off that row.
+fn slot_at(screen: Rect, p: Pos2) -> Option<u8> {
+    if !screen.contains(p) || p.y < screen.bottom() - CELL.y {
+        return None;
+    }
+    let cols = (screen.width() / CELL.x).floor() as u16;
+    let x = ((p.x - screen.left()) / CELL.x).floor() as u16;
+    (1..=10u8).find(|&n| {
+        let (digit, label) = chrome::key_cells(cols, n);
+        (digit.x..label.right().max(digit.right())).contains(&x)
+    })
+}
+
+/// The shell's input hook (`super::FKeyInput`), after the F-key aliases and the mode button
+/// took theirs: while the help is open the pointer is its own, before egui sees any of it — so
+/// nothing under it, a modal's backdrop included, is hovered, pressed or clicked. Its scroll bar
+/// ([`on_bar`], [`dragged`]), the wheel anywhere, and the F-key row's slots 1 and 3, pressed and
+/// let go there, which close it as F1 and F3 do (another slot does nothing); every pointer event
+/// then goes.
+pub(crate) fn input_hook(ctx: &egui::Context, events: &mut Vec<Event>) {
     let Some(mut open) = ctx.data(|d| d.get_temp::<Open>(open_id())) else {
         return;
     };
     let page = open.rows.saturating_sub(1).max(1);
     let last = open.total.saturating_sub(open.rows);
     let screen = ctx.content_rect();
-    let on_keys = |p: Pos2| screen.contains(p) && p.y >= screen.bottom() - CELL.y;
+    let mut closed = false;
+    let mut lines = 0.0;
+    events.retain(|e| match e {
+        Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            ..
+        } => {
+            open.drag = false;
+            let slot = slot_at(screen, *pos).filter(|n| matches!(n, 1 | 3));
+            if *pressed {
+                open.slot = slot;
+                match open
+                    .bar
+                    .and_then(|bar| on_bar(bar, *pos, open.top, last, page))
+                {
+                    Some(Press::To(top)) => open.top = top,
+                    Some(Press::Drag) => open.drag = true,
+                    None => {}
+                }
+            } else {
+                closed |= open.slot.is_some() && open.slot == slot;
+                open.slot = None;
+            }
+            false
+        }
+        Event::PointerMoved(pos) => {
+            if let Some(bar) = open.bar.filter(|_| open.drag) {
+                open.top = dragged(bar, *pos, last);
+            }
+            false
+        }
+        Event::MouseWheel { unit, delta, .. } => {
+            lines += match unit {
+                egui::MouseWheelUnit::Point => -delta.y / CELL.y,
+                _ => -delta.y * 3.0,
+            };
+            false
+        }
+        Event::PointerGone => {
+            (open.drag, open.slot) = (false, None);
+            false
+        }
+        Event::WindowFocused(false) => {
+            (open.drag, open.slot) = (false, None);
+            true
+        }
+        Event::PointerButton { .. }
+        | Event::MouseMoved(_)
+        | Event::Touch { .. }
+        | Event::Zoom(_)
+        | Event::Rotate(_) => false,
+        _ => true,
+    });
+    open.top = (open.top as f32 + lines).round().clamp(0.0, last as f32) as usize;
+    ctx.data_mut(|d| {
+        if closed {
+            d.remove_temp::<Open>(open_id());
+        } else {
+            d.insert_temp(open_id(), open);
+        }
+    });
+}
+
+/// Before the window's pass: the screen's own keys, then the rest of the frame's input withheld
+/// from the window — every key but Cmd/Ctrl+Q and +W (they close it as ever), the typed text —
+/// and the pointer's state cleared (its events went in [`input_hook`]; egui still holds where
+/// it last was, so nothing under the screen is hovered).
+pub(crate) fn begin_pass(ctx: &egui::Context) {
+    let Some(mut open) = ctx.data(|d| d.get_temp::<Open>(open_id())) else {
+        return;
+    };
+    let page = open.rows.saturating_sub(1).max(1);
+    let last = open.total.saturating_sub(open.rows);
     let closed = ctx.input_mut(|i| {
         let mut closed = false;
         for key in [Key::Escape, Key::F1, Key::F3] {
@@ -498,56 +619,14 @@ pub(crate) fn begin_pass(ctx: &egui::Context) {
         if keys::take(i, Key::End, Mods::None) {
             open.top = last;
         }
-        // The scroll bar, from the pointer's own events: no widget in a plugin's pass.
-        for e in &i.events {
-            match e {
-                Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed,
-                    ..
-                } => {
-                    open.drag = false;
-                    let bar = open.bar.filter(|_| *pressed);
-                    match bar.and_then(|bar| on_bar(bar, *pos, open.top, last, page)) {
-                        Some(Press::To(top)) => open.top = top,
-                        Some(Press::Drag) => open.drag = true,
-                        None => {}
-                    }
-                }
-                Event::PointerMoved(pos) if open.drag => {
-                    if let Some(bar) = open.bar {
-                        open.top = dragged(bar, *pos, last);
-                    }
-                }
-                Event::PointerGone | Event::WindowFocused(false) => open.drag = false,
-                _ => {}
-            }
-        }
-        let lines: f32 = i
-            .events
-            .iter()
-            .map(|e| match e {
-                Event::MouseWheel { unit, delta, .. } => match unit {
-                    egui::MouseWheelUnit::Point => -delta.y / CELL.y,
-                    _ => -delta.y * 3.0,
-                },
-                _ => 0.0,
-            })
-            .sum();
-        open.top = (open.top as f32 + lines).round().clamp(0.0, last as f32) as usize;
-        let row = i.pointer.latest_pos().is_some_and(on_keys);
         i.events.retain(|e| match e {
             Event::Key { key, modifiers, .. } => {
                 matches!(key, Key::Q | Key::W) && Mods::Command.matches(*modifiers)
             }
             Event::ModifiersChanged(_) | Event::WindowFocused(_) => true,
-            Event::PointerMoved(_) | Event::PointerButton { .. } | Event::PointerGone => row,
             _ => false,
         });
-        if !row {
-            i.pointer = Default::default();
-        }
+        i.pointer = Default::default();
         i.smooth_scroll_delta = Vec2::ZERO;
         closed
     });
@@ -747,12 +826,19 @@ mod tests {
         let keys: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
         assert!(keys.contains(&"Ctrl/⌘+R"), "{keys:?}");
         assert!(keys.contains(&"Ctrl/⌘+U"), "{keys:?}");
+        // The aliases with where each works (T27, 10 §9): the F-keys' digits, the switch.
         assert_eq!(
-            aliases(),
+            aliases().as_slice(),
             [
                 Line {
                     keys: "Ctrl/⌘+1…0 · Alt+1…0".into(),
                     what: "F1…F10 (Alt+1…0 in a terminal); so does a click on a slot".into(),
+                },
+                Line {
+                    keys: "F12 · Alt+G".into(),
+                    what: "Between the terminal and a window, under sopen --tui (Alt+G in a \
+                           terminal); so does a click on [GUI] or [TUI]"
+                        .into(),
                 },
                 Line {
                     keys: "Ctrl/⌘".into(),
@@ -897,23 +983,14 @@ mod tests {
         own.extend_from_slice(chrome::HEX_KEYS);
         let page = for_context(Context::Viewer, Mode::Preview, &own);
         let keys: Vec<&str> = page.lines.iter().map(|l| l.keys.as_str()).collect();
-        let [digits, command] = aliases();
-        assert_eq!(
-            keys,
-            [
-                "F1",
-                "F3, Esc",
-                "F4",
-                "1, 2, 3",
-                "F9",
-                "F5",
-                "F6",
-                "F7",
-                "F8",
-                &digits.keys,
-                &command.keys
-            ]
-        );
+        let aliases = aliases();
+        let want: Vec<&str> = [
+            "F1", "F3, Esc", "F4", "1, 2, 3", "F9", "F5", "F6", "F7", "F8",
+        ]
+        .into_iter()
+        .chain(aliases.iter().map(|l| l.keys.as_str()))
+        .collect();
+        assert_eq!(keys, want);
         assert_eq!(line(&page, "F5").unwrap().what, "Save (as Ctrl/⌘+S)");
         assert_eq!(line(&page, "F3, Esc").unwrap().what, "Back to the list");
         assert_eq!(
@@ -932,30 +1009,26 @@ mod tests {
         let row = chrome::merged(&[chrome::HELP_KEY, chrome::EXIT_KEY], chrome::IMAGE_KEYS);
         let page = for_window(&row);
         assert_eq!(page.title, "Keys");
-        let [digits, command] = aliases();
-        assert_eq!(
-            page.lines,
-            [
-                Line {
-                    keys: "F1".into(),
-                    what: "This screen".into()
-                },
-                Line {
-                    keys: "F3".into(),
-                    what: "Close the window (as Ctrl/⌘+W)".into()
-                },
-                Line {
-                    keys: "F5".into(),
-                    what: "Save (as Ctrl/⌘+S)".into()
-                },
-                Line {
-                    keys: "F7".into(),
-                    what: "Save As: a new local file with your edits (as Ctrl/⌘+Alt+S)".into()
-                },
-                digits,
-                command,
-            ]
-        );
+        let own = [
+            Line {
+                keys: "F1".into(),
+                what: "This screen".into(),
+            },
+            Line {
+                keys: "F3".into(),
+                what: "Close the window (as Ctrl/⌘+W)".into(),
+            },
+            Line {
+                keys: "F5".into(),
+                what: "Save (as Ctrl/⌘+S)".into(),
+            },
+            Line {
+                keys: "F7".into(),
+                what: "Save As: a new local file with your edits (as Ctrl/⌘+Alt+S)".into(),
+            },
+        ];
+        let want: Vec<Line> = own.into_iter().chain(aliases()).collect();
+        assert_eq!(page.lines, want);
     }
 
     /// Every context's page, with every slice landed, holds every row this machine can press
@@ -1078,7 +1151,7 @@ mod tests {
             "the scroll bar"
         );
         drv.key(&mut win, Key::End, egui::Modifiers::NONE);
-        let [digits, _] = aliases();
+        let digits = aliases()[0].clone();
         let (alias, layer) = in_cells(&drv, &digits.keys).expect("the alias line in cells");
         // Its words start beside it (they wrap by cells: see below).
         let (what, _) = in_cells(&drv, "F1…F10 (Alt+1…0 in a terminal);").expect("its words");
@@ -1116,15 +1189,21 @@ mod tests {
             drv.colors_of("F2, Shift+F6"),
             Some(vec![chrome::PALETTE.help_key])
         );
-        let [digits, command] = aliases();
+        let [digits, switch, command] = aliases();
         assert!(drv.find_text(&digits.keys).is_none(), "below the screen");
         assert!(drv
             .find_text("Esc, F1 or F3: back · ↑ ↓ PgUp PgDn: more")
             .is_some());
         drv.key(&mut win, Key::End, egui::Modifiers::NONE);
         // Whole, not cut: the alias keys fit the key column.
-        assert!(drv.find_text(&digits.keys).is_some(), "End: the aliases");
+        assert!(drv.find_text(&switch.keys).is_some(), "End: the aliases");
         assert!(drv.find_text(&command.keys).is_some(), "End: the last line");
+        drv.key(&mut win, Key::ArrowUp, egui::Modifiers::NONE);
+        drv.key(&mut win, Key::ArrowUp, egui::Modifiers::NONE);
+        assert!(
+            drv.find_text(&digits.keys).is_some(),
+            "↑ ↑: the digits' alias"
+        );
         assert!(drv.find_text("This screen").is_none());
         drv.key(&mut win, Key::Home, egui::Modifiers::NONE);
         assert!(drv.find_text("This screen").is_some());
@@ -1139,12 +1218,27 @@ mod tests {
     }
 
     /// A window of its own: its F-key row ([`crate::gui::own_keys`]) under a label.
-    struct WithRow;
+    /// …with a button that counts its clicks, and F5 (Save) on its row, counted too.
+    #[derive(Default)]
+    struct WithRow {
+        clicks: usize,
+        saves: usize,
+    }
 
     impl Window for WithRow {
         fn ui(&mut self, ui: &mut egui::Ui) {
-            crate::gui::own_keys(ui, &[]);
-            ui.label("under the help");
+            crate::gui::own_keys(
+                ui,
+                &[chrome::FKey {
+                    n: 5,
+                    label: "Save",
+                }],
+            );
+            self.saves +=
+                usize::from(ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F5)));
+            if ui.button("under the help").clicked() {
+                self.clicks += 1;
+            }
         }
 
         fn ready(&self) -> bool {
@@ -1152,14 +1246,21 @@ mod tests {
         }
     }
 
-    /// The F-key row stays in sight under the help, and its slots stay its keys (04 §6.1, the
-    /// help's alias line): a click on the Help slot is F1 and closes it, on the Exit slot F3 and
-    /// closes the help, not the window; the rest of the window gets no click meanwhile.
+    /// The F-key row stays in sight under the help, and its Help and Exit slots close it (as F1
+    /// and F3 do): a click on the Help slot closes it, on the Exit slot too — the help, not the
+    /// window. The window gets no click meanwhile: neither its button nor another slot (Save)
+    /// acts, and the help stays.
     #[test]
-    fn the_f_key_rows_slots_stay_its_keys_under_the_help() {
+    fn the_f_key_rows_help_and_exit_slots_close_the_help_and_nothing_else_acts() {
         let mut drv = Driver::new(800.0, 480.0);
-        let mut win = WithRow;
+        let mut win = WithRow::default();
         drv.idle(&mut win, 2);
+        let button = drv
+            .find_text("under the help")
+            .expect("the button")
+            .center();
+        drv.click(&mut win, button);
+        assert_eq!(win.clicks, 1, "the control: the button counts");
         drv.key(&mut win, Key::F1, egui::Modifiers::NONE);
         assert!(is_open(&drv.ctx));
         drv.click_text(&mut win, "Help   ");
@@ -1167,13 +1268,141 @@ mod tests {
         assert!(!is_open(&drv.ctx), "the Help slot: F1");
         drv.key(&mut win, Key::F1, egui::Modifiers::NONE);
         assert!(is_open(&drv.ctx));
-        let label = drv.find_text("under the help").expect("the label").center();
-        drv.click(&mut win, label);
+        drv.click(&mut win, button);
+        drv.click_text(&mut win, "Save   ");
+        drv.idle(&mut win, 2);
+        assert_eq!(
+            (win.clicks, win.saves),
+            (1, 0),
+            "no click reached the window"
+        );
         assert!(is_open(&drv.ctx), "a click elsewhere: nothing");
         drv.click_text(&mut win, "Exit   ");
         drv.idle(&mut win, 1);
         assert!(!is_open(&drv.ctx), "the Exit slot: F3 closes the help");
         assert!(!drv.closed(), "not the window");
+        drv.click_text(&mut win, "Save   ");
+        drv.idle(&mut win, 2);
+        assert_eq!(
+            win.saves, 1,
+            "the control: the Save slot is F5 without the help"
+        );
+    }
+
+    /// On narrow and tiny grids (10 §6: the box less the grid's eight cells) the help writes
+    /// nothing outside its box's inside but its frame, its scroll bar and its shadow: the words
+    /// never over the frame's right line or into the shadow — under 12 cells beside the keys
+    /// they go under them — and the margin cells stay blank; no grid panics, 0 × 0 included.
+    #[test]
+    fn on_narrow_grids_the_help_stays_inside_its_box() {
+        let page = for_context(Context::List, Mode::Preview, &[]);
+        let p = chrome::PALETTE;
+        for (cols, rows) in [
+            (0u16, 0u16),
+            (1, 1),
+            (9, 4),
+            (9, 30),
+            (10, 30),
+            (20, 30),
+            (34, 30),
+        ] {
+            let screen = Grid {
+                origin: Pos2::ZERO,
+                cols,
+                rows,
+            };
+            let laid = lay(&page, screen);
+            let buf = draw(&laid, &page.title, laid.last());
+            let f = laid.frame;
+            let [right, under] = dialog::shadow_of(f);
+            let bar = laid.bar();
+            let a = buf.area;
+            for y in a.top()..a.bottom() {
+                for x in a.left()..a.right() {
+                    let at = cells::Position::new(x, y);
+                    let c = &buf[(x, y)];
+                    let what = format!("{cols}x{rows} ({x},{y}) {:?} in {f:?}", c.symbol());
+                    let shown = c.symbol().trim().to_string();
+                    if !f.contains(at) && (right.contains(at) || under.contains(at)) {
+                        assert_eq!(c.bg, ratatui_core::style::Color::Rgb(0, 0, 0), "{what}");
+                        assert_eq!(shown, "", "the shadow: {what}");
+                    } else if !f.contains(at) {
+                        assert_eq!(
+                            *c,
+                            ratatui_core::buffer::Cell::default(),
+                            "untouched: {what}"
+                        );
+                    } else if y == f.top() {
+                        // The top line: the frame's and the title's.
+                    } else if bar.is_some_and(|b| b.contains(at)) {
+                        assert!(
+                            shown.is_empty()
+                                || cells::frame_cell(c.symbol(), Some(p.track), Some(p.track_back)),
+                            "the scroll bar: {what}"
+                        );
+                    } else if x == f.left() || x + 1 == f.right() || y + 1 == f.bottom() {
+                        assert!(
+                            shown.chars().all(cells::frame_glyph) && !shown.is_empty(),
+                            "the frame: {what}"
+                        );
+                    } else if x == f.left() + 1 || x + 2 == f.right() || y == f.top() + 1 {
+                        assert_eq!(shown, "", "the margin: {what}");
+                    }
+                }
+            }
+            // Each row shown holds its keys and its words, none drawn over.
+            let list = laid.list();
+            let shown = laid.rows.iter().skip(laid.last()).take(laid.shown);
+            for (k, (keys, words)) in shown.enumerate() {
+                let y = list.y + k as u16;
+                if !a.contains(cells::Position::new(list.x, y)) {
+                    continue;
+                }
+                let row = cells::row_text(&buf, y).0;
+                for text in [keys, words] {
+                    assert!(
+                        row.contains(text.trim()),
+                        "{cols}x{rows}: {text:?} in {row:?}"
+                    );
+                }
+            }
+            // In a window too: no panic, and the keys work.
+            let mut drv = Driver::new(f32::from(cols) * CELL.x, f32::from(rows) * CELL.y);
+            let mut win = Shows {
+                page: Some(page.clone()),
+            };
+            drv.idle(&mut win, 2);
+            drv.key(&mut win, Key::End, egui::Modifiers::NONE);
+            drv.key(&mut win, Key::Escape, egui::Modifiers::NONE);
+            assert!(!is_open(&drv.ctx));
+        }
+        // Beside the keys from 12 cells of words on; under them below.
+        let at = |cols| {
+            let grid = Grid {
+                origin: Pos2::ZERO,
+                cols,
+                rows: 30,
+            };
+            lay(&page, grid).rows[..2].to_vec()
+        };
+        let (f1, words) = ("F1".to_string(), "This screen".to_string());
+        assert_eq!(
+            at(80),
+            [
+                (f1.clone(), words.clone()),
+                (
+                    "F2, Shift+F6".into(),
+                    "Rename the entry under the bar, in place".into()
+                )
+            ]
+        );
+        // 12 cells inside: the words under the keys, two cells in, wrapped at the other ten.
+        let first = words.split(' ').next().unwrap_or_default().to_string();
+        assert_eq!(
+            at(20),
+            [(f1, String::new()), (String::new(), first)],
+            "under the keys"
+        );
     }
 
     /// The screen's state as the last pass left it.
@@ -1234,16 +1463,16 @@ mod tests {
             at(1),
         );
         assert_eq!(top(&drv), 0, "and back to the top");
-        // A notch of the wheel: three rows; nothing under the help moved.
-        drv.wheel(&mut win, at(0) - Vec2::new(200.0, 0.0), -1.0);
+        // A notch of the wheel, off the box as on it: three rows.
+        drv.wheel(&mut win, Pos2::new(4.0, 20.0), -1.0);
         assert_eq!(top(&drv), 3);
         drv.wheel(&mut win, at(0), 1.0);
         assert_eq!(top(&drv), 0);
     }
 
     /// A line longer than the words column wraps by cells under the words column (its keys on
-    /// its first row alone); a long title is cut in the frame; on an area too short for the box
-    /// the box is cut to it — never over the title row or the status and F-key rows.
+    /// its first row alone), every word kept; on an area too short for the box the box is cut to
+    /// it — never over the title row or the status and F-key rows.
     #[test]
     fn the_help_wraps_by_cells_and_stays_between_the_rows() {
         let words = "Rename the entry under the bar, in place, and then — since the row is \

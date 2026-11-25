@@ -1673,6 +1673,117 @@ fn a_dialog_egui_draws_is_a_hand_off_box_with_its_line() {
     assert!(!vt.text().contains(MODAL_LINE), "{}", vt.text());
 }
 
+/// F1's help opened over a dialog egui draws: the dialog's hand-off box stands under the help —
+/// every cell of the help is on screen as the help painted it, none of the box over it.
+#[test]
+fn the_help_stays_over_a_dialogs_hand_off_box() {
+    struct AsksThenHelp(Asks);
+    impl super::Window for AsksThenHelp {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            if ui.input(|i| i.key_pressed(Key::H)) {
+                crate::gui::help::open(ui.ctx(), crate::gui::help::for_window(&[]));
+            }
+            self.0.ui(ui);
+        }
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+    let tape = Tape::default();
+    {
+        let mut s = tape.0.borrow_mut();
+        s.size = (100, 30);
+        s.events.extend(typed("dh"));
+        s.stop = Some(libc::SIGTERM);
+    }
+    let bytes = Bytes::default();
+    let mut b = Backend::new(tape.clone(), bytes.clone(), skin(), true);
+    let mut no_switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> { Ok(None) };
+    let mut win = AsksThenHelp(Asks { open: false });
+    let end = b.run(&mut win, &mut no_switch).unwrap();
+    assert_eq!(end, End::Signal(libc::SIGTERM));
+    assert!(win.0.open && crate::gui::help::is_open(&b.ctx));
+    let screen = b.screen();
+    assert!(!screen.hand_offs.is_empty(), "the dialog's box");
+    let layers = cells::layers(&b.ctx);
+    let help = (layers.iter())
+        .find(|l| l.layer.order == egui::Order::Tooltip)
+        .expect("the help's cells");
+    let (ox, oy) = (
+        (help.origin.x / CELL.x) as u16,
+        (help.origin.y / CELL.y) as u16,
+    );
+    let a = help.buf.area;
+    let mut differ = vec![];
+    for y in a.top()..a.bottom() {
+        for x in a.left()..a.right() {
+            let (want, got) = (&help.buf[(x, y)], &screen.buf[(ox + x, oy + y)]);
+            // The corners neither the box nor its shadow takes are left as they were.
+            let untouched = *want == ratatui_core::buffer::Cell::default();
+            if !untouched && (want.symbol() != got.symbol() || want.bg != got.bg) {
+                differ.push(format!("({},{}) {:?}", ox + x, oy + y, got.symbol()));
+            }
+        }
+    }
+    assert!(differ.is_empty(), "the help covered: {differ:?}");
+}
+
+/// Under F1's help the browser's F-key row is in sight but its slots are the help's: a click on
+/// Copy opens no Copy dialog and leaves the help; the control: without the help it does.
+#[test]
+fn under_the_help_the_copy_slot_does_nothing() {
+    let fx = fixture(0);
+    let (mut drv, mut win) = window(&fx, 100, 30);
+    drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
+    drv.key(&mut win, Key::F1, Modifiers::NONE);
+    drv.idle(&mut win, 2);
+    drv.click_text(&mut win, "Copy");
+    drv.idle(&mut win, 2);
+    assert!(crate::gui::help::is_open(&drv.ctx), "the help stays");
+    assert!(drv.find_text("[ Copy ]").is_none(), "no Copy dialog");
+    drv.key(&mut win, Key::Escape, Modifiers::NONE);
+    drv.click_text(&mut win, "Copy");
+    drv.idle(&mut win, 2);
+    assert!(
+        drv.find_text("[ Copy ]").is_some(),
+        "the control: the slot is F5"
+    );
+}
+
+/// While F1's help is open a click on a hand-off box beside it (the preview of the file under
+/// the bar) is the help's, as every click is: no switch, the help stays.
+#[test]
+fn a_click_on_a_hand_off_box_beside_the_help_does_not_switch() {
+    let fx = fixture(0);
+    let (mut b, tape, _bytes) = backend(&fx, 100, 30, false);
+    let mut events = vec![plain(KeyCode::End), plain(KeyCode::F(1))];
+    events.extend(click(96, 10));
+    tape.0.borrow_mut().events.extend(events);
+    tape.0.borrow_mut().stop = Some(libc::SIGTERM);
+    let switched = Rc::new(RefCell::new(0));
+    let count = switched.clone();
+    let mut switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
+        *count.borrow_mut() += 1;
+        Ok(None)
+    };
+    let mut win = Shared(fx.b.clone());
+    assert_eq!(
+        b.run(&mut win, &mut switch).unwrap(),
+        End::Signal(libc::SIGTERM)
+    );
+    let screen = b.screen();
+    assert!(
+        screen
+            .hand_offs
+            .iter()
+            .any(|r| r.contains(Position::new(96, 10))),
+        "the control: a hand-off box is there: {:?}",
+        screen.hand_offs
+    );
+    assert_eq!(*switched.borrow(), 0, "no switch");
+    assert!(crate::gui::help::is_open(&b.ctx), "the help stays");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Pictures across the switch (10 §7.2).
 
