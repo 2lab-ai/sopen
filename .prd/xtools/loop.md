@@ -16,15 +16,13 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
 
 | ID | Status | What | Who |
 |---|---|---|---|
-| XW-dialogs | 🟡 running | 10 §17: the list's dialogs in cells; branch `feat/xw-dialogs` | coder |
-| XW-term | 🔴 open | 10 §17: the terminal backend and `sopen --tui` (ships X1b); after XW-dialogs | coder |
-| VM-7 | 🔴 open | 08 §13: the egui binding of the view keys and the views; after XR-T's egui answer (it shares `browser.rs`) | coder |
+| XW-term | 🟡 running | 10 §17: the terminal backend and `sopen --tui` (ships X1b); branch `feat/xw-term` | coder |
+| VM-7 | 🟡 running | 08 §13: the egui binding of the view keys and the views (1/2/3, 9 View, F8 encodings); branch `feat/vm7-egui-views` | coder |
 | VM-8 | 🔴 open | 08 §13: the terminal binding. Carried: `src/view_keys.rs`'s module doc now names `term_input::RELEASES` (the translator makes every release); VM-8 builds on that | coder |
 | VM-D0 | 🔴 open | 08 §13: 04 §2 and K-R1 brought to the shipped code | orchestrator |
-| WV-C | 🟡 running | 09 §12: the page server; branch `feat/wv-c-page-server` | coder |
-| WV-rest | 🔴 open | 09 §12's WV-A, WV-B, WV-D, WV-E2 and WV-F, in its order (WV-0, WV-E1 and X-W1 are closed) | coder |
+| WV-A | 🟡 merging | 09 §12: the macOS engine (#126, in review) | coder |
+| WV-rest | 🔴 open | 09 §12's WV-C2, WV-B, WV-D, WV-E2 and WV-F, in its order (X-W1, WV-0, WV-E1 and WV-C are closed) | coder |
 | X3-hex | 🔴 open | 10 §16's hex step. Carried from #108's review: point the hex tests' `drawn()` at `texts()` once hex paints cells (`galleys()` then holds one-character glyphs), and note that `rects()` will list cell backgrounds and the caret | coder |
-| ED-buf | 🟡 running | 12 §16: ED-0 (the scaffold, folded in) and ED-buf, the piece table; branch `feat/ed-buf` | coder |
 | ED-units | 🔴 open | 12 §16's units: ED-enc, ED-ops, ED-save (no screen); then ED-screen, ED-dialogs, ED-layout (ships X5), ED-git, ED-route, after their 10 units | coder |
 
 ## Follow-ups found on the way (not units yet)

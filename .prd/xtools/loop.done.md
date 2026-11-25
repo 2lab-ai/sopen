@@ -161,12 +161,27 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
 - **Web (09 §12).**
   - **WV-E1** (#117): `--browser`.
   - **WV-0** (#118): the component core and the scheme contract, which is head, exact-length body or fail; a stop at any point; head-less stops matched by URL and Range.
+- **XW-dialogs** (#125): the list's dialogs and the F2 field in cells.
+  - Fields keep egui's editor, laid out on cells, so clicks, IME and scrolling follow the cells.
+  - A dialog stays between the title and status rows, at most 76 columns wide, with a black-cell shadow.
+- **WV-C** (#124): the page server.
+  - Paths: steps refuse `..` with no filesystem call, then realpath and a root check; a folder without its `/` is sent to `NAME/`.
+  - Freshness: one checked handle per view plus a block cache; a fault forgets the file.
+  - Range per RFC 9110; the charset comes from WHATWG's prescan or `pick`.
+  - The budget counts bytes read; the local reader is FIFO-safe. Pipelining is WV-C2.
+- **ED-0 + ED-buf** (#122): the editor's piece table.
+  - The original file is shared and never copied; add blocks never move; the line index is LF counts per 4 KiB.
+  - A CR LF pair is never split; undo is stored as pieces.
+  - `restore` rebuilds a document for the journal; a piece from another buffer is `Stale`.
+  - EB-1's memory bound counts what the file and buffer add.
 - **Reviews.** Two engines per unit, then one fix-check; the orchestrator verified the last fixes at their lines.
 - **Prereleases, installed on both hosts:**
   - preview-2026-11-24-2256-c9e2949510d2 (WV-E1);
   - preview-2026-11-25-0010-d7b90ce8cd82 (XW-list, WV-0);
   - preview-2026-11-25-0038-ddafaca53216 (VM-3);
-  - preview-2026-11-25-0216-602a9e7157db (VM-4).
+  - preview-2026-11-25-0216-602a9e7157db (VM-4);
+  - preview-2026-11-25-0243-380ec0c77e4b (ED-buf);
+  - preview-2026-11-25-0340-f58623c45457 (XW-dialogs, WV-C).
 
 ### Closed rows
 
@@ -181,4 +196,7 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
 | VM-4 | ✅ done 2026-11-25 | 08 §13: CP949 / EUC-KR through `encoding_rs`: decoder, sync bytes, grid cut, lazy phase checkpoints, the default's step 3 (#121) | coder |
 | WV-E1 | ✅ done 2026-11-25 | 09 §12: the CLI half of the address window, `--browser` (#117) | coder |
 | WV-0 | ✅ done 2026-11-25 | 09 §12: the component core, the scheme contract, the shell's part (#118) | coder |
+| XW-dialogs | ✅ done 2026-11-25 | 10 §17: the list's dialogs and the F2 field in cells (#125) | coder |
+| WV-C | ✅ done 2026-11-25 | 09 §12: the page server (#124) | coder |
+| ED-buf | ✅ done 2026-11-25 | 12 §16: ED-0 (folded in) and ED-buf, the piece table (#122) | coder |
 | F-k_d1 | ✅ done 2026-11-25 | s6's k_d1: the Trash check runs on a worker; the test waits for it (#111) | coder |
