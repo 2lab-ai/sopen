@@ -18,7 +18,6 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
 |---|---|---|---|
 | XW-dialogs | 🟡 running | 10 §17: the list's dialogs in cells; branch `feat/xw-dialogs` | coder |
 | XW-term | 🔴 open | 10 §17: the terminal backend and `sopen --tui` (ships X1b); after XW-dialogs | coder |
-| VM-4 | 🟡 merging | 08 §13: CP949 / EUC-KR through `encoding_rs` (#121) | coder |
 | VM-7 | 🔴 open | 08 §13: the egui binding of the view keys and the views; after XR-T's egui answer (it shares `browser.rs`) | coder |
 | VM-8 | 🔴 open | 08 §13: the terminal binding. Carried: `src/view_keys.rs`'s module doc now names `term_input::RELEASES` (the translator makes every release); VM-8 builds on that | coder |
 | VM-D0 | 🔴 open | 08 §13: 04 §2 and K-R1 brought to the shipped code | orchestrator |
@@ -36,7 +35,8 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
 | F-numpad | 🔴 open | The Ctrl+numpad digit alias reads the physical key first (`src/gui/mod.rs`, `fkey_events`) | coder |
 | F-keynames | 🔴 open | Key names outside help still mix forms: "Cmd/Ctrl+R" literals, "⌘/Ctrl" hovers, README line 95; 01, 02 and 03 write `Cmd/Ctrl+Z` | coder |
 | F-ci-macos | 🔴 open | A merge to main runs `ci.yml` twice on macOS: CI's own push run and Preview's `gate` (`preview.yml` calls `ci.yml`). Dropping CI's push trigger for main, so that Preview's gate is the one run, would halve the macOS checks per merge while runners are short | orchestrator |
-| F-timing | 🔴 open | Wall-clock bounds that fail under a loaded full run and pass alone, seen 2026-11-25: `gui::image::robustness_tests::malformed_headers_never_panic_the_header_read` (one interlaced-PNG case took 2.86 s against `CASE_LIMIT` 2 s, Linux load ~12; alone 5/5), `s3::g_r5_a_waiting_hook…` (no hook pid within 10 s) and `git::tests::runner::a_record_or_an_output_past_its_bound_is_stopped` (each once at load 33–45; alone 5/5 and 3/3). Bound the work, not the wall clock, as #101–#103 did | coder |
+| F-timing | 🔴 open | Wall-clock bounds that fail under a loaded full run and pass alone, seen 2026-11-25: `gui::image::robustness_tests::malformed_headers_never_panic_the_header_read` (one interlaced-PNG case took 2.86 s against `CASE_LIMIT` 2 s, Linux load ~12; alone 5/5), `s3::g_r5_a_waiting_hook…` (no hook pid within 10 s) and `git::tests::runner::a_record_or_an_output_past_its_bound_is_stopped` (each once at load 33–45; alone 5/5 and 3/3), and `s5::d2_the_first_frame_and_the_screens_info_lines_arrive_in_time` (first frame 618 ms in ED-buf's Linux full run; alone 3/3). Bound the work, not the wall clock, as #101–#103 did | coder |
+| F-cell-select | 🔴 open | Text drawn in cells (the list since #119, the dialogs since XW-dialogs) cannot be selected or copied; main's egui labels could (`selectable_labels`), e.g. a report's failure reason or the clash question's path. A cell selection with Cmd/Ctrl+C, the same in the window and the terminal (where the terminal's own selection works only with mouse reporting off) | coder |
 | F-list-perf | 🔴 open | The list in cells costs 0.71 ms a frame in release against main's 0.23 ms (2,000 entries, 1000×700 at 2×; #119): one galley per glyph. One galley per run of one-cell glyphs measured 0.47 ms; it needs 10 §4's "its glyph at its own cell, never through egui's text layout" amended, `cells.rs` paint and its tests, and the kit's `glyphs`/`placed` | coder |
 
 ## Build facts

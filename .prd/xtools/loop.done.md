@@ -154,6 +154,10 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
     - Corroborated binary signatures refuse the pattern's guess. MZ needs a PE header or the DOS stub; ID3 needs its version and flags.
     - The text bar's encoding is never cut.
     - 09's page charset follows `pick`.
+  - **VM-4** (#121): CP949 / EUC-KR through `encoding_rs`.
+    - Character starts are proven by a sync byte, a line start within REACH, or a lazy phase checkpoint; with none, rows show ░, never a wrong glyph.
+    - The guess (D39 (a)–(e)) is a Korean-first prior; real Chinese prose is stopped by (b)/(d). An ASCII-share criterion was tried and deleted.
+    - encoding_rs and its WHATWG data are in THIRD-PARTY-NOTICES §6a; the stripped binary grows by 166 KB.
 - **Web (09 §12).**
   - **WV-E1** (#117): `--browser`.
   - **WV-0** (#118): the component core and the scheme contract, which is head, exact-length body or fail; a stop at any point; head-less stops matched by URL and Range.
@@ -161,7 +165,8 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
 - **Prereleases, installed on both hosts:**
   - preview-2026-11-24-2256-c9e2949510d2 (WV-E1);
   - preview-2026-11-25-0010-d7b90ce8cd82 (XW-list, WV-0);
-  - the VM-3 one, after #120.
+  - preview-2026-11-25-0038-ddafaca53216 (VM-3);
+  - preview-2026-11-25-0216-602a9e7157db (VM-4).
 
 ### Closed rows
 
@@ -173,6 +178,7 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
 | XW-list | ✅ done 2026-11-25 | 10 §17: the list, title, status and F-key rows in cells; ships X1a (#119) | coder |
 | VM-2 | ✅ done 2026-11-25 | 08 §13: the text document per encoding, the bar's encoding, `SOPEN_STATE enc=` (#114) | coder |
 | VM-3 | ✅ done 2026-11-25 | 08 §13: UTF-16/32 sniffed as text; corroborated signatures refuse the guess; the bar's encoding never cut (#120) | coder |
+| VM-4 | ✅ done 2026-11-25 | 08 §13: CP949 / EUC-KR through `encoding_rs`: decoder, sync bytes, grid cut, lazy phase checkpoints, the default's step 3 (#121) | coder |
 | WV-E1 | ✅ done 2026-11-25 | 09 §12: the CLI half of the address window, `--browser` (#117) | coder |
 | WV-0 | ✅ done 2026-11-25 | 09 §12: the component core, the scheme contract, the shell's part (#118) | coder |
 | F-k_d1 | ✅ done 2026-11-25 | s6's k_d1: the Trash check runs on a worker; the test waits for it (#111) | coder |
