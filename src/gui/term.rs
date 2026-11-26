@@ -21,8 +21,9 @@
 //!   window paints them. The cursor stands at the caret's cell (a field's: the terminal draws a
 //!   Hangul composition there, 10 §4), else it is hidden.
 //! - **Hand-off boxes** (T17, 10 §11): cells no layer covers are a pane the window draws in egui
-//!   (the preview, a viewer, the tree, the git panel) — in the terminal a frame saying `F12 shows
-//!   it in the window`; a click on it is the switch.
+//!   (the preview's frame, a viewer not yet in cells, the tree, the git panel) — in the terminal a
+//!   frame saying `F12 shows it in the window`; a click on it is the switch. The hex view is
+//!   cells (X3-hex), so it is drawn here as in the window.
 //! - **Colours** are sent as RGB when `COLORTERM` says `truecolor` or `24bit`, else through
 //!   [`cells::index256`]; never the 16 indexes a theme repaints (T15).
 //! - **Ambiguous width** (10 §10, TS-6): the first time the terminal is taken, `─` is written at
@@ -1632,6 +1633,7 @@ impl<T: Tty, O: Write> Backend<T, O> {
             return Ok(());
         }
         self.term.wide = probed.ambiguous;
+        cells::set_ambiguous_wide(&self.ctx, self.term.wide);
         if probed.kitty {
             self.term.out.write_all(KITTY_PUSH.as_bytes())?;
             self.pushed = true;
