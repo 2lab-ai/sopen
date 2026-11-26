@@ -161,6 +161,13 @@ fn cell_at(drv: &Driver, p: Pos2) -> Option<crate::gui::cells::Seen> {
     })
 }
 
+/// The row of cells `text` stands on in the last pass of `drv` (its first place), whole.
+fn cell_row_of(drv: &Driver, text: &str) -> Option<String> {
+    let layers = crate::gui::cells::layers(&drv.ctx);
+    let hit = crate::gui::cells::find(&layers, text).into_iter().next()?;
+    Some(crate::gui::cells::row_text(&layers[hit.layer].buf, hit.cells.y).0)
+}
+
 /// Files under `dir`, recursively; an absent `dir` has none, any other error fails the test.
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
@@ -634,7 +641,7 @@ fn save_refuses_a_changed_remote_and_keeps_the_edit() {
     assert_eq!(std::fs::read(&kept[0]).unwrap(), want);
     assert!(refused.contains(kept[0].to_str().unwrap()), "{refused}");
     assert!(
-        fx.drv.find_text(&refused).is_some(),
+        crate::gui::browser::shown_wrapped(&fx.drv, &refused),
         "the refusal and where the edit went, shown whole"
     );
     assert!(fx.win.doc.dirty(), "still unsaved");
@@ -737,7 +744,7 @@ fn a_base_changed_in_place_is_refused_before_anything_is_written() {
     );
     assert!(refused.contains(&*list.to_string_lossy()), "{refused}");
     assert!(
-        fx.drv.find_text(&refused).is_some(),
+        crate::gui::browser::shown_wrapped(&fx.drv, &refused),
         "named whole in the rows"
     );
     assert!(std::fs::read(&path).unwrap().ends_with(b"more"));
@@ -1050,18 +1057,26 @@ fn closing_with_unsaved_edits_asks() {
     fx.typed("00");
     assert!(!fx.win.close_requested());
     assert!(fx.win.prompt);
-    fx.drv.idle(&mut fx.win, 2);
-    for label in ["Discard", "Cancel"] {
+    // The prompt's own journal write lands and its box gains a row (where Discard deletes the
+    // kept edits): only then do its buttons stand where a click finds them.
+    fx.drv.until(&mut fx.win, 20, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 1);
+    for label in ["[ Discard ]", "[ Cancel ]"] {
         assert!(fx.drv.find_text(label).is_some(), "{label}");
     }
-    // The prompt's Save, besides the F-key row's 5Save (the toolbar's is `[ Save ]`).
-    let saves = fx.drv.texts().into_iter().filter(|(_, _, t)| t == "Save");
+    // The prompt's `[ Save ]`, besides the toolbar's.
+    let saves = fx
+        .drv
+        .texts()
+        .into_iter()
+        .filter(|(_, _, t)| t == "[ Save ]");
     assert_eq!(saves.count(), 2, "the prompt's Save");
-    fx.drv.click_text(&mut fx.win, "Cancel");
+    fx.drv.click_text(&mut fx.win, "[ Cancel ]");
     assert!(!fx.win.prompt && !fx.win.close_ok);
     assert!(!fx.win.close_requested());
-    fx.drv.idle(&mut fx.win, 2);
-    fx.drv.click_text(&mut fx.win, "Discard");
+    fx.drv.until(&mut fx.win, 20, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 1);
+    fx.drv.click_text(&mut fx.win, "[ Discard ]");
     assert!(fx.win.close_ok);
     assert_eq!(std::fs::read(&fx.remote).unwrap(), FIXTURE);
 }
@@ -1081,7 +1096,10 @@ fn without_one_step_replace_save_is_off_and_save_copy_works() {
     let mut win = window_for(file);
     let mut drv = Driver::new(1000.0, 600.0);
     drv.idle(&mut win, 3);
-    assert!(drv.find_text(CANNOT_REPLACE).is_some(), "said whole");
+    assert!(
+        crate::gui::browser::shown_wrapped(&drv, CANNOT_REPLACE),
+        "said whole"
+    );
     drv.frame(&mut win, vec![Event::Text("00".into())], Modifiers::NONE);
     drv.key(&mut win, Key::S, command(false));
     assert!(win.job.is_none(), "Save did not start");
@@ -1182,7 +1200,7 @@ fn a_file_at_a_revision_moves_and_goes_to_but_edits_and_saves_nothing() {
         fx.win.rows.is_empty() && fx.win.recovering.is_none(),
         "no earlier session's journal is looked for"
     );
-    assert!(fx.drv.find_text("Restore").is_none());
+    assert!(fx.drv.find_text("[ Restore ]").is_none());
     assert!(
         fx.win.painted && fx.win.rows_painted > 0,
         "the rows are shown"
@@ -2122,7 +2140,7 @@ fn a_report_never_moves_the_rows() {
     for pass in 0..4 {
         fx.drv.idle(&mut fx.win, 1);
         assert!(
-            fx.drv.find_text(&long).is_none(),
+            !crate::gui::browser::shown_wrapped(&fx.drv, &long),
             "{pass}: not while the button is down"
         );
         assert_eq!(fx.win.layout.unwrap(), before, "{pass}");
@@ -2130,7 +2148,7 @@ fn a_report_never_moves_the_rows() {
     fx.drv.release(&mut fx.win, egui::PointerButton::Primary);
     fx.settle();
     assert!(
-        fx.drv.find_text(&long).is_some(),
+        crate::gui::browser::shown_wrapped(&fx.drv, &long),
         "shown whole after the release"
     );
     let after = fx.win.layout.unwrap();
@@ -2354,7 +2372,10 @@ fn a_local_file_changed_right_after_its_save_turns_the_window_read_only() {
         .unwrap_or_else(|| panic!("not said: {rows:?}"))
         .clone();
     assert!(said.contains(&*lists[0].to_string_lossy()), "{said}");
-    assert!(fx.drv.find_text(&said).is_some(), "said whole");
+    assert!(
+        crate::gui::browser::shown_wrapped(&fx.drv, &said),
+        "said whole"
+    );
     let changed = fx.win.doc.changed_count();
     fx.key(Key::ArrowRight, Modifiers::NONE);
     fx.typed("11");
@@ -2634,15 +2655,18 @@ fn read_only_with_unlisted_edits_asks_before_closing_and_retries() {
     assert!(fx.win.read_only.is_some());
     assert!(fx.lists().is_empty());
     assert!(!fx.win.close_requested(), "closed with unlisted edits");
-    fx.drv.idle(&mut fx.win, 2);
-    for label in ["Discard", "Cancel"] {
+    // The prompt's own journal write lands and its box gains a row (where Discard deletes the
+    // kept edits): only then do its buttons stand where a click finds them.
+    fx.drv.until(&mut fx.win, 20, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 1);
+    for label in ["[ Discard ]", "[ Cancel ]"] {
         assert!(fx.drv.find_text(label).is_some(), "{label}");
     }
-    fx.drv.click_text(&mut fx.win, "Cancel");
+    fx.drv.click_text(&mut fx.win, "[ Cancel ]");
     assert!(!fx.win.close_ok);
     unblock(&blocked);
     fx.settle();
-    fx.drv.click_text(&mut fx.win, "Keep edits…");
+    fx.drv.click_text(&mut fx.win, "[ Keep edits… ]");
     fx.settle();
     let lists = fx.lists();
     assert_eq!(lists.len(), 1, "{lists:?}");
@@ -2685,7 +2709,10 @@ fn read_only_edits_can_be_listed_at_a_chosen_path() {
     fx.lands(saved, snapshot);
     fx.settle();
     // Typed into the path field, as the owner does: click it, select all, type across frames.
-    let write = fx.drv.find_text("Write the list there").expect("the row");
+    let write = fx
+        .drv
+        .find_text("[ Write the list there ]")
+        .expect("the row");
     let field = Pos2::new(write.left() - 60.0, write.center().y);
     fx.drv.click(&mut fx.win, field);
     fx.drv.idle(&mut fx.win, 2);
@@ -2705,11 +2732,94 @@ fn read_only_edits_can_be_listed_at_a_chosen_path() {
     }
     // Checked before anything is written: a wrong path must not be written anywhere.
     assert_eq!(fx.win.keep_to, typed, "the typing did not reach the field");
-    fx.drv.click_text(&mut fx.win, "Write the list there");
+    fx.drv.click_text(&mut fx.win, "[ Write the list there ]");
     fx.settle();
     let text = std::fs::read_to_string(&chosen).unwrap();
     assert!(text.lines().any(|l| l == "0x0: 0011"), "{text}");
     assert!(fx.win.close_requested());
+    unblock(&blocked);
+}
+
+/// The read-only window's keep row by keyboard (X3-questions): Tab from the grid (nothing is
+/// typed read-only) to `[ Keep edits… ]`, Tab to the path field — Esc there gives the keyboard
+/// back to the grid — typing goes into the field, Tab to `[ Write the list there ]`, Enter
+/// writes the list there.
+#[test]
+fn the_keep_row_is_reached_and_pressed_by_keyboard() {
+    if running_as_root() {
+        eprintln!("skipping: root ignores folder permissions");
+        return;
+    }
+    let after = Arc::new(Mutex::new(None::<PathBuf>));
+    let target = after.clone();
+    let fs = FirstWrite {
+        fs: LocalFs::new(),
+        before_write: None,
+        after_rename: Some(Box::new(move || {
+            let path = target.lock().unwrap().clone().unwrap();
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .write_all_at(b"ZZ", 3)
+                .unwrap();
+        })),
+    };
+    let after2 = after.clone();
+    let (mut fx, _old, saved) = saved_in_place(Box::new(fs), move |fx| {
+        *after2.lock().unwrap() = Some(fx.remote.clone());
+        fx.typed("00");
+    });
+    let snapshot = fx.win.doc.patches().clone();
+    fx.typed("11");
+    let blocked = fx.block_lists();
+    fx.lands(saved, snapshot);
+    fx.settle();
+    assert!(
+        fx.drv.find_text("[ Keep edits… ]").is_some(),
+        "the keep row"
+    );
+    let focused = |fx: &Fx| fx.drv.ctx.memory(|m| m.focused());
+    let keep = below_id(Press::KeepEdits);
+    fx.key(Key::Tab, Modifiers::NONE);
+    assert_eq!(focused(&fx), Some(keep), "Tab: Keep edits…");
+    let p = chrome::PALETTE;
+    assert_eq!(
+        fx.drv.colors_of("[ Keep edits… ]"),
+        Some(vec![p.bar_text]),
+        "in the bar's colours"
+    );
+    fx.key(Key::Tab, Modifiers::NONE);
+    fx.drv.idle(&mut fx.win, 1);
+    assert_eq!(focused(&fx), Some(keep_id()), "Tab: the path field");
+    fx.key(Key::Escape, Modifiers::NONE);
+    fx.drv.idle(&mut fx.win, 1);
+    assert_eq!(focused(&fx), Some(grid_id()), "Esc: the grid");
+    fx.key(Key::Tab, Modifiers::NONE);
+    fx.key(Key::Tab, Modifiers::NONE);
+    fx.drv.idle(&mut fx.win, 1);
+    assert_eq!(focused(&fx), Some(keep_id()));
+    fx.key(Key::A, command(false));
+    let chosen = fx.tmp.path().join("by-keys.txt");
+    let typed = chosen.to_str().unwrap().to_string();
+    fx.drv.frame(
+        &mut fx.win,
+        vec![Event::Text(typed.clone())],
+        Modifiers::NONE,
+    );
+    fx.drv.idle(&mut fx.win, 1);
+    assert_eq!(fx.win.keep_to, typed, "typed into the field");
+    fx.key(Key::Tab, Modifiers::NONE);
+    assert_eq!(
+        focused(&fx),
+        Some(below_id(Press::WriteList)),
+        "Tab: Write the list there"
+    );
+    fx.key(Key::Enter, Modifiers::NONE);
+    fx.settle();
+    let text = std::fs::read_to_string(&chosen).unwrap();
+    assert!(text.lines().any(|l| l == "0x0: 0011"), "{text}");
+    assert!(fx.win.close_requested(), "listed: closing is free");
     unblock(&blocked);
 }
 
@@ -2739,7 +2849,7 @@ fn the_kept_line_carries_the_saves_notes() {
         Ok(())
     }));
     fx.settle();
-    fx.drv.click_text(&mut fx.win, "Write the list there");
+    fx.drv.click_text(&mut fx.win, "[ Write the list there ]");
     fx.settle();
     assert!(std::fs::read_to_string(&chosen)
         .unwrap()
@@ -2749,7 +2859,10 @@ fn the_kept_line_carries_the_saves_notes() {
     assert!(line.contains("could not be removed"), "{line}");
     let dir = private.lock().unwrap().clone().unwrap();
     assert!(line.contains(&*dir.to_string_lossy()), "{line}");
-    assert!(fx.drv.find_text(&line).is_some(), "shown whole");
+    assert!(
+        crate::gui::browser::shown_wrapped(&fx.drv, &line),
+        "shown whole"
+    );
     unblock(&blocked);
 }
 
@@ -3028,8 +3141,12 @@ fn f3_on_a_dirty_window_brings_up_the_prompt_and_discard_closes() {
     fx.key(Key::F3, Modifiers::NONE);
     assert_eq!(fx.drv.refused_closes, 1, "an edit: the close is refused");
     assert!(!fx.drv.window_closed);
+    // The prompt's own journal write lands and its box gains a row (where Discard deletes the
+    // kept edits): only then do its buttons stand where a click finds them.
+    fx.drv.until(&mut fx.win, 20, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 1);
     assert!(fx.drv.find_text("Unsaved changes").is_some(), "the prompt");
-    fx.drv.click_text(&mut fx.win, "Discard");
+    fx.drv.click_text(&mut fx.win, "[ Discard ]");
     fx.drv.idle(&mut fx.win, 1);
     assert!(fx.drv.window_closed, "Discard closes it");
     assert_eq!(
@@ -3090,7 +3207,11 @@ fn f5_f6_f8_respect_a_focused_field_the_prompt_a_save_and_read_only() {
     // The prompt is up.
     assert!(!fx.win.close_requested());
     assert!(fx.win.prompt);
-    fx.drv.idle(&mut fx.win, 2);
+    // The prompt's own journal write lands and its box gains a row (where Discard deletes the
+    // kept edits): only then do its buttons stand where a click finds them.
+    fx.drv.until(&mut fx.win, 20, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 1);
+
     let pane = fx.win.cursor.pane;
     for key in [Key::F5, Key::F6, Key::F8] {
         fx.key(key, Modifiers::NONE);
@@ -3102,7 +3223,7 @@ fn f5_f6_f8_respect_a_focused_field_the_prompt_a_save_and_read_only() {
         "F6 under the prompt"
     );
     assert_eq!(fx.win.cursor.pane, pane, "F8 under the prompt");
-    fx.drv.click_text(&mut fx.win, "Cancel");
+    fx.drv.click_text(&mut fx.win, "[ Cancel ]");
     // Read-only.
     fx.win.turn_read_only("the file changed");
     fx.key(Key::F5, Modifiers::NONE);
@@ -3115,7 +3236,9 @@ fn f5_f6_f8_respect_a_focused_field_the_prompt_a_save_and_read_only() {
 }
 
 /// `SOPEN_STATE` `close=ask` (the prompt's receipt): with an edit, the first pass brings up the
-/// unsaved-changes prompt in the dialog look — black on cyan, its title in its frame.
+/// unsaved-changes prompt in the dialog look, in cells (10 §6) — black on cyan, its title in its
+/// double line, its buttons `[ X ]`, its shadow black cells; nothing changes under the pointer
+/// (egui's buttons were inverted there).
 #[test]
 fn close_ask_brings_up_the_prompt_in_the_dialog_look() {
     let mut fx = fetched("blob.bin", FIXTURE, 1000.0, 600.0);
@@ -3123,42 +3246,42 @@ fn close_ask_brings_up_the_prompt_in_the_dialog_look() {
     fx.win.ask_close = true;
     fx.drv.idle(&mut fx.win, 3);
     assert!(fx.win.prompt);
-    let p = chrome::PALETTE;
-    assert_eq!(
-        fx.drv.colors_of("Unsaved changes"),
-        Some(vec![p.dialog_text])
-    );
-    let discard = fx.drv.find_text("Discard").expect("the prompt's buttons");
-    // `rects` lists the cells' background runs and the caret too (the rows are cells); the
-    // prompt's are painted over them, so the last one under a point is the prompt's.
-    let cyan = fx.drv.rects().iter().any(|(r, f, _)| {
-        *f == p.dialog_back && r.contains(discard.left_top() - egui::vec2(4.0, 4.0))
-    });
-    assert!(cyan, "the prompt is cyan");
+    // The prompt's own journal write lands and its box gains a row (where Discard deletes the
+    // kept edits): only then do its buttons stand where a click finds them.
+    fx.drv.until(&mut fx.win, 20, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 1);
     assert!(!fx.win.ask_close, "asked once");
-    // Its text is black on cyan; a button's label keeps its state's colour, so the one under
-    // the pointer (inverted: cyan on black) never goes black on black.
+    let p = chrome::PALETTE;
+    let title = cell_row_of(&fx.drv, " Unsaved changes ").expect("its title");
+    assert!(title.contains("╔═") && title.contains("═╗"), "{title}");
     let message = fx.drv.text_starting_with("Save the changes").unwrap();
+    assert_eq!(fx.drv.colors_of(&message), Some(vec![p.dialog_text]));
+    let discard = fx
+        .drv
+        .find_text("[ Discard ]")
+        .expect("the prompt's buttons");
+    let seen = |fx: &Fx| cell_at(&fx.drv, discard.center()).expect("a cell");
+    let before = seen(&fx);
     assert_eq!(
-        fx.drv.painted_colors_of(&message),
-        Some(vec![p.dialog_text])
+        (before.fg, before.bg),
+        (Some(p.dialog_text), Some(p.dialog_back)),
+        "black on cyan"
     );
-    assert_eq!(fx.drv.painted_colors_of("Cancel"), Some(vec![cga::BLACK]));
-    let under = |fx: &Fx, at: Pos2| {
-        fx.drv
-            .rects()
-            .iter()
-            .rev()
-            .find(|(r, _, _)| r.contains(at))
-            .map(|(_, f, _)| *f)
-    };
-    let at = discard.center();
-    fx.drv.move_to(&mut fx.win, at);
+    fx.drv.move_to(&mut fx.win, discard.center());
     fx.drv.idle(&mut fx.win, 2);
-    let label = fx.drv.painted_colors_of("Discard").unwrap();
-    let fill = under(&fx, at).expect("the button's fill");
-    assert_eq!(fill, cga::BLACK, "hovered: inverted");
-    assert_eq!(label, vec![cga::CYAN], "hovered: cyan on black");
+    assert_eq!(seen(&fx), before, "nothing changes under the pointer");
+    // The shadow: the two cells right of the box's right border are black.
+    let layers = crate::gui::cells::layers(&fx.drv.ctx);
+    let hit = crate::gui::cells::find(&layers, "[ Discard ]")[0];
+    let l = &layers[hit.layer];
+    let row = &l.seen()[usize::from(hit.cells.y - l.buf.area.y)];
+    let border = row
+        .iter()
+        .rposition(|c| c.symbol == "║")
+        .expect("its border");
+    for c in &row[border + 1..border + 3] {
+        assert_eq!(c.bg, Some(cga::BLACK), "the shadow: {c:?}");
+    }
 }
 
 /// 04 §3: a viewer's own F-key acts with no modifier at all — Shift+F5 or Alt+F5 saves nothing,
@@ -4503,13 +4626,12 @@ mod stream {
         );
         sx.drv.resize(400.0, 400.0);
         sx.frames(4);
-        let seen = sx
-            .drv
-            .find_text(CHANGED)
-            .expect("the warning is cut or out of sight");
-        assert!(seen.left() >= 0.0 && seen.right() <= 400.0, "{seen:?}");
-        let rows = sx.drv.rows_of(CHANGED).unwrap();
-        assert!(rows >= 2, "{rows} row at 400 points");
+        // Wrapped by cells, its rows wholly on screen (the cells `shown_wrapped` reads).
+        assert!(
+            crate::gui::browser::shown_wrapped(&sx.drv, CHANGED),
+            "the warning is cut or out of sight"
+        );
+        assert!(sx.drv.find_text(CHANGED).is_none(), "one row at 400 points");
         let row = 0x1000 / ROW;
         assert!(
             (sx.win.top_row..sx.win.top_row + sx.win.visible).contains(&row),
@@ -5628,13 +5750,15 @@ mod stream {
             ed.key(Key::S, command(false));
             ed.frames(2);
             assert!(ed.win.confirm.is_some(), "{side:?}: no question");
-            let asked = ed
-                .drv
-                .text_starting_with(&format!("Save to {} (", ed.shown()))
-                .unwrap_or_default();
+            let asked = format!(
+                "Save to {} ({})? sopen checks its size, modification time and the pages under \
+                 your edits. A program writing to the file while it saves can lose that write.",
+                ed.shown(),
+                crate::human(ed.win.doc.size())
+            );
             assert!(
-                asked.contains("A program writing to the file while it saves can lose that write"),
-                "{asked}"
+                crate::gui::browser::shown_wrapped(&ed.drv, &asked),
+                "{side:?}: {asked}"
             );
             assert_eq!(
                 ed.moved.now(),
@@ -5928,7 +6052,7 @@ mod stream {
                 && rows[0].contains("(1 byte changed) kept at "),
             "{rows:?}"
         );
-        assert!(ed.drv.find_text("Restore").is_some(), "its button");
+        assert!(ed.drv.find_text("[ Restore ]").is_some(), "its button");
         ed.press_row("unsaved edits", RowAction::Restore);
         ed.goto(0x1234);
         ed.ready();
@@ -5996,8 +6120,9 @@ mod stream {
         ed.kept();
         let dir = ed.journals().pop().unwrap();
         assert!(!ed.win.close_requested());
-        ed.frames(2);
-        ed.drv.click_text(&mut ed.win, "Discard");
+        ed.ready();
+        ed.frames(1);
+        ed.drv.click_text(&mut ed.win, "[ Discard ]");
         assert!(ed.win.discard && ed.win.close_ok);
         let win = std::mem::replace(
             &mut ed.win,
@@ -6053,7 +6178,7 @@ mod stream {
                 && rows[0].ends_with(".undo.txt"),
             "{rows:?}"
         );
-        assert!(ed.drv.find_text("Load as edits").is_some());
+        assert!(ed.drv.find_text("[ Load as edits ]").is_some());
         ed.press_row("bytes replaced", RowAction::Load);
         ed.goto(0x1000 + 5);
         ed.ready();
@@ -6202,16 +6327,12 @@ mod stream {
             w.save_as.as_ref().is_some_and(|(m, ..)| !m.busy())
         });
         ed.frames(2);
-        let said: Vec<String> = ed
-            .drv
-            .texts()
-            .into_iter()
-            .map(|(_, _, t)| t)
-            .filter(|t| t.contains("exists"))
-            .collect();
-        assert_eq!(
-            said,
-            ["model.edited-1.bin exists — not replaced. Save again saves as model.edited-2.bin"],
+        // Wrapped by cells at the box's width.
+        assert!(
+            crate::gui::browser::shown_wrapped(
+                &ed.drv,
+                "model.edited-1.bin exists — not replaced. Save again saves as model.edited-2.bin"
+            ),
             "the refusal"
         );
         assert_eq!(std::fs::read(&field).unwrap(), b"someone else's");
@@ -6246,25 +6367,17 @@ mod stream {
             crate::gui::binary::tilde(&out)
         );
         save_as_into(&mut ed, &out);
-        let said = |ed: &Ed| -> Vec<String> {
-            ed.drv
-                .texts()
-                .into_iter()
-                .map(|(_, _, t)| t)
-                .filter(|t| t.contains("every name from"))
-                .collect()
-        };
-        assert_eq!(said(&ed), std::slice::from_ref(&taken), "the modal's note");
+        // Its rows, wrapped by cells at the box's width.
+        let said = |ed: &Ed, text: &str| crate::gui::browser::shown_wrapped(&ed.drv, text);
+        assert!(said(&ed, &taken), "the modal's note");
+        assert!(!said(&ed, "exists"), "no refusal yet");
         ed.key(Key::Enter, Modifiers::NONE);
         ed.drv.until(&mut ed.win, 60, |w| {
             w.save_as.as_ref().is_some_and(|(m, ..)| !m.busy())
         });
         ed.frames(2);
-        let refused = said(&ed);
-        assert!(
-            refused.len() == 1 && refused[0].ends_with(&taken) && refused[0].contains("exists"),
-            "{refused:?}"
-        );
+        let refused = format!("{} exists: {taken}", out.join("model.edited.bin").display());
+        assert!(said(&ed, &refused), "{refused}");
         assert_eq!(
             std::fs::read(out.join("model.edited.bin")).unwrap(),
             b"the owner's file"
@@ -6336,11 +6449,13 @@ mod stream {
             w.save_as.as_ref().is_some_and(|(m, ..)| !m.busy())
         });
         ed.frames(2);
-        let said = ed
-            .drv
-            .text_starting_with(&format!("{} changed while it was read (", ed.shown()))
-            .unwrap_or_default();
-        assert!(said.ends_with("; nothing was saved"), "{said:?}");
+        // Wrapped by cells at the box's width: how it begins, and how it ends.
+        let begins = format!("{} changed while it was read (", ed.shown());
+        assert!(crate::gui::browser::shown_wrapped(&ed.drv, &begins));
+        assert!(crate::gui::browser::shown_wrapped(
+            &ed.drv,
+            "; nothing was saved"
+        ));
         assert!(entries(&out).is_empty(), "{:?}", entries(&out));
         assert!(ed.win.doc.unsaved());
     }
@@ -6351,14 +6466,20 @@ mod stream {
     /// what §10 says; Save copy stands in for Save where Save is off.
     #[test]
     fn e16_the_close_prompt_saves_saves_as_discards_or_cancels() {
-        // The prompt's buttons: a label it shows besides the F-key row's (`5Save`; the
-        // toolbar's are `[ Save ]`, `[ Save copy ]`, `[ Save As… ]`).
+        // The prompt's buttons, in cells: a `[ label ]` it shows besides the toolbar's
+        // (`[ Save ]`, `[ Save copy ]`, `[ Save As… ]`).
         let buttons = |ed: &Ed| -> Vec<&str> {
             ["Save", "Save copy", "Save As…", "Discard", "Cancel"]
                 .into_iter()
                 .filter(|b| {
-                    ed.drv.texts().iter().filter(|(_, _, t)| t == b).count()
-                        > usize::from(*b == "Save")
+                    let label = format!("[ {b} ]");
+                    let toolbar = usize::from(matches!(*b, "Save" | "Save copy" | "Save As…"));
+                    ed.drv
+                        .texts()
+                        .iter()
+                        .filter(|(_, _, t)| *t == label)
+                        .count()
+                        > toolbar
                 })
                 .collect()
         };
@@ -6366,25 +6487,24 @@ mod stream {
         let mut ed = ed(&body());
         ed.typed("AB");
         assert!(!ed.win.close_requested());
-        ed.frames(2);
-        assert!(ed
-            .drv
-            .find_text(&format!(
-                "Save the changes to {} before closing?",
-                ed.shown()
-            ))
-            .is_some());
+        ed.ready();
+        ed.frames(1);
+        assert!(crate::gui::browser::shown_wrapped(
+            &ed.drv,
+            &format!("Save the changes to {} before closing?", ed.shown())
+        ));
         assert_eq!(buttons(&ed), ["Save", "Save As…", "Discard", "Cancel"]);
-        ed.drv.click_text(&mut ed.win, "Cancel");
+        ed.drv.click_text(&mut ed.win, "[ Cancel ]");
         assert!(!ed.win.prompt && !ed.win.close_ok && ed.win.doc.unsaved());
         // Save: it saves, then closes.
         assert!(!ed.win.close_requested());
-        ed.frames(2);
+        ed.ready();
+        ed.frames(1);
         let save = ed
             .drv
             .texts()
             .iter()
-            .filter(|(_, _, t)| t == "Save")
+            .filter(|(_, _, t)| t == "[ Save ]")
             .map(|(r, _, _)| r.center())
             .next_back()
             .unwrap();
@@ -6400,12 +6520,13 @@ mod stream {
         std::fs::create_dir(&out).unwrap();
         ed.win.save_as_folder = Some(out.clone());
         assert!(!ed.win.close_requested());
-        ed.frames(2);
+        ed.ready();
+        ed.frames(1);
         let prompt_save_as = ed
             .drv
             .texts()
             .iter()
-            .filter(|(_, _, t)| t == "Save As…")
+            .filter(|(_, _, t)| t == "[ Save As… ]")
             .map(|(r, _, _)| r.center())
             .next_back()
             .unwrap();
@@ -6426,13 +6547,14 @@ mod stream {
         ed.typed("EF");
         ed.win.can_replace = false;
         assert!(!ed.win.close_requested());
-        ed.frames(2);
+        ed.ready();
+        ed.frames(1);
         assert_eq!(buttons(&ed), ["Save copy", "Save As…", "Discard", "Cancel"]);
         let copy = ed
             .drv
             .texts()
             .iter()
-            .filter(|(_, _, t)| t == "Save copy")
+            .filter(|(_, _, t)| t == "[ Save copy ]")
             .map(|(r, _, _)| r.center())
             .next_back()
             .unwrap();
@@ -6452,8 +6574,9 @@ mod stream {
         assert_eq!(dirs.len(), 1, "{dirs:?}");
         assert_eq!(kept_in(&dirs[0]).0, ["0x0: 12 was 00"]);
         assert!(!ed.win.close_requested());
-        ed.frames(2);
-        ed.drv.click_text(&mut ed.win, "Discard");
+        ed.ready();
+        ed.frames(1);
+        ed.drv.click_text(&mut ed.win, "[ Discard ]");
         assert!(
             ed.win.close_ok && ed.win.close_requested(),
             "closing is allowed"
@@ -7173,13 +7296,18 @@ mod stream {
                     "{tag}: {line:?}"
                 );
                 ed.frames(2);
-                assert!(ed.drv.find_text("Remove it").is_some(), "{tag}: no button");
+                assert!(
+                    ed.drv.find_text("[ Remove it ]").is_some(),
+                    "{tag}: no button"
+                );
                 // Save waits for the answer.
                 ed.key(Key::S, command(false));
                 ed.frames(2);
                 assert!(ed.win.job.is_none(), "{tag}: saved before the answer");
-                ed.drv
-                    .click_text(&mut ed.win, if keep { "Keep it" } else { "Remove it" });
+                ed.drv.click_text(
+                    &mut ed.win,
+                    if keep { "[ Keep it ]" } else { "[ Remove it ]" },
+                );
                 ed.drv.until(&mut ed.win, 30, |w| {
                     w.answering.is_none() && w.left.is_none()
                 });
@@ -7268,7 +7396,7 @@ mod stream {
                 if discard {
                     assert!(!ed.win.close_requested(), "{tag}");
                     ed.frames(2);
-                    ed.drv.click_text(&mut ed.win, "Discard");
+                    ed.drv.click_text(&mut ed.win, "[ Discard ]");
                     assert!(ed.win.discard && ed.win.close_ok, "{tag}");
                 } else {
                     ed.key(Key::Z, command(false));
@@ -7376,7 +7504,7 @@ mod stream {
         let open = hold.clone();
         ed.win.before_drain = Some(Box::new(move || open.store(false, Ordering::SeqCst)));
         ed.frames(2);
-        ed.drv.click_text(&mut ed.win, "Remove it");
+        ed.drv.click_text(&mut ed.win, "[ Remove it ]");
         let deadline = Instant::now() + Duration::from_secs(30);
         while temp.exists() {
             assert!(Instant::now() < deadline, "never removed");
@@ -7385,7 +7513,7 @@ mod stream {
         assert!(ed.win.answering.is_some(), "the answer is done already");
         assert!(!ed.win.close_requested());
         ed.frames(2);
-        ed.drv.click_text(&mut ed.win, "Discard");
+        ed.drv.click_text(&mut ed.win, "[ Discard ]");
         assert!(ed.win.discard && ed.win.close_ok);
         let win = std::mem::replace(
             &mut ed.win,
@@ -7460,7 +7588,7 @@ mod stream {
                 std::fs::write(&temp, b"another program's file").unwrap();
                 if live {
                     ed.frames(2);
-                    ed.drv.click_text(&mut ed.win, "Remove it");
+                    ed.drv.click_text(&mut ed.win, "[ Remove it ]");
                     ed.drv.until(&mut ed.win, 30, |w| w.answering.is_none());
                     assert!(live_question(&ed).is_some(), "{tag}: the question went");
                 } else {
@@ -7485,7 +7613,7 @@ mod stream {
                 );
                 if live {
                     ed.frames(2);
-                    ed.drv.click_text(&mut ed.win, "Keep it");
+                    ed.drv.click_text(&mut ed.win, "[ Keep it ]");
                     ed.drv.until(&mut ed.win, 30, |w| {
                         w.answering.is_none() && w.left.is_none()
                     });
@@ -7553,7 +7681,7 @@ mod stream {
                 "{side:?}"
             );
             ed.frames(2);
-            ed.drv.click_text(&mut ed.win, "Remove it");
+            ed.drv.click_text(&mut ed.win, "[ Remove it ]");
             ed.drv.until(&mut ed.win, 30, |w| w.answering.is_none());
             assert_eq!(std::fs::read(&temp).unwrap(), bytes, "{side:?}: removed");
             let status = ed.win.status.text.clone();
@@ -7701,7 +7829,7 @@ mod stream {
                 let held = std::fs::read(&temp).unwrap();
                 if live {
                     ed.frames(2);
-                    ed.drv.click_text(&mut ed.win, "Remove it");
+                    ed.drv.click_text(&mut ed.win, "[ Remove it ]");
                     ed.drv.until(&mut ed.win, 30, |w| w.answering.is_none());
                 } else {
                     ed.press_row("could not verify", RowAction::Remove);
@@ -7776,7 +7904,7 @@ mod stream {
                 ed.win.status.text
             );
             ed.frames(2);
-            ed.drv.click_text(&mut ed.win, "Remove it");
+            ed.drv.click_text(&mut ed.win, "[ Remove it ]");
             ed.drv.until(&mut ed.win, 30, |w| w.answering.is_none());
             assert!(
                 live_question(&ed).is_some(),
@@ -7785,7 +7913,7 @@ mod stream {
             assert!(temp.exists());
             ed.moved.fail_remove.store(false, Ordering::SeqCst);
             ed.frames(2);
-            ed.drv.click_text(&mut ed.win, "Remove it");
+            ed.drv.click_text(&mut ed.win, "[ Remove it ]");
             ed.drv.until(&mut ed.win, 30, |w| {
                 w.answering.is_none() && w.left.is_none()
             });
@@ -8205,9 +8333,9 @@ mod stream {
                 .clone()
                 .expect("a refusal that offers other ways");
             assert!(offer.contains("this server has no copy-data"), "{offer}");
-            assert!(ed.drv.find_text("Write in place…").is_some());
+            assert!(ed.drv.find_text("[ Write in place… ]").is_some());
             assert_eq!(ed.moved.now(), (0, 0, 0), "refused before any transfer");
-            ed.drv.click_text(&mut ed.win, "Write in place…");
+            ed.drv.click_text(&mut ed.win, "[ Write in place… ]");
             assert!(ed
                 .win
                 .in_place_ask
@@ -8220,7 +8348,7 @@ mod stream {
                     patch::At::Go
                 }
             });
-            ed.drv.click_text(&mut ed.win, "Write in place");
+            ed.drv.click_text(&mut ed.win, "[ Write in place ]");
             ed.drv.until(&mut ed.win, 60, |w| w.job.is_none());
             assert_eq!(bytes_at(&ed.remote, E1_AT, 1), [0xDE], "the first run");
             ed.reopen();
@@ -8235,7 +8363,7 @@ mod stream {
                     .any(|l| l.starts_with("bytes replaced by the save at ")),
                 "{rows:?}"
             );
-            assert!(ed.drv.find_text("Load as edits").is_some());
+            assert!(ed.drv.find_text("[ Load as edits ]").is_some());
         }
     }
 
@@ -8453,8 +8581,11 @@ mod stream {
             ),
             "{rows:?}"
         );
-        assert!(ed.drv.find_text("Restore").is_none(), "no Restore button");
-        assert!(ed.drv.find_text("Discard").is_some());
+        assert!(
+            ed.drv.find_text("[ Restore ]").is_none(),
+            "no Restore button"
+        );
+        assert!(ed.drv.find_text("[ Discard ]").is_some());
         ed.win.row_action(0, RowAction::Restore);
         ed.frames(3);
         assert_eq!(ed.win.doc.changed_count(), 0, "applied");
@@ -8498,8 +8629,8 @@ mod stream {
         ed.frames(3);
         let rows = ed.rows();
         assert!(rows[0].ends_with(crate::journal::ASK_PENDING), "{rows:?}");
-        assert!(ed.drv.find_text("Restore anyway").is_some());
-        ed.drv.click_text(&mut ed.win, "Restore anyway");
+        assert!(ed.drv.find_text("[ Restore anyway ]").is_some());
+        ed.drv.click_text(&mut ed.win, "[ Restore anyway ]");
         ed.ready();
         assert_eq!(ed.win.doc.byte(3), Some(0xCC));
     }
@@ -8767,6 +8898,8 @@ mod stream {
             );
         }
     }
+
+    mod questions;
 
     /// 07 §4.1: without `copy-data`, the refusal of a file above 256 MiB states the cost at the
     /// rate the viewer is getting (over `sftp-server` the stream's reads take real time, so the
