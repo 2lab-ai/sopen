@@ -2141,6 +2141,113 @@ fn gui_with_no_display_here_is_its_line_and_exit_1() {
     );
 }
 
+/// [`sopen`] with `input` on its standard input, which then ends.
+fn sopen_fed(home: &Path, args: &[&str], env: &[(&str, &str)], input: &str) -> Output {
+    let mut cmd = sopen_command(home);
+    cmd.args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut guard = Reaped(Some(cmd.spawn().unwrap()));
+    let child = guard.0.as_mut().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // A sopen that refused before reading it all closes the pipe: that is no failure here.
+    let _ = std::io::Write::write_all(&mut stdin, input.as_bytes());
+    drop(stdin);
+    let stdout = collected(child.stdout.take());
+    let stderr = collected(child.stderr.take());
+    let deadline = std::time::Instant::now() + RUN_LIMIT;
+    let status = loop {
+        if let Some(status) = guard.0.as_mut().unwrap().try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sopen {args:?} did not end within {RUN_LIMIT:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    guard.0 = None;
+    let left = || deadline.saturating_duration_since(std::time::Instant::now());
+    Output {
+        status,
+        stdout: stdout.recv_timeout(left()).expect("stdout ended"),
+        stderr: stderr.recv_timeout(left()).expect("stderr ended"),
+    }
+}
+
+/// HOST's half of the switch (`--here --gui --state-stdin`, 10 §7.3, X2-host) refuses before any
+/// window, exit 2 (§7.3's "too old for the switch, or a usage error") with one line and nothing
+/// on its output: a newer state than it reads (§7.4's line), a state of another host than the
+/// folder's, no state, a file, an address. A display is named on Linux, so the refusals, not
+/// §7.1's no-display line, are what is seen; no window opens.
+#[test]
+fn hosts_half_of_the_switch_refuses_before_any_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(tmp.path()).unwrap().join("dir");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    let dir = dir.to_str().unwrap().to_string();
+    let state = |v: u32, host: &str| {
+        format!(
+            "{{\"v\":{v},{host}\"panels\":[{{\"folder\":\"{dir}\"}},{{\"folder\":\"{dir}\"}}]}}\n"
+        )
+    };
+    let display = [("DISPLAY", ":0")];
+    let file = format!("{dir}/a.txt");
+    for (source, input, line) in [
+        (
+            dir.clone(),
+            state(2, ""),
+            "sopen: the sender sent switch state v2; this sopen reads up to v1 — update one of \
+             them\n"
+                .to_string(),
+        ),
+        (
+            dir.clone(),
+            state(1, "\"host\":\"box\","),
+            "sopen: the switch's state is of box, this window of this machine\n".to_string(),
+        ),
+        (
+            dir.clone(),
+            String::new(),
+            "sopen: the input ended before the switch's state\n".to_string(),
+        ),
+        (
+            file.clone(),
+            state(1, ""),
+            format!("sopen: --state-stdin opens a folder; {file} is not one\n"),
+        ),
+        (
+            "http://127.0.0.1:9/".to_string(),
+            state(1, ""),
+            "sopen: --state-stdin opens a folder; http://127.0.0.1:9/ is an address\n".to_string(),
+        ),
+    ] {
+        let args = ["--here", "--gui", "--state-stdin", "--", &source];
+        let out = sopen_fed(tmp.path(), &args, &display, &input);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{source}: {}",
+            text(&out.stderr)
+        );
+        assert_eq!(text(&out.stderr), line, "{source}");
+        assert_eq!(text(&out.stdout), "", "{source}");
+    }
+    // Without `--here` and `--gui` it is not a command line sopen takes.
+    let out = sopen_fed(
+        tmp.path(),
+        &["--state-stdin", "--", &dir],
+        &display,
+        &state(1, ""),
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+}
+
 #[test]
 fn no_sopen_on_the_target_is_its_own_message_and_127() {
     let tmp = tempfile::tempdir().unwrap();

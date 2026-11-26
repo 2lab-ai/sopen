@@ -653,6 +653,29 @@ of: if ssh has not exited 2 s later (it stays for the browser's connections), so
 (`sopen on HOST ended while ssh stayed for the browser's connections; the tunnel to … is closed`); if it has, HOST's
 exit code. The tunnel is tested against a stand-in ssh; a live receipt against a real HOST is still open.
 
+HOST's half of the switch from `sopen --tui` ([10](10-tui.md) §7.3) is `sopen --here --gui --state-stdin --
+FOLDER`: a hidden flag that needs `--here` and `--gui` and goes with nothing that opens something else (`--tui`,
+`--app`, `--hex`, `--browser`, `--hold-until-eof`). The first line of its input is the switch's state (10 §7.4, one
+JSON line). A state it cannot take — a newer `v` (`the sender sent switch state v<n>; this sopen reads up to v<m> —
+update one of them`), no line, one that does not read, a state of another host than FOLDER's — and a file or an
+address as FOLDER are usage errors (exit 2), said before any window opens; FOLDER is any folder SOURCE can name, on
+HOST or on another machine (the switch sends one on its own machine as `<that machine>:<abs>`). The file browser
+opens at the state in a switched window: F12, its title row's `[TUI]`, the close button and Cmd/Ctrl+Q and +W
+return, unsaved edits first asking the window's own close prompt (its Cancel keeps the window); once it has
+returned and what still writes has ended, HOST's sopen prints `sopen-xtools-state <the state's JSON line>` — a fixed
+cue, as `sopen-tunnel-open` is — and exits 0 (3 after a refused save, as any window). The rest of its input is read
+to its end, as `--hold-until-eof` reads it, and heard by the window drawn or hidden. At the end — the other side's
+sopen gone — nothing is read from or written to the session again, and the window closes when it holds nothing it
+would lose; with unsaved edits or a job that writes it stays, after the fixed line `sopen-xtools-kept`, until it is
+closed there, no longer showing `[TUI]`. The session can die at any time while something still writes (a report
+after the window, a Save's progress), so HOST's sopen relays its standard output and error to the session through
+pipes of its own: a relay whose session is gone drains what it is given, and no write in sopen fails. Each relay is
+asked before the session is let go, and before sopen exits, to pass on all it was given and answer; so the kept line
+said just before the session is let go reaches it (at most 2 s), and the state's cue reaches a peer that reads it
+slowly (at most 30 s: a peer that keeps the session open and stops reading holds sopen's end that long, as it held
+its writes before the relays); a dead session answers at once. Then the relays have at most 2 s more to end, for a
+child still holding one of the pipes.
+
 On HOST, sopen is looked for on PATH, then in the usual Homebrew and cargo install paths; when there is none HOST
 prints `sopen is not installed on HOST (brew install 2lab-ai/tap/sopen-preview)` and the run exits 127. A
 non-interactive ssh session on macOS has no Homebrew on PATH, and sopen finds ffmpeg on PATH: HOST's sopen runs with

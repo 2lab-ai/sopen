@@ -2699,6 +2699,17 @@ impl Browser {
                 self.shown.as_ref().map_or(&[], |s| s.as_slice()),
             )
     }
+
+    /// What the window would lose if it closed unasked (10 §7.3, HOST's input ending; X2-host):
+    /// the viewer on screen holds unsaved edits or runs a Save (07 §10), or a file operation or
+    /// a git action runs (§7.4's jobs that write). A viewer already closed that still writes is
+    /// waited for after the window ([`open`]), so it loses nothing.
+    pub(crate) fn would_lose(&mut self) -> bool {
+        let holds = |v: &mut Viewer| v.embedded.window.hold() != crate::views::Hold::Clean;
+        self.viewer.as_mut().is_some_and(holds)
+            || self.ops.busy()
+            || self.git.panels.iter().any(|p| !p.running.is_empty())
+    }
 }
 
 impl Window for Browser {

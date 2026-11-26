@@ -926,6 +926,12 @@ pub fn set_mode_button(ctx: &egui::Context, label: &'static str) {
     ctx.data_mut(|d| d.insert_temp(mode_button_id(), ModeButton(label)));
 }
 
+/// The title row shows no mode button again, as a window started directly (HOST's switched
+/// window once its session has ended, 10 §7.3).
+pub fn clear_mode_button(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<ModeButton>(mode_button_id()));
+}
+
 /// Where the mode button stands on screen, as the last pass drew it: the shell's input hook
 /// takes a press there before anything else sees it (`gui::FKeyInput`) — the switch, as F12,
 /// whatever is open; a modal's backdrop never gets it.

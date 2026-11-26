@@ -90,6 +90,15 @@ struct Cli {
     /// open, wait for the input's end — the other machine's sopen ending — then exit 0.
     #[arg(long, hide = true, requires = "here", conflicts_with_all = ["app", "hex"])]
     hold_until_eof: bool,
+    /// Internal (HOST's half of the switch from `sopen --tui`, 10 §7.3): the switch's state is
+    /// the first line of the input; the folder opens at it in a window that hands it back.
+    #[arg(
+        long,
+        hide = true,
+        requires_all = ["here", "gui"],
+        conflicts_with_all = ["tui", "app", "hex", "hold_until_eof", "browser"]
+    )]
+    state_stdin: bool,
     /// Receipt check: play FILE on the real audio device at gain 0 for ~2 s and print the
     /// callback / underrun counts (AGENTS.md "Receipts").
     #[arg(
@@ -230,6 +239,9 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 fn main() -> ExitCode {
+    // `--state-stdin`: its relayed output is passed on to the session to the last byte when
+    // `main` ends, a panic's message included (a no-op for any other run).
+    let _relayed = gui::switch_host::EndOfRun;
     let cli = Cli::parse();
     if let Some(editor) = cli
         .raise_window
@@ -288,6 +300,7 @@ fn main() -> ExitCode {
                 cli.hex,
                 cli.tui,
                 cli.gui,
+                cli.state_stdin,
                 dirs,
                 &mut rec,
             )
@@ -544,9 +557,14 @@ fn run_source(
     hex: bool,
     tui: bool,
     gui: bool,
+    state_stdin: bool,
     dirs: &Dirs,
     rec: &mut Record,
 ) -> Result<u8> {
+    // HOST's half of the switch: a folder here, whatever the destination (it is told `--here`).
+    if state_stdin {
+        return run_state_stdin(source, dirs, rec).map(|()| 0);
+    }
     // An address before anything reads SOURCE as a path or `host:path` (`http` would be a host).
     if let Some(url) = sopen::url::parse(source) {
         if tui {
@@ -972,6 +990,49 @@ fn run_tui(
         target: flag.map(str::to_string),
     };
     let outcome = gui::term::open(start, &hooks, to)?;
+    rec.action = Some(outcome.action());
+    rec.conflict = outcome.conflict;
+    match outcome.refused {
+        Some(message) => Err(Refused(message).into()),
+        None => Ok(()),
+    }
+}
+
+/// `sopen --here --gui --state-stdin -- FOLDER` (10 §7.3, X2-host): HOST's half of the switch.
+/// The window needs a display here (§7.1's line, exit 1, before anything is read). The state is
+/// the first line of the input, and FOLDER a folder — here or on another machine, as any SOURCE:
+/// the switch sends one on its own machine as `<that machine>:/abs` (§7.3); a state this sopen
+/// cannot take, a file or an address is a usage error (exit 2) before any window. The browser
+/// opens at the state in a switched window ([`gui::switch_host`]), which prints the cue.
+fn run_state_stdin(source: &str, dirs: &Dirs, rec: &mut Record) -> Result<()> {
+    if sopen::url::parse(source).is_some() {
+        bail!(Usage(format!(
+            "--state-stdin opens a folder; {} is an address",
+            sopen::url::redacted(source)
+        )));
+    }
+    window_here(gui::display_available())?;
+    let sent = gui::switch_host::read_state(&mut std::io::stdin().lock()).map_err(Usage)?;
+    gui::fkeys_for_run(dirs.state.clone());
+    let target = target::parse(source).map_err(anyhow::Error::msg)?;
+    let (mut place, path) = Place::connect(&target, dirs, rec)?;
+    let abs = place.fs().realpath(&path)?;
+    if !place.fs().stat(&abs)?.is_dir {
+        bail!(Usage(format!(
+            "--state-stdin opens a folder; {} is not one",
+            place.display(&abs)
+        )));
+    }
+    rec.kind = Some(Kind::Directory);
+    rec.action = Some("open");
+    let hooks = gui::Hooks::from_env()?;
+    let start = browser_for(place, &abs, dirs);
+    // Another host's state is refused before any window: a usage error, as a refused line.
+    let ran = gui::switch_host::run(start, &hooks, sent);
+    let outcome = ran.map_err(|e| match e.downcast::<gui::switch_host::NotGiven>() {
+        Ok(not) => Usage(not.0).into(),
+        Err(e) => e,
+    })?;
     rec.action = Some(outcome.action());
     rec.conflict = outcome.conflict;
     match outcome.refused {
@@ -1931,6 +1992,52 @@ mod tests {
         assert!(Cli::try_parse_from(["sopen", "stems", "--work-dir", "/w", "a.mp3"]).is_err());
         assert!(Cli::try_parse_from(["sopen", "stems", "--wait-to-publish", "a.mp3"]).is_err());
         assert!(Cli::try_parse_from(["sopen"]).is_err());
+    }
+
+    /// `--state-stdin` (10 §7.3, X2-host), hidden: as HOST's half of the switch is given it —
+    /// with `--here` and `--gui`, a folder after `--` — and refused without either of them or
+    /// beside a flag that opens something else.
+    #[test]
+    fn state_stdin_is_hosts_half_of_the_switch() {
+        let given = [
+            "sopen",
+            "--here",
+            "--gui",
+            "--state-stdin",
+            "--",
+            "/srv/dir",
+        ];
+        let cli = Cli::try_parse_from(given).unwrap();
+        assert!(cli.state_stdin && cli.here && cli.gui && !cli.tui);
+        assert_eq!(cli.source.as_deref(), Some("/srv/dir"));
+        for flags in [&["--here"][..], &["--gui"], &[]] {
+            let args = ["sopen", "--state-stdin"]
+                .into_iter()
+                .chain(flags.iter().copied());
+            assert!(
+                Cli::try_parse_from(args.chain(["/d"])).is_err(),
+                "{flags:?}"
+            );
+        }
+        for other in [
+            &["--tui"][..],
+            &["--app", "X"],
+            &["--hex"],
+            &["--browser"],
+            &["--hold-until-eof"],
+            &["--target", "box"],
+        ] {
+            let args = ["sopen", "--here", "--gui", "--state-stdin"]
+                .into_iter()
+                .chain(other.iter().copied());
+            assert!(
+                Cli::try_parse_from(args.chain(["/d"])).is_err(),
+                "{other:?}"
+            );
+        }
+        assert!(!Cli::try_parse_from(["sopen", "a"]).unwrap().state_stdin);
+        let help = Cli::command_for_test().render_long_help().to_string();
+        assert!(!help.contains("state-stdin"), "hidden: {help}");
     }
 
     /// A folder, with no `--app` / `--hex`, opens in the browser (not the editor); with a

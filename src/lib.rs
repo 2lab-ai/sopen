@@ -101,12 +101,15 @@ pub fn debug_enabled() -> bool {
     std::env::var("SOPEN_LOG").is_ok_and(|v| v.eq_ignore_ascii_case("debug"))
 }
 
-/// `debug!("...")` prints `sopen[debug] ...` to stderr when `SOPEN_LOG=debug`.
+/// `debug!("...")` prints `sopen[debug] ...` to stderr when `SOPEN_LOG=debug`, ignoring a write
+/// error: a standard error whose reader is gone (a session that died, the F-key watchdog's pipe
+/// once sopen has ended) drops the line rather than panicking, as `eprintln!` would.
 #[macro_export]
 macro_rules! debug {
     ($($arg:tt)*) => {
         if $crate::debug_enabled() {
-            eprintln!("sopen[debug] {}", format_args!($($arg)*));
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "sopen[debug] {}", format_args!($($arg)*));
         }
     };
 }
