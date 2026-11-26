@@ -722,3 +722,145 @@ fn r1_discard_before_the_prompts_write_lands_leaves_no_journal() {
         ed.journals()
     );
 }
+
+/// One pass carrying `events` (key presses as given: egui marks a press of a key still down as
+/// its repeat).
+fn pass(ed: &mut Ed, events: Vec<Event>, modifiers: Modifiers) {
+    ed.drv.frame(&mut ed.win, events, modifiers);
+}
+
+fn press(key: Key, modifiers: Modifiers) -> Event {
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+
+/// R2: the pass in which Tab brings the keyboard to a row's first control carries a Space
+/// repeat (Space held while typing in the ASCII column): it presses nothing — the temp the
+/// question names is still there, the question still asked.
+#[test]
+fn r2_a_repeat_in_the_pass_tab_brings_the_keyboard_presses_nothing() {
+    let mut ed = ed(&body());
+    ed.typed("AB");
+    kill_at(&mut ed, patch::Step::Copy(1));
+    ed.reopen();
+    let temps = ed.temps();
+    assert_eq!(temps.len(), 1, "{temps:?}");
+    ed.win.place(0, Pane::Ascii);
+    key_event(&mut ed, Key::Space, true);
+    let events = vec![
+        press(Key::Tab, Modifiers::NONE),
+        press(Key::Space, Modifiers::NONE),
+    ];
+    pass(&mut ed, events, Modifiers::NONE);
+    ed.drv.until(&mut ed.win, 20, |w| w.removing.is_none());
+    ed.frames(1);
+    key_event(&mut ed, Key::Space, false);
+    assert_eq!(ed.temps(), temps, "the repeat removed the temp");
+    assert!(
+        ed.rows().iter().any(|l| l.ends_with("— remove it?")),
+        "the question was answered: {:?}",
+        ed.rows()
+    );
+}
+
+/// R2: the same with Shift+Tab from the hex column, which brings the keyboard to the last
+/// control — the second row's `[ Discard ]`: both journals stay.
+#[test]
+fn r2_a_repeat_in_the_pass_shift_tab_brings_the_keyboard_discards_nothing() {
+    let mut ed = two_kept_journals();
+    ed.win.place(0, Pane::Hex);
+    key_event(&mut ed, Key::Space, true);
+    let events = vec![
+        press(Key::Tab, Modifiers::SHIFT),
+        press(Key::Space, Modifiers::NONE),
+    ];
+    pass(&mut ed, events, Modifiers::SHIFT);
+    ed.frames(1);
+    key_event(&mut ed, Key::Space, false);
+    assert_eq!(ed.journals().len(), 2, "the repeat discarded a journal");
+    assert_eq!(ed.rows().len(), 2);
+}
+
+/// R2: Space held after it pressed a row's `[ Discard ]` (the keyboard back on the grid, the
+/// cursor in the ASCII column): its repeats, with the text a keyboard sends for each, type no
+/// byte until it is let go.
+#[test]
+fn r2_a_held_space_after_a_row_press_types_nothing() {
+    let mut ed = two_kept_journals();
+    ed.win.place(0, Pane::Ascii);
+    for _ in 0..3 {
+        tab(&mut ed, false);
+    }
+    // Space down: the press (and its text, which the button takes).
+    let down = vec![
+        press(Key::Space, Modifiers::NONE),
+        Event::Text(" ".to_string()),
+    ];
+    pass(&mut ed, down.clone(), Modifiers::NONE);
+    assert_eq!(ed.journals().len(), 1, "Discard pressed");
+    for _ in 0..3 {
+        pass(&mut ed, down.clone(), Modifiers::NONE);
+    }
+    key_event(&mut ed, Key::Space, false);
+    ed.frames(1);
+    assert_eq!(ed.win.doc.changed_count(), 0, "the held Space typed bytes");
+    // Let go, a Space typed is a byte again.
+    ed.drv
+        .frame(&mut ed.win, vec![Event::Text(" ".into())], Modifiers::NONE);
+    ed.frames(1);
+    assert_eq!(
+        ed.win.doc.changed_count(),
+        1,
+        "a Space typed after the release"
+    );
+}
+
+/// R2: the read-only keep row on a window too narrow for its path field beside
+/// `[ Keep edits… ]` (18 cells and fewer): the field goes on a row of its own, so every Tab stop
+/// has cells — Tab from the grid reaches `[ Keep edits… ]`, the field (its caret drawn, what is
+/// typed in it), then `[ Write the list there ]` — at 18 and at 19 cells (and, beside, at 56
+/// and 57, where the last button wraps or does not).
+#[test]
+fn r2_the_keep_field_always_has_cells_when_it_is_a_tab_stop() {
+    if running_as_root() {
+        eprintln!("skipping: root ignores folder permissions");
+        return;
+    }
+    for cols in [18u16, 19, 56, 57] {
+        let mut fx = fetched("blob.bin", FIXTURE, f32::from(cols) * 8.0, 600.0);
+        let blocked = fx.block_lists();
+        fx.win.turn_read_only("a test");
+        assert!(fx.win.retained.is_none(), "{cols}: listed nowhere");
+        fx.drv.idle(&mut fx.win, 3);
+        let focused = |fx: &Fx| fx.drv.ctx.memory(|m| m.focused());
+        fx.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(focused(&fx), Some(below_id(Press::KeepEdits)), "{cols}");
+        fx.key(Key::Tab, Modifiers::NONE);
+        fx.drv.idle(&mut fx.win, 1);
+        assert_eq!(focused(&fx), Some(keep_id()), "{cols}: the field");
+        // The caret on one of the field's cells, inside the window: a field of no cells puts
+        // it past the row's end.
+        let caret = cells::layers(&fx.drv.ctx).iter().any(|l| {
+            let a = l.buf.area;
+            l.caret.is_some_and(|c| c.x < a.right() && c.y < a.bottom())
+        });
+        assert!(caret, "{cols}: the field has the keyboard but no cell");
+        fx.key(Key::A, command(false));
+        fx.drv.frame(
+            &mut fx.win,
+            vec![Event::Text("x.txt".into())],
+            Modifiers::NONE,
+        );
+        fx.drv.idle(&mut fx.win, 1);
+        assert_eq!(fx.win.keep_to, "x.txt", "{cols}: typed into the field");
+        fx.key(Key::Tab, Modifiers::NONE);
+        assert_eq!(focused(&fx), Some(below_id(Press::WriteList)), "{cols}");
+        assert!(in_cells(&fx.drv, "[ Write the list"), "{cols}: drawn");
+        unblock(&blocked);
+    }
+}

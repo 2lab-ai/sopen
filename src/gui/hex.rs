@@ -1939,6 +1939,9 @@ pub(super) struct HexWindow {
     /// The context of the last pass (the window's or the terminal's): what a background
     /// generation's end repaints.
     wake: Option<egui::Context>,
+    /// Enter or Space that pressed a control of the rows below the grid, while it stays down
+    /// ([`HexWindow::drop_held`]).
+    held: Option<Key>,
 }
 
 impl Drop for HexWindow {
@@ -2163,11 +2166,14 @@ enum Below {
     Buttons(Vec<(u16, Control)>, Option<u16>),
     /// The read-only window's: `[ Keep edits… ]` and its path field, `field` cells wide, then
     /// `[ Write the list there ]` — on this row (`write`), or alone on the next
-    /// ([`Below::KeepWrite`]) where this one has no room for it.
+    /// ([`Below::KeepWrite`]) where this one has no room for it. Where not even a cell of the
+    /// field fits beside the button (`field` 0), the field is a row of its own first
+    /// ([`Below::KeepField`]).
     Keep {
         field: u16,
         write: bool,
     },
+    KeepField(u16),
     KeepWrite,
 }
 
@@ -2178,6 +2184,12 @@ fn below_id(press: Press) -> egui::Id {
 /// A button's cells: `[ label ]`.
 fn button_cells(label: &str) -> u16 {
     cells::width(label) as u16 + 4
+}
+
+/// Whether a button at cell `x` of a row `cols` wide shows a cell (it is cut at the row's end):
+/// only one that shows is drawn, acts, and is a Tab stop.
+fn shows(x: u16, cols: u16) -> bool {
+    x < cols
 }
 
 /// `controls` on rows `cols` cells wide, from cell 1, two blanks apart — a `│` with a blank
@@ -2411,6 +2423,7 @@ impl HexWindow {
             under: Vec::new(),
             covering: Vec::new(),
             wake: None,
+            held: None,
         }
     }
 
@@ -3661,17 +3674,26 @@ impl HexWindow {
         }
         if self.read_only.is_some() && self.retained.is_none() {
             // `[ Keep edits… ]`, the field, `[ Write the list there ]` on one row where the
-            // field keeps its fewest cells; else the last on the next row.
+            // field keeps its fewest cells; else the last on the next row — and the field on a
+            // row of its own where not a cell of it fits beside the button.
             let at = 1 + button_cells("Keep edits…") + 2;
             let after = 2 + button_cells("Write the list there") + 1;
-            let write = cols >= at + KEEP_FEWEST + after;
-            let field = if write {
-                cols - at - after
+            if cols >= at + KEEP_FEWEST + after {
+                let field = cols - at - after;
+                out.push(Below::Keep { field, write: true });
+            } else if cols > at + 1 {
+                let field = cols - at - 1;
+                out.push(Below::Keep {
+                    field,
+                    write: false,
+                });
+                out.push(Below::KeepWrite);
             } else {
-                cols.saturating_sub(at + 1).max(1)
-            };
-            out.push(Below::Keep { field, write });
-            if !write {
+                out.push(Below::Keep {
+                    field: 0,
+                    write: false,
+                });
+                out.push(Below::KeepField(cols.saturating_sub(2)));
                 out.push(Below::KeepWrite);
             }
         }
@@ -3743,13 +3765,25 @@ impl HexWindow {
             match row {
                 Below::Text(..) => {}
                 Below::Buttons(all, _) => {
-                    let on = all.iter().filter(|(_, c)| c.on);
+                    let on = all.iter().filter(|(x, c)| c.on && shows(*x, cols));
                     out.extend(on.map(|(_, c)| below_id(c.press)));
                 }
-                Below::Keep { .. } => out.extend([below_id(Press::KeepEdits), keep_id()]),
+                Below::Keep { field, .. } => {
+                    if shows(1, cols) {
+                        out.push(below_id(Press::KeepEdits));
+                    }
+                    if *field > 0 {
+                        out.push(keep_id());
+                    }
+                }
+                Below::KeepField(field) => {
+                    if *field > 0 {
+                        out.push(keep_id());
+                    }
+                }
                 Below::KeepWrite => {}
             }
-            if matches!(row_write(row), Some(true)) {
+            if matches!(row_write(row), Some(true)) && shows(1, cols) {
                 out.push(below_id(Press::WriteList));
             }
         }
@@ -3818,15 +3852,18 @@ impl HexWindow {
                 Below::Keep { field, write: here } => {
                     button(ui, &mut buf, 1, y, &keep);
                     let at = 1 + button_cells(keep.label) + 2;
-                    let field = Cells::new(at, y, (*field).min(cols.saturating_sub(at)), 1);
-                    dialog::field(ui, &grid, field, keep_id(), &mut self.keep_to, |e| e);
-                    let focused = ctx.memory(|m| m.has_focus(keep_id()));
-                    let id = keep_id();
-                    let shown =
-                        dialog::field_cells(&ctx, &mut buf, field, id, &self.keep_to, focused);
-                    caret = caret.or(shown);
+                    let field = Cells::new(at, y, *field, 1);
+                    if field.width > 0 {
+                        caret = caret.or(self.keep_field(ui, &grid, &mut buf, field));
+                    }
                     if *here {
                         button(ui, &mut buf, field.right() + 2, y, &write);
+                    }
+                }
+                Below::KeepField(field) => {
+                    let field = Cells::new(1, y, *field, 1);
+                    if field.width > 0 {
+                        caret = caret.or(self.keep_field(ui, &grid, &mut buf, field));
                     }
                 }
                 Below::KeepWrite => button(ui, &mut buf, 1, y, &write),
@@ -3840,6 +3877,56 @@ impl HexWindow {
             caret,
         );
         pressed
+    }
+
+    /// The key that pressed a control below the grid ([`HexWindow::held`]), while it stays
+    /// down: its presses — a held key's are its auto-repeats — and, for Space, the text each one
+    /// sends are taken from the pass, so they never type into the grid the keyboard went back to
+    /// (or press what has it now). Let go — its release in this pass, or no longer down — it is
+    /// forgotten, and what comes after the release stays.
+    fn drop_held(&mut self, ctx: &egui::Context) {
+        let Some(key) = self.held else {
+            return;
+        };
+        ctx.input_mut(|i| {
+            let released = i.events.iter().position(
+                |e| matches!(e, egui::Event::Key { key: k, pressed: false, .. } if *k == key),
+            );
+            let end = released.unwrap_or(i.events.len());
+            let mut k = 0;
+            i.events.retain(|e| {
+                let before = k < end;
+                k += 1;
+                let held = match e {
+                    egui::Event::Key {
+                        key: k,
+                        pressed: true,
+                        ..
+                    } => *k == key,
+                    egui::Event::Text(t) => key == Key::Space && t == " ",
+                    _ => false,
+                };
+                !(before && held)
+            });
+            if released.is_some() || !i.key_down(key) {
+                self.held = None;
+            }
+        });
+    }
+
+    /// The keep row's path field at cells `at` of `buf` (on `grid`): its engine and its cells
+    /// (`ops::dialog`'s), and the caret's cell while it has the keyboard.
+    fn keep_field(
+        &mut self,
+        ui: &mut egui::Ui,
+        grid: &Grid,
+        buf: &mut Buffer,
+        at: Cells,
+    ) -> Option<Position> {
+        let ctx = ui.ctx().clone();
+        dialog::field(ui, grid, at, keep_id(), &mut self.keep_to, |e| e);
+        let focused = ctx.memory(|m| m.has_focus(keep_id()));
+        dialog::field_cells(&ctx, buf, at, keep_id(), &self.keep_to, focused)
     }
 
     /// What a control of the rows below the grid asked for.
@@ -3913,6 +4000,24 @@ impl HexWindow {
                 m.move_focus(egui::FocusDirection::None);
             })
         };
+        // A key's auto-repeat never presses a control: only a press of its own does — also in
+        // the pass in which Tab brings the keyboard to one (the control has it at once, and is
+        // drawn later in the pass). Typed text is its `Text`, which this leaves.
+        if !controls.is_empty() {
+            ctx.input_mut(|input| {
+                input.events.retain(|e| {
+                    !matches!(
+                        e,
+                        egui::Event::Key {
+                            key: Key::Enter | Key::Space,
+                            pressed: true,
+                            repeat: true,
+                            ..
+                        }
+                    )
+                })
+            });
+        }
         let Some(i) = at else {
             if focused.is_none() && left() && bare_key(ctx, Key::Escape) {
                 focus(grid_id());
@@ -3933,20 +4038,6 @@ impl HexWindow {
             return false;
         };
         ctx.memory_mut(|m| m.set_focus_lock_filter(controls[i], lock));
-        // A key's auto-repeat never presses a control: only a press of its own does.
-        ctx.input_mut(|input| {
-            input.events.retain(|e| {
-                !matches!(
-                    e,
-                    egui::Event::Key {
-                        key: Key::Enter | Key::Space,
-                        pressed: true,
-                        repeat: true,
-                        ..
-                    }
-                )
-            })
-        });
         if take(false) {
             match controls.get(i + 1) {
                 Some(next) => focus(*next),
@@ -5251,6 +5342,7 @@ impl super::Window for HexWindow {
         }
         let whole = ui.max_rect();
         self.wake = Some(ctx.clone());
+        self.drop_held(&ctx);
         // Under the questions up (the area as last laid out): the toolbar's cells.
         self.under = self.questions_cover();
         self.start_recovery(&ctx);
@@ -5328,8 +5420,13 @@ impl super::Window for HexWindow {
                 .show(ui, |ui| self.below_ui(ui, &rows))
                 .inner;
             if let Some(press) = pressed {
+                // Pressed by Enter or Space (not a click): that key is held back until let go.
+                let by_key = [Key::Enter, Key::Space]
+                    .into_iter()
+                    .find(|k| ctx.input(|i| i.key_pressed(*k)));
                 spend_presses(&ctx);
                 self.below_press(&ctx, press);
+                self.held = by_key.or(self.held);
             }
         }
         egui::CentralPanel::default()
