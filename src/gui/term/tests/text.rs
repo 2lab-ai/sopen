@@ -82,3 +82,62 @@ fn ts4_the_text_viewer_shows_the_windows_cells_in_the_terminal() {
     );
     the_same_cells(&fx, &drv, &mut win, "F8's list");
 }
+
+/// TS-6 (10 §10, T38) on the text viewer: the glyphs it draws for control characters — BEL's
+/// `•`, CAN's `↑`, a C1 control's `·` — are sopen's own (the CP437 table), so an ambiguous-wide
+/// terminal is sent their stand-ins, substituted where the viewer lays its row (the printer cannot
+/// tell them from content); the same characters written in the file stay as they are, content
+/// laid in two cells; the bar's own words (` · `, a cut's `…`) are sent theirs too, so the stats
+/// stay whole. A terminal that draws `─` in one cell gets the glyphs.
+#[test]
+fn ts6_the_text_viewers_control_glyphs_have_their_stand_ins() {
+    let fx = fixture_with(0, &["a-ctrl.txt"]);
+    let path = std::path::Path::new(&fx.root).join("a-ctrl.txt");
+    std::fs::write(path, "a\u{7}b\u{18}c\u{85}d ♥• end\n").unwrap();
+    let (mut drv, mut win) = window(&fx, 100, 30);
+    for _ in 0..4 {
+        drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
+    }
+    drv.key(&mut win, Key::Enter, Modifiers::NONE);
+    drv.until(&mut win, 20, |w| w.ready());
+    drv.idle(&mut win, 2);
+    let narrow_vt = terminal_of(&drv.ctx, &mut win, 100, 30, true);
+    let text = narrow_vt.text();
+    assert!(text.contains("a•b↑c·d ♥• end"), "the glyphs:\n{text}");
+    // An ambiguous-wide terminal on the same context: its probe says so to the passes.
+    let tape = Tape::default();
+    {
+        let mut s = tape.0.borrow_mut();
+        s.size = (100, 30);
+        s.ambiguous = true;
+    }
+    let out = Bytes::default();
+    let mut b = Backend::new(tape, out.clone(), drv.ctx.clone(), true);
+    b.offset = later();
+    b.enter().unwrap();
+    b.pass(&mut win, vec![]).unwrap();
+    b.draw().unwrap();
+    let mut wide = Vt::wide(100, 30);
+    wide.feed(&out.0.borrow());
+    let text = wide.text();
+    let row = (0..wide.rows)
+        .map(|y| wide.row(y))
+        .find(|r| r.contains("end"))
+        .unwrap_or_else(|| panic!("the row:\n{text}"));
+    assert!(row.contains("a.b^c.d "), "the stand-ins: {row:?}\n{text}");
+    let content = row.split("d ").nth(1).unwrap_or_default();
+    assert!(
+        content.starts_with('♥') && content.contains('•'),
+        "the file's own ♥ and • as they are: {row:?}"
+    );
+    // The bar's own words keep their cells: its ` · ` as ` . `, the stats whole, the cut title's
+    // `…` a `~`.
+    assert!(
+        wide.row(1)
+            .contains(" 1 lines . 20 B . plain text . UTF-8 "),
+        "the bar whole: {:?}",
+        wide.row(1)
+    );
+    assert!(wide.row(1).starts_with(" ~"), "{:?}", wide.row(1));
+    b.leave();
+}

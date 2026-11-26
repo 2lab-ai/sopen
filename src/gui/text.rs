@@ -3873,6 +3873,10 @@ struct TextWindow {
     memo: wrap::Memo,
     /// The cells rows are laid out in (the last pass's).
     room: usize,
+    /// The pass is a terminal's that draws a glyph of ambiguous width in two cells (10 §10,
+    /// [`cells::ambiguous_wide`]): sopen's own glyphs in the rows and its own words around them
+    /// get their stand-ins where they are laid ([`own_glyph`], [`own_text`]).
+    wide: bool,
     wheel_rest: f32,
     /// Not wrapped: the part of a byte the wheel sideways has moved by and not yet moved.
     wheel_across: f32,
@@ -4120,6 +4124,7 @@ impl TextWindow {
             shoot_loading: false,
             memo: wrap::Memo::default(),
             room: 0,
+            wide: false,
             wheel_rest: 0.0,
             wheel_across: 0.0,
             page: None,
@@ -5452,7 +5457,10 @@ impl TextWindow {
         if right <= x0 {
             return;
         }
-        let shown = cells::fit_start(&stats, usize::from(right - x0));
+        let shown = own_text(
+            &cells::fit_start(&stats, usize::from(right - x0)),
+            self.wide,
+        );
         let at = right - cells::width(&shown) as u16;
         cells::put(buf, at, y, &shown, usize::from(right - at), dim);
         let room = usize::from(at - x0).saturating_sub(2);
@@ -5461,7 +5469,12 @@ impl TextWindow {
             return;
         }
         let title = cells::fit_left(&self.title, room);
-        cells::put(buf, x0, y, &title, room, Pen::new(p.text, p.back));
+        // (The path is the file's own, but the `…` a cut adds.)
+        let shown = match title.strip_prefix('…') {
+            Some(rest) if title != self.title => format!("{}{rest}", own_text("…", self.wide)),
+            _ => title.clone(),
+        };
+        cells::put(buf, x0, y, &shown, room, Pen::new(p.text, p.back));
         if title != self.title {
             let row = grid.rect(Cells::new(x0, y, room as u16, 1));
             ui.interact(
@@ -5638,10 +5651,12 @@ impl TextWindow {
         }
         let (place, status) = self.status_line();
         let pen = Pen::new(p.text, p.back);
+        let wide = self.wide;
         let mut x = x0;
         let put = |buf: &mut Buffer, x: &mut u16, text: &str, end: u16| {
             let room = usize::from(end.saturating_sub(*x));
-            *x += cells::put(buf, *x, y, &cells::fit_start(text, room), room, pen) as u16;
+            let shown = own_text(&cells::fit_start(text, room), wide);
+            *x += cells::put(buf, *x, y, &shown, room, pen) as u16;
         };
         // Before the field: its `Go to`, and the place's ` │ ` before that.
         let place_end = match field {
@@ -5673,7 +5688,7 @@ impl TextWindow {
             let caret = dialog::field_cells(ctx, buf, at, goto_id(), text, focused);
             if text.is_empty() {
                 let room = usize::from(at.width).saturating_sub(1);
-                let hint = cells::fit_start(GOTO_HINT, room);
+                let hint = own_text(&cells::fit_start(GOTO_HINT, room), wide);
                 let black = chrome::cga::BLACK;
                 cells::put(buf, at.x + 1, y, &hint, room, Pen::new(p.dim, black));
             }
@@ -5690,7 +5705,8 @@ impl TextWindow {
         let color = if status.error { p.error } else { p.text };
         let room = usize::from(end.saturating_sub(x));
         let shown = cells::fit_start(&text, room);
-        cells::put(buf, x, y, &shown, room, Pen::new(color, p.back));
+        let laid = own_text(&shown, wide);
+        cells::put(buf, x, y, &laid, room, Pen::new(color, p.back));
         if shown != text {
             let row = grid.rect(Cells::new(x, y, room as u16, 1));
             ui.interact(
@@ -5815,6 +5831,7 @@ impl TextWindow {
         }
         let p = chrome::PALETTE;
         let dim = Pen::new(p.dim, p.back);
+        let wide = self.wide;
         // The window: its frame, titled as PC Shell's (single-lined in a preview: it does not
         // have the keyboard), the rows inside it.
         let inner = cells::frame(buf, frame, TITLE, !self.preview);
@@ -5956,7 +5973,7 @@ impl TextWindow {
         let number = |buf: &mut Buffer, y: u16, row: &wrap::Row| {
             let label = match row.line {
                 Some(line) => (line + 1).to_string(),
-                None if row.loose => format!("…0x{:X}", row.at),
+                None if row.loose => format!("{}0x{:X}", own_text("…", wide), row.at),
                 None => format!("0x{:X}", row.at),
             };
             let room = usize::from(gutter_end - rows.x);
@@ -5980,7 +5997,7 @@ impl TextWindow {
                 // while they all fit and the row goes on.
                 let mut most = 2 * usize::from(end - text_x) + 16;
                 loop {
-                    let chars = row_chars(row, colors, p.text, p.dim, most);
+                    let chars = row_chars(row, colors, p.text, p.dim, most, wide);
                     let all = chars.len() < most;
                     if lay_row(buf, text_x, y, end, &chars) || all {
                         break;
@@ -5994,14 +6011,16 @@ impl TextWindow {
                 // index pass reaches them (06 §7.2).
                 for k in page.rows.len()..usize::from(rows.height) {
                     let room = usize::from(end - text_x);
-                    cells::put(buf, text_x, rows.y + k as u16, LOADING, room, dim);
+                    let loading = own_text(LOADING, wide);
+                    cells::put(buf, text_x, rows.y + k as u16, &loading, room, dim);
                 }
             }
         }
         if self.pending && self.page.as_ref().is_none_or(Page::is_empty) && rows.height > 0 {
             // Nothing to show yet (a stream's first block is on its way): one dim row.
             let x = (rows.x + 1).min(end);
-            cells::put(buf, x, rows.y, LOADING, usize::from(end - x), dim);
+            let loading = own_text(LOADING, wide);
+            cells::put(buf, x, rows.y, &loading, usize::from(end - x), dim);
         }
         if self.pending {
             // How long this read has been on its way; a pass when the status row says more.
@@ -6120,13 +6139,16 @@ impl Laid {
 
 /// A row's first `most` characters as painted (a tab as its spaces), each in its colour: by
 /// `colors`, the line's colour per character with the row's first at index `first`, else plain;
-/// its placeholder marks and C1 controls' `·` `dim` (08 §7.4, D32).
+/// its placeholder marks and C1 controls' `·` `dim` (08 §7.4, D32). In an ambiguous-wide
+/// terminal (`wide`) a control character's glyph — sopen's own — is its stand-in
+/// ([`own_glyph`]); the same glyph written in the file stays as it is.
 fn row_chars(
     row: &wrap::Row,
     colors: Option<(usize, &[Color32])>,
     plain: Color32,
     dim: Color32,
     most: usize,
+    wide: bool,
 ) -> Vec<(char, Color32)> {
     let mut out = Vec::with_capacity(row.cut.shown.len().min(most));
     for (i, &(c, n)) in row.cut.shown.iter().enumerate() {
@@ -6141,9 +6163,36 @@ fn row_chars(
                 .and_then(|(first, colors)| colors.get(first + i).copied())
                 .unwrap_or(plain)
         };
+        let c = match row.cut.own.binary_search(&i) {
+            Ok(_) => own_glyph(c, wide),
+            Err(_) => c,
+        };
         out.extend(std::iter::repeat_n((c, color), usize::from(n)));
     }
     out
+}
+
+/// A glyph of sopen's own table (a control character's code page 437 glyph, a C1 control's `·`)
+/// as a terminal that draws a glyph of ambiguous width in two cells (`wide`) is sent it (10 §10,
+/// T38): §10's stand-in, `.` for one it has none for (a letter the printer would lay in two
+/// cells); as it is everywhere else — as the hex view's CP437 column (`hex::column_glyph`).
+fn own_glyph(c: char, wide: bool) -> char {
+    if !wide || !super::term::ambiguous(c) {
+        return c;
+    }
+    let stand_in = super::term::narrow(c.encode_utf8(&mut [0u8; 4]));
+    stand_in.and_then(|s| s.chars().next()).unwrap_or('.')
+}
+
+/// Words of sopen's own on the viewer's rows (the stats' and the status row's ` · `, a cut's
+/// `…`, `loading…`) as an ambiguous-wide terminal (`wide`) is sent them: their `·` `.` and `…`
+/// `~` (10 §10), so the words keep their cells; as they are everywhere else.
+fn own_text(text: &str, wide: bool) -> String {
+    if wide {
+        text.replace('·', ".").replace('…', "~")
+    } else {
+        text.to_string()
+    }
 }
 
 /// Whether `c` is written right to left (`Some(true)`: Hebrew, Arabic and the other
@@ -6380,6 +6429,7 @@ impl Window for TextWindow {
             self.keys(&ctx, typing);
         }
         let p = chrome::PALETTE;
+        self.wide = cells::ambiguous_wide(&ctx);
         let grid = Grid::over(ui.max_rect());
         let laid = Laid::on(&grid, self.preview, &self.notices);
         let mut buf = Buffer::empty(grid.all());

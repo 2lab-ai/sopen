@@ -62,6 +62,13 @@ fn faint(c: char) -> bool {
     ('\u{80}'..='\u{9F}').contains(&c)
 }
 
+/// Whether `c`'s face is a glyph of sopen's own (a tab is spaces): a C0 control or DEL as its
+/// code page 437 glyph, a C1 control as `·` — what an ambiguous-wide terminal is sent a stand-in
+/// for where the row is laid (10 §10, T38), where the same glyph written in the file is content.
+fn own(c: char) -> bool {
+    (c < ' ' && c != '\t') || c == '\u{7F}' || faint(c)
+}
+
 /// What stands for a byte no rule proves a character start before (08 §7.4, D28), painted dim:
 /// a mark is honest where a syllable read out of phase would not be.
 pub(super) const MARK: char = '░';
@@ -129,6 +136,9 @@ pub(super) struct Cut {
     pub dim: usize,
     /// Which of `shown` are C1 controls' dim `·` (08 D32), in order.
     pub dots: Vec<usize>,
+    /// Which of `shown` are a control character's glyph — sopen's own, not the file's: C0 and
+    /// DEL's code page 437 glyphs, C1's `·` ([`own`]) — in order.
+    pub own: Vec<usize>,
 }
 
 #[cfg(test)]
@@ -207,8 +217,9 @@ struct Clusters {
     kind: Vec<Kind>,
     /// Each character as painted, with how many times (a tab: spaces).
     shown: Vec<(char, u8)>,
-    /// Which characters are C1 controls (painted dim, D32).
+    /// Which characters are C1 controls (painted dim, D32), and which control characters at all.
     dots: Vec<usize>,
+    own: Vec<usize>,
 }
 
 impl Clusters {
@@ -225,6 +236,7 @@ impl Clusters {
             kind: Vec::new(),
             shown: Vec::with_capacity(cells.len()),
             dots: (0..cells.len()).filter(|&i| faint(cells[i].ch)).collect(),
+            own: (0..cells.len()).filter(|&i| own(cells[i].ch)).collect(),
         };
         let (mut x, mut i) = (0usize, 0usize);
         for g in face.graphemes(true) {
@@ -281,6 +293,7 @@ pub(super) fn cut_row(cells: &[Cell], complete: bool, width: usize) -> Cut {
             shown: Vec::new(),
             dim: 0,
             dots: Vec::new(),
+            own: Vec::new(),
         };
     }
     #[cfg(test)]
@@ -336,6 +349,7 @@ pub(super) fn cut_row(cells: &[Cell], complete: bool, width: usize) -> Cut {
         shown: c.shown[..shown].to_vec(),
         dim: 0,
         dots: c.dots.iter().copied().filter(|&i| i < shown).collect(),
+        own: c.own.iter().copied().filter(|&i| i < shown).collect(),
     }
 }
 
@@ -1033,7 +1047,7 @@ impl Wrapper<'_> {
                 None => marked(enc, start, &bytes, whole, None),
             };
             let mut shown = Vec::with_capacity(cells.len());
-            let mut dots = Vec::new();
+            let (mut dots, mut owns) = (Vec::new(), Vec::new());
             // By cluster as painted: a tab to its stop in cells from the row's start (a wide
             // glyph takes two, a mark nothing past its base).
             let faces: String = (cells.iter())
@@ -1048,8 +1062,12 @@ impl Wrapper<'_> {
                     continue;
                 }
                 for c in g.chars() {
-                    if faint(cells[shown.len()].ch) {
+                    let ch = cells[shown.len()].ch;
+                    if faint(ch) {
                         dots.push(shown.len());
+                    }
+                    if own(ch) {
+                        owns.push(shown.len());
                     }
                     shown.push((c, 1));
                 }
@@ -1067,6 +1085,7 @@ impl Wrapper<'_> {
                     dim: dim.min(shown.len()),
                     shown,
                     dots,
+                    own: owns,
                 }),
                 first_char,
             });

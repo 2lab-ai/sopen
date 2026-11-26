@@ -402,26 +402,34 @@ fn the_bars_arrows_step_a_row_and_its_track_jumps() {
     );
 }
 
-/// Every glyph the viewer draws for a character from its own tables — a control's code page 437
-/// glyph, DEL's `⌂`, a C1 control's `·`, a placeholder mark — has a stand-in in an
-/// ambiguous-wide terminal (10 §10, T38) or is no ambiguous glyph: none is a letter the printer
-/// would lay in two cells as a text's (XW-receipts' carried note on CP437 letters: the text
-/// viewer shows none).
+/// A row's control characters are recorded as sopen's own glyphs, wrapped or not — C0 and DEL as
+/// their code page 437 glyphs, a C1 control as `·` — and only those: laid for an ambiguous-wide
+/// terminal each of width A is its stand-in (`•` `.`, `↑` `^`, `·` `.`) while the same glyphs
+/// written in the file stay content; laid for any other, the glyphs.
 #[test]
-fn the_viewers_own_glyphs_all_have_their_stand_ins() {
-    let mut own: Vec<char> = (0u8..0x20)
-        .chain([0x7F])
-        .map(|b| wrap::face(char::from(b)))
-        .collect();
-    own.extend(['\u{85}', '\u{9B}'].map(wrap::face));
-    own.push(wrap::MARK);
-    for c in own {
-        let shown = c.to_string();
-        assert!(
-            !term::ambiguous(c) || term::narrow(&shown).is_some(),
-            "{c:?} ({:04X}) would be laid in two cells",
-            u32::from(c)
-        );
+fn a_rows_control_glyphs_and_only_they_get_stand_ins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write(
+        tmp.path(),
+        "c.txt",
+        "a\u{7}b\u{18}c\u{85}d\u{1}e\u{7F} ♥•↑·\n".as_bytes(),
+    );
+    let mut win = TextWindow::new(TextDoc::open(&path).unwrap(), "box:c".into(), "c", vec![]);
+    let mut drv = Driver::new(400.0, 160.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    for mode in ["wrapped", "not wrapped"] {
+        let row = &win.page.as_ref().unwrap().rows[0];
+        assert_eq!(row.cut.text(), "a•b↑c·d☺e⌂ ♥•↑·", "{mode}");
+        assert_eq!(row.cut.own, [1, 3, 5, 7, 9], "{mode}");
+        let laid = |wide: bool| -> String {
+            let chars = row_chars(row, None, Color32::WHITE, Color32::GRAY, 64, wide);
+            chars.into_iter().map(|(c, _)| c).collect()
+        };
+        // (`☺` and `⌂` are not of width A: one cell in every terminal.)
+        assert_eq!(laid(true), "a.b^c.d☺e⌂ ♥•↑·", "{mode}");
+        assert_eq!(laid(false), "a•b↑c·d☺e⌂ ♥•↑·", "{mode}");
+        drv.key(&mut win, Key::W, Modifiers::NONE);
+        drv.until(&mut win, 5, |w| w.ready());
     }
 }
 
