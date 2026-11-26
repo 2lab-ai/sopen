@@ -6,12 +6,12 @@
 viewers, the image, video, audio and hex editors, the git panel and the directory tree.
 
 <p align="center">
-  <a href="#folders-the-file-browser-with-git">folders</a> · <a href="#images-crop-pixelize-paste-save-back">images</a> · <a href="#video-and-audio-cut-on-the-timeline-save-back">video and audio</a> · <a href="#big-and-binary-files">big files</a> · <a href="#in-the-terminal---tui">--tui</a> · <a href="#on-another-machines-screen---target">--target</a> · <a href="#from-the-command-line-sopen-cut-sopen-stems">cut and stems</a> · <a href="#install">install</a> · <a href="docs/README.md">docs</a>
+  <a href="#streaming-any-file-however-big-opens-at-once">streaming</a> · <a href="#folders-the-file-browser-with-git">folders</a> · <a href="#images-crop-pixelize-paste-save-back">images</a> · <a href="#video-and-audio-cut-on-the-timeline-save-back">video and audio</a> · <a href="#big-and-binary-files">big files</a> · <a href="#in-the-terminal---tui">--tui</a> · <a href="#on-another-machines-screen---target">--target</a> · <a href="#from-the-command-line-sopen-cut-sopen-stems">cut and stems</a> · <a href="#install">install</a> · <a href="docs/README.md">docs</a>
 </p>
 
 [![sopen: the tutorial and ten short demos at 2lab.ai/sopen — the file browser and its git panel, huge logs, image, video and audio editing saved back, a 24 GB file in the hex editor, --tui, sopen cut and sopen stems](screenshots/sopen-film-poster.png)](https://www.2lab.ai/sopen)
 
-<p align="center"><sub>▶ <a href="https://www.2lab.ai/sopen">The tutorial and ten short demos</a>, recorded on the real sopen with demo data, with English and Korean captions.</sub></p>
+<p align="center"><sub>▶ <a href="https://www.2lab.ai/sopen">The tutorial, the streaming comparison and ten short demos</a>, recorded on the real sopen with demo data, with English and Korean captions.</sub></p>
 
 ```sh
 sopen myserver:~/project           # folder → the xtools file browser: two panels, Enter views any file
@@ -27,6 +27,26 @@ sopen --target <host> http://127.0.0.1:1234/  # this machine's web page in <host
 ```
 
 Same syntax as `scp`. Uses your `ssh` and `~/.ssh/config`; the remote needs nothing but sshd.
+
+## Streaming: any file, however big, opens at once
+
+[![scp and sopen side by side, both started on the same 24 GB video on the same server over the same 100 Mbit/s link, 29.5 s after Enter: on the left scp has copied 331 MB (1 %) at 11.4 MB/s with 33:30 to go, so nothing can play yet; on the right sopen is playing the video at 0:50:02, after a jump to minute 50](screenshots/streaming-24gb-video.png)](https://www.2lab.ai/sopen#streaming)
+
+A remote file is never copied first just to be looked at. Every viewer — video and audio, the hex
+editor, the file browser's text viewer, images — reads what is on screen and a little around it,
+then the rest as you move, like a video stream: however big the file, it shows at once. Measured
+from one server over a link held to 100 Mbit/s:
+
+| Opening | Copied first with `scp` | With `sopen` |
+| --- | --- | --- |
+| a 24 GB video | 34 min before the first frame | playing 0.5 s after Enter, 2.3 MB read; at minute 50 one second after the click |
+| a 24 GB disk image, in the hex editor | 36 min | the first screen after 64 KiB; 20 GB in, 192 KiB read in all |
+| a 182 MB log with a 150 MB line, in the text viewer | 15 s | the first screen after 64 KiB; line 400,001 after 32 MB |
+| a 10240×5760 JPEG of 18.8 MB | 1.6 s | the whole picture 0.8 s after Enter, sharpening as the rest arrives |
+
+<sub>The `scp` times are each file's size at the 11.4 MB/s `scp` showed on that link; the `sopen`
+bytes are sopen's own stream counters. ▶ <a href="https://www.2lab.ai/sopen#streaming">The
+comparison, recorded</a> on the real sopen in two Linux containers.</sub>
 
 ## Folders: the file browser, with git
 
