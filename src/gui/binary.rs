@@ -12,12 +12,14 @@
 //! connection. The dialog's answers go through [`Source`] and the native save dialog through
 //! [`Chooser`]; both are traits, so the tests drive the real window with stand-ins too.
 
+use super::browser::ops::dialog::{self, Button, Ink, Inputs, Part};
+use super::cells::{self, Buffer, Grid, Pen};
 use super::chrome;
 use super::hex::{self, HexFile, HexWindow};
 use super::{Choice, Hooks, Origin, Outcome, Window};
 use crate::remote::RemoteFs;
 use anyhow::{anyhow, bail, Context as _, Result};
-use eframe::egui::{self, Color32, Key, Pos2, Rect, Vec2};
+use eframe::egui::{self, Key};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -34,14 +36,22 @@ mod interrupt;
 
 pub use interrupt::Interrupted;
 
-/// The dialog's size when it opens (its height then follows its content).
+/// The dialog's size when it opens (its height then follows its content): 88 cells by 15 rows,
+/// the box of a remote file's question and its hint on one row.
 pub const WINDOW: [f32; 2] = [704.0, 240.0];
-/// The smallest the dialog may be made.
-const MIN_SIZE: [f32; 2] = [420.0, 160.0];
+/// The smallest the dialog may be made: 56 cells wide, where its row of buttons still fits.
+const MIN_SIZE: [f32; 2] = [448.0, 160.0];
 /// The dialog box's title in its frame.
 const TITLE: &str = "Binary File";
-/// How far the box runs below its last line (its double line sits in the last half of it).
-const BOX_BELOW: f32 = 10.0;
+/// The hex answer's button (01 §6a: the default, Enter).
+const HEX: &str = "Open in hex editor";
+/// The cells the box's inside has at least (its hint's, if more): as wide whatever the stage,
+/// so a note that comes or goes never changes its width.
+const WIDE: usize = 76;
+/// The fewest cells the file's name keeps on its line.
+const NAME_LEAST: usize = 12;
+/// A grid as tall as no dialog: the box's rows as its parts want them ([`BinaryWindow::fit`]).
+const TALL: u16 = 1000;
 /// How long "saved <path>" stays before the window closes.
 const SAVED_LINGER: Duration = Duration::from_millis(1200);
 /// Browse… came back without a path: cancelled, or no system dialog could be shown (rfd says
@@ -1827,8 +1837,9 @@ pub struct BinaryWindow {
     /// Passes so far, and the height last asked of the window (and when).
     frames: u64,
     asked: Option<(f32, u64)>,
-    /// A file at a revision (03 §6.3, S2-F): "Save to…" is off with the reason, and the hex
-    /// window it becomes is read-only. The browser never routes such a file here (it opens
+    /// A file at a revision (03 §6.3, S2-F): "Save to…" and Browse… are off, the reason a row
+    /// under the buttons (cells have no hover, 10 §6), the path a weak text rather than a field,
+    /// and the hex window it becomes is read-only. The browser never routes such a file here (it opens
     /// anything that is not text, an image or media in the hex window); this keeps the dialog
     /// from being a way to save one.
     read_only: bool,
@@ -1846,6 +1857,30 @@ impl Drop for BinaryWindow {
 
 fn path_id() -> egui::Id {
     egui::Id::unique("sopen-binary-path")
+}
+
+fn dialog_id() -> egui::Id {
+    egui::Id::unique("sopen-binary-dialog")
+}
+
+fn hex_id() -> egui::Id {
+    dialog_id().with("hex")
+}
+
+fn save_id() -> egui::Id {
+    dialog_id().with("save")
+}
+
+fn cancel_id() -> egui::Id {
+    dialog_id().with("cancel")
+}
+
+fn browse_id() -> egui::Id {
+    dialog_id().with("browse")
+}
+
+fn close_id() -> egui::Id {
+    dialog_id().with("close")
 }
 
 impl BinaryWindow {
@@ -2160,188 +2195,202 @@ impl BinaryWindow {
         }
     }
 
-    /// The dialog's content; returns where it ends (its height decides the window's).
-    fn dialog(&mut self, ui: &mut egui::Ui) -> f32 {
-        let ctx = ui.ctx().clone();
+    /// The running "Save to…"'s stop, while one runs (06 §7.5).
+    fn saving(&self) -> Option<Arc<Decision>> {
+        match &self.stage {
+            Stage::Moving {
+                dest: Some(_),
+                cancel,
+                ..
+            } => Some(cancel.clone()),
+            _ => None,
+        }
+    }
+
+    /// The file's line in `room` cells: its name — cut by cells where the line would not fit —
+    /// two blanks, then its size and kind.
+    fn file_line(&self, room: usize) -> String {
+        let describe = self.info.describe();
+        let name_room = room.saturating_sub(cells::width(&describe) + 2);
+        let name = cells::fit_start(&self.info.name, name_room.max(NAME_LEAST));
+        format!("{name}  {describe}")
+    }
+
+    /// The dialog's parts on a grid `cols` wide as the stage has them, and its nominal width:
+    /// the file's line, the buttons — for a file at a revision, the reason "Save to…" is off
+    /// under them — the path field (while not asking, or read-only, the path in the weak colour,
+    /// as an off control is), Browse…, the hint, what runs (its line and the progress row), what
+    /// was saved, then the notes (the clash note among them).
+    fn parts(&self, cols: u16) -> (Vec<Part>, usize) {
+        let local = self.info.local;
+        let nominal = WIDE.max(cells::width(hint(local)));
+        let room = dialog::inside_width(cols, nominal, 0);
+        let mut parts = vec![Part::Text(self.file_line(room), Ink::Text)];
         if let Stage::Failed(message) = &self.stage {
-            let message = message.clone();
-            ui.add_space(4.0);
-            ui.add(egui::Label::new(egui::RichText::new(&self.info.name).heading()).truncate());
-            let error = ui.visuals().error_fg_color;
-            super::disclosures(ui, &[(message, error)]);
-            ui.add_space(8.0);
-            if ui.button("Close").clicked()
-                || ctx.input_mut(|i| {
-                    i.consume_key(egui::Modifiers::NONE, Key::Escape)
-                        || i.consume_key(egui::Modifiers::NONE, Key::Enter)
-                })
-            {
-                self.close(&ctx);
-            }
-            return ui.cursor().top();
+            parts.extend(lines_of(message, Ink::Error));
+            parts.extend([
+                Part::Blank,
+                Part::Buttons(vec![Button::new("Close", close_id())]),
+            ]);
+            return (parts, nominal);
         }
         let asking = self.asking();
-        let local = self.info.local;
-        let mut path_enter = false;
-        ui.add_space(4.0);
-        ui.add(egui::Label::new(egui::RichText::new(&self.info.name).heading()).truncate());
-        ui.label(self.info.describe());
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            let fill = ui.visuals().selection.bg_fill;
-            let hex = ui
-                .add_enabled(
-                    asking,
-                    egui::Button::new(egui::RichText::new("Open in hex editor").strong())
-                        .fill(fill),
-                )
-                .on_hover_text("Enter — opens it in the xtools hex editor");
-            if hex.clicked() {
-                self.start_hex(&ctx);
-            }
-            let save = ui
-                .add_enabled(asking && !self.read_only, egui::Button::new("Save to…"))
-                .on_hover_text(if local {
-                    "copies it to the path below; never over an existing file"
-                } else {
-                    "downloads it to the path below; never over an existing file"
-                })
-                .on_disabled_hover_text(super::image::AT_A_REVISION);
-            if save.clicked() {
-                self.start_save(&ctx, false);
-            }
-            // While "Save to…" runs it stops that (06 §7.5), as Esc does; else it closes.
-            let saving = match &self.stage {
-                Stage::Moving {
-                    dest: Some(_),
-                    cancel,
-                    ..
-                } => Some(cancel.clone()),
-                _ => None,
-            };
-            let cancel = ui
-                .add_enabled(asking || saving.is_some(), egui::Button::new("Cancel"))
-                .on_hover_text("Esc");
-            if cancel.clicked() {
-                match saving {
-                    Some(stop) => drop(stop.cancel()),
-                    None => self.close(&ctx),
+        // Where nothing may be saved (a file at a revision), what would choose a path is off.
+        let saves = asking && !self.read_only;
+        let button = |label: &str, id: egui::Id, on: bool| Button {
+            on,
+            ..Button::new(label, id)
+        };
+        parts.extend([
+            Part::Blank,
+            Part::Buttons(vec![
+                button(HEX, hex_id(), asking),
+                button("Save to…", save_id(), saves),
+                button("Cancel", cancel_id(), asking || self.saving().is_some()),
+            ]),
+        ]);
+        // Cells have no hover (10 §6): the reason is a row of its own.
+        if self.read_only {
+            let why = super::image::AT_A_REVISION;
+            parts.push(Part::Text(format!("Save to… is off: {why}"), Ink::Weak));
+        }
+        parts.extend([
+            Part::Blank,
+            if saves {
+                Part::Field {
+                    label: String::new(),
+                    id: path_id(),
                 }
-            }
-        });
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let room = (ui.available_width() - 90.0).max(120.0);
-            let field = ui.add_enabled(
-                asking,
-                chrome::field(&mut self.path)
-                    .id(path_id())
-                    .desired_width(room),
-            );
-            // Enter in the path field saves there (it never opens the hex editor).
-            if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                path_enter = true;
-            }
-            if ui
-                .add_enabled(asking, egui::Button::new("Browse…"))
-                .on_hover_text("the system's save dialog")
-                .clicked()
-            {
-                self.browse();
-            }
-        });
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new(hint(local)).weak());
+            } else {
+                Part::Text(cells::fit_left(&self.path, room), Ink::Weak)
+            },
+            Part::Buttons(vec![button("Browse…", browse_id(), saves)]),
+            Part::Text(hint(local).to_string(), Ink::Weak),
+        ]);
         match &self.stage {
             Stage::Moving {
                 dest, done, total, ..
             } => {
-                ui.add_space(6.0);
+                parts.push(Part::Text(
+                    match dest {
+                        Some(dest) => format!("saving to {}… Esc cancels", tilde(dest)),
+                        // A remote file opens as a stream (06 §7.5): nothing is fetched for it.
+                        None => "opening it in the hex editor…".to_string(),
+                    },
+                    Ink::Text,
+                ));
                 let (d, t) = (done.load(Ordering::Relaxed), total.load(Ordering::Relaxed));
-                let frac = if t > 0 { d as f32 / t as f32 } else { 0.0 };
-                ui.label(match (dest, local) {
-                    (Some(dest), _) => format!("saving to {}… Esc cancels", tilde(dest)),
-                    // A remote file opens as a stream (06 §7.5): nothing is fetched for it.
-                    (None, _) => "opening it in the hex editor…".to_string(),
-                });
-                let label = format!(
-                    "{:.0}% · {} / {}",
-                    frac * 100.0,
-                    crate::human(d),
-                    crate::human(t)
-                );
-                let label = egui::RichText::new(label).color(chrome::PALETTE.field_text);
-                ui.add(egui::ProgressBar::new(frac).text(label));
+                parts.push(Part::Text(progress_row(d, t, room), Ink::Text));
             }
             Stage::Saved { line, notes, .. } => {
-                ui.add_space(6.0);
-                ui.label(line.as_str());
+                parts.push(Part::Text(line.clone(), Ink::Text));
+                parts.extend(notes.iter().flat_map(|n| lines_of(n, Ink::Text)));
                 if !notes.is_empty() {
-                    let plain = ui.visuals().text_color();
-                    let lines: Vec<(String, Color32)> =
-                        notes.iter().map(|n| (n.clone(), plain)).collect();
-                    super::disclosures(ui, &lines);
-                    if ui.button("Close").clicked() {
-                        self.close(&ctx);
-                    }
+                    parts.push(Part::Buttons(vec![Button::new("Close", close_id())]));
                 }
             }
-            Stage::Choosing(_) => {
-                ui.add_space(6.0);
-                ui.label("waiting for the system's save dialog…");
-            }
+            Stage::Choosing(_) => parts.push(Part::Text(
+                "waiting for the system's save dialog…".to_string(),
+                Ink::Text,
+            )),
             _ => {}
         }
-        let (error, plain) = (ui.visuals().error_fg_color, ui.visuals().text_color());
-        let lines: Vec<(String, Color32)> = self
-            .notes
-            .iter()
-            .map(|(t, e)| (t.clone(), if *e { error } else { plain }))
-            .collect();
-        if !lines.is_empty() {
-            ui.add_space(4.0);
-            super::disclosures(ui, &lines);
-        }
+        parts.extend(
+            self.notes.iter().flat_map(|(text, error)| {
+                lines_of(text, if *error { Ink::Error } else { Ink::Text })
+            }),
+        );
         if self.close_when_done {
-            super::disclosures(ui, &[(CLOSES_AFTER.to_string(), plain)]);
+            parts.push(Part::Text(CLOSES_AFTER.to_string(), Ink::Text));
+        }
+        (parts, nominal)
+    }
+
+    /// The dialog in cells on `grid` (10 §6, through `ops::dialog`): laid out, shown as a modal
+    /// at its cells, and what its controls and keys asked for done. Esc is taken before the
+    /// controls, and Enter where it is the dialog's — the path field has the keyboard (it saves
+    /// there; it never opens the hex editor) or nothing has (it opens the hex editor) — so a
+    /// focused button keeps Enter and Space as its click. A click on the F-key row at the foot
+    /// of `whole`, which the modal keeps from the row, is handed to the row's slot. Returns the
+    /// box's rows as its parts want them, whatever the grid gives (they decide the window's
+    /// height).
+    fn dialog(&mut self, ctx: &egui::Context, grid: Grid, whole: egui::Rect) -> u16 {
+        let focused = ctx.memory(|m| m.focused());
+        let in_field = focused == Some(path_id());
+        let enter = (focused.is_none() || in_field)
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+        let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+        let (parts, nominal) = self.parts(grid.cols);
+        let layout = dialog::layout(grid, TITLE, nominal, &parts);
+        let tall = Grid { rows: TALL, ..grid };
+        let rows = dialog::layout(tall, TITLE, nominal, &parts).covers()[0].height;
+        let typing = self.asking() && !self.read_only;
+        let inputs = Inputs {
+            field: typing.then_some(&mut self.path),
+            ..Inputs::default()
+        };
+        let shown = dialog::show(ctx, dialog_id(), &layout, inputs);
+        let backdrop = &shown.modal.backdrop_response;
+        if backdrop.clicked() && !super::hosted(ctx) {
+            if let Some(n) = backdrop
+                .interact_pointer_pos()
+                .and_then(|p| slot_at(whole, p))
+            {
+                chrome::press_fkey(ctx, n);
+            }
+        }
+        if let Stage::Failed(_) = self.stage {
+            if enter || escape || shown.clicked(close_id()) {
+                self.close(ctx);
+            }
+            return rows;
+        }
+        if shown.clicked(hex_id()) {
+            self.start_hex(ctx);
+        }
+        if shown.clicked(save_id()) {
+            self.start_save(ctx, false);
+        }
+        // While "Save to…" runs Cancel stops that (06 §7.5), as Esc does; else it closes.
+        if shown.clicked(cancel_id()) {
+            match self.saving() {
+                Some(stop) => drop(stop.cancel()),
+                None => self.close(ctx),
+            }
+        }
+        if shown.clicked(browse_id()) {
+            self.browse();
+        }
+        if shown.clicked(close_id()) {
+            self.close(ctx);
         }
         // Esc during "Save to…" cancels it (06 §7.5); Enter does nothing then, and neither does
         // anything while the hex window is being opened.
-        if let Stage::Moving {
-            dest: Some(_),
-            cancel,
-            ..
-        } = &self.stage
-        {
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
-                cancel.cancel();
-            }
+        if let (Some(stop), true) = (self.saving(), escape) {
+            stop.cancel();
         }
-        // Keys while asking: Enter in the path field saves; Enter with nothing focused opens
-        // the hex editor (a focused button takes Enter as its own click); Esc cancels.
         if self.asking() {
-            if path_enter {
-                self.start_save(&ctx, true);
-            } else if ctx.memory(|m| m.focused()).is_none()
-                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter))
-            {
-                self.start_hex(&ctx);
+            if enter && in_field {
+                self.start_save(ctx, true);
+            } else if enter {
+                self.start_hex(ctx);
             }
-            if self.asking() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
-            {
-                self.close(&ctx);
+            if self.asking() && escape {
+                self.close(ctx);
             }
         }
-        ui.cursor().top()
+        rows
     }
 
-    /// The window as tall as its content — `bottom` is where the dialog's shadow ends — unless
-    /// `SOPEN_WINDOW_SIZE` fixed it.
-    fn fit(&mut self, ctx: &egui::Context, bottom: f32) {
+    /// The window as tall as the dialog's box of `rows` — a blank row above it, its shadow's
+    /// row and a blank row under that — and the rows around them (`around` points: the F-key
+    /// row, and any above it), unless `SOPEN_WINDOW_SIZE` fixed it. Asked on the first pass,
+    /// then again only when the box's rows change.
+    fn fit(&mut self, ctx: &egui::Context, rows: u16, around: f32) {
         if self.hooks.window_size.is_some() {
             return;
         }
-        let height = bottom.ceil().max(MIN_SIZE[1]);
+        let height = (around + f32::from(rows + 3) * chrome::CELL.y).max(MIN_SIZE[1]);
         if self.asked.is_some_and(|(h, _)| (h - height).abs() < 1.0) {
             return;
         }
@@ -2367,6 +2416,60 @@ fn hint(local: bool) -> &'static str {
     }
 }
 
+/// `text` as the dialog's texts in `ink`, a part for each of its lines: a cell drops a line
+/// break (an error can carry ssh's lines), where the egui label broke the line there.
+fn lines_of(text: &str, ink: Ink) -> impl Iterator<Item = Part> + '_ {
+    text.lines()
+        .map(move |line| Part::Text(line.to_string(), ink))
+}
+
+/// The progress row in `room` cells (10 §6): a bar of `█` for what is done and `░` for the rest
+/// — `▓` for a cell half done — then, two blanks on, the share and the figures.
+fn progress_row(done: u64, total: u64, room: usize) -> String {
+    let frac = if total > 0 {
+        (done as f64 / total as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let figures = format!(
+        "{:.0}% · {} / {}",
+        frac * 100.0,
+        crate::human(done),
+        crate::human(total)
+    );
+    let bar = room.saturating_sub(cells::width(&figures) + 2);
+    if bar == 0 {
+        return figures;
+    }
+    let filled = frac * bar as f64;
+    let full = filled.floor() as usize;
+    let half = usize::from(full < bar && filled - full as f64 >= 0.5);
+    let rest = bar - full - half;
+    format!(
+        "{}{}{}  {figures}",
+        "█".repeat(full),
+        "▓".repeat(half),
+        "░".repeat(rest)
+    )
+}
+
+/// The F-key slot with a label in the window's row (`own_keys`': F1, F3) under `p`, the row
+/// the last cell of `whole`, its slots on whole cells as [`chrome::key_cells`] lays them (the
+/// key help reads the row the same way).
+fn slot_at(whole: egui::Rect, p: egui::Pos2) -> Option<u8> {
+    let cell = chrome::CELL;
+    if !whole.contains(p) || p.y < whole.bottom() - cell.y {
+        return None;
+    }
+    let cols = (whole.width() / cell.x).floor() as u16;
+    let x = ((p.x - whole.left()) / cell.x).floor() as u16;
+    [chrome::HELP_KEY, chrome::EXIT_KEY].iter().find_map(|key| {
+        let (digit, label) = chrome::key_cells(cols, key.n);
+        let end = label.right().max(digit.right());
+        (digit.x..end).contains(&x).then_some(key.n)
+    })
+}
+
 impl Window for BinaryWindow {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -2378,56 +2481,25 @@ impl Window for BinaryWindow {
         if let Stage::Hex(window) = &mut self.stage {
             return window.ui(ui);
         }
+        let whole = ui.max_rect();
         // The F-key row at the bottom (F3 closes, as Cmd/Ctrl+W and Esc do).
         super::own_keys(ui, &[]);
-        // A PC Shell dialog box on the blue screen: cyan, its double line a cell in, the file's
-        // question in it, the shadow two cells right and one down — over the F-key row, which
-        // shows through it. The box (and its shadow) are laid under the content, which decides
-        // how tall they are.
-        let cell = chrome::CELL;
-        let margin = egui::Margin {
-            left: (2.0 * cell.x) as i8,
-            right: (4.0 * cell.x) as i8,
-            top: (1.5 * cell.y) as i8,
-            bottom: 0,
-        };
-        let bottom = egui::CentralPanel::default()
-            .frame(
-                egui::Frame::NONE
-                    .fill(chrome::PALETTE.back)
-                    .inner_margin(margin),
-            )
+        // A PC Shell dialog box on the blue screen, in cells (10 §6): the screen's cells blue,
+        // the box over them centred with its shadow.
+        let p = chrome::PALETTE;
+        let area = egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(p.back))
             .show(ui, |ui| {
-                let window = ui.ctx().viewport_rect();
-                // The whole window, the F-key row's cells too (the shadow falls on them).
-                let mut screen = ui.painter().clone();
-                screen.set_clip_rect(window);
-                let under = screen.add(egui::Shape::Noop);
-                chrome::dialog_visuals(ui);
-                // Where the last line ends (the cursor is a line's spacing below it).
-                let end = self.dialog(ui) - ui.spacing().item_spacing.y;
-                let dialog = Rect::from_min_max(
-                    window.min,
-                    Pos2::new(window.right() - 2.0 * cell.x, end + BOX_BELOW),
-                );
-                let p = chrome::PALETTE;
-                screen.set(
-                    under,
-                    egui::Shape::Vec(vec![
-                        egui::Shape::rect_filled(
-                            dialog.translate(Vec2::new(2.0 * cell.x, cell.y)),
-                            0.0,
-                            p.shadow,
-                        ),
-                        egui::Shape::rect_filled(dialog, 0.0, p.dialog_back),
-                    ]),
-                );
-                chrome::dialog_lines(&screen, dialog, TITLE);
-                // The shadow's row is the F-key row's.
-                dialog.bottom() + cell.y
+                let area = ui.max_rect();
+                let grid = Grid::over(area);
+                let mut screen = Buffer::empty(grid.all());
+                cells::fill(&mut screen, grid.all(), Pen::new(p.text, p.back));
+                cells::paint(ui.painter(), grid.origin, &screen, None);
+                area
             })
             .inner;
-        self.fit(&ctx, bottom);
+        let rows = self.dialog(&ctx, Grid::over(area), whole);
+        self.fit(&ctx, rows, whole.height() - area.height());
         self.painted = true;
     }
 
@@ -2498,23 +2570,21 @@ mod read_only_tests {
         }
     }
 
-    struct Never;
+    /// A system dialog that never answers, counting how often it is asked.
+    struct Never(Arc<AtomicUsize>);
 
     impl Chooser for Never {
         fn choose(&mut self, _: &Path) -> Receiver<Option<PathBuf>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
             std::sync::mpsc::channel().1
         }
     }
 
-    /// A click on "Save to…" (off) saves nothing, and the save itself (`start_save`, where the
-    /// button and Enter in the path field both lead) refuses with the reason in the dialog's
-    /// notes. The hover text and the Enter key are not driven here.
-    #[test]
-    fn a_file_at_a_revision_has_no_save_to() {
-        let saves = Arc::new(AtomicUsize::new(0));
-        let tmp = tempfile::tempdir().unwrap();
+    /// A dialog on a file at a revision, read-only, with what it counts: saves, system dialogs.
+    fn at_a_revision(dir: &Path) -> (BinaryWindow, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (saves, chooses) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let hooks = Hooks {
-            save_to: Some(tmp.path().join("out.bin")),
+            save_to: Some(dir.join("out.bin")),
             ..Hooks::default()
         };
         let info = Info {
@@ -2526,13 +2596,67 @@ mod read_only_tests {
         let mut win = BinaryWindow::new(
             info,
             Box::new(Counted(saves.clone())),
-            Box::new(Never),
+            Box::new(Never(chooses.clone())),
             &hooks,
         );
         win.set_read_only(true);
+        (win, saves, chooses)
+    }
+
+    /// Cells have no hover (10 §6): the reason Save to… is off is a row under the buttons from
+    /// the first pass, before any input; Browse… is off and the path is a weak text, no field —
+    /// so no route leads to a save that is refused only then. A click on Browse… or on the
+    /// path's row does nothing. The control: the same dialog not read-only has none of it.
+    #[test]
+    fn a_file_at_a_revision_says_why_save_to_is_off_and_offers_no_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reason = format!("Save to… is off: {}", super::super::image::AT_A_REVISION);
+        let (mut win, saves, chooses) = at_a_revision(tmp.path());
+        let mut drv = crate::gui::testkit::Driver::new(WINDOW[0], 320.0);
+        drv.idle(&mut win, 1);
+        let row = drv
+            .find_text(&reason)
+            .expect("the reason, on the first pass");
+        let weak = crate::gui::chrome::PALETTE.dialog_weak;
+        assert_eq!(drv.colors_of(&reason).unwrap(), [weak]);
+        let buttons = drv.find_text("[ Save to… ]").expect("the buttons");
+        assert_eq!(row.top(), buttons.bottom(), "right under the buttons");
+        let path = win.path.clone();
+        assert_eq!(drv.colors_of(&path).unwrap(), [weak], "the path, weak");
+        drv.click(&mut win, drv.find_text(&path).unwrap().center());
+        assert_ne!(drv.ctx.memory(|m| m.focused()), Some(path_id()), "no field");
+        drv.click_text(&mut win, "[ Browse… ]");
+        drv.idle(&mut win, 2);
+        assert_eq!(chooses.load(Ordering::SeqCst), 0, "Browse… is off");
+        assert!(
+            win.asking() && win.notes.is_empty(),
+            "nothing refused after the fact"
+        );
+        assert_eq!(saves.load(Ordering::SeqCst), 0);
+
+        let (mut open, _, _) = at_a_revision(tmp.path());
+        open.set_read_only(false);
+        let mut drv = crate::gui::testkit::Driver::new(WINDOW[0], 320.0);
+        drv.idle(&mut open, 1);
+        assert!(drv.find_text(&reason).is_none(), "the control: no reason");
+        let path = open.path.clone();
+        assert_eq!(
+            drv.colors_of(&path).unwrap(),
+            [crate::gui::chrome::cga::WHITE],
+            "the control: the field"
+        );
+    }
+
+    /// A click on "Save to…" (off) saves nothing, and the save itself (`start_save`, where the
+    /// button and the system dialog's answer both lead, the backstop behind the controls that
+    /// are off) refuses with the reason in the dialog's notes.
+    #[test]
+    fn a_file_at_a_revision_has_no_save_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut win, saves, _) = at_a_revision(tmp.path());
         let mut drv = crate::gui::testkit::Driver::new(WINDOW[0], 320.0);
         drv.idle(&mut win, 3);
-        drv.click_text(&mut win, "Save to…");
+        drv.click_text(&mut win, "[ Save to… ]");
         drv.idle(&mut win, 2);
         let ctx = drv.ctx.clone();
         win.start_save(&ctx, true);

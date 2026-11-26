@@ -608,8 +608,9 @@ Every file row has two **endpoints**, old and new — a blob, the index, the wor
   `rename from … rename to …` with no hunk, a rename with changes as the rename and its hunks
   (*verified, git 2.56.1*; `diff <rev> -- <path now>` alone would show the file as added). F4 opens the
   path now; a file deleted since says so on the status row.
-- **Read-only** means the viewer's Save and Save copy are off, with the reason on hover: `a file at a
-  revision has no place to be saved` (the viewers' `read_only` flag, slice S2-E, 02 §8).
+- **Read-only** means the viewer's Save and Save copy are off, with the reason on hover — a row
+  where there is no hover (a screen in cells, 10 §6: the binary dialog's): `a file at a revision
+  has no place to be saved` (the viewers' `read_only` flag, slice S2-E, 02 §8).
 - F4 on a file row opens the working file (its path now) in the editor, as the list's F4 does (01 A2).
 
 ### 6.4 Compare two commits
