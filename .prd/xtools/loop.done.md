@@ -290,3 +290,26 @@ Five units merged and shipped one by one, each prerelease installed on the Mac a
 | X2-state | ✅ done 2026-11-26 | 10 §17's X2: the switch's state, `"v": 1` (#146) | coder |
 | VM-8 | ✅ done 2026-11-26 | 10 §17's X3 (08 §13's row): 08's views in the terminal (#147) | coder |
 
+## R1 (part 8) — the hex window's questions, the preview side in cells and HOST's half of the switch, closed 2026-11-26
+
+Three units merged and shipped one by one. The Linux host was back for #149's prerelease; from then on each prerelease is installed on the Mac and the Linux host.
+
+- **X3-questions** (#149): the hex window's questions in cells — the close prompt, the first Save above 256 MiB, Write in place and Save As (one cell modal shared by the hex, image and media windows) — and the rows below its grid, with Tab into their buttons. Raising the close prompt starts its journal write, and the window is not ready until it lands.
+- **X3-preview** (#151): the browser's preview side in cells — its frame titled with the file, the read's progress, `…` and why there is no preview. A text or hex preview paints its own cells inside it; a picture, a video, a sound, the info card and a page in a window keep egui's frame until X6, each one hand-off box in a terminal. The frame does not change while a file is prepared: a ready preview keeps its own, and before that the file's last ready preview or its name decides.
+- **X2-host** (#150): `sopen --here --gui --state-stdin -- FOLDER`, HOST's half of the switch — the state from the first line of input, the window at that state, `sopen-xtools-state <json>` on F12, `[TUI]`, the close button or Cmd/Ctrl+Q and +W; exit 2 before any window for a state it cannot take. When the input ends with nothing to lose the window closes; otherwise HOST says `sopen-xtools-kept` and keeps the window. HOST's fds 1 and 2 go through relays, so nothing sopen writes sees EPIPE. §7.3's [추정] measured: a command run by `ssh -T` gets no SIGHUP when the local ssh is killed.
+- **A merge of main broke three tests without a conflict.** #149 drew the close prompt in cells, so X2-host's `switch_host` tests found no `Cancel` to click; they now let the window settle first (`click_prompt`). The module gate runs again after every merge of main, before the push.
+- **Receipts:** the hex view's Save As and close prompt, the same cells in the window and `--tui`; a Hangul `.txt`, a `.png` and a binary under the bar, the window's `SOPEN_CELLS` and the TUI's identical below the head line; `--state-stdin`'s F12 state cue, the kept cue with the window open at 25 s, and exit 0 with its output dead from the start.
+- **Reviews.** Two engines per unit, then one fix-check; the orchestrator verified the last fixes at their lines. CI-only failures were timing tests outside the units (F-timing), passed on a rerun of the failed job.
+- **Prereleases:**
+  - preview-2026-11-26-1158-9f716b30e3a3 (the ledger, #148; the Mac only, the Linux host offline);
+  - preview-2026-11-26-1346-9a6f00a05959 (X3-questions);
+  - preview-2026-11-26-1552-2ac751ea2847 (X3-preview);
+  - preview-2026-11-26-1726-01751df2b2d0 (X2-host, built after one cancelled run).
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| X3-questions | ✅ done 2026-11-26 | 10 §17's X3: the hex window's questions and rows, and Save As, in cells (#149) | coder |
+| X3-preview | ✅ done 2026-11-26 | 10 §17's X3: the preview side's frame and progress line in cells (#151) | coder |
+| X2-host | ✅ done 2026-11-26 | 10 §17's X2: HOST's half, `--state-stdin` and its two cues (#150) | coder |
