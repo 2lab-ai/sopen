@@ -148,7 +148,10 @@ downloaded and checked by build.rs; `SHERPA_ONNX_LIB_DIR` for offline builds); `
   --lib -- --ignored --exact <path>`, `--exact` taking the full path; `src/edit/buffer/tests.rs`:
   `edit::buffer::tests::eb1_100_mib_within_1_ms_and_1_1x`, 12 EB-1's 100 MB timing and memory, and
   `edit::buffer::tests::eb5_a_200_mb_delete_adds_only_its_pieces`, EB-5's 200 MB delete; each
-  prints `1 passed`) and the system Trash (`src/remote/local/trash.rs`,
+  prints `1 passed`), the editor's kept highlighting states over 16 MiB of Rust (12 EH-3, its own
+  binary for its counting allocator: `cargo test --release --test kept_states_heap -- --ignored
+  --nocapture`; recorded 18.73 MiB against its 32 MiB bound — every run asserts the same rate over
+  2 MiB) and the system Trash (`src/remote/local/trash.rs`,
   `the_system_trash_takes_a_file_and_a_link`; it puts two entries in the Trash and prints where). A test build
   never reaches the owner's Trash: `LocalFs`'s Trash is a stand-in of the test process's own.
 - Public repo hygiene: no machine names, IP addresses, home-directory paths or session scratch paths in
