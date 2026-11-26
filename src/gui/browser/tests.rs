@@ -404,7 +404,7 @@ fn keys_in_a_viewer_never_move_the_list() {
     fx.key(Key::Escape);
     // The byte typed is an edit: the hex window asks.
     assert!(fx.drv.find_text("Unsaved changes").is_some());
-    fx.drv.click_text(&mut fx.b, "Discard");
+    fx.drv.click_text(&mut fx.b, "[ Discard ]");
     assert!(fx.b.viewer.is_none());
     assert!(!fx.drv.closed());
     assert_eq!((fx.b.active, fx.current().as_str()), (0, "data.bin"));
@@ -433,7 +433,7 @@ fn a_viewers_f_keys_join_the_browsers_row() {
         fx.drv.find_text("Unsaved changes").is_some(),
         "the hex window asks"
     );
-    fx.drv.click_text(&mut fx.b, "Discard");
+    fx.drv.click_text(&mut fx.b, "[ Discard ]");
     assert!(fx.b.viewer.is_none());
     assert!(!fx.drv.closed(), "only the viewer went");
     assert!(
@@ -480,7 +480,7 @@ fn a_hosted_hex_viewers_f5_and_f6_work_and_respect_its_prompt() {
         0x10,
         "F5 under the prompt"
     );
-    fx.drv.click_text(&mut fx.b, "Discard");
+    fx.drv.click_text(&mut fx.b, "[ Discard ]");
     assert!(fx.b.viewer.is_none());
     assert_eq!(std::fs::read(&file).unwrap()[16], 0x10);
 }
