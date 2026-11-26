@@ -574,8 +574,8 @@ the hooks keep without a window. `--app` and an address never get it. HOST's exi
 `--gui` (`error: unexpected argument '--gui' found`, a sopen older than it) as the first line it wrote on stderr
 (colours and blank lines aside) and nothing on its stdout — clap's refusal before anything runs — makes sopen run the
 same forward once more without it, after `sopen on HOST is older and does not know --gui; running it there again
-without it` on stderr; any other exit 2 is passed on as it is. HOST's sopen given `--gui` with no display there says
-`no display here — …`, which comes through as `on HOST: sopen: no display here — …`. `--gui` without a HOST opens
+without it` on stderr; any other exit 2 is passed on as it is. HOST's output passes through this side byte by byte as
+it is read, only watched for that line (a terminal query a program there waits on is never held). `--gui` without a HOST opens
 here as before, and with no display here (Linux without `DISPLAY` / `WAYLAND_DISPLAY`) exits 1 with `no display here
 — sopen config target <host>, or --target, opens the window on
 another machine`. When ssh itself fails (its exit code 255) sopen exits 1 with `could not

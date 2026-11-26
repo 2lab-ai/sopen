@@ -2092,10 +2092,10 @@ fn a_target_that_did_something_before_the_line_is_not_run_again() {
     }
 }
 
-/// HOST's sopen given `--gui` with no display there says §7.1's line; this side passes it on after
-/// `on HOST: `, so it is not taken for this machine's, and leaves with HOST's exit 1.
+/// HOST's sopen given `--gui` with no display there says §7.1's line; this side passes it on as
+/// it came, through the stream it watches, and leaves with HOST's exit 1 — no retry.
 #[test]
-fn hosts_no_display_line_is_said_as_hosts() {
+fn hosts_no_display_line_passes_as_it_came() {
     let tmp = tempfile::tempdir().unwrap();
     let ssh = FakeSsh::new(tmp.path());
     let line =
@@ -2115,7 +2115,8 @@ fn hosts_no_display_line_is_said_as_hosts() {
         ],
     );
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
-    assert_eq!(text(&out.stderr), format!("on {HOST}: {line}\n"));
+    assert_eq!(text(&out.stderr), format!("{line}\n"));
+    assert_eq!(ssh_calls(&ssh).len(), 1);
 }
 
 /// `--gui` asks for the window where SOURCE opens; here, with no display, that is §7.1's line and

@@ -496,7 +496,7 @@ pub fn run(host: &str, source: &str, flags: Flags, state_dir: &Path) -> Result<u
     if flags.gui {
         let out: Sink = || Box::new(std::io::stdout());
         let err: Sink = || Box::new(std::io::stderr());
-        let (status, refused) = watched(ssh(flags), tty, host, out, err)?;
+        let (status, refused) = watched(ssh(flags), tty, out, err)?;
         if !older(status.code(), refused) {
             return exit_code(host, status);
         }
@@ -531,18 +531,12 @@ fn older(code: Option<i32>, refused: bool) -> bool {
 /// Where one of HOST's streams goes on this side.
 type Sink = fn() -> Box<dyn std::io::Write>;
 
-/// Runs `ssh` with HOST's output piped through this side ([`Relay`]) to `out` and `err`, and
-/// returns ssh's status and whether HOST's sopen refused `--gui` at parse time: under `-t`
-/// (`tty`) the terminal there takes HOST's stdout and stderr both, ssh's stdout, whose first line
-/// must be [`UNKNOWN_GUI`]; under `-T` that must be the first line of ssh's stderr, and its stdout
-/// empty.
-fn watched(
-    mut ssh: Command,
-    tty: bool,
-    host: &str,
-    out: Sink,
-    err: Sink,
-) -> Result<(ExitStatus, bool)> {
+/// Runs `ssh` with HOST's output piped through this side to `out` and `err` — every byte passed
+/// on the moment it is read, and only watched ([`Scan`]) — and returns ssh's status and whether
+/// HOST's sopen refused `--gui` at parse time: under `-t` (`tty`) the terminal there takes HOST's
+/// stdout and stderr both, ssh's stdout, whose first line must be [`UNKNOWN_GUI`]; under `-T`
+/// that must be the first line of ssh's stderr, and its stdout empty.
+fn watched(mut ssh: Command, tty: bool, out: Sink, err: Sink) -> Result<(ExitStatus, bool)> {
     use std::process::Stdio;
     ssh.stdout(Stdio::piped());
     if !tty {
@@ -551,8 +545,8 @@ fn watched(
     let mut child = ssh
         .spawn()
         .context("cannot run ssh (is OpenSSH installed?)")?;
-    let (out_seen, out_done) = watch(child.stdout.take(), out, host);
-    let on_err = (!tty).then(|| watch(child.stderr.take(), err, host));
+    let (out_seen, out_done) = watch(child.stdout.take(), out);
+    let on_err = (!tty).then(|| watch(child.stderr.take(), err));
     let status = child.wait().context("ssh did not run to its end")?;
     let (err_seen, err_done) = match on_err {
         Some((seen, done)) => (Some(seen), Some(done)),
@@ -580,30 +574,22 @@ struct Seen {
     wrote: bool,
 }
 
-/// Copies `pipe` to `sink()` through a [`Relay`] for `host`, as it comes; the shared [`Seen`]
-/// follows it, and the receiver gets `()` at the pipe's end.
+/// Copies `pipe` to `sink()`, each read passed on as it is the moment it is read — a terminal's
+/// query that a program on HOST then waits on (`ESC[6n`) cannot wait for a line's end — and only
+/// then [`Scan`]ned; the shared [`Seen`] follows it, and the receiver gets `()` at the pipe's end.
 fn watch(
     pipe: Option<impl std::io::Read + Send + 'static>,
     sink: Sink,
-    host: &str,
 ) -> (
     std::sync::Arc<std::sync::Mutex<Seen>>,
     std::sync::mpsc::Receiver<()>,
 ) {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Seen::default()));
     let shared = seen.clone();
-    let mut relay = Relay::new(host);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let pass = |bytes: &[u8], relay: &Relay| {
-            if !bytes.is_empty() {
-                let mut sink = sink();
-                let _ = sink.write_all(bytes);
-                let _ = sink.flush();
-            }
-            *shared.lock().unwrap_or_else(|e| e.into_inner()) = relay.seen;
-        };
         if let Some(mut pipe) = pipe {
+            let mut scan = Scan::default();
             let mut bytes = [0u8; 8192];
             loop {
                 let n = match pipe.read(&mut bytes) {
@@ -612,84 +598,43 @@ fn watch(
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
-                let passed = relay.take(&bytes[..n]);
-                pass(&passed, &relay);
+                let mut sink = sink();
+                let _ = sink.write_all(&bytes[..n]);
+                let _ = sink.flush();
+                scan.take(&bytes[..n]);
+                *shared.lock().unwrap_or_else(|e| e.into_inner()) = scan.seen;
             }
-            let rest = relay.end();
-            pass(&rest, &relay);
+            scan.end();
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = scan.seen;
         }
         let _ = tx.send(());
     });
     (seen, rx)
 }
 
-/// One of HOST's streams on its way here: passed on as it comes, but for a line that may still be
-/// HOST's no-display line (`sopen: ` and [`crate::gui::term::NO_DISPLAY`]), held until it is —
-/// then passed on after `on HOST: `, so it is not read as this machine's — or cannot be; and its
-/// first line that is not blank is read for [`UNKNOWN_GUI`] ([`Seen`]). A line ends at `\n` or
-/// `\r` (a terminal's `\r\n`); ANSI escape sequences (clap's colours) do not count.
-struct Relay {
-    /// `on HOST: `.
-    on_host: String,
-    /// `sopen: ` and the no-display line.
-    no_display: String,
-    /// The start of the current line, not passed on yet: it may still be the no-display line.
-    held: Vec<u8>,
-    /// The current line cannot be (or is) the no-display line: the rest of it passes.
-    passing: bool,
-    /// The current line so far, up to [`Relay::KEPT`] bytes (past that, coloured, it is longer
-    /// than clap's line), for [`Seen::first`].
+/// Watches one of HOST's streams, never holding any of it: whether a byte came, and whether its
+/// first line that is not blank is [`UNKNOWN_GUI`] ([`Seen`]). A line ends at `\n` or `\r` (a
+/// terminal's `\r\n`); ANSI escape sequences (clap's colours) do not count.
+#[derive(Default)]
+struct Scan {
+    /// The current line so far, up to [`Scan::KEPT`] bytes (past that, coloured, it is longer
+    /// than clap's line).
     line: Vec<u8>,
     seen: Seen,
 }
 
-impl Relay {
+impl Scan {
     const KEPT: usize = 512;
 
-    fn new(host: &str) -> Self {
-        Self {
-            on_host: format!("on {host}: "),
-            no_display: format!("sopen: {}", crate::gui::term::NO_DISPLAY),
-            held: Vec::new(),
-            passing: false,
-            line: Vec::new(),
-            seen: Seen::default(),
-        }
-    }
-
-    /// Takes the next bytes; returns those to pass on now.
-    fn take(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(bytes.len());
+    fn take(&mut self, bytes: &[u8]) {
         for &b in bytes {
             self.seen.wrote = true;
             if b == b'\n' || b == b'\r' {
                 self.line_end();
-                out.append(&mut self.held);
-                out.push(b);
-                self.passing = false;
-                continue;
-            }
-            if self.line.len() < Self::KEPT {
+            } else if self.line.len() < Self::KEPT {
                 self.line.push(b);
             }
-            if self.passing {
-                out.push(b);
-                continue;
-            }
-            self.held.push(b);
-            // Bytes, not text: a character cut between two reads is still a prefix.
-            let plain = without_escapes(&self.held);
-            let line = self.no_display.as_bytes();
-            if plain.starts_with(line) {
-                out.extend_from_slice(self.on_host.as_bytes());
-                out.append(&mut self.held);
-                self.passing = true;
-            } else if !line.starts_with(&plain) {
-                out.append(&mut self.held);
-                self.passing = true;
-            }
         }
-        out
     }
 
     /// The current line has ended: the first that is not blank is clap's or not.
@@ -703,10 +648,9 @@ impl Relay {
         self.line.clear();
     }
 
-    /// The stream's end: what is still held passes, and its last line counts.
-    fn end(&mut self) -> Vec<u8> {
+    /// The stream's end: its last line counts.
+    fn end(&mut self) {
         self.line_end();
-        std::mem::take(&mut self.held)
     }
 }
 
@@ -1805,7 +1749,6 @@ mod tests {
     /// (`ssh -t`) gets it — and counts only as the first line that is not blank, in chunks of any
     /// size: after another line it is not parse-time evidence. The same line for another flag,
     /// or not at a line's start, is not it; and the answer is an older sopen only with exit 2.
-    /// Everything passes as it came.
     #[test]
     fn hosts_unknown_gui_line_counts_only_as_its_first() {
         let before = clap::Command::new("sopen")
@@ -1823,14 +1766,12 @@ mod tests {
         let coloured = e.render().ansi().to_string().replace('\n', "\r\n");
         assert!(coloured.contains('\x1b'), "{coloured:?}");
         let first = |bytes: &[u8], chunk: usize| {
-            let mut relay = Relay::new("box");
-            let mut passed = Vec::new();
+            let mut scan = Scan::default();
             for part in bytes.chunks(chunk) {
-                passed.extend(relay.take(part));
+                scan.take(part);
             }
-            passed.extend(relay.end());
-            assert_eq!(passed, bytes, "passed as it came");
-            relay.seen.first == Some(true)
+            scan.end();
+            scan.seen.first == Some(true)
         };
         for text in [&plain, &coloured] {
             for chunk in [1, 7, 4096] {
@@ -1863,42 +1804,6 @@ mod tests {
         }
     }
 
-    /// HOST's no-display line (`sopen: ` and §7.1's line) passes with `on HOST: ` before it, so it
-    /// is not read as this machine's — plain or under a terminal there, in chunks of any size;
-    /// every other line, one that starts like it included, passes as it came.
-    #[test]
-    fn hosts_no_display_line_says_it_is_hosts() {
-        let relayed = |bytes: &[u8], chunk: usize| {
-            let mut relay = Relay::new("box");
-            let mut passed = Vec::new();
-            for part in bytes.chunks(chunk) {
-                passed.extend(relay.take(part));
-            }
-            passed.extend(relay.end());
-            String::from_utf8(passed).unwrap()
-        };
-        let line = format!("sopen: {}", crate::gui::term::NO_DISPLAY);
-        for chunk in [1, 5, 4096] {
-            for end in ["\n", "\r\n", ""] {
-                let text = format!("a\n{line}{end}b\n");
-                assert_eq!(
-                    relayed(text.as_bytes(), chunk),
-                    format!("a\non box: {line}{end}b\n"),
-                    "by {chunk}"
-                );
-            }
-            for same in [
-                "sopen: no display for the file browser (DISPLAY / WAYLAND_DISPLAY unset)\n",
-                "sopen: no display here\n",
-                "x sopen: no display here — sopen config target <host>\n",
-                "sopen: 한글 ü\n",
-                "",
-            ] {
-                assert_eq!(relayed(same.as_bytes(), chunk), same, "by {chunk}");
-            }
-        }
-    }
-
     /// `watched` reads the right stream on each side of `tty` (X2-gui): under `-t` ssh's stdout
     /// (HOST's terminal takes both of its streams), under `-T` ssh's stderr with its stdout
     /// empty. Swapping the two arms, or taking a line on HOST's stdout under `-T` for a refusal,
@@ -1914,7 +1819,7 @@ mod tests {
                 // Not watched under `-t`: kept off the test's own stderr.
                 sh.stderr(std::process::Stdio::null());
             }
-            let (status, refused) = watched(sh, tty, "box", sink, sink).unwrap();
+            let (status, refused) = watched(sh, tty, sink, sink).unwrap();
             assert_eq!(status.code(), Some(2));
             refused
         };
@@ -1927,6 +1832,69 @@ mod tests {
             false
         ));
         assert!(!run(format!("printf 'did it\\n'; {clap}; exit 2"), true));
+    }
+
+    /// What reached this side's sink of one of HOST's streams in
+    /// [`hosts_bytes_pass_while_it_waits`].
+    static GOT: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+    struct Got;
+
+    impl std::io::Write for Got {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            GOT.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// HOST's bytes reach this side the moment they are read, on both branches of `watched`: a
+    /// terminal query (`ESC[6n`, the cursor's place) that a program there writes and then waits
+    /// on is passed on while it waits — never held for a line's end, which would never come
+    /// (the X2-gui fix-check, 2026-11-26).
+    #[test]
+    fn hosts_bytes_pass_while_it_waits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let got: Sink = || Box::new(Got);
+        let sink: Sink = || Box::new(std::io::sink());
+        // (tty, where the query goes, the sinks of ssh's stdout and stderr)
+        for (tty, to, out, err) in [
+            (true, "", got, sink),
+            (false, " >&2", sink, got),
+            (false, "", got, sink),
+        ] {
+            GOT.lock().unwrap().clear();
+            let done = tmp.path().join(format!("done-{tty}-{}", to.len()));
+            let mut sh = Command::new("/bin/sh");
+            sh.arg("-c")
+                .arg(format!(
+                    r#"printf '\033[6n'{to}; while [ ! -e "$1" ]; do sleep 0.05; done"#
+                ))
+                .arg("sh")
+                .arg(&done)
+                .stdin(std::process::Stdio::null());
+            if tty {
+                sh.stderr(std::process::Stdio::null());
+            }
+            let run = std::thread::spawn(move || watched(sh, tty, out, err).unwrap());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let passed = loop {
+                if GOT.lock().unwrap().as_slice() == b"\x1b[6n" {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            std::fs::write(&done, "").unwrap();
+            let (status, refused) = run.join().unwrap();
+            assert!(passed, "tty={tty}{to}: the query was held");
+            assert_eq!(status.code(), Some(0));
+            assert!(!refused);
+        }
     }
 
     // -----------------------------------------------------------------------------------------

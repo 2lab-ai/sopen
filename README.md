@@ -106,7 +106,7 @@ A local file (or a `localhost:` one) is fetched by `<host>` from this machine by
 name, so that name must work for `ssh` on `<host>`.
 
 `--gui` asks for the window: with a target, sopen there gets it too (never with `--app` or for an
-address), and with no desktop session there it says `on <host>: sopen: no display here — …` and
+address), and with no desktop session there its sopen says `no display here — …` and
 exits 1 instead of today's fallbacks. Without `--gui` a forwarded run is as before: `<host>` picks
 by what it finds. (When the terminal becomes xtools' default, sopen will add `--gui` itself for
 what opens in a window.) A `<host>` whose sopen is older than `--gui` refuses it (its own usage
