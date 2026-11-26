@@ -559,6 +559,12 @@ fn no_edit_undo_or_redo_while_a_save_runs() {
 /// Types `path` into the Save As modal's field, over what it holds, and presses Enter.
 fn save_as_to(fx: &mut Fx, path: &Path) {
     fx.until_shown("Save shot.png with your edits to a new local file");
+    // The shared modal in cells (X3-questions).
+    let layers = crate::gui::cells::layers(&fx.drv.ctx);
+    for text in [" Save As ", "[ Browse… ]", "[ Save ]  [ Cancel ]"] {
+        let found = crate::gui::cells::find(&layers, text);
+        assert!(!found.is_empty(), "{text:?} in cells");
+    }
     fx.key(Key::A, command(false));
     let text = vec![Event::Text(path.to_str().unwrap().to_string())];
     fx.drv.frame(&mut fx.win, text, Modifiers::NONE);

@@ -795,6 +795,191 @@ impl Fx {
     fn says(&self, text: &str) -> bool {
         self.drv.find_text(text).is_some() || self.drv.text_starting_with(text).is_some()
     }
+
+    /// Whether the last pass drew `text` in cells (10 §4–§6), on one row of a cell layer.
+    fn in_cells(&self, text: &str) -> bool {
+        in_cells(&self.drv, text)
+    }
+}
+
+/// Whether the last pass of `drv` drew `text` in cells, on one row of a cell layer: not an egui
+/// galley, which a terminal never shows.
+fn in_cells(drv: &Driver, text: &str) -> bool {
+    let layers = crate::gui::cells::layers(&drv.ctx);
+    !crate::gui::cells::find(&layers, text).is_empty()
+}
+
+/// The row of cells `text` stands on in the last pass of `drv` (its first place), whole.
+fn cell_row_of(drv: &Driver, text: &str) -> Option<String> {
+    let layers = crate::gui::cells::layers(&drv.ctx);
+    let hit = crate::gui::cells::find(&layers, text).into_iter().next()?;
+    Some(crate::gui::cells::row_text(&layers[hit.layer].buf, hit.cells.y).0)
+}
+
+/// The modal in cells (10 §4–§6, X3-questions): a box of whole cells, its title in its double
+/// line, black on cyan, with its words as the egui modal had them — the file's line, the path
+/// field (black cells, the path in white, the caret its cell), `[ Browse… ]`, the size and the
+/// time, the hint, `[ Save ]` and `[ Cancel ]` — and its shadow black cells.
+#[test]
+fn the_modal_is_cells_with_its_words() {
+    let fx = modal_with(
+        Fake::new(),
+        Size::Exact(24_000_000_000),
+        Some(3.6e6),
+        Answers(None),
+    );
+    let p = chrome::PALETTE;
+    for text in [
+        "Save model.bin with your edits to a new local file",
+        "[ Browse… ]",
+        "24.0 GB — about 1 h 50 min at 3.6 MB/s",
+        "never over an existing file · Enter saves · Esc cancels",
+        "[ Save ]",
+        "[ Cancel ]",
+    ] {
+        assert!(fx.in_cells(text), "{text:?} in cells");
+    }
+    let title = cell_row_of(&fx.drv, " Save As ").expect("the title in its frame");
+    assert!(title.contains("╔═") && title.contains("═╗"), "{title}");
+    assert_eq!(
+        fx.drv
+            .colors_of("Save model.bin with your edits to a new local file"),
+        Some(vec![p.dialog_text])
+    );
+    assert_eq!(fx.drv.colors_of("[ Save ]"), Some(vec![p.dialog_text]));
+    // The field: its cells black, the path's end in white (a temp folder's path is wider than
+    // the field: the field shows its end, as the engine scrolled it), the caret in it.
+    let name = "model.edited.bin";
+    assert!(fx.in_cells(name), "the path's end in the field");
+    let layers = crate::gui::cells::layers(&fx.drv.ctx);
+    let hit = crate::gui::cells::find(&layers, name)[0];
+    let l = &layers[hit.layer];
+    assert_eq!(
+        crate::gui::cells::colors(l, hit.cells),
+        [chrome::cga::WHITE]
+    );
+    let row = &l.seen()[usize::from(hit.cells.y - l.buf.area.y)];
+    let bg = row[usize::from(hit.cells.x - l.buf.area.x)].bg;
+    assert_eq!(bg, Some(chrome::cga::BLACK), "the field's cells are black");
+    assert!(
+        l.caret.is_some_and(|c| c.y == hit.cells.y),
+        "the caret in it"
+    );
+}
+
+/// The path field takes Hangul as typed text and a paste, both whole, in cells; Enter saves to
+/// the path it holds.
+#[test]
+fn the_field_takes_hangul_and_a_paste() {
+    let mut fx = modal(Fake::new());
+    let folder = fx.dir.join("저장 폴더");
+    std::fs::create_dir(&folder).unwrap();
+    fx.drv.key(&mut fx.host, Key::A, Modifiers::COMMAND);
+    let typed = format!("{}/한글", folder.display());
+    fx.drv.frame(
+        &mut fx.host,
+        vec![egui::Event::Text(typed.clone())],
+        Modifiers::NONE,
+    );
+    fx.drv.paste_text(&mut fx.host, "-붙임.bin");
+    fx.drv.idle(&mut fx.host, 1);
+    assert_eq!(fx.host.modal().path, format!("{typed}-붙임.bin"));
+    assert!(fx.in_cells("한글-붙임.bin"), "in the field's cells");
+    fx.key(Key::Enter);
+    fx.landed();
+    assert_eq!(std::fs::read(folder.join("한글-붙임.bin")).unwrap(), BODY);
+}
+
+/// While it writes, the modal says where in cells, and the progress is a row of cells: a bar of
+/// `█` and `░` (`▓` a cell half done), then the bytes and the time left; the path is a weak
+/// text then, not a field, and `[ Save ]` and `[ Browse… ]` are off (the weak colour).
+#[test]
+fn the_progress_is_a_row_of_cells() {
+    let (fake, held) = held();
+    let mut fx = modal(fake);
+    fx.key(Key::Enter);
+    let half = BODY.len() / 2;
+    let want = format!("50 % ({half} of {} B)", BODY.len());
+    fx.drv.until(&mut fx.host, 10, |h| {
+        h.modal
+            .as_ref()
+            .and_then(SaveAs::progress_text)
+            .is_some_and(|t| t.starts_with(&want))
+    });
+    fx.drv.idle(&mut fx.host, 1);
+    assert!(fx.in_cells("saving to "), "where, in cells");
+    let row = cell_row_of(&fx.drv, &want).expect("the progress in cells");
+    let bar = row.trim_start_matches(['║', ' ']);
+    assert!(bar.starts_with('█'), "{row}");
+    assert!(
+        row.contains('░') && row.contains(&format!("  {want}")),
+        "{row}"
+    );
+    let weak = chrome::PALETTE.dialog_weak;
+    assert_eq!(fx.drv.colors_of("[ Save ]"), Some(vec![weak]), "off");
+    assert_eq!(fx.drv.colors_of("[ Browse… ]"), Some(vec![weak]), "off");
+    assert!(
+        crate::gui::cells::layers(&fx.drv.ctx)
+            .iter()
+            .all(|l| l.caret.is_none()),
+        "no field while it writes"
+    );
+    held.go.send(()).unwrap();
+    fx.landed();
+    assert!(matches!(fx.host.ended.as_slice(), [Ended::Saved { .. }]));
+}
+
+/// The clash (a name taken meanwhile): the refusal is a row of cells in the dialog's error
+/// colour, the next free name in the field.
+#[test]
+fn the_clash_is_said_in_cells() {
+    let dest = Arc::new(Mutex::new(None::<PathBuf>));
+    let d2 = dest.clone();
+    let mut once = true;
+    let fake = Fake::new().mid(move |_, _| {
+        if std::mem::take(&mut once) {
+            let dest = d2.lock().unwrap().clone().unwrap();
+            std::fs::write(dest, b"someone else's").unwrap();
+        }
+    });
+    let mut fx = modal(fake);
+    *dest.lock().unwrap() = Some(fx.dir.join("model.edited.bin"));
+    fx.key(Key::Enter);
+    fx.landed();
+    // Wrapped at the box's 76 cells: the refusal's words, then the next free name on its own row.
+    let said = "model.edited.bin exists — not replaced. Save again saves as";
+    assert!(fx.in_cells(said), "the refusal in cells");
+    let error = chrome::PALETTE.dialog_error;
+    assert_eq!(fx.drv.colors_of(said), Some(vec![error]));
+    assert_eq!(fx.drv.colors_of("model.edited-1.bin"), Some(vec![error]));
+    assert_eq!(
+        fx.host.modal().path,
+        binary::tilde(&fx.dir.join("model.edited-1.bin")),
+        "the next free name in the field"
+    );
+}
+
+/// Tab moves the keyboard from the field to `[ Browse… ]`, then `[ Save ]`, then `[ Cancel ]`,
+/// each in the bar's colours while it has it; Space on `[ Cancel ]` closes the modal, writing
+/// nothing.
+#[test]
+fn tab_walks_the_buttons_and_space_presses_one() {
+    let fake = Fake::new();
+    let fills = fake.fills.clone();
+    let mut fx = modal(fake);
+    let p = chrome::PALETTE;
+    for button in ["[ Browse… ]", "[ Save ]", "[ Cancel ]"] {
+        fx.key(Key::Tab);
+        fx.drv.idle(&mut fx.host, 1);
+        assert_eq!(
+            fx.drv.colors_of(button),
+            Some(vec![p.bar_text]),
+            "{button} has the keyboard"
+        );
+    }
+    fx.key(Key::Space);
+    assert!(matches!(fx.host.ended.as_slice(), [Ended::Closed]));
+    assert_eq!(fills.load(Ordering::SeqCst), 0);
 }
 
 /// The modal is a PC Shell box titled Save As: the path field prefilled with the edited name in
@@ -812,14 +997,10 @@ fn the_modal_shows_the_path_the_size_and_the_expected_time() {
         fx.host.modal().path,
         binary::tilde(&fx.dir.join("model.edited.bin"))
     );
-    // In the field (a temp folder's path is wider than the field: it scrolls, so it is drawn
-    // in part).
-    let path = binary::tilde(&fx.dir.join("model.edited.bin"));
-    assert!(
-        fx.drv.galleys().iter().any(|(_, g)| g.text() == path),
-        "in the field"
-    );
-    assert!(fx.says("Browse…"));
+    // In the field's cells (a temp folder's path is wider than the field: it scrolls, so its
+    // end is drawn).
+    assert!(fx.in_cells("model.edited.bin"), "in the field");
+    assert!(fx.says("[ Browse… ]"));
     assert!(fx.says("24.0 GB — about 1 h 50 min at 3.6 MB/s"));
     assert!(fx.host.ended.is_empty());
 }
@@ -947,7 +1128,7 @@ fn the_cancel_button_stops_a_running_save() {
             .is_some_and(|m| m.progress_text().is_some())
     });
     fx.drv.idle(&mut fx.host, 1);
-    fx.drv.click_text(&mut fx.host, "Cancel");
+    fx.drv.click_text(&mut fx.host, "[ Cancel ]");
     fx.landed();
     assert!(fx.says(binary::SAVE_CANCELLED));
     assert!(names(&fx.dir).is_empty(), "{:?}", names(&fx.dir));
@@ -1010,7 +1191,7 @@ fn esc_or_cancel_while_asking_closes_without_writing() {
         let fills = fake.fills.clone();
         let mut fx = modal(fake);
         if by_button {
-            fx.drv.click_text(&mut fx.host, "Cancel");
+            fx.drv.click_text(&mut fx.host, "[ Cancel ]");
         } else {
             fx.key(Key::Escape);
         }
@@ -1029,15 +1210,18 @@ fn browse_saves_where_the_system_dialog_says() {
     let tmp = tempfile::tempdir().unwrap();
     let chosen = tmp.path().join("chosen.bin");
     let mut fx = modal_with(Fake::new(), exact(), None, Answers(Some(chosen.clone())));
-    fx.drv.click_text(&mut fx.host, "Browse…");
+    fx.drv.click_text(&mut fx.host, "[ Browse… ]");
     fx.landed();
     assert_eq!(std::fs::read(&chosen).unwrap(), BODY);
     assert!(matches!(fx.host.ended.as_slice(), [Ended::Saved { path, .. }] if *path == chosen));
 
     let mut fx = modal_with(Fake::new(), exact(), None, Answers(None));
-    fx.drv.click_text(&mut fx.host, "Browse…");
+    fx.drv.click_text(&mut fx.host, "[ Browse… ]");
     fx.drv.idle(&mut fx.host, 2);
-    assert!(fx.says(binary::BROWSE_NONE));
+    // Wrapped at the box's 76 cells.
+    let (head, tail) = binary::BROWSE_NONE.split_at(binary::BROWSE_NONE.find(" field").unwrap());
+    assert!(fx.says(head), "{head}");
+    assert!(fx.says(tail.trim_start()), "{tail}");
     assert!(fx.host.ended.is_empty());
 }
 

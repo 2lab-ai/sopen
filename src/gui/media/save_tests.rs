@@ -1298,6 +1298,13 @@ fn f7_and_alt_command_s_open_save_as_and_save_as_writes_a_local_file() {
         assert!(ed.win.save_as.is_none());
         ed.drv.key(&mut ed.win, Key::F7, Modifiers::NONE);
         assert!(ed.win.save_as.is_some(), "F7 opens Save As");
+        // The shared modal in cells (X3-questions).
+        ed.drv.idle(&mut ed.win, 1);
+        let layers = crate::gui::cells::layers(&ed.drv.ctx);
+        for text in [" Save As ", "[ Browse… ]", "[ Save ]  [ Cancel ]"] {
+            let found = crate::gui::cells::find(&layers, text);
+            assert!(!found.is_empty(), "{side:?}: {text:?} in cells");
+        }
         ed.drv.key(&mut ed.win, Key::Enter, Modifiers::NONE);
         ed.drv.until(&mut ed.win, 60, |w| w.save_as.is_none());
         let saved = folder.join("r.edited.wav");

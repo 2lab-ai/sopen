@@ -262,3 +262,31 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
 | XW-receipts | ✅ done 2026-11-25 | 10 §17's X3: `SOPEN_CELLS` and TS-6 (#138) | coder |
 | X3-hex | ✅ done 2026-11-26 | 10 §17's X3: the hex viewer in cells (#139) | coder |
 
+## R1 (part 7) — the binary dialog, the text viewer, `--gui`, the switch's state and the views in a terminal, closed 2026-11-26
+
+Five units merged and shipped one by one, each prerelease installed on the Mac and the Linux host.
+
+- **X3-binary** (#143): the binary dialog in cells — the file's line, `[ Hex ]` and `[ Save to… ]`, the path field, the progress and the clash note; the window fitted to its rows.
+- **X3-text** (#145): the text viewer and its preview in cells in both backends, wrapped and scrolled sideways by cells; in the TUI the text view where a hand-off box stood. CP437 stand-ins apply to chrome and control-character glyphs only: content keeps its letters (TS-1, TS-4, TS-6).
+- **X2-gui** (#144): `--gui` — the window here, or with no display §7.1's line and exit 1 before anything is read; refused beside `--app` and `--tui`. A forward passes it only when the owner gave it (the automatic rule waits behind `AUTO_GUI` for XF); an older HOST that refuses it at parse time gets the run once more without it. HOST's bytes pass as they are read: a prefix on its lines held a terminal query once (the fix-check's find), so there is none.
+- **X2-state** (#146): the switch's state, one JSON line, `"v": 1`, taken from one browser and given to a new one; checked as untrusted input wherever it is read or given; paths rewritten out and back; a dialog reopened only on its side, folder and entries, the pass that reopens it dropping its input. Nothing sends it yet: X2-host and X2-switch will.
+- **VM-8** (#147): 08's views in the terminal — the window's slots with pages not drawn, so `index.html` opens on its source (3) in the TUI and on its page (1) in the window; a preview made under one backend is made again after a switch; the view keys through the translator.
+- **Receipts** on the installed builds: the hex view and the text viewer in `--tui` (Hangul in two cells); the binary dialog's cells with a Hangul file name; `--gui --tui` exits 2; `--gui` without a display exits 1 with its line on the Linux host; `index.html` in `--tui` opens on its source, the bar reading `1 Page · 2 Hex · 3 Text`.
+- **Reviews.** Two engines per unit, then one fix-check; the orchestrator verified the last fixes at their lines. CI-only failures were timing tests outside the units (F-timing), passed on a rerun of the failed job.
+- **Prereleases:**
+  - preview-2026-11-26-0456-3adfa7be05c1 (X3-binary);
+  - preview-2026-11-26-0646-ca4b291f9d8a (X3-text);
+  - preview-2026-11-26-0852-fa141481f257 (X2-gui);
+  - preview-2026-11-26-0954-8e0c880d8956 (X2-state);
+  - preview-2026-11-26-1027-3b186f4fca4b (VM-8).
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| X3-binary | ✅ done 2026-11-26 | 10 §17's X3: the binary dialog in cells (#143) | coder |
+| X3-text | ✅ done 2026-11-26 | 10 §17's X3: the text viewer and its preview in cells (#145) | coder |
+| X2-gui | ✅ done 2026-11-26 | 10 §17's X2: `--gui` and its forward, with an older HOST's retry (#144) | coder |
+| X2-state | ✅ done 2026-11-26 | 10 §17's X2: the switch's state, `"v": 1` (#146) | coder |
+| VM-8 | ✅ done 2026-11-26 | 10 §17's X3 (08 §13's row): 08's views in the terminal (#147) | coder |
+

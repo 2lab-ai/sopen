@@ -556,6 +556,12 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                 match placed {
                     Placed::Text(at, text, pen) => {
                         let room = usize::from(frame_cells.right().saturating_sub(at.x + 2));
+                        // The blanks after it in its pen too: one run, which a terminal that
+                        // lays a glyph of ambiguous width in two cells moves into them (10 §10)
+                        // where the frame's colours would have cut it (a hint's `·`, a note's
+                        // `—`).
+                        let row = Cells::new(at.x, at.y, room as u16, 1);
+                        cells::fill(&mut buf, row, *pen);
                         cells::put(&mut buf, at.x, at.y, text, room, *pen);
                     }
                     Placed::Held(cells, id) => {

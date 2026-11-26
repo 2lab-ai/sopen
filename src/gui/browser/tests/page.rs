@@ -1018,7 +1018,7 @@ fn wv_d_a_save_in_hex_makes_the_page_view_again() {
     fx.key(Key::F9);
     digit(&mut fx, 1);
     assert!(fx.drv.find_text("Unsaved changes").is_some(), "the prompt");
-    fx.drv.click_text_on_top(&mut fx.b, "Save");
+    fx.drv.click_text_on_top(&mut fx.b, "[ Save ]");
     fx.drv.until(&mut fx.b, 20, |_| {
         std::fs::read(&file).unwrap()[0] == 0x41 && fake.views() == 2
     });

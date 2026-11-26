@@ -6,8 +6,12 @@
 //!   or the next free `-N` ([`first_path`]); Browse… (the system's save dialog, a
 //!   [`Chooser`]); the size and the time expected at the rate the viewer is getting
 //!   ([`expected_line`]). While it writes it shows the bytes and the time left
-//!   ([`progress_line`]); Esc or Cancel stops it. It ends when a save lands or when it is
-//!   dismissed ([`Ended`]); a save that does not land leaves it open, saying why.
+//!   ([`progress_line`]) after a row of `█░` cells; Esc or Cancel stops it. It ends when a save
+//!   lands or when it is dismissed ([`Ended`]); a save that does not land leaves it open, saying
+//!   why. It is cells (10 §4–§6, X3-questions): an `ops::dialog` box — its field `ops::dialog`'s,
+//!   `[ Browse… ]`, `[ Save ]  [ Cancel ]` — on the window's grid ([`SaveAs::show`]) or on one
+//!   the window gives, between its title and status rows ([`SaveAs::show_on`]); in a terminal it
+//!   is drawn as in the window.
 //! - **The writer** ([`write`]): it removes what killed saves left in the chosen folder
 //!   (`binary::sweep_dead`, as `save_new` does), then refuses before anything is made when the
 //!   folder has less free space than the output ([`room`]). Then it writes through `binary::save_new`'s
@@ -27,11 +31,12 @@
 //!   cancels and waits.
 
 use super::binary::{self, Chooser, Decision, SaveError};
-use super::chrome;
+use super::browser::ops::dialog::{self, Button, Ink, Inputs, Part};
+use super::cells::{self, Cells, Grid};
 use crate::remote::patch::{about, part_of};
 use crate::remote::LocalFs;
 use anyhow::{anyhow, Result};
-use eframe::egui::{self, Color32, Key, Modifiers};
+use eframe::egui::{self, Key, Modifiers};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -442,6 +447,47 @@ fn field_id() -> egui::Id {
     egui::Id::unique("sopen-save-as-path")
 }
 
+fn dialog_id() -> egui::Id {
+    egui::Id::unique("sopen-save-as")
+}
+
+fn browse_id() -> egui::Id {
+    dialog_id().with("browse")
+}
+
+fn save_id() -> egui::Id {
+    dialog_id().with("save")
+}
+
+fn cancel_id() -> egui::Id {
+    dialog_id().with("cancel")
+}
+
+/// The modal's title in its frame.
+const TITLE: &str = "Save As";
+/// The cells the box's inside has at least (the egui modal's 64), so a line that comes or goes
+/// never changes its width.
+const WIDE: usize = 64;
+
+/// The progress row in `room` cells (10 §6): a bar of `█` for what is done and `░` for the rest
+/// — `▓` for a cell half done — then, two blanks on, `figures` (the bytes and the time left).
+fn progress_row(frac: f64, figures: &str, room: usize) -> String {
+    let bar = room.saturating_sub(cells::width(figures) + 2);
+    if bar == 0 {
+        return figures.to_string();
+    }
+    let filled = frac.clamp(0.0, 1.0) * bar as f64;
+    let full = filled.floor() as usize;
+    let half = usize::from(full < bar && filled - full as f64 >= 0.5);
+    let rest = bar - full - half;
+    format!(
+        "{}{}{}  {figures}",
+        "█".repeat(full),
+        "▓".repeat(half),
+        "░".repeat(rest)
+    )
+}
+
 /// The Save As modal (07 §7, §10), over a window. See the module's words for how a window uses
 /// it.
 pub struct SaveAs {
@@ -647,9 +693,90 @@ impl SaveAs {
         None
     }
 
-    /// One pass of the modal: what came back, its keys (Enter saves, Esc stops a running save
-    /// or else closes), then the box. Returns how it ended, once it has.
+    /// One pass of the modal on the whole window's grid ([`SaveAs::show_on`]); the image and
+    /// media windows show it so.
     pub fn show(&mut self, ctx: &egui::Context) -> Option<Ended> {
+        self.show_on(ctx, dialog::grid(ctx))
+    }
+
+    /// The modal's parts on a grid `cols` wide (10 §6, through `ops::dialog`): the file's line,
+    /// the path field — while it can save; else the path a weak text, as an off control is — and
+    /// `[ Browse… ]`, the size and the time expected, the hint, what runs (where it writes and
+    /// the progress row), the system's dialog awaited, the notes, then `[ Save ]  [ Cancel ]`.
+    fn parts(&self, cols: u16) -> Vec<Part> {
+        let can = self.can_save();
+        let room = dialog::inside_width(cols, WIDE, 0);
+        let button = |label: &str, id: egui::Id, on: bool| Button {
+            on,
+            ..Button::new(label, id)
+        };
+        let mut parts = vec![
+            Part::Text(
+                format!("Save {} with your edits to a new local file", self.name),
+                Ink::Text,
+            ),
+            Part::Blank,
+            if can {
+                Part::Field {
+                    label: String::new(),
+                    id: field_id(),
+                }
+            } else {
+                Part::Text(cells::fit_left(&self.path, room), Ink::Weak)
+            },
+            Part::Buttons(vec![button("Browse…", browse_id(), can)]),
+            Part::Text(expected_line(self.size, self.rate), Ink::Text),
+            Part::Text(
+                "never over an existing file · Enter saves · Esc cancels".to_string(),
+                Ink::Weak,
+            ),
+        ];
+        if let (Some(progress), Stage::Writing { dest, done, .. }) =
+            (self.progress_text(), &self.stage)
+        {
+            let frac = match self.size.bytes() {
+                0 => 0.0,
+                total => (done.load(Ordering::Relaxed) as f64 / total as f64).min(1.0),
+            };
+            parts.extend([
+                Part::Blank,
+                Part::Text(
+                    format!("saving to {}… Esc cancels", binary::tilde(dest)),
+                    Ink::Text,
+                ),
+                Part::Text(progress_row(frac, &progress, room), Ink::Text),
+            ]);
+        }
+        if matches!(self.stage, Stage::Choosing(_)) {
+            parts.push(Part::Text(
+                "waiting for the system's save dialog…".to_string(),
+                Ink::Text,
+            ));
+        }
+        for (text, error) in &self.notes {
+            let ink = if *error { Ink::Error } else { Ink::Text };
+            parts.extend(text.lines().map(|l| Part::Text(l.to_string(), ink)));
+        }
+        parts.extend([
+            Part::Blank,
+            Part::Buttons(vec![
+                button("Save", save_id(), can),
+                Button::new("Cancel", cancel_id()),
+            ]),
+        ]);
+        parts
+    }
+
+    /// The cells of `grid` the modal covers there, its box and its shadow, for the window to
+    /// blank before it paints them (cells.rs: one buffer of cells over another).
+    pub fn covers(&self, grid: Grid) -> Vec<Cells> {
+        dialog::layout(grid, TITLE, WIDE, &self.parts(grid.cols)).covers()
+    }
+
+    /// One pass of the modal on `grid` (the window's, between its title and status rows): what
+    /// came back, its keys (Enter saves, Esc stops a running save or else closes), then the box
+    /// in cells (10 §6, `ops::dialog`). Returns how it ended, once it has.
+    pub fn show_on(&mut self, ctx: &egui::Context, grid: Grid) -> Option<Ended> {
         if let Some(ended) = self.poll(ctx) {
             return Some(ended);
         }
@@ -659,85 +786,24 @@ impl SaveAs {
         let escape = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
         let enter = !on_button && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
         // The field has the keyboard while the modal asks, unless one of its buttons has it.
-        // Asked again every pass: a disabled widget gives the focus up, and the modal's first
-        // pass is an invisible sizing pass, so a request made once at open is lost.
+        // Asked again every pass: a disabled control gives the focus up.
         let take_back = self.can_save() && !on_button && focused != Some(field);
         if std::mem::take(&mut self.focus) || take_back {
             ctx.memory_mut(|m| m.request_focus(field));
         }
-        let (mut save, mut stop, mut browse) = (enter, escape, false);
-        let (can, writing) = (self.can_save(), self.busy());
-        let progress = self.progress_text();
-        let expected = expected_line(self.size, self.rate);
-        let width = (64.0 * chrome::CELL.x)
-            .min(ctx.content_rect().width() - 8.0 * chrome::CELL.x)
-            .max(20.0 * chrome::CELL.x);
-        // Every button laid out this pass: one with the focus keeps Enter as its own click.
-        let mut buttons = Vec::new();
-        chrome::dialog(ctx, egui::Id::unique("sopen-save-as"), "Save As", |ui| {
-            ui.set_width(width);
-            ui.label(format!(
-                "Save {} with your edits to a new local file",
-                self.name
-            ));
-            ui.add_space(chrome::CELL.y / 2.0);
-            ui.horizontal(|ui| {
-                let room =
-                    (ui.available_width() - 11.0 * chrome::CELL.x).max(10.0 * chrome::CELL.x);
-                ui.add_enabled(
-                    can,
-                    chrome::field(&mut self.path).id(field).desired_width(room),
-                );
-                let chooser = ui
-                    .add_enabled(can, egui::Button::new("Browse…"))
-                    .on_hover_text("the system's save dialog");
-                buttons.push(chooser.id);
-                browse |= chooser.clicked();
-            });
-            ui.label(expected);
-            ui.label(
-                egui::RichText::new("never over an existing file · Enter saves · Esc cancels")
-                    .weak(),
-            );
-            if let (Some(progress), Stage::Writing { dest, done, .. }) = (&progress, &self.stage) {
-                ui.add_space(chrome::CELL.y / 2.0);
-                ui.label(format!("saving to {}… Esc cancels", binary::tilde(dest)));
-                let total = self.size.bytes();
-                let frac = if total > 0 {
-                    (done.load(Ordering::Relaxed) as f32 / total as f32).min(1.0)
-                } else {
-                    0.0
-                };
-                let text = egui::RichText::new(progress.as_str()).color(chrome::PALETTE.field_text);
-                ui.add(egui::ProgressBar::new(frac).text(text));
-            }
-            if matches!(self.stage, Stage::Choosing(_)) {
-                ui.label("waiting for the system's save dialog…");
-            }
-            let (error, plain) = (ui.visuals().error_fg_color, ui.visuals().text_color());
-            let lines: Vec<(String, Color32)> = self
-                .notes
-                .iter()
-                .map(|(t, e)| (t.clone(), if *e { error } else { plain }))
-                .collect();
-            if !lines.is_empty() {
-                ui.add_space(chrome::CELL.y / 4.0);
-                super::disclosures(ui, &lines);
-            }
-            ui.add_space(chrome::CELL.y / 2.0);
-            ui.horizontal(|ui| {
-                let ok = ui.add_enabled(can, egui::Button::new("Save"));
-                let no = ui.button("Cancel").on_hover_text(if writing {
-                    "Esc — stops the save"
-                } else {
-                    "Esc"
-                });
-                buttons.extend([ok.id, no.id]);
-                save |= ok.clicked();
-                stop |= no.clicked();
-            });
-        });
-        self.buttons = buttons;
+        let can = self.can_save();
+        let parts = self.parts(grid.cols);
+        let layout = dialog::layout(grid, TITLE, WIDE, &parts);
+        let inputs = Inputs {
+            field: can.then_some(&mut self.path),
+            ..Inputs::default()
+        };
+        let shown = dialog::show(ctx, dialog_id(), &layout, inputs);
+        // Every button laid out: one with the focus keeps Enter as its own click.
+        self.buttons = vec![browse_id(), save_id(), cancel_id()];
+        let save = enter || shown.clicked(save_id());
+        let stop = escape || shown.clicked(cancel_id());
+        let browse = shown.clicked(browse_id());
         if stop {
             match &self.stage {
                 Stage::Writing { decision, .. } => drop(decision.cancel()),
