@@ -280,6 +280,14 @@ fn edit_bytes(drv: &mut Driver, w: &mut Switched) {
     );
 }
 
+/// Clicks the viewer's close prompt's `label` (`[ Cancel ]`, `[ Discard ]`) once the window has
+/// settled: no journal write of the prompt's still on its way ([`Window::ready`] holds the
+/// viewer's), and a pass after that drew the buttons where a click finds them.
+fn click_prompt(drv: &mut Driver, w: &mut Switched, label: &str) {
+    settle(drv, w);
+    drv.click_text_on_top(w, label);
+}
+
 /// The sender's browser, moved by the owner's keys: dual mode, the bar on a folder in the left
 /// side, the right side in a long folder, scrolled, the bar deep in it. Its state through its
 /// line opens HOST's window at the same cells, `[TUI]` on its title row (the receipt leaves the
@@ -434,14 +442,14 @@ fn unsaved_edits_ask_first_and_cancel_keeps_the_window() {
             "the prompt first"
         );
         assert!(!drv.window_closed);
-        drv.click_text_on_top(w, "Cancel");
+        click_prompt(drv, w, "[ Cancel ]");
         drv.idle(w, 2);
         assert!(drv.find_text("Unsaved changes").is_none());
         assert!(!drv.window_closed, "Cancel keeps the window");
         assert_eq!(said.text(), "", "nothing said");
         key(drv, w, Key::F12);
         drv.idle(w, 2);
-        drv.click_text_on_top(w, "Discard");
+        click_prompt(drv, w, "[ Discard ]");
         drv.idle(w, 3);
         assert!(drv.window_closed, "Discard returns");
     });
@@ -578,12 +586,12 @@ fn the_input_ending_with_unsaved_edits_keeps_the_window() {
                 "the prompt: {:?}",
                 drv.texts().into_iter().map(|t| t.2).collect::<Vec<_>>()
             );
-            drv.click_text_on_top(w, "Cancel");
+            click_prompt(drv, w, "[ Cancel ]");
             drv.idle(w, 2);
             assert!(!drv.window_closed, "Cancel keeps it");
             drv.key(w, Key::W, Modifiers::COMMAND);
             drv.idle(w, 2);
-            drv.click_text_on_top(w, "Discard");
+            click_prompt(drv, w, "[ Discard ]");
             drv.idle(w, 3);
             assert!(drv.window_closed, "closed there");
         },
@@ -629,7 +637,7 @@ fn the_button_goes_with_the_session() {
             assert!(!drv.window_closed);
             drv.key(w, Key::W, Modifiers::COMMAND);
             drv.idle(w, 2);
-            drv.click_text_on_top(w, "Discard");
+            click_prompt(drv, w, "[ Discard ]");
             drv.idle(w, 3);
             assert!(drv.window_closed, "closed there");
         },
