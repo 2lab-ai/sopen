@@ -229,3 +229,36 @@ loop.md round section; a regression reopens as a new loop.md row with Source `re
 | ED-enc | ✅ done 2026-11-25 | 12 §16: `Encoding::encode` and its refusal (#127) | coder |
 | VM-7 | ✅ done 2026-11-25 | 08 §13: the egui binding of the view keys and the views (1/2/3, 9 View, F8 encodings) (#128) | coder |
 | XW-term | ✅ done 2026-11-25 | 10 §17: the terminal backend and `sopen --tui`; ships X1b (#129) | coder |
+
+## R1 (part 6) — pages, the help in cells, the editor's model, shared streams and receipts, closed 2026-11-25
+
+- **WV-D** (#131) answers owner message 18: `.html`/`.htm` and styled `.xml` render as pages in the preview and the viewer (scripts off, outside requests blocked and counted, the folder as root); Page·Hex·Text; the source with the reason when no engine. #135 made its hand-over tests deterministic.
+- **XW-help2** (#132): F1's help drawn in cells in both backends, shown in the terminal, one `⌘` face in every window.
+- **ED-ops** (#133) and **ED-save** (#136): the editor's commands over the buffer (bounded work on one huge line) and its save path (§9.1's steps through `replace_guarded`: the local exchange, the SFTP link guard, reconcile by identity; the SFTP window before the rename stated as a limit).
+- **VM-7b** (#137): one remote file's views share its stream and one save session, given back only once a hidden view's work ended; a viewer back within 06 §6.
+- **XW-receipts** (#138): `SOPEN_CELLS` writes either backend's screen as text; TS-6 — an ambiguous-wide terminal gets §10's chrome stand-ins in one start-up round trip.
+- **X3-hex** (#139): the hex viewer in cells in both backends — in the TUI the hex view where a hand-off box stood; the CP437 column's stand-ins through §10's table; the title row keeps the mode button's width (TS-1).
+- **Docs:** the ledger (#130); X2 and X3 cut into units (#134).
+- **The Linux host** was offline from about 19:50 to 22:40 KST (11-25); PRs' ubuntu CI stood in as the Linux gate and prereleases went to the Mac only until it returned (preview-2026-11-25-1338-d8733a5ee00a installed on both).
+- **Reviews.** Two engines per unit, then one fix-check; the orchestrator verified the last fixes at their lines. Two CI-only failures were test races (a free-space-dependent oracle; a Save read after it landed), fixed in the tests.
+- **Prereleases:**
+  - preview-2026-11-25-0939-e59eda3fc46a (WV-D);
+  - preview-2026-11-25-1008-623d6fc33266 (XW-help2);
+  - preview-2026-11-25-1056-8e1391e16ad0 (ED-ops);
+  - preview-2026-11-25-1148-c14204ebfe3e (ED-save);
+  - preview-2026-11-25-1338-d8733a5ee00a (XW-receipts);
+  - preview-2026-11-25-1406-ca5fee3974e1 (VM-7b);
+  - preview-2026-11-25-1751-d98f95eb71eb (X3-hex, built at #140's commit after two cancelled macOS builds).
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| WV-D | ✅ done 2026-11-25 | 09 §12: the page view in the browser (#131, #135) | coder |
+| XW-help2 | ✅ done 2026-11-25 | F1's help in cells in both backends (#132) | coder |
+| ED-ops | ✅ done 2026-11-25 | 12 §16: the editor's commands over the buffer (#133) | coder |
+| ED-save | ✅ done 2026-11-25 | 12 §16: the editor's save path without a screen (#136) | coder |
+| VM-7b | ✅ done 2026-11-25 | 08 §13: views of one remote file share its stream and one save session (#137) | coder |
+| XW-receipts | ✅ done 2026-11-25 | 10 §17's X3: `SOPEN_CELLS` and TS-6 (#138) | coder |
+| X3-hex | ✅ done 2026-11-26 | 10 §17's X3: the hex viewer in cells (#139) | coder |
+

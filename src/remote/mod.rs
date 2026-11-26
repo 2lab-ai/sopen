@@ -11,6 +11,7 @@ mod ranged;
 mod sftp;
 pub mod treefs;
 
+pub(crate) use local::stat_of;
 pub use local::LocalFs;
 #[cfg(test)]
 pub(crate) use ranged::{
@@ -101,6 +102,105 @@ pub enum Step<'a> {
     Removed { temp: &'a str },
     /// The temp this replace made could not be removed: it is left, and the result names it.
     Left { temp: &'a str },
+}
+
+/// A local file's identity (12 §3 "the baseline"): what a rename or an exchange changes and a
+/// write in place keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// Where [`RemoteFs::replace_guarded`] is (12 §9.1, E32), told as it happens: [`Step`]'s steps,
+/// and beside them the guard's own phases, each before the request that moves the replace to it,
+/// so a caller records it durably first (07 §3.1).
+#[derive(Debug, Clone, Copy)]
+pub enum Guard<'a> {
+    Step(Step<'a>),
+    /// Local: the exchange of the staged temp with the target is next. Both by device and inode:
+    /// what tells, after a crash, whether the exchange happened.
+    Exchanging {
+        temp: &'a str,
+        temp_id: FileId,
+        target_id: FileId,
+    },
+    /// Local: the version the exchange displaced is not the one read; the exchange back is next.
+    SwappedBack {
+        temp: &'a str,
+    },
+    /// Remote: the hard link of the target to `link` — the version about to be replaced — is
+    /// next.
+    Linked {
+        link: &'a str,
+    },
+    /// Remote: the rename got its reply; the link check is next.
+    Committed {
+        link: &'a str,
+    },
+    /// Remote: the link holds the version read; its removal is next.
+    Verified {
+        link: &'a str,
+    },
+    /// The other writer's version at `from` — what the exchange displaced when the exchange back
+    /// failed, or the link changed in the moment before the rename — is renamed `kept` next.
+    Kept {
+        from: &'a str,
+        kept: &'a str,
+    },
+    /// No guard after all (the exchange or the link refused): today's check, then rename.
+    Unguarded(Unguarded),
+}
+
+/// The guard a replace ran without, and the line said once per filesystem or server (12 §9.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Unguarded {
+    /// `ENOSYS`, `EINVAL`, `ENOTSUP` or `EOPNOTSUPP` from the exchange.
+    NoExchange,
+    /// No `hardlink@openssh.com`, or the link refused for this file.
+    NoLink,
+}
+
+impl Unguarded {
+    pub fn line(self) -> &'static str {
+        match self {
+            Unguarded::NoExchange => {
+                "this filesystem cannot exchange files: a change in the last moment before the \
+                 save is not caught"
+            }
+            Unguarded::NoLink => {
+                "this server cannot link files: a change in the last moment before the save is \
+                 not caught"
+            }
+        }
+    }
+}
+
+/// What [`RemoteFs::replace_guarded`] did: [`WriteOutcome`], where the other writer's version
+/// is kept when one was found in the moment before (`<name>.sopen-replaced-<stamp>`, or the
+/// path it is still at), and the guard it ran without.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replaced {
+    pub outcome: WriteOutcome,
+    pub kept: Option<String>,
+    pub unguarded: Option<Unguarded>,
+}
+
+/// The exchange is not offered here: the errno (`ENOSYS`: an older kernel or a seccomp filter;
+/// `EINVAL`, `ENOTSUP`, `EOPNOTSUPP`: a filesystem without it).
+#[derive(Debug)]
+pub struct NoExchange(pub i32);
+
+impl std::fmt::Display for NoExchange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exchange is not offered here (errno {})", self.0)
+    }
+}
+
+impl std::error::Error for NoExchange {}
+
+pub fn is_no_exchange(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<NoExchange>())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -479,6 +579,33 @@ pub trait RemoteFs: IntoBoxed {
     fn hash_check_limit(&self) -> u64 {
         HASH_CHECK_MAX
     }
+    /// Exchanges `a` and `b` in one call (12 §9.1: `renamex_np(RENAME_SWAP)` on macOS,
+    /// `renameat2(RENAME_EXCHANGE)` on Linux). [`NoExchange`] where it is not offered — the
+    /// default, as SFTP has none.
+    fn exchange(&mut self, a: &str, b: &str) -> Result<()> {
+        Err(anyhow::Error::new(NoExchange(libc::ENOSYS))
+            .context(format!("cannot exchange {a} and {b}")))
+    }
+    /// The device and inode of `path` itself (never through a link) and its link count; `None`
+    /// when nothing is there or the file layer has no such thing (SFTP v3, the default).
+    fn file_id(&mut self, _path: &str) -> Result<Option<(FileId, u64)>> {
+        Ok(None)
+    }
+    /// Makes `dir`'s entries durable where the file layer can (the local disk); elsewhere it
+    /// does nothing.
+    fn sync_dir(&mut self, _dir: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Moves `from` to `to`, never replacing anything: an error when `to` exists. The default is
+    /// a hard link to `to` (which refuses an existing name; over SFTP `hardlink@openssh.com`),
+    /// then `from` removed — both names hold the file when that removal fails.
+    fn move_new(&mut self, from: &str, to: &str) -> Result<()> {
+        self.link_new(from, to)?;
+        if let Err(e) = self.remove(from) {
+            crate::debug!("{from} stays beside {to}: {e:#}");
+        }
+        Ok(())
+    }
 
     /// The connection becomes the byte transport of `path` (06 §2): the file is opened on it
     /// once, its handle `fstat`ed, and its reads and status requests go out on this one session.
@@ -737,6 +864,55 @@ pub trait RemoteFs: IntoBoxed {
         Ok(WriteOutcome::Written { now, notes })
     }
 
+    /// The editor's Save (12 §9.1, E32): [`RemoteFs::write_atomic_with`]'s checks and upload,
+    /// then a replace that a version changed in the meantime cannot slip through unseen.
+    ///
+    /// - With `id` (a local file's device and inode as read): the staged temp is
+    ///   [`RemoteFs::exchange`]d with the target in one call, and the file it displaced must be
+    ///   the version read — the same device and inode, size, mtime and SHA-256. Then it is
+    ///   removed and the folder fsynced; otherwise the two are exchanged back, so the other
+    ///   writer's version is where it was, and the outcome is a conflict. An exchange back that
+    ///   fails leaves sopen's version in place and keeps the other at
+    ///   `<name>.sopen-replaced-<stamp>` ([`keep_aside`]), named in the notes and in
+    ///   [`Replaced::kept`]. Where the exchange is not offered ([`NoExchange`]): today's rename,
+    ///   [`Unguarded::NoExchange`].
+    /// - Without, where the server links (`hardlink@openssh.com`): the target is hard-linked to
+    ///   `.<name>.sopen-prev-<random>` before today's re-read, the temp renamed over it, and the
+    ///   link then read whole and hashed against the version read: equal, it is removed;
+    ///   different, it is the other writer's change from the moment before the rename and kept
+    ///   as `<name>.sopen-replaced-<stamp>`. A link refused for this file (a status reply):
+    ///   today's route, [`Unguarded::NoLink`]. No link is removed unchecked, but one that is a
+    ///   second name of the file still in place.
+    /// - Without either: [`RemoteFs::write_atomic_with`], [`Unguarded::NoLink`].
+    ///
+    /// `steps` hears [`Guard`]s as `write_atomic_with`'s caller hears [`Step`]s, each before the
+    /// request that follows it — but for the link route's [`Step::Staged`], told before today's
+    /// check so that the check is the last request before the rename. Over SFTP a file replaced by
+    /// a rename between that check and the rename is not seen (E32); the exchange has no such
+    /// moment. Nothing is moved that `steps` refused to record.
+    fn replace_guarded(
+        &mut self,
+        local: &Path,
+        target: &str,
+        expected: Fingerprint,
+        id: Option<FileId>,
+        steps: &mut dyn FnMut(Guard<'_>) -> Result<()>,
+    ) -> Result<Replaced> {
+        match id {
+            Some(id) => exchange_guard(self, local, target, &expected, id, steps),
+            None if self.can_link() => link_guard(self, local, target, &expected, steps),
+            None => {
+                let outcome = self
+                    .write_atomic_with(local, target, expected, &mut |s| steps(Guard::Step(s)))?;
+                Ok(Replaced {
+                    outcome,
+                    kept: None,
+                    unguarded: Some(Unguarded::NoLink),
+                })
+            }
+        }
+    }
+
     /// Uploads the local file into `dir` as `wanted`, or `<stem>-N.<ext>` when that name is
     /// taken; never replaces an existing file. Returns the final name. Publishing is a hard
     /// link from a temp (the file appears complete); where links are unavailable the file is
@@ -898,6 +1074,24 @@ fn prepare_swap<F: RemoteFs + ?Sized>(
     notes: &mut Vec<String>,
     steps: &mut dyn FnMut(Step<'_>) -> Result<()>,
 ) -> Result<Swap> {
+    let staged = stage_checks(fs, target, tmp, current, uploaded, mode, steps)?;
+    match recheck(fs, target, current, expected, notes)? {
+        None => Ok(Swap::Ready(staged)),
+        Some((now, reason)) => Ok(Swap::Changed(now, reason)),
+    }
+}
+
+/// [`prepare_swap`]'s first half: the temp as uploaded — its stat (the next baseline), told as
+/// [`Step::Written`], with the target's owner and mode.
+fn stage_checks<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    target: &str,
+    tmp: &str,
+    current: &Stat,
+    uploaded: &Uploaded,
+    mode: u32,
+    steps: &mut dyn FnMut(Step<'_>) -> Result<()>,
+) -> Result<Stat> {
     // The temp as it will be renamed: what the target will be right after the rename. Owner
     // and mode were given through its handle (create_from); here they are only checked, never
     // set by path — the name may no longer be the file just written.
@@ -935,16 +1129,28 @@ fn prepare_swap<F: RemoteFs + ?Sized>(
             describe_stat(&staged)
         );
     }
+    Ok(staged)
+}
+
+/// [`prepare_swap`]'s second half, today's check before the replace: the target's content
+/// against the fetch's (up to the hash limit), then its stat. `None`: unchanged.
+fn recheck<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    target: &str,
+    current: &Stat,
+    expected: &Fingerprint,
+    notes: &mut Vec<String>,
+) -> Result<Option<(Option<Stat>, String)>> {
     if let Some(want) = expected.sha256 {
         if current.size <= fs.hash_check_limit() {
             let mut sink = Hashing::new(std::io::sink());
             fs.read_to(target, &mut sink, &mut |_| {})
                 .with_context(|| format!("cannot re-read {target} to check it for changes"))?;
             if sink.finish().sha256 != want {
-                return Ok(Swap::Changed(
+                return Ok(Some((
                     Some(*current),
                     "its content changed (same size and modification time)".to_string(),
-                ));
+                )));
             }
         } else {
             notes.push(format!(
@@ -953,9 +1159,560 @@ fn prepare_swap<F: RemoteFs + ?Sized>(
         }
     }
     match check_target(fs, target, expected)? {
-        Check::Same(_) => Ok(Swap::Ready(staged)),
-        Check::Changed(now, reason) => Ok(Swap::Changed(now, reason)),
+        Check::Same(_) => Ok(None),
+        Check::Changed(now, reason) => Ok(Some((now, reason))),
     }
+}
+
+/// What a guarded replace has staged next to the target.
+struct Staged {
+    tmp: String,
+    /// The temp as it will land: the next baseline.
+    stat: Stat,
+    uploaded: Uploaded,
+    mode: u32,
+    /// The target as checked before the upload.
+    current: Stat,
+}
+
+/// A guarded replace up to its own part ([`RemoteFs::replace_guarded`]): as
+/// [`RemoteFs::write_atomic_with`] — refused without `posix-rename`, the target's stat checked,
+/// the temp created exclusively with its owner and mode and checked ([`stage_checks`]). A
+/// change found is the outcome (`Err`); a temp made and then failed is removed or named.
+fn begin_guarded<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    local: &Path,
+    target: &str,
+    expected: &Fingerprint,
+    steps: &mut dyn FnMut(Guard<'_>) -> Result<()>,
+) -> Result<std::result::Result<Staged, WriteOutcome>> {
+    if !fs.can_replace() {
+        bail!(
+            "this server cannot replace a file in one step (it does not offer \
+             posix-rename@openssh.com), so {target} was not touched; use Save copy to write the \
+             edit next to it instead"
+        );
+    }
+    let current = match check_target(fs, target, expected)? {
+        Check::Same(s) => s,
+        Check::Changed(now, reason) => {
+            let notes = Vec::new();
+            return Ok(Err(WriteOutcome::Conflict { now, reason, notes }));
+        }
+    };
+    let mode = current.mode & 0o7777;
+    let (Some(uid), Some(gid)) = (current.uid, current.gid) else {
+        unreachable!("check_target refuses a target without an owner")
+    };
+    let (dir, name) = split_parent(target);
+    let tmp = join(dir, &format!(".{name}.sopen-{}", random_hex()));
+    steps(Guard::Step(Step::Named { temp: &tmp }))?;
+    let uploaded = match fs.create_from(local, &tmp, Some(Like { mode, uid, gid })) {
+        Ok(u) => u,
+        Err(e) if e.created == Created::Unknown => {
+            let what = format!("{target} was not replaced, but creating {tmp} got no reply");
+            return Err(unknown_at(e.error, &what, &tmp));
+        }
+        Err(e) => {
+            let e = match e.created {
+                Created::Yes => remove_telling(fs, &tmp, e.error, &mut |s| steps(Guard::Step(s))),
+                _ => abandon(fs, &tmp, e),
+            };
+            return Err(e.context(format!("{target} was not replaced")));
+        }
+    };
+    let checked = stage_checks(fs, target, &tmp, &current, &uploaded, mode, &mut |s| {
+        steps(Guard::Step(s))
+    });
+    let stat = match checked {
+        Ok(stat) => stat,
+        Err(e) => {
+            let e = e.context(format!("{target} was not replaced"));
+            return Err(remove_telling(fs, &tmp, e, &mut |s| steps(Guard::Step(s))));
+        }
+    };
+    Ok(Ok(Staged {
+        tmp,
+        stat,
+        uploaded,
+        mode,
+        current,
+    }))
+}
+
+/// Removes this replace's own temp, telling `steps` whether it went; when it cannot, `notes`
+/// name it.
+fn drop_temp<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    tmp: &str,
+    notes: &mut Vec<String>,
+    steps: &mut dyn FnMut(Guard<'_>) -> Result<()>,
+) {
+    match fs.remove(tmp) {
+        Ok(()) => {
+            let _ = steps(Guard::Step(Step::Removed { temp: tmp }));
+        }
+        Err(e) => {
+            let _ = steps(Guard::Step(Step::Left { temp: tmp }));
+            notes.push(format!("the temp file {tmp} could not be removed: {e:#}"));
+        }
+    }
+}
+
+/// After the target became the staged temp (renamed or exchanged): is it still that object?
+/// The next baseline, as [`RemoteFs::write_atomic_with`] gives it: the staged stat with what was
+/// uploaded.
+fn after_replace<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    target: &str,
+    staged: &Stat,
+    mode: u32,
+    uploaded: &Uploaded,
+    notes: &mut Vec<String>,
+) -> Result<Stat> {
+    let after = fs
+        .lstat_opt(target)
+        .with_context(|| format!("replaced {target} but cannot stat it"))?;
+    match after {
+        Some(now) if now.is_file && !now.is_symlink && same_stat(&now, staged) => {
+            if now.mode & 0o7777 != mode {
+                notes.push(format!(
+                    "saved, but {target} now has mode {:o}, not {mode:o} (changed right after the \
+                     save?)",
+                    now.mode & 0o7777
+                ));
+            }
+        }
+        other => notes.push(format!(
+            "saved, but the file changed right after: {target} is {} — sopen wrote {} (another \
+             writer?); the next save from this copy will be refused",
+            other.map_or("gone".to_string(), |s| describe_stat(&s)),
+            describe_stat(staged)
+        )),
+    }
+    Ok(Stat {
+        mode,
+        sha256: Some(uploaded.sha256),
+        ..*staged
+    })
+}
+
+/// [`after_replace`] once the replace has committed: nothing after the commit undoes it, so a
+/// failure there is a note and the baseline is what was staged.
+fn landed_stat<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    target: &str,
+    staged: &Stat,
+    mode: u32,
+    uploaded: &Uploaded,
+    notes: &mut Vec<String>,
+) -> Stat {
+    match after_replace(fs, target, staged, mode, uploaded, notes) {
+        Ok(now) => now,
+        Err(e) => {
+            notes.push(format!("{e:#}"));
+            Stat {
+                mode,
+                sha256: Some(uploaded.sha256),
+                ..*staged
+            }
+        }
+    }
+}
+
+/// Makes the folder holding `path` durable after a local replace changed its entries; a failure
+/// is a note (the change itself is done).
+fn sync_parent<F: RemoteFs + ?Sized>(fs: &mut F, path: &str, notes: &mut Vec<String>) {
+    let (dir, _) = split_parent(path);
+    if let Err(e) = fs.sync_dir(dir) {
+        notes.push(format!("the folder {dir} could not be made durable: {e:#}"));
+    }
+}
+
+/// The temp renamed over the target, as [`RemoteFs::write_atomic_with`] does once its checks
+/// passed: today's route, where the guard is not offered.
+#[allow(clippy::too_many_arguments)]
+fn rename_staged<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    tmp: &str,
+    target: &str,
+    staged: &Stat,
+    mode: u32,
+    uploaded: &Uploaded,
+    mut notes: Vec<String>,
+    steps: &mut dyn FnMut(Guard<'_>) -> Result<()>,
+) -> Result<WriteOutcome> {
+    if let Err(e) = fs.rename_over(tmp, target) {
+        if is_outcome_unknown(&e) {
+            let what = format!("the rename of {tmp} over {target} got no reply");
+            return Err(unknown_at(e, &what, target));
+        }
+        let e = e.context(format!(
+            "cannot rename {tmp} over {target}; {target} was not replaced"
+        ));
+        return Err(remove_telling(fs, tmp, e, &mut |s| steps(Guard::Step(s))));
+    }
+    let _ = steps(Guard::Step(Step::Renamed { temp: tmp }));
+    sync_parent(fs, target, &mut notes);
+    let now = landed_stat(fs, target, staged, mode, uploaded, &mut notes);
+    Ok(WriteOutcome::Written { now, notes })
+}
+
+/// The SHA-256 of `path` read whole, and its byte count.
+fn hash_of<F: RemoteFs + ?Sized>(fs: &mut F, path: &str) -> Result<Uploaded> {
+    let mut sink = Hashing::new(std::io::sink());
+    fs.read_to(path, &mut sink, &mut |_| {})?;
+    Ok(sink.finish())
+}
+
+/// How the file at `path` — what an exchange displaced, or a link to what a rename replaced —
+/// differs from the version read (`expected`, and `id` where the file layer has identities);
+/// `None`: it is that version, its content hashed. An error when that cannot be told (no hash, a
+/// file over the hash limit, a read that failed): nothing is removed on it.
+fn differs_from_read<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    path: &str,
+    expected: &Fingerprint,
+    id: Option<FileId>,
+) -> Result<Option<String>> {
+    let Some(now) = fs.lstat_opt(path)? else {
+        return Ok(Some("it is gone".to_string()));
+    };
+    if now.is_symlink || !now.is_file {
+        return Ok(Some("it is no longer a regular file".to_string()));
+    }
+    if let Some(id) = id {
+        if fs.file_id(path)?.map(|(got, _)| got) != Some(id) {
+            return Ok(Some(
+                "another file took its name since it was read".to_string(),
+            ));
+        }
+    }
+    if now.size != expected.size || now.mtime != expected.mtime {
+        return Ok(Some(describe_change(expected, &now)));
+    }
+    // Never "the version read" on its stat alone: without the content checked, it is unchecked.
+    let Some(want) = expected.sha256 else {
+        bail!("there is no hash of the version read to check {path} against");
+    };
+    if now.size > fs.hash_check_limit() {
+        bail!("{path} is over the size whose content is checked");
+    }
+    if hash_of(fs, path)?.sha256 != want {
+        return Ok(Some(
+            "its content changed (same size and modification time)".to_string(),
+        ));
+    }
+    Ok(None)
+}
+
+/// Moves the other writer's version at `from` to `<name>.sopen-replaced-<stamp>` beside
+/// `target` (`-N` after it when that is taken), never over anything ([`RemoteFs::move_new`]: a
+/// name another recovery copy took a moment before is refused, and the next one tried). Told as
+/// [`Guard::Kept`] before; when that cannot be recorded nothing is moved and the error says so —
+/// the version stays at `from`. The path it is kept at.
+pub fn keep_aside<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    from: &str,
+    target: &str,
+    steps: &mut dyn FnMut(Guard<'_>) -> Result<()>,
+) -> Result<String> {
+    let (dir, name) = split_parent(target);
+    let base = format!(
+        "{name}.sopen-replaced-{}",
+        crate::cache::utc_stamp(SystemTime::now())
+    );
+    for n in 0..MAX_SUFFIX {
+        let kept = match n {
+            0 => join(dir, &base),
+            n => join(dir, &format!("{base}-{n}")),
+        };
+        if fs.lstat_opt(&kept)?.is_some() {
+            continue;
+        }
+        steps(Guard::Kept { from, kept: &kept })
+            .context("the move was not recorded, so it was not made")?;
+        match fs.move_new(from, &kept) {
+            Ok(()) => return Ok(kept),
+            Err(e) if is_outcome_unknown(&e) => return Err(e),
+            Err(_) if fs.lstat_opt(&kept)?.is_some() => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    bail!("no free name beside {target} to keep {from} at")
+}
+
+/// [`RemoteFs::replace_guarded`] on a file with an identity: the exchange (12 §9.1, local).
+fn exchange_guard<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    local: &Path,
+    target: &str,
+    expected: &Fingerprint,
+    id: FileId,
+    steps: &mut dyn FnMut(Guard<'_>) -> Result<()>,
+) -> Result<Replaced> {
+    let done = |outcome| Replaced {
+        outcome,
+        kept: None,
+        unguarded: None,
+    };
+    // Another file at the name — a replace by rename since the read — is a change whatever its
+    // size and mtime (after the stat's own reasons: gone, a link, not a regular file).
+    if fs.can_replace() {
+        if let Check::Changed(now, reason) = check_target(fs, target, expected)? {
+            let notes = Vec::new();
+            return Ok(done(WriteOutcome::Conflict { now, reason, notes }));
+        }
+        if let Some((now, _)) = fs.file_id(target)? {
+            if now != id {
+                let reason = "another file took its name since it was read".to_string();
+                let now = fs.lstat_opt(target)?;
+                return Ok(done(WriteOutcome::Conflict {
+                    now,
+                    reason,
+                    notes: Vec::new(),
+                }));
+            }
+        }
+    }
+    let s = match begin_guarded(fs, local, target, expected, steps)? {
+        Ok(s) => s,
+        Err(outcome) => return Ok(done(outcome)),
+    };
+    let tmp = s.tmp.as_str();
+    let mut notes = Vec::new();
+    match recheck(fs, target, &s.current, expected, &mut notes) {
+        Ok(None) => {}
+        Ok(Some((now, reason))) => {
+            drop_temp(fs, tmp, &mut notes, steps);
+            return Ok(done(WriteOutcome::Conflict { now, reason, notes }));
+        }
+        Err(e) => {
+            let e = e.context(format!("{target} was not replaced"));
+            return Err(remove_telling(fs, tmp, e, &mut |s| steps(Guard::Step(s))));
+        }
+    }
+    let ready = steps(Guard::Step(Step::Staged {
+        temp: tmp,
+        stat: &s.stat,
+        uploaded: &s.uploaded,
+    }))
+    .and_then(|()| {
+        fs.file_id(tmp)?
+            .map(|(temp_id, _)| temp_id)
+            .with_context(|| format!("cannot tell the device and inode of {tmp}"))
+    })
+    .and_then(|temp_id| {
+        steps(Guard::Exchanging {
+            temp: tmp,
+            temp_id,
+            target_id: id,
+        })
+        .map(|()| temp_id)
+    });
+    let temp_id = match ready {
+        Ok(temp_id) => temp_id,
+        Err(e) => return Err(remove_telling(fs, tmp, e, &mut |s| steps(Guard::Step(s)))),
+    };
+    match fs.exchange(tmp, target) {
+        Ok(()) => {}
+        Err(e) if is_no_exchange(&e) => {
+            crate::debug!("{e:#}; replacing {target} by a rename");
+            let _ = steps(Guard::Unguarded(Unguarded::NoExchange));
+            let outcome =
+                rename_staged(fs, tmp, target, &s.stat, s.mode, &s.uploaded, notes, steps)?;
+            return Ok(Replaced {
+                outcome,
+                kept: None,
+                unguarded: Some(Unguarded::NoExchange),
+            });
+        }
+        Err(e) if is_outcome_unknown(&e) => {
+            // It may have happened: what is at either name is the record's to tell.
+            let what = format!("the exchange of {tmp} with {target} got no reply");
+            return Err(unknown_at(e, &what, target));
+        }
+        Err(e) => {
+            let e = e.context(format!("{target} was not replaced"));
+            return Err(remove_telling(fs, tmp, e, &mut |s| steps(Guard::Step(s))));
+        }
+    }
+    // The file at the temp's name is the version displaced: is it the version read?
+    let why = match differs_from_read(fs, tmp, expected, Some(id)) {
+        Ok(why) => why,
+        Err(e) => Some(format!("what it replaced could not be checked ({e:#})")),
+    };
+    let Some(reason) = why else {
+        drop_temp(fs, tmp, &mut notes, steps);
+        sync_parent(fs, target, &mut notes);
+        let now = landed_stat(fs, target, &s.stat, s.mode, &s.uploaded, &mut notes);
+        return Ok(done(WriteOutcome::Written { now, notes }));
+    };
+    // Not the version read: exchanged back, so the other writer's version is where it was —
+    // once that is recorded; unrecorded, nothing is moved and the other version stays at the
+    // temp's name, said.
+    let back = match steps(Guard::SwappedBack { temp: tmp }) {
+        Ok(()) => Some(fs.exchange(tmp, target)),
+        Err(e) => {
+            crate::debug!("the exchange back was not recorded, so it was not made: {e:#}");
+            None
+        }
+    };
+    if let Some(Ok(())) = back {
+        // Sopen's version is at the temp's name again — only it is removed.
+        match fs.file_id(tmp) {
+            Ok(Some((now, _))) if now == temp_id => drop_temp(fs, tmp, &mut notes, steps),
+            _ => notes.push(format!("{tmp} is left: it is not the file sopen staged")),
+        }
+        sync_parent(fs, target, &mut notes);
+        let now = fs.lstat_opt(target).ok().flatten();
+        return Ok(done(WriteOutcome::Conflict { now, reason, notes }));
+    }
+    // Sopen's version stays; the other one is kept beside the file, never removed — at the
+    // temp's name when the exchange back was not recorded, or its move fails.
+    let kept = match back {
+        Some(Err(e)) => {
+            crate::debug!("the exchange back failed: {e:#}");
+            keep_aside(fs, tmp, target, steps).unwrap_or_else(|_| tmp.to_string())
+        }
+        _ => tmp.to_string(),
+    };
+    notes.push(format!("replaced; the other version is kept at {kept}"));
+    sync_parent(fs, target, &mut notes);
+    let now = landed_stat(fs, target, &s.stat, s.mode, &s.uploaded, &mut notes);
+    Ok(Replaced {
+        outcome: WriteOutcome::Written { now, notes },
+        kept: Some(kept),
+        unguarded: None,
+    })
+}
+
+/// [`RemoteFs::replace_guarded`] where the server links: the link check (12 §9.1, remote).
+fn link_guard<F: RemoteFs + ?Sized>(
+    fs: &mut F,
+    local: &Path,
+    target: &str,
+    expected: &Fingerprint,
+    steps: &mut dyn FnMut(Guard<'_>) -> Result<()>,
+) -> Result<Replaced> {
+    let s = match begin_guarded(fs, local, target, expected, steps)? {
+        Ok(s) => s,
+        Err(outcome) => {
+            return Ok(Replaced {
+                outcome,
+                kept: None,
+                unguarded: None,
+            })
+        }
+    };
+    let tmp = s.tmp.as_str();
+    let mut notes = Vec::new();
+    let (dir, name) = split_parent(target);
+    let link = join(dir, &format!(".{name}.sopen-prev-{}", random_hex()));
+    if let Err(e) = steps(Guard::Linked { link: &link }) {
+        return Err(remove_telling(fs, tmp, e, &mut |s| steps(Guard::Step(s))));
+    }
+    let mut unguarded = None;
+    let linked = match fs.link_new(target, &link) {
+        Ok(()) => true,
+        Err(e) if is_outcome_unknown(&e) => {
+            // The link may be there: kept, and named, for the reconciliation.
+            let what = format!("{target} was not replaced, but linking it to {link} got no reply");
+            let e = unknown_at(e, &what, &link);
+            return Err(remove_telling(fs, tmp, e, &mut |s| steps(Guard::Step(s))));
+        }
+        Err(e) => {
+            crate::debug!("link {target} -> {link} refused ({e:#}); today's check, then rename");
+            unguarded = Some(Unguarded::NoLink);
+            let _ = steps(Guard::Unguarded(Unguarded::NoLink));
+            false
+        }
+    };
+    // Up to the rename the link is a second name of the file still in place: removing it loses
+    // nothing.
+    let unlink = |fs: &mut F, notes: &mut Vec<String>| {
+        if linked {
+            if let Err(e) = fs.remove(&link) {
+                notes.push(format!("{link} could not be removed: {e:#}"));
+            }
+        }
+    };
+    // Recorded first, so that today's check — the content re-read, then the stat — is the last
+    // thing before the rename, no record or request between them (a hard link pins the version
+    // in place, not the path's next occupant: one that replaces the file by its own rename after
+    // the check is replaced unseen, E32).
+    if let Err(e) = steps(Guard::Step(Step::Staged {
+        temp: tmp,
+        stat: &s.stat,
+        uploaded: &s.uploaded,
+    })) {
+        unlink(fs, &mut notes);
+        return Err(remove_telling(fs, tmp, e, &mut |s| steps(Guard::Step(s))));
+    }
+    match recheck(fs, target, &s.current, expected, &mut notes) {
+        Ok(None) => {}
+        Ok(Some((now, reason))) => {
+            unlink(fs, &mut notes);
+            drop_temp(fs, tmp, &mut notes, steps);
+            return Ok(Replaced {
+                outcome: WriteOutcome::Conflict { now, reason, notes },
+                kept: None,
+                unguarded,
+            });
+        }
+        Err(e) => {
+            unlink(fs, &mut notes);
+            let e = e.context(format!("{target} was not replaced"));
+            return Err(remove_telling(fs, tmp, e, &mut |s| steps(Guard::Step(s))));
+        }
+    }
+    if let Err(e) = fs.rename_over(tmp, target) {
+        if is_outcome_unknown(&e) {
+            // It may have landed: the temp and the link stay, for the reconciliation.
+            let what = format!("the rename of {tmp} over {target} got no reply");
+            return Err(unknown_at(e, &what, target));
+        }
+        unlink(fs, &mut notes);
+        let e = e.context(format!(
+            "cannot rename {tmp} over {target}; {target} was not replaced"
+        ));
+        return Err(remove_telling(fs, tmp, e, &mut |s| steps(Guard::Step(s))));
+    }
+    let _ = steps(Guard::Step(Step::Renamed { temp: tmp }));
+    let mut kept = None;
+    if linked {
+        let _ = steps(Guard::Committed { link: &link });
+        match differs_from_read(fs, &link, expected, None) {
+            Ok(None) => {
+                let _ = steps(Guard::Verified { link: &link });
+                if let Err(e) = fs.remove(&link) {
+                    crate::debug!("{link}: {e:#}");
+                    notes.push(format!("saved; remove {link} by hand"));
+                }
+            }
+            Ok(Some(_)) => {
+                let at = keep_aside(fs, &link, target, steps).unwrap_or_else(|_| link.clone());
+                notes.push(format!(
+                    "saved, but {name} changed in the moment before — that version is kept at \
+                     {at}"
+                ));
+                kept = Some(at);
+            }
+            Err(e) => {
+                crate::debug!("{link}: {e:#}");
+                notes.push(format!(
+                    "saved, but what it replaced could not be checked — kept at {link}"
+                ));
+                kept = Some(link.clone());
+            }
+        }
+    }
+    let now = landed_stat(fs, target, &s.stat, s.mode, &s.uploaded, &mut notes);
+    Ok(Replaced {
+        outcome: WriteOutcome::Written { now, notes },
+        kept,
+        unguarded,
+    })
 }
 
 fn owner((uid, gid): (Option<u32>, Option<u32>)) -> String {

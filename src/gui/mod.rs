@@ -867,23 +867,23 @@ pub fn hosted(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<Hosted>(hosted_id()).is_some())
 }
 
-/// A window's F-key row at the bottom of `ui` — F1 (its key help, [`help`]), F3 (closes it, as
-/// Cmd/Ctrl+W does) and its own `keys` — and F1 and F3 themselves, without modifiers (04 §3
-/// rule 1); above the row, while the F-key switch did not take effect, a status row saying so
-/// ([`fkeys_status`], 04 §6.3: the row's slots and Cmd/Ctrl+digits still work). Nothing while
-/// it is hosted: the host's row lists the window's keys with its own, its F1 and F3 are the
-/// host's, and so is its status row. Call it before the window's other bottom panels (the row
-/// is the window's last).
+/// A window's F-key row at the bottom of `ui`, in cells (10 §4, §6) — F1 (its key help,
+/// [`help`]), F3 (closes it, as Cmd/Ctrl+W does) and its own `keys` — and F1 and F3 themselves,
+/// without modifiers (04 §3 rule 1); above the row, while the F-key switch did not take effect,
+/// a status row in cells saying so ([`fkeys_status`], 04 §6.3: the row's slots and
+/// Cmd/Ctrl+digits still work). Each is one row tall, so what is above them stays on the grid.
+/// Nothing while it is hosted: the host's row lists the window's keys with its own, its F1 and
+/// F3 are the host's, and so is its status row. Call it before the window's other bottom panels
+/// (the row is the window's last).
 pub fn own_keys(ui: &mut egui::Ui, keys: &[chrome::FKey]) {
     let ctx = ui.ctx().clone();
     if hosted(&ctx) {
         return;
     }
     let row = chrome::merged(&[chrome::HELP_KEY, chrome::EXIT_KEY], keys);
-    chrome::key_panel(ui, "sopen-own-keys", &row);
+    chrome::key_panel_cells(ui, "sopen-own-keys", &row);
     if let Some(line) = fkeys_status(&ctx) {
-        chrome::bar_panel(egui::Panel::bottom("sopen-own-fkeys"))
-            .show(ui, |ui| chrome::status_row(ui, &Status::error(line)));
+        chrome::status_panel_cells(ui, "sopen-own-fkeys", &Status::error(line));
     }
     // Not while a text field has the keyboard (F-keys are not text, but the field is the
     // owner's).
@@ -1289,8 +1289,6 @@ struct Dump {
     /// The pass the receipt is of, ended: it is written at the start of the next.
     taken: Option<term::WindowPass>,
     written: bool,
-    /// The watchdog's word.
-    done: Arc<AtomicBool>,
     result: Arc<Mutex<Option<Result<String, String>>>>,
 }
 
@@ -1314,9 +1312,6 @@ impl<W: Window> Window for Receipted<W> {
                 Err(e) => Err(format!("cannot write {}: {e}", dump.path.display())),
             });
             dump.written = true;
-            if !dump.shot {
-                dump.done.store(true, Ordering::SeqCst);
-            }
         }
         if dump.written {
             self.inner.ui(ui);
@@ -1940,6 +1935,17 @@ pub(crate) fn give_up(why: &str) -> ! {
     std::process::exit(1);
 }
 
+/// The receipt hooks' watchdog: `secs` from now sopen gives up (exit 1, [`give_up`]) unless
+/// `done` is set by then.
+pub(crate) fn arm_watchdog(secs: u64, hook: &'static str, done: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(secs));
+        if !done.load(Ordering::SeqCst) {
+            give_up(&format!("the {hook} hook stalled for {secs} s"));
+        }
+    });
+}
+
 /// Runs `window` until it closes. With the screenshot or the cells hook a watchdog ends a
 /// stalled run after `SOPEN_WATCHDOG` seconds (default 30, [`watchdog_secs`]).
 pub fn run_window<W: Window + 'static>(
@@ -1964,27 +1970,21 @@ pub fn run_window_sized<W: Window + 'static>(
     // face (`fonts::pin_symbols`).
     fonts::prefetch();
     let shot_done = Arc::new(AtomicBool::new(false));
-    // The watchdog's word: set once the window is gone too, however it went (a window that
-    // closed or did not start stalls nothing), so it never ends a process that goes on — the
-    // terminal backend's, which still holds its terminal.
-    let disarm = shot_done.clone();
+    // The watchdog's word: set once the window is gone, however it went (a window that closed
+    // or did not start stalls nothing), so it never ends a process that goes on — the terminal
+    // backend's, which still holds its terminal — and never before (a receipt written, then a
+    // window that does not close, is still a stall).
+    let disarm = Arc::new(AtomicBool::new(false));
     let shot_result: Arc<Mutex<Option<Result<String, String>>>> = Arc::default();
     let dump_result: Arc<Mutex<Option<Result<String, String>>>> = Arc::default();
     let closed = Arc::new(AtomicBool::new(false));
     if hooks.screenshot.is_some() || hooks.cells.is_some() {
-        let secs = watchdog_secs();
         let hook = if hooks.screenshot.is_some() {
             "screenshot"
         } else {
             "cells"
         };
-        let done = shot_done.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(secs));
-            if !done.load(Ordering::SeqCst) {
-                give_up(&format!("the {hook} hook stalled for {secs} s"));
-            }
-        });
+        arm_watchdog(watchdog_secs(), hook, disarm.clone());
     }
     let dump = hooks.cells.clone().map(|path| Dump {
         path,
@@ -1993,7 +1993,6 @@ pub fn run_window_sized<W: Window + 'static>(
         ready_frames: 0,
         taken: None,
         written: false,
-        done: shot_done.clone(),
         result: dump_result.clone(),
     });
     let shell = Shell {

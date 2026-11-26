@@ -636,12 +636,11 @@ impl Tty for Tape {
         Ok(self.0.borrow().size)
     }
 
-    fn kitty(&mut self) -> bool {
-        false
-    }
-
-    fn ambiguous_wide(&mut self) -> bool {
-        false
+    fn probe(&mut self) -> term::Probed {
+        term::Probed {
+            kitty: false,
+            ambiguous: false,
+        }
     }
 
     fn drop_input(&mut self) {}

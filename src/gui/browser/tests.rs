@@ -17,6 +17,7 @@ mod s4;
 mod s5;
 mod s6;
 mod vm7;
+mod vm7b;
 mod x1a;
 mod x1b;
 
@@ -2058,10 +2059,11 @@ fn a_video_opens_in_the_media_window_and_esc_leaves_it() {
 
 /// Enter on a remote `.mp4` that does not open: the status row says why about the file as its
 /// owner knows it, `host:/abs`, named once — never the URL of the byte server ffprobe read it
-/// through, nor a cache copy. An empty one is said to be empty (the byte server has no range of
-/// it to serve, and its words are not shown); one that is not a video is what ffprobe said of
-/// it. From the list (dual mode: no preview) and from the preview's card, which says the same.
-/// Needs ffmpeg (skips without it, unless `SOPEN_REQUIRE_FFMPEG` is set).
+/// through, nor a cache copy: one that is not a video is what ffprobe said of it. An empty one
+/// opens on Hex, the reason its first row (08 D10: the byte server has no range of it to serve,
+/// and its words are not shown). From the list (dual mode: no preview) and from the preview's
+/// card, which says the same. Needs ffmpeg (skips without it, unless `SOPEN_REQUIRE_FFMPEG` is
+/// set).
 #[test]
 fn a_remote_file_that_fails_to_open_is_named_as_host_abs_never_as_its_cache_copy() {
     if let Err(e) = crate::ffmpeg::resolve() {
@@ -2097,22 +2099,24 @@ fn a_remote_file_that_fails_to_open_is_named_as_host_abs_never_as_its_cache_copy
             }
             fx.key(Key::Enter);
             fx.settle();
+            if bytes.is_empty() {
+                let on = fx.b.viewer.as_ref().and_then(|v| v.views.set.on_screen());
+                assert_eq!(on, Some(crate::views::View::Hex), "{mode:?} {name}: on Hex");
+                let why = "the file is empty (0 bytes); it is shown as bytes";
+                assert!(shows(&fx, why), "{mode:?} {name}: the reason first");
+                for never in ["Server returned", "127.0.0.1", "http://"] {
+                    assert!(!shows(&fx, never), "{mode:?} {name}: {never} shown");
+                }
+                continue;
+            }
             assert!(fx.b.viewer.is_none(), "{mode:?} {name}: nothing to show");
             let said = fx.b.status.text.clone();
             assert!(fx.b.status.error, "{mode:?}: {said}");
             let known = format!("box:{}/{name}", fx.root);
-            if bytes.is_empty() {
-                assert_eq!(
-                    said,
-                    format!("{known} is empty (0 bytes): nothing to play"),
-                    "{mode:?}: the file as its owner knows it"
-                );
-            } else {
-                assert!(
-                    said.starts_with(&format!("ffprobe cannot read {known}: ")),
-                    "{mode:?}: the file as its owner knows it: {said}"
-                );
-            }
+            assert!(
+                said.starts_with(&format!("ffprobe cannot read {known}: ")),
+                "{mode:?}: the file as its owner knows it: {said}"
+            );
             for never in ["Server returned", "127.0.0.1", "http://"] {
                 assert!(!said.contains(never), "{mode:?}: {said}");
             }

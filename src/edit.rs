@@ -15,4 +15,5 @@
 
 pub mod arm;
 pub mod buffer;
+pub mod file;
 pub mod ops;
