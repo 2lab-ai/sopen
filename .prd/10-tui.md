@@ -759,6 +759,10 @@ on the title row (`chrome.rs:805-832`) and F8's list of encodings as a cell dial
   *tui* §14.5 (video across machines) is settled by T8.
 - ***tui* §5's ambiguous list.** It names `░` as ambiguous; python3's `unicodedata` gives it N, so §10
   keeps it and substitutes the rest.
+- **§17's X3-binary row vs 01 §6a on the hex answer's label** (found building X3-binary). The row
+  names the buttons `[ Hex ]` and `[ Save to… ]`; 01 §6a, the README and the dialog's tests name
+  the default "Open in hex editor". Kept as built: `[ Open in hex editor ]  [ Save to… ]  [ Cancel
+  ]` (48 cells, inside the smallest window's 56); the row's `[ Hex ]` is shorthand.
 - **T35 vs a HOST with an older sopen, and vs a text file** (found cutting X2). `--gui` on every
   forward would break a plain `sopen --target HOST FILE` on a HOST whose sopen predates it (exit 2,
   clap's line; `--browser` has that reach by design, `forward.rs:387-389`, but is asked for), and

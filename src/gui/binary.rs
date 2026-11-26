@@ -1837,8 +1837,9 @@ pub struct BinaryWindow {
     /// Passes so far, and the height last asked of the window (and when).
     frames: u64,
     asked: Option<(f32, u64)>,
-    /// A file at a revision (03 §6.3, S2-F): "Save to…" is off with the reason, and the hex
-    /// window it becomes is read-only. The browser never routes such a file here (it opens
+    /// A file at a revision (03 §6.3, S2-F): "Save to…" and Browse… are off, the reason a row
+    /// under the buttons (cells have no hover, 10 §6), the path a weak text rather than a field,
+    /// and the hex window it becomes is read-only. The browser never routes such a file here (it opens
     /// anything that is not text, an image or media in the hex window); this keeps the dialog
     /// from being a way to save one.
     read_only: bool,
@@ -2216,9 +2217,10 @@ impl BinaryWindow {
     }
 
     /// The dialog's parts on a grid `cols` wide as the stage has them, and its nominal width:
-    /// the file's line, the buttons, the path field — while not asking, the path in the weak
-    /// colour, as an off control is — Browse…, the hint, what runs (its line and the progress
-    /// row), what was saved, then the notes (the clash note among them).
+    /// the file's line, the buttons — for a file at a revision, the reason "Save to…" is off
+    /// under them — the path field (while not asking, or read-only, the path in the weak colour,
+    /// as an off control is), Browse…, the hint, what runs (its line and the progress row), what
+    /// was saved, then the notes (the clash note among them).
     fn parts(&self, cols: u16) -> (Vec<Part>, usize) {
         let local = self.info.local;
         let nominal = WIDE.max(cells::width(hint(local)));
@@ -2233,6 +2235,8 @@ impl BinaryWindow {
             return (parts, nominal);
         }
         let asking = self.asking();
+        // Where nothing may be saved (a file at a revision), what would choose a path is off.
+        let saves = asking && !self.read_only;
         let button = |label: &str, id: egui::Id, on: bool| Button {
             on,
             ..Button::new(label, id)
@@ -2241,11 +2245,18 @@ impl BinaryWindow {
             Part::Blank,
             Part::Buttons(vec![
                 button(HEX, hex_id(), asking),
-                button("Save to…", save_id(), asking && !self.read_only),
+                button("Save to…", save_id(), saves),
                 button("Cancel", cancel_id(), asking || self.saving().is_some()),
             ]),
+        ]);
+        // Cells have no hover (10 §6): the reason is a row of its own.
+        if self.read_only {
+            let why = super::image::AT_A_REVISION;
+            parts.push(Part::Text(format!("Save to… is off: {why}"), Ink::Weak));
+        }
+        parts.extend([
             Part::Blank,
-            if asking {
+            if saves {
                 Part::Field {
                     label: String::new(),
                     id: path_id(),
@@ -2253,7 +2264,7 @@ impl BinaryWindow {
             } else {
                 Part::Text(cells::fit_left(&self.path, room), Ink::Weak)
             },
-            Part::Buttons(vec![button("Browse…", browse_id(), asking)]),
+            Part::Buttons(vec![button("Browse…", browse_id(), saves)]),
             Part::Text(hint(local).to_string(), Ink::Weak),
         ]);
         match &self.stage {
@@ -2313,9 +2324,9 @@ impl BinaryWindow {
         let layout = dialog::layout(grid, TITLE, nominal, &parts);
         let tall = Grid { rows: TALL, ..grid };
         let rows = dialog::layout(tall, TITLE, nominal, &parts).covers()[0].height;
-        let asking = self.asking();
+        let typing = self.asking() && !self.read_only;
         let inputs = Inputs {
-            field: asking.then_some(&mut self.path),
+            field: typing.then_some(&mut self.path),
             ..Inputs::default()
         };
         let shown = dialog::show(ctx, dialog_id(), &layout, inputs);
@@ -2443,19 +2454,19 @@ fn progress_row(done: u64, total: u64, room: usize) -> String {
 }
 
 /// The F-key slot with a label in the window's row (`own_keys`': F1, F3) under `p`, the row
-/// the last cell of `whole`, laid out as [`chrome::fkey_row`] lays it.
+/// the last cell of `whole`, its slots on whole cells as [`chrome::key_cells`] lays them (the
+/// key help reads the row the same way).
 fn slot_at(whole: egui::Rect, p: egui::Pos2) -> Option<u8> {
-    let row = egui::Rect::from_min_max(
-        egui::pos2(whole.left(), whole.bottom() - chrome::CELL.y),
-        whole.max,
-    );
-    if !row.contains(p) {
+    let cell = chrome::CELL;
+    if !whole.contains(p) || p.y < whole.bottom() - cell.y {
         return None;
     }
+    let cols = (whole.width() / cell.x).floor() as u16;
+    let x = ((p.x - whole.left()) / cell.x).floor() as u16;
     [chrome::HELP_KEY, chrome::EXIT_KEY].iter().find_map(|key| {
-        let (digit, label) = chrome::key_slot(row.left(), row.width(), key.n);
-        let slot = digit.union(label).translate(egui::vec2(0.0, row.top()));
-        slot.contains(p).then_some(key.n)
+        let (digit, label) = chrome::key_cells(cols, key.n);
+        let end = label.right().max(digit.right());
+        (digit.x..end).contains(&x).then_some(key.n)
     })
 }
 
@@ -2559,23 +2570,21 @@ mod read_only_tests {
         }
     }
 
-    struct Never;
+    /// A system dialog that never answers, counting how often it is asked.
+    struct Never(Arc<AtomicUsize>);
 
     impl Chooser for Never {
         fn choose(&mut self, _: &Path) -> Receiver<Option<PathBuf>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
             std::sync::mpsc::channel().1
         }
     }
 
-    /// A click on "Save to…" (off) saves nothing, and the save itself (`start_save`, where the
-    /// button and Enter in the path field both lead) refuses with the reason in the dialog's
-    /// notes. The hover text and the Enter key are not driven here.
-    #[test]
-    fn a_file_at_a_revision_has_no_save_to() {
-        let saves = Arc::new(AtomicUsize::new(0));
-        let tmp = tempfile::tempdir().unwrap();
+    /// A dialog on a file at a revision, read-only, with what it counts: saves, system dialogs.
+    fn at_a_revision(dir: &Path) -> (BinaryWindow, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (saves, chooses) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let hooks = Hooks {
-            save_to: Some(tmp.path().join("out.bin")),
+            save_to: Some(dir.join("out.bin")),
             ..Hooks::default()
         };
         let info = Info {
@@ -2587,10 +2596,64 @@ mod read_only_tests {
         let mut win = BinaryWindow::new(
             info,
             Box::new(Counted(saves.clone())),
-            Box::new(Never),
+            Box::new(Never(chooses.clone())),
             &hooks,
         );
         win.set_read_only(true);
+        (win, saves, chooses)
+    }
+
+    /// Cells have no hover (10 §6): the reason Save to… is off is a row under the buttons from
+    /// the first pass, before any input; Browse… is off and the path is a weak text, no field —
+    /// so no route leads to a save that is refused only then. A click on Browse… or on the
+    /// path's row does nothing. The control: the same dialog not read-only has none of it.
+    #[test]
+    fn a_file_at_a_revision_says_why_save_to_is_off_and_offers_no_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reason = format!("Save to… is off: {}", super::super::image::AT_A_REVISION);
+        let (mut win, saves, chooses) = at_a_revision(tmp.path());
+        let mut drv = crate::gui::testkit::Driver::new(WINDOW[0], 320.0);
+        drv.idle(&mut win, 1);
+        let row = drv
+            .find_text(&reason)
+            .expect("the reason, on the first pass");
+        let weak = crate::gui::chrome::PALETTE.dialog_weak;
+        assert_eq!(drv.colors_of(&reason).unwrap(), [weak]);
+        let buttons = drv.find_text("[ Save to… ]").expect("the buttons");
+        assert_eq!(row.top(), buttons.bottom(), "right under the buttons");
+        let path = win.path.clone();
+        assert_eq!(drv.colors_of(&path).unwrap(), [weak], "the path, weak");
+        drv.click(&mut win, drv.find_text(&path).unwrap().center());
+        assert_ne!(drv.ctx.memory(|m| m.focused()), Some(path_id()), "no field");
+        drv.click_text(&mut win, "[ Browse… ]");
+        drv.idle(&mut win, 2);
+        assert_eq!(chooses.load(Ordering::SeqCst), 0, "Browse… is off");
+        assert!(
+            win.asking() && win.notes.is_empty(),
+            "nothing refused after the fact"
+        );
+        assert_eq!(saves.load(Ordering::SeqCst), 0);
+
+        let (mut open, _, _) = at_a_revision(tmp.path());
+        open.set_read_only(false);
+        let mut drv = crate::gui::testkit::Driver::new(WINDOW[0], 320.0);
+        drv.idle(&mut open, 1);
+        assert!(drv.find_text(&reason).is_none(), "the control: no reason");
+        let path = open.path.clone();
+        assert_eq!(
+            drv.colors_of(&path).unwrap(),
+            [crate::gui::chrome::cga::WHITE],
+            "the control: the field"
+        );
+    }
+
+    /// A click on "Save to…" (off) saves nothing, and the save itself (`start_save`, where the
+    /// button and the system dialog's answer both lead, the backstop behind the controls that
+    /// are off) refuses with the reason in the dialog's notes.
+    #[test]
+    fn a_file_at_a_revision_has_no_save_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut win, saves, _) = at_a_revision(tmp.path());
         let mut drv = crate::gui::testkit::Driver::new(WINDOW[0], 320.0);
         drv.idle(&mut win, 3);
         drv.click_text(&mut win, "[ Save to… ]");

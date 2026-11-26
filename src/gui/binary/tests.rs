@@ -2911,4 +2911,62 @@ mod x3 {
         assert!(fx.drv.closed(), "the Exit slot asks the window to close");
         assert_eq!(fx.calls(), (0, 0));
     }
+
+    /// Only the row's labelled slots act, each as its own key: the blue a row above Exit and
+    /// the empty slot 2 do nothing (the window stays, the help stays closed), slot 1 opens the
+    /// help; and Exit closes with the path field holding the keyboard too.
+    #[test]
+    fn x3_only_the_rows_labelled_slots_act_under_the_dialog() {
+        let help_open = |fx: &Fx| crate::gui::help::is_open(&fx.drv.ctx);
+        let mut fx = dialog();
+        fx.drv.take_viewport_commands();
+        let exit = fx.drv.find_text("Exit   ").expect("the Exit slot");
+        fx.drv
+            .click(&mut fx.win, exit.center() - Vec2::new(0.0, CELL.y));
+        fx.drv.idle(&mut fx.win, 2);
+        assert!(!fx.drv.closed(), "the blue above Exit is not the slot");
+        fx.drv.click_text(&mut fx.win, "2");
+        fx.drv.idle(&mut fx.win, 2);
+        assert!(
+            !fx.drv.closed() && !help_open(&fx),
+            "slot 2 has no key here"
+        );
+        fx.drv.click_text(&mut fx.win, "Help   ");
+        fx.drv.idle(&mut fx.win, 2);
+        assert!(help_open(&fx), "slot 1 opens the help");
+        assert!(!fx.drv.closed());
+
+        let mut fx = dialog();
+        fx.focus_path();
+        fx.drv.take_viewport_commands();
+        fx.drv.click_text(&mut fx.win, "Exit   ");
+        fx.drv.idle(&mut fx.win, 2);
+        assert!(fx.drv.closed(), "Exit closes from the field too");
+        assert_eq!(fx.calls(), (0, 0));
+    }
+
+    /// `[ Cancel ]` during a "Save to…" stops it (06 §7.5), as Esc does: nothing is written, the
+    /// run counts it stopped, and the dialog asks again, saying so.
+    #[test]
+    fn x3_cancel_during_a_save_stops_it_and_asks_again() {
+        let (release, hold) = mpsc::channel();
+        let mut fx = dialog_with(Opts {
+            hold: Some(hold),
+            ..Opts::default()
+        });
+        fx.drv.click_text(&mut fx.win, "[ Save to… ]");
+        assert!(fx.win.saving().is_some(), "saving");
+        fx.drv.click_text(&mut fx.win, "[ Cancel ]");
+        assert!(!fx.win.close_ok, "Cancel stops the save, it does not close");
+        release.send(()).unwrap();
+        fx.until_asking();
+        assert!(fx.out_files().is_empty(), "{:?}", fx.out_files());
+        assert_eq!(fx.win.ended.lock().unwrap().moved, Moved::Stopped);
+        assert!(in_cells(&fx.drv, SAVE_CANCELLED), "the dialog says so");
+        assert!(
+            in_cells(&fx.drv, "[ Save to… ]") && !fx.win.close_ok,
+            "asking again"
+        );
+        assert_eq!(fx.calls(), (0, 1));
+    }
 }
