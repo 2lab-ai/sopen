@@ -23,6 +23,7 @@ pub mod playback;
 pub mod save_as;
 mod select;
 pub mod streamed;
+pub mod switch_host;
 pub mod term;
 pub mod term_input;
 #[cfg(test)]

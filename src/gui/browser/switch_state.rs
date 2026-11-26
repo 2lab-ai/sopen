@@ -190,7 +190,6 @@ impl From<Mode> for view::Mode {
 
 impl SwitchState {
     /// The state as one line of JSON, `"v"` first (no newline: one in a name is escaped).
-    #[cfg_attr(not(test), allow(dead_code))] // X2-host's and X2-switch's; only tests until then.
     pub(crate) fn line(&self) -> String {
         serde_json::to_string(self).expect("a switch state is always JSON")
     }
@@ -336,7 +335,6 @@ fn retarget(d: &mut DialogState, map: impl Fn(&str) -> anyhow::Result<String>) {
 /// the line lacks taking its default and one this sopen does not know ignored; a newer `v` is
 /// refused with §7.4's line, a lower one — v1 is the first, so none was ever written — with its
 /// own (§7.4's older versions are read once a v2 exists); then [`SwitchState::check`]ed.
-#[cfg_attr(not(test), allow(dead_code))] // X2-host's and X2-switch's; only tests until then.
 pub(crate) fn read(line: &str, from: &str) -> Result<SwitchState, String> {
     let unread =
         |e: serde_json::Error| format!("{from} sent a switch state that does not read: {e}");
@@ -422,7 +420,6 @@ impl Browser {
     /// The switch's state of this browser (10 §7.4): nothing in it changes. `ctx` is the one
     /// the browser is drawn in (a dialog field's caret is its edit state there). While a given
     /// state is still being put back, what is not back yet is the given state's.
-    #[cfg_attr(not(test), allow(dead_code))] // X2-host's and X2-switch's; only tests until then.
     pub(crate) fn take_state(&self, ctx: &egui::Context) -> SwitchState {
         let panel = |i: usize| {
             let p = &self.panels[i];
@@ -484,7 +481,6 @@ impl Browser {
     /// before: what each side lists, and the rest once that is listed (see the module's header).
     /// `Err`, and nothing changes: a state that does not pass [`SwitchState::check`], one of
     /// another host (its paths are not this window's), a browser drawn or given one already.
-    #[cfg_attr(not(test), allow(dead_code))] // X2-host's and X2-switch's; only tests until then.
     pub(crate) fn give_state(&mut self, state: SwitchState) -> Result<(), String> {
         state.check()?;
         if self.painted || self.given.is_some() {
