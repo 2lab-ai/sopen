@@ -239,6 +239,9 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 fn main() -> ExitCode {
+    // `--state-stdin`: its relayed output is passed on to the session to the last byte when
+    // `main` ends, a panic's message included (a no-op for any other run).
+    let _relayed = gui::switch_host::EndOfRun;
     let cli = Cli::parse();
     if let Some(editor) = cli
         .raise_window

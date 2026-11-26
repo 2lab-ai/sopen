@@ -664,10 +664,13 @@ opens at the state in a switched window: F12, its title row's `[TUI]`, the close
 return, unsaved edits first asking the window's own close prompt (its Cancel keeps the window); once it has
 returned and what still writes has ended, HOST's sopen prints `sopen-xtools-state <the state's JSON line>` — a fixed
 cue, as `sopen-tunnel-open` is — and exits 0 (3 after a refused save, as any window). The rest of its input is read
-to its end, as `--hold-until-eof` reads it. At the end — the other side's sopen gone — nothing is read from or
-written to the session again (its standard input, output and error go to `/dev/null`), and the window closes when it
-holds nothing it would lose; with unsaved edits or a job that writes it stays, after the fixed line
-`sopen-xtools-kept`, until it is closed there.
+to its end, as `--hold-until-eof` reads it, and heard by the window drawn or hidden. At the end — the other side's
+sopen gone — nothing is read from or written to the session again, and the window closes when it holds nothing it
+would lose; with unsaved edits or a job that writes it stays, after the fixed line `sopen-xtools-kept`, until it is
+closed there, no longer showing `[TUI]`. The session can die at any time while something still writes (a report
+after the window, a Save's progress), so HOST's sopen relays its standard output and error to the session through
+pipes of its own: a relay whose session is gone drains what it is given, and no write in sopen fails; the relays pass
+on their last bytes, the cue among them, before sopen exits (at most 2 s more for a child still holding one).
 
 On HOST, sopen is looked for on PATH, then in the usual Homebrew and cargo install paths; when there is none HOST
 prints `sopen is not installed on HOST (brew install 2lab-ai/tap/sopen-preview)` and the run exits 127. A

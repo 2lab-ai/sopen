@@ -581,7 +581,7 @@ fn the_input_ending_with_unsaved_edits_keeps_the_window() {
             drv.click_text_on_top(w, "Cancel");
             drv.idle(w, 2);
             assert!(!drv.window_closed, "Cancel keeps it");
-            key(drv, w, Key::F12);
+            drv.key(w, Key::W, Modifiers::COMMAND);
             drv.idle(w, 2);
             drv.click_text_on_top(w, "Discard");
             drv.idle(w, 3);
@@ -595,6 +595,265 @@ fn the_input_ending_with_unsaved_edits_keeps_the_window() {
         "nothing after the cue"
     );
     assert!(said.gone.get(), "the session is let go");
+}
+
+/// Once the session has ended (the input's end, the window kept), the window is one started
+/// directly: no `[TUI]` on its title row, and F12 takes nothing back — there is no one to
+/// return to; its close still asks.
+#[test]
+fn the_button_goes_with_the_session() {
+    let (_tmp, root) = root();
+    let input = Input::default();
+    let said = Said::default();
+    let ran = host(
+        &root,
+        None,
+        &at(&root, "data.bin"),
+        &input,
+        &said,
+        |drv, w| {
+            settle(drv, w);
+            assert!(drv.find_text("[TUI]").is_some(), "the session's button");
+            edit_bytes(drv, w);
+            // Where the title row drew it, over the viewer's views too.
+            let drawn = |drv: &Driver| chrome::mode_button_rect(&drv.ctx).is_some();
+            assert!(drawn(drv), "the button over the viewer");
+            input.end();
+            drv.idle(w, 3);
+            assert_eq!(said.text(), format!("{KEPT_CUE}\n"));
+            assert!(!drawn(drv), "no button once kept");
+            key(drv, w, Key::F12);
+            drv.idle(w, 3);
+            assert_eq!(drv.refused_closes, 0, "F12 asked nothing");
+            assert!(drv.find_text("Unsaved changes").is_none(), "no prompt");
+            assert!(!drv.window_closed);
+            drv.key(w, Key::W, Modifiers::COMMAND);
+            drv.idle(w, 2);
+            drv.click_text_on_top(w, "Discard");
+            drv.idle(w, 3);
+            assert!(drv.window_closed, "closed there");
+        },
+    );
+    ran.unwrap();
+    assert_eq!(said.text(), format!("{KEPT_CUE}\n"));
+}
+
+/// A hidden window is not drawn — eframe runs only the shell's `logic` then — yet it hears its
+/// input's end there: with nothing to lose it asks to close, with unsaved edits it says
+/// [`KEPT_CUE`] and stays.
+#[test]
+fn a_hidden_window_hears_the_input_end() {
+    let (_tmp, root) = root();
+    let hidden = |drv: &mut Driver, w: &mut Switched| {
+        let out = drv
+            .ctx
+            .run_logic(&egui::RawInput::default(), |ctx| w.logic(ctx));
+        out.viewport_commands
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|c| c.contains(&egui::ViewportCommand::Close))
+    };
+    let input = Input::default();
+    let said = Said::default();
+    let ran = host(
+        &root,
+        None,
+        &at(&root, "notes.txt"),
+        &input,
+        &said,
+        |drv, w| {
+            settle(drv, w);
+            input.end();
+            assert!(hidden(drv, w), "nothing to lose: it asks to close, undrawn");
+        },
+    );
+    ran.unwrap();
+    assert_eq!(said.text(), "");
+    assert!(said.gone.get(), "the session is let go");
+    let input = Input::default();
+    let said = Said::default();
+    let ran = host(
+        &root,
+        None,
+        &at(&root, "data.bin"),
+        &input,
+        &said,
+        |drv, w| {
+            settle(drv, w);
+            edit_bytes(drv, w);
+            input.end();
+            assert!(!hidden(drv, w), "kept");
+            assert_eq!(said.text(), format!("{KEPT_CUE}\n"), "said undrawn");
+            assert!(said.gone.get(), "the session is let go");
+            drv.key(w, Key::W, Modifiers::COMMAND);
+            drv.idle(w, 2);
+            drv.click_text_on_top(w, "Discard");
+            drv.idle(w, 3);
+            assert!(drv.window_closed, "closed there");
+        },
+    );
+    ran.unwrap();
+    assert_eq!(said.text(), format!("{KEPT_CUE}\n"));
+}
+
+/// A relay (the session's output, `--state-stdin`) whose session has gone drains: what is
+/// written into it — far more than a pipe holds — always goes through, and it ends at its
+/// input's end.
+#[test]
+fn a_relay_drains_once_its_session_is_gone() {
+    let (gone, session) = std::io::pipe().unwrap();
+    drop(gone);
+    let (from, mut into) = std::io::pipe().unwrap();
+    let (ended, relay_ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        relay(from, session);
+        let _ = ended.send(());
+    });
+    let (wrote, written) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let all = (0..256).try_for_each(|_| into.write_all(&[b'x'; 8192]));
+        let _ = wrote.send(all.map_err(|e| e.to_string()));
+    });
+    let all = written
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the writes never stall");
+    assert_eq!(all, Ok(()), "every write went through");
+    relay_ended
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the relay ends at its input's end");
+}
+
+/// Set in the child of [`a_dead_session_never_stops_what_still_writes`]: where its job lands.
+const RELAY_CHILD: &str = "SOPEN_TEST_RELAY_CHILD";
+
+/// The child's cue: the window has returned.
+const RETURNED: &str = "sopen-test-returned";
+
+/// Once the window has returned and its cue is out, the session can die while something still
+/// writes — a file operation's report after the window (`Leftover::finish`), a viewer's
+/// `waiting…`, a completion line in a pass. With fds 1 and 2 relayed ([`relay_stdio`]) none of
+/// those writes fails: the job's own write lands and the run ends 0 ([`end_of_run`]). A child of
+/// this test binary plays HOST's sopen with its own fds 1 and 2; the test is the other side, which
+/// drops its ends of the session after the child's cue.
+#[test]
+fn a_dead_session_never_stops_what_still_writes() {
+    use std::io::BufRead as _;
+    if let Some(landed) = std::env::var_os(RELAY_CHILD) {
+        return relay_child(Path::new(&landed));
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let landed = tmp.path().join("landed");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "gui::switch_host::tests::a_dead_session_never_stops_what_still_writes",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(RELAY_CHILD, &landed)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    let (seen, cue) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = std::io::BufReader::new(stdout.unwrap()).lines();
+        // The test harness's `test … ... ` stands before it on its line.
+        let saw = lines.any(|l| l.is_ok_and(|l| l.ends_with(RETURNED)));
+        // The other side's end of the output goes before it says it saw the cue.
+        drop(lines);
+        let _ = seen.send(saw);
+    });
+    let saw = cue.recv_timeout(std::time::Duration::from_secs(120));
+    assert_eq!(saw, Ok(true), "the child's cue");
+    drop(stderr);
+    // The input ends: the child's job goes on writing into the dead session.
+    drop(stdin);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the child did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(status.success(), "the child ended {status:?}");
+    assert_eq!(
+        std::fs::read_to_string(&landed).ok().as_deref(),
+        Some("the job's write landed")
+    );
+}
+
+/// The child's half: fds 1 and 2 relayed, the cue, then — once the other side is gone — a job
+/// that says far more than a pipe holds on both, then lands its write.
+fn relay_child(landed: &Path) {
+    relay_stdio().expect("fds 1 and 2 relayed");
+    println!("{RETURNED}");
+    let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+    for n in 0..2000 {
+        println!("a completion, line {n}");
+        eprintln!("sopen: the file operation ended after the window closed: line {n}");
+    }
+    std::fs::write(landed, "the job's write landed").unwrap();
+    end_of_run();
+}
+
+/// Set in the child of [`a_debug_line_on_a_dead_stderr_is_dropped`]: where it lands its write.
+const DEBUG_CHILD: &str = "SOPEN_TEST_DEBUG_CHILD";
+
+/// `SOPEN_LOG=debug`'s lines (`crate::debug!`) never fail on a standard error whose reader is
+/// gone — the F-key watchdog's, which inherits the relay's pipe and outlives sopen (its retry
+/// line, `fnkeys::watch`): the line is dropped and what comes after it runs. A child of this test
+/// binary writes them once its standard error's reader is gone; it lands a file and ends 0.
+#[test]
+fn a_debug_line_on_a_dead_stderr_is_dropped() {
+    if let Some(landed) = std::env::var_os(DEBUG_CHILD) {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        for n in 0..2000 {
+            crate::debug!("F-key watchdog: a retry, line {n}");
+        }
+        std::fs::write(landed, "after the debug lines").unwrap();
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let landed = tmp.path().join("landed");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "gui::switch_host::tests::a_debug_line_on_a_dead_stderr_is_dropped",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DEBUG_CHILD, &landed)
+        .env("SOPEN_LOG", "debug")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Its standard error's reader goes first; then its input ends and it writes.
+    drop(child.stderr.take());
+    drop(child.stdin.take());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the child did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(status.success(), "the child ended {status:?}");
+    assert_eq!(
+        std::fs::read_to_string(&landed).ok().as_deref(),
+        Some("after the debug lines")
+    );
 }
 
 /// A run a hook drives (`SOPEN_CELLS`): the shell lets its close through unasked (`closing()`

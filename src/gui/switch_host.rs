@@ -9,12 +9,22 @@
 //!
 //! The rest of the input is read to its end on a thread of its own, as `--hold-until-eof` waits
 //! for it: its end is the other side's sopen gone (Ctrl+C there, the link dropping — a session
-//! without a pty sends no SIGHUP, 10 §7.3). Nothing reads this side's output then: the session
-//! is let go — standard input, output and error on `/dev/null`, so nothing more is read from it
-//! or written to it (a closed pipe fails every write, and `eprintln!` panics on that). With
-//! nothing to lose the window closes, no cue; with unsaved edits or a job that writes
+//! without a pty sends no SIGHUP, 10 §7.3). The window hears it in the shell's `logic`
+//! ([`Window::logic`]), which runs before every pass and in place of it while the window is
+//! hidden. With nothing to lose the window closes, no cue; with unsaved edits or a job that writes
 //! ([`Browser::would_lose`]) it stays, after [`KEPT_CUE`], until it is closed here, by its own
-//! close prompt. A run a hook drives (`SOPEN_CELLS`, `SOPEN_SCREENSHOT`) ends by its hook.
+//! close prompt — a window started directly from then on, no `[TUI]`. Either way the session is
+//! let go: nothing more is read from it or written to it. A run a hook drives (`SOPEN_CELLS`,
+//! `SOPEN_SCREENSHOT`) ends by its hook.
+//!
+//! The session can die at any time, the window open or gone, while something still writes — a
+//! file operation's report after the window, a viewer's `waiting…`, a completion line in a pass.
+//! A write to its dead pipe fails, `println!` and `eprintln!` panic on that, and what still
+//! writes is cut short. So the run's standard output and error are relayed ([`relay_stdio`]):
+//! fds 1 and 2 are pipes, and a thread copies each to the session's stream, kept aside; once a
+//! write there fails, or the session is let go, the thread only drains its pipe. Nothing in sopen
+//! ever writes to a dead session, and [`end_of_run`] lets the relays pass on the last bytes — the
+//! cue among them — before sopen exits. Order within each stream is kept.
 //!
 //! The cues are fixed lines, as [`crate::url::TUNNEL_OPEN`] is, written ignoring write errors
 //! ([`crate::url::write_cue`]).
@@ -22,13 +32,15 @@
 use super::browser::switch_state::{self, SwitchState};
 use super::browser::{self, Browser, Start};
 use super::{Hooks, Outcome, Window};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use eframe::egui;
 use std::cell::RefCell;
 use std::io::{BufRead, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 /// The line HOST's sopen prints once its window has handed the browser back (10 §7.3), a space
 /// and the state's JSON line after it: the cue the switch's other side reads instead of passing
@@ -77,9 +89,11 @@ impl std::fmt::Display for NotGiven {
 impl std::error::Error for NotGiven {}
 
 /// Opens the browser `start` makes at `sent` in a switched window (see the module's header),
-/// its input watched to its end; prints the cue once it has handed the browser back and what
-/// still wrote has ended. A state `start` cannot take is [`NotGiven`], before any window.
+/// its input watched to its end and its output relayed to the session ([`relay_stdio`]; `main`
+/// calls [`end_of_run`] last); prints the cue once it has handed the browser back and what still
+/// wrote has ended. A state `start` cannot take is [`NotGiven`], before any window.
 pub fn run(start: Start, hooks: &Hooks, sent: Sent) -> Result<Outcome> {
+    relay_stdio().context("cannot relay the output to the session")?;
     let input = Input::default();
     input.watch(std::io::stdin())?;
     run_on(start, hooks, sent, input, Cues::stdio(), |title, window| {
@@ -159,12 +173,21 @@ impl Cues {
     }
 }
 
-/// Standard input, output and error on `/dev/null`: what anything in this process — a debug
-/// line, a report printed after the window, sopen's own exit — or a child started later writes
-/// goes nowhere, never to a pipe whose other end is gone.
+/// The session let go: its input and the two streams the relays write to become `/dev/null`
+/// (the relays drain into it from then on). Without relays, fds 1 and 2 themselves.
 fn let_go_of_the_session() {
-    use std::os::fd::AsRawFd;
     let _ = std::io::stdout().flush();
+    let session = RELAYS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map_or([1, 2], |r| r.session);
+    on_null([0].into_iter().chain(session));
+}
+
+/// `/dev/null` put on each of `fds`, this process's own: what is written there goes nowhere,
+/// what is read there has ended.
+fn on_null(fds: impl IntoIterator<Item = RawFd>) {
     let Ok(null) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -172,10 +195,135 @@ fn let_go_of_the_session() {
     else {
         return;
     };
-    for fd in 0..=2 {
-        // SAFETY: dup2 of a descriptor this process owns onto its own standard ones.
+    for fd in fds {
+        // SAFETY: dup2 onto a descriptor this process owns; atomic, so a write in flight on it
+        // ends on what it was.
         unsafe {
             libc::dup2(null.as_raw_fd(), fd);
+        }
+    }
+}
+
+/// The relays of this process's standard output and error while they run ([`relay_stdio`]).
+static RELAYS: Mutex<Option<Relays>> = Mutex::new(None);
+
+/// What [`end_of_run`] and [`let_go_of_the_session`] need of the relays.
+struct Relays {
+    /// The session's standard output and error, kept aside: never closed before sopen exits (a
+    /// relay may still write there), only put on `/dev/null` when the session is let go.
+    session: [RawFd; 2],
+    /// A word from each relay once its pipe has ended and all it read is passed on.
+    ended: mpsc::Receiver<()>,
+}
+
+/// How long [`end_of_run`] waits for the relays: a child that inherited fd 1 or 2 and still
+/// runs holds its pipe open past sopen's own end.
+const RELAY_WAIT: Duration = Duration::from_secs(2);
+
+/// Fds 1 and 2 put on pipes, each relayed by a thread of its own to the session's stream it
+/// replaces, kept aside (see the module's header). A child started from then on inherits the
+/// pipe as it inherited the session. Once per process; a second call does nothing.
+pub(crate) fn relay_stdio() -> std::io::Result<()> {
+    let mut relays = RELAYS.lock().unwrap_or_else(PoisonError::into_inner);
+    if relays.is_some() {
+        return Ok(());
+    }
+    let _ = std::io::stdout().flush();
+    let (done, ended) = mpsc::channel();
+    let mut session = [-1; 2];
+    let mut ends = Vec::new();
+    for (i, fd) in [1, 2].into_iter().enumerate() {
+        let (from, into) = std::io::pipe()?;
+        // SAFETY: a copy of this process's own standard stream, close-on-exec: no child holds
+        // the session through it.
+        let kept = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if kept < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        session[i] = kept;
+        let done = done.clone();
+        std::thread::Builder::new()
+            .name(format!("sopen-relay-{fd}"))
+            .spawn(move || {
+                relay(from, SessionFd(kept));
+                let _ = done.send(());
+            })?;
+        ends.push((into, fd));
+    }
+    // Only once both relays run does anything write into a pipe.
+    for (into, fd) in ends {
+        // SAFETY: dup2 of a pipe's write end, this process's own, onto its own fd 1 or 2.
+        unsafe {
+            libc::dup2(into.as_raw_fd(), fd);
+        }
+    }
+    *relays = Some(Relays { session, ended });
+    Ok(())
+}
+
+/// One of the session's streams, kept aside, written to by its descriptor (never closed here).
+struct SessionFd(RawFd);
+
+impl Write for SessionFd {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // SAFETY: a write of `buf` to a descriptor this process owns.
+        let n = unsafe { libc::write(self.0, buf.as_ptr().cast(), buf.len()) };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Copies `from` to `to` until `from` ends; once a write to `to` fails — the session gone — it
+/// only drains `from`, so whatever writes into it never sees an error.
+fn relay(mut from: impl Read, mut to: impl Write) {
+    let mut chunk = [0u8; 8192];
+    let mut live = true;
+    loop {
+        match from.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => {
+                if live && to.write_all(&chunk[..n]).is_err() {
+                    live = false;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// [`end_of_run`] when it goes: `main` holds one from its first line, so the relays finish
+/// however `main` ends — returned, or unwound by a panic whose message is in a pipe.
+pub struct EndOfRun;
+
+impl Drop for EndOfRun {
+    fn drop(&mut self) {
+        end_of_run();
+    }
+}
+
+/// The end of a `--state-stdin` run, `main`'s last step ([`EndOfRun`]; `gui::give_up` before its
+/// exit too): fds 1 and 2 put on `/dev/null`, so the pipes' write ends close, and the relays let
+/// finish passing on what they still hold — the cue among it — for at most [`RELAY_WAIT`].
+/// Nothing for any other run.
+pub fn end_of_run() {
+    let Some(relays) = RELAYS.lock().unwrap_or_else(PoisonError::into_inner).take() else {
+        return;
+    };
+    let _ = std::io::stdout().flush();
+    on_null([1, 2]);
+    let deadline = Instant::now() + RELAY_WAIT;
+    for _ in relays.session {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if relays.ended.recv_timeout(left).is_err() {
+            return;
         }
     }
 }
@@ -196,7 +344,7 @@ enum Session {
 /// The browser in HOST's switched window (10 §7.2): `[TUI]` on its title row; F12, `[TUI]` and
 /// every close return through the browser's own close ([`Browser::close_requested`]: a viewer's
 /// prompt first), the state taken just before it — a viewer it closes is in it. The input's end
-/// is heard on the next pass.
+/// is heard in the shell's `logic` — drawn or hidden — and at the top of a pass.
 pub(crate) struct Switched {
     browser: Browser,
     /// The window's context, from its first pass: the state's dialog caret is its edit state.
@@ -216,6 +364,29 @@ impl Switched {
         self.ctx.clone().unwrap_or_default()
     }
 
+    /// The window's context, kept the first time it is seen — before the input's end is looked
+    /// at: an end after this wakes the window.
+    fn bind(&mut self, ctx: &egui::Context) {
+        if self.ctx.is_none() {
+            let _ = self.input.wake.set(ctx.clone());
+            self.ctx = Some(ctx.clone());
+        }
+    }
+
+    /// The input's end, once, while the other side still waits for the state: with nothing to
+    /// lose the window asks to close; else it is kept. A hook's run is left to its hook.
+    fn heed_the_input(&mut self, ctx: &egui::Context) {
+        if self.scripted || self.session != Session::Open || !self.input.ended() {
+            return;
+        }
+        if self.browser.would_lose() {
+            self.keep();
+        } else {
+            self.session = Session::Ending;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     /// The input ended while the window holds something it would lose: [`KEPT_CUE`], the
     /// session let go, the window kept.
     fn keep(&mut self) {
@@ -227,31 +398,31 @@ impl Switched {
 }
 
 impl Window for Switched {
+    fn logic(&mut self, ctx: &egui::Context) {
+        self.bind(ctx);
+        self.heed_the_input(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        if self.ctx.is_none() {
-            // Before the input's end is looked at: an end after this wakes the window.
-            let _ = self.input.wake.set(ctx.clone());
-            self.ctx = Some(ctx.clone());
+        self.bind(&ctx);
+        // Before the browser's pass, should the shell's `logic` not have run first.
+        self.heed_the_input(&ctx);
+        // The session's button; once it has ended, none, as a window started directly.
+        let open = self.session == Session::Open;
+        if open {
+            super::chrome::set_mode_button(&ctx, "[TUI]");
+        } else {
+            super::chrome::clear_mode_button(&ctx);
         }
-        super::chrome::set_mode_button(&ctx, "[TUI]");
         self.browser.ui(ui);
         // Both looked at, so a played F12 never stays in the input.
         let played = played_switch(&ctx);
-        if super::switch_asked(&ctx) || played {
+        if (super::switch_asked(&ctx) || played) && open {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if self.scripted {
             *self.handed.borrow_mut() = Some(self.browser.take_state(&ctx));
-            return;
-        }
-        if self.session == Session::Open && self.input.ended() {
-            if self.browser.would_lose() {
-                self.keep();
-            } else {
-                self.session = Session::Ending;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
         }
     }
 
@@ -326,6 +497,7 @@ pub(crate) fn run_on(
     let cues = Rc::new(RefCell::new(cues));
     let handed = Rc::new(RefCell::new(None));
     let scripted = hooks.scripted();
+    let watched = input.clone();
     let outcome = browser::open_on(start, hooks, |title, mut browser| {
         browser.give_state(sent.0).map_err(NotGiven)?;
         show(
@@ -341,9 +513,13 @@ pub(crate) fn run_on(
             },
         )
     })?;
-    if let Some(state) = handed.take() {
-        cues.borrow_mut()
-            .say(&format!("{STATE_CUE} {}", state.line()));
+    match handed.take() {
+        Some(state) => cues
+            .borrow_mut()
+            .say(&format!("{STATE_CUE} {}", state.line())),
+        // Closed for the input's end — while hidden eframe closes it unasked: let go here.
+        None if !scripted && watched.ended() => cues.borrow_mut().let_go(),
+        None => {}
     }
     Ok(outcome)
 }

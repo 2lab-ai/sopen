@@ -797,6 +797,13 @@ pub trait Window {
     fn set_wrapped(&mut self, wrapped: bool) {
         let _ = wrapped;
     }
+
+    /// Before every pass and, while the window is hidden (minimised, covered), instead of it —
+    /// the shell's `logic`: what the window must hear even when it is not drawn (HOST's switched
+    /// window, its input's end: 10 §7.3). The default does nothing.
+    fn logic(&mut self, ctx: &egui::Context) {
+        let _ = ctx;
+    }
 }
 
 /// The view keys of the file browser's viewer while one is open (08 §8, VM-7): what the view on
@@ -1359,6 +1366,10 @@ impl<W: Window> Window for Receipted<W> {
     fn keys(&self) -> &'static [chrome::FKey] {
         self.inner.keys()
     }
+
+    fn logic(&mut self, ctx: &egui::Context) {
+        self.inner.logic(ctx);
+    }
 }
 
 struct Shell<W: Window> {
@@ -1539,11 +1550,13 @@ impl<W: Window> eframe::App for Shell<W> {
     }
 
     /// Before every `ui` and, while the window is hidden (minimised, covered), instead of it:
-    /// the F-key switch hears whether a window of this process is in front.
+    /// the F-key switch hears whether a window of this process is in front, and the window its
+    /// own ([`Window::logic`]).
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(feed) = &self.fkeys {
             feed.pass(ctx);
         }
+        self.inner.logic(ctx);
     }
 
     /// The window is about to go — eframe runs this before it destroys the window and its
@@ -1945,6 +1958,8 @@ fn start<A>(
 /// to end by itself — it is bounded by its input.
 pub(crate) fn give_up(why: &str) -> ! {
     eprintln!("sopen: {why}; giving up");
+    // `--state-stdin`: the line reaches the session before the exit (a no-op otherwise).
+    switch_host::end_of_run();
     std::process::exit(1);
 }
 
