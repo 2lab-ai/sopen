@@ -985,9 +985,20 @@ fn run_tui(
         parent.to_string()
     };
     let start = browser_for(place, &folder, dirs);
+    // The switch to HOST hands back a state, given to a browser made again on this place (10
+    // §7.3): its folder over a new connection.
+    let fresh: gui::term::Fresh = {
+        let (target, dirs, folder) = (target.clone(), dirs.clone(), folder.clone());
+        std::rc::Rc::new(move || {
+            let (place, _) = Place::connect(&target, &dirs, &mut Record::default())?;
+            Ok(browser_for(place, &folder, &dirs))
+        })
+    };
     let to = gui::term::Destination {
         here,
         target: flag.map(str::to_string),
+        state_dir: dirs.state.clone(),
+        fresh: Some(fresh),
     };
     let outcome = gui::term::open(start, &hooks, to)?;
     rec.action = Some(outcome.action());

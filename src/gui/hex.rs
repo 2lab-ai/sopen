@@ -5230,13 +5230,19 @@ impl HexWindow {
             self.prompt = false;
             self.open_save_as(true);
         } else if shown.clicked(id.with("discard")) {
-            self.prompt = false;
-            self.discard = true;
-            self.close_ok = true;
+            self.discard_edits();
             super::request_close(ctx);
         } else if shown.clicked(id.with("cancel")) || shown.modal.should_close() {
             self.prompt = false;
         }
+    }
+
+    /// Discard (07 §10): the window closes without asking, and its journal — this session's,
+    /// the one it holds — is removed as it goes ([`HexWindow::settle_journal`]).
+    fn discard_edits(&mut self) {
+        self.prompt = false;
+        self.discard = true;
+        self.close_ok = true;
     }
 
     /// The first Save of a file above 256 MiB (07 §4.5): what its checks cannot see, asked once
@@ -5593,6 +5599,10 @@ impl super::Window for HexWindow {
             read_only: self.at_revision || self.read_only.is_some(),
             saving: self.job.is_some() && self.stream.is_some(),
         })
+    }
+
+    fn discard(&mut self) {
+        self.discard_edits();
     }
 
     fn hold(&mut self) -> crate::views::Hold {

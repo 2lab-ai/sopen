@@ -14,9 +14,24 @@ changes: a folder still opens in a window.
   moves it into a window on this machine, at the terminal's size, and back: F12 there, its
   `[TUI]`, or closing the window (Cmd/Ctrl+Q and +W too) returns
   to the terminal with everything as it was — the bar, a dialog with what you typed in it. Keys
-  typed into the terminal meanwhile are dropped. With `--target`, `SOPEN_TARGET` or a config
-  `target` naming another machine, it stays in the terminal and says so (the switch to another
-  machine comes later); on Linux without a display it says how to get one.
+  typed into the terminal meanwhile are dropped. On Linux without a display it says how to get
+  one.
+- **With a target** (`--target`, `SOPEN_TARGET` or a config `target` naming another machine), F12
+  opens the window on that machine's screen instead, at the same folders, bars, selections,
+  dialog and viewer, and at the terminal's size: sopen there runs over ssh, the way a `--target`
+  run does (it needs sopen installed, and reaches this machine's files by its own ssh). Meanwhile
+  the terminal waits, dimmed, its line saying where xtools is, the other machine's last message
+  on the status row; only Ctrl+C is read. F12 there, its `[TUI]` or closing it (its own unsaved
+  edits ask first there) brings the terminal back with what was done in the window. **Ctrl+C**
+  here ends the window there — or, if it has unsaved edits, leaves it open and says so; a second
+  Ctrl+C stops waiting for the other machine. Before it goes, a running copy, git action or save
+  is waited for (`waiting for …` on the status row); unsaved edits in the viewer ask `Save the
+  changes to … before switching to …?` — Save, Save As… (it switches once that has landed),
+  Discard (the file opens there as stored, and the edits here are dropped once its window hands back — kept here if it never does) or Cancel; and the git panel's
+  open dialog or the planner's plan, which do not cross yet, ask whether to switch without them.
+  Every way the other side can end — sopen not installed there, a usage error from an older
+  sopen, ssh not reaching it, a refused save — is one line on the status row, and the terminal
+  lists again.
 - The text viewer (Enter on a text file: its rows, wrapped or not, highlighted, Go to, F8's
   encodings) and the hex editor (`2` in a viewer: its rows, cursor, Go to field, buttons and
   status row) are drawn in the terminal as in the window. What the terminal does not draw yet —

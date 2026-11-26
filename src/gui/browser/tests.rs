@@ -22,6 +22,7 @@ mod vm8;
 mod x1a;
 mod x1b;
 mod x2host;
+mod x2switch;
 
 const RUST: &str = "// a comment\nfn main() {\n    let answer = 42;\n}\n";
 

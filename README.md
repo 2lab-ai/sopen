@@ -129,7 +129,8 @@ sopen --tui myserver:/srv/app      # the file browser in this terminal
 
 The same file browser in the terminal you typed it in — the same frames, colours and keys. `F12`
 (or `Alt+G`, or a click on `[GUI]`) moves it into a window on this machine and back, with
-everything as it was. Details: [docs/tui.md](docs/tui.md).
+everything as it was — or, with a target, into a window on that machine's screen (below).
+Details: [docs/tui.md](docs/tui.md).
 
 ## On another machine's screen: `--target`
 
@@ -144,6 +145,17 @@ Type on one machine, see it on another: `<host>` runs its own installed sopen wi
 the file's remote still needs only sshd. An `http://` or `https://` address opens in the default
 browser of the machine that shows things; with a target, a loopback one (`localhost`, `127.x.y.z`,
 `[::1]`) is served from this machine through an ssh tunnel of its own, closed when this sopen ends.
+
+```sh
+sopen --tui --target <host> ~/src   # the file browser here; F12 moves it to a window on <host>
+```
+
+From `sopen --tui` with a target, `F12` opens the window on `<host>`'s screen at the same folders,
+selections, dialog and viewer, and closing it there (or `F12` there) brings the terminal back with
+whatever was done in it. Meanwhile the terminal waits, dimmed; `Ctrl+C` there ends the window on
+`<host>` — or leaves it open if it has unsaved edits. Unsaved edits here are asked about first
+(Save, Save As…, Discard, Cancel), so is an open git dialog (it does not cross yet), and a running
+copy or save is waited for. `<host>` reaches this machine's files by its own ssh.
 Details: [docs/target.md](docs/target.md) and [docs/urls.md](docs/urls.md).
 
 ## From the command line: `sopen cut`, `sopen stems`

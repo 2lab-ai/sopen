@@ -498,8 +498,10 @@ enum Session {
 
 /// The browser in HOST's switched window (10 §7.2): `[TUI]` on its title row; F12, `[TUI]` and
 /// every close return through the browser's own close ([`Browser::close_requested`]: a viewer's
-/// prompt first), the state taken just before it — a viewer it closes is in it. The input's end
-/// is heard in the shell's `logic` — drawn or hidden — and at the top of a pass.
+/// prompt first), the state taken just before it — a viewer it closes is in it; after the
+/// viewer's prompt, the state taken when it came up, so its Save or Discard returns with the
+/// viewer too. The input's end is heard in the shell's `logic` — drawn or hidden — and at the top
+/// of a pass.
 pub(crate) struct Switched {
     browser: Browser,
     /// The window's context, from its first pass: the state's dialog caret is its edit state.
@@ -512,6 +514,10 @@ pub(crate) struct Switched {
     session: Session,
     /// The state the window hands back.
     handed: Rc<RefCell<Option<SwitchState>>>,
+    /// The state taken at the close that brought up the viewer's prompt, its viewer in it: handed
+    /// back on the close that the prompt's answer (Save, Discard) brings, once the browser has
+    /// dropped the viewer; its Cancel drops it (X2-switch).
+    asked: Option<SwitchState>,
 }
 
 impl Switched {
@@ -563,6 +569,11 @@ impl Window for Switched {
         self.bind(&ctx);
         // Before the browser's pass, should the shell's `logic` not have run first.
         self.heed_the_input(&ctx);
+        // The viewer's prompt was answered by staying (Cancel, a Save that did not land): the
+        // state taken when it came up is not this window's any more.
+        if self.asked.is_some() && self.browser.viewer_stays() {
+            self.asked = None;
+        }
         // The session's button; once it has ended, none, as a window started directly.
         let open = self.session == Session::Open;
         if open {
@@ -590,9 +601,11 @@ impl Window for Switched {
             Session::Open => {
                 let state = self.browser.take_state(&self.ctx());
                 if !self.browser.close_requested() {
+                    // The viewer's prompt is up: its answer's close comes with the viewer gone.
+                    self.asked = Some(state);
                     return false;
                 }
-                *self.handed.borrow_mut() = Some(state);
+                *self.handed.borrow_mut() = Some(self.asked.take().unwrap_or(state));
                 self.session = Session::Returned;
                 true
             }
@@ -665,6 +678,7 @@ pub(crate) fn run_on(
                 scripted,
                 session: Session::Open,
                 handed: handed.clone(),
+                asked: None,
             },
         )
     })?;

@@ -37,13 +37,16 @@
 //!   settled ([`cells_text`]), and the run ends; a window writes its own the same way
 //!   ([`window_receipt`]), so the two are compared by a diff.
 //! - **The clipboard** (§4): egui's `CopyText` is OSC 52; the terminal's paste arrives bracketed.
-//! - **The switch** (§7.1–§7.2, T4): F12, Alt+G (the shell's hook, in the terminal only) or a
+//! - **The switch** (§7.1–§7.3, T4): F12, Alt+G (the shell's hook, in the terminal only) or a
 //!   click on a hand-off box. Where the window would open is read then, as 01 §4a resolves a run;
-//!   a HOST says it comes with the remote switch (X2) and no display says how to get one — on the
-//!   status row, until the next key. Else the terminal is left, the browser runs in a window of
-//!   the terminal's grid size (T16) and comes back with its state when F12 is pressed there or the
+//!   a HOST is the remote switch ([`remote`]: the window on HOST, the terminal kept and dimmed
+//!   until it hands the state back) and no display says how to get one — on the status row,
+//!   until the next key. Else the terminal is left, the browser runs in a window of the
+//!   terminal's grid size (T16) and comes back with its state when F12 is pressed there or the
 //!   window closes (Cmd/Ctrl+Q and +W too); the focused field's edit state goes and comes back
 //!   with it. A window that does not open brings the terminal back with the reason (T31).
+
+mod remote;
 
 use super::browser::{self, Browser};
 use super::cells::{self, Buffer, Cells, Layer, Pen, Position};
@@ -1555,6 +1558,9 @@ pub(crate) struct Backend<T: Tty, O: Write> {
     pub receipt: Option<Receipt>,
     /// `SOPEN_STATE`'s `help=1`: F1 is still to be pressed once the screen is ready.
     pub help_first: bool,
+    /// Whether a switch the window held back may go now (10 §7.4: the job it waited for ended,
+    /// the Save chosen landed): looked at after every pass, which then switches as F12 does.
+    pub switch_due: Option<Box<dyn FnMut() -> bool>>,
     /// When a repaint asked for since the last look wants its pass — from any thread
     /// (`Context::set_request_repaint_callback`): a worker done while the terminal is idle.
     asked: Arc<Mutex<Option<Instant>>>,
@@ -1595,6 +1601,7 @@ impl<T: Tty, O: Write> Backend<T, O> {
             titles: vec![],
             receipt: None,
             help_first: false,
+            switch_due: None,
             asked,
             started: Instant::now(),
             offset: 0.0,
@@ -1861,7 +1868,8 @@ impl<T: Tty, O: Write> Backend<T, O> {
             if passed.closed {
                 return Ok(End::Closed);
             }
-            if passed.switch || hand_off {
+            let held = self.switch_due.as_mut().is_some_and(|due| due());
+            if passed.switch || hand_off || held {
                 // A signal that came during this pass ends the run: no window for it.
                 if let Some(signal) = self.tty.stopped() {
                     return Ok(End::Signal(signal));
@@ -1973,12 +1981,19 @@ pub(crate) enum Place {
 }
 
 /// The run's `--here` and `--target`: with `SOPEN_TARGET` and the config's `target`, read when
-/// the owner switches, they say where the window opens (10 §7.1, 01 §4a).
-#[derive(Debug, Clone, Default)]
+/// the owner switches, they say where the window opens (10 §7.1, 01 §4a). For a HOST (§7.3):
+/// sopen's state folder (the ssh master's socket), and how a browser is made again on the
+/// terminal's place — its folder over a new connection — for the state HOST hands back.
+#[derive(Clone, Default)]
 pub struct Destination {
     pub here: bool,
     pub target: Option<String>,
+    pub state_dir: PathBuf,
+    pub fresh: Option<Fresh>,
 }
+
+/// A browser's start on the terminal's place, made again ([`Destination::fresh`]).
+pub type Fresh = Rc<dyn Fn() -> Result<browser::Start>>;
 
 impl Destination {
     fn place(&self) -> Result<Place> {
@@ -2096,24 +2111,21 @@ impl Window for Switched {
     }
 }
 
-/// The switch from the terminal (10 §7.1–§7.2) to `place`: a HOST or no display is a line for
-/// the status row and nothing else; this machine leaves the terminal, says [`IN_A_WINDOW`],
-/// runs the browser in `window` and takes the terminal again — its unread input dropped — with
-/// the browser as the window left it. A window that did not open is a line (T31).
+/// The switch from the terminal (10 §7.1–§7.3) to `place`: a HOST is `host`'s — the remote
+/// switch ([`remote::to_host`]), the terminal kept; no display is a line for the status row and
+/// nothing else; this machine leaves the terminal, says [`IN_A_WINDOW`], runs the browser in
+/// `window` and takes the terminal again — its unread input dropped — with the browser as the
+/// window left it. A window that did not open is a line (T31).
 pub(crate) fn to_window<T: Tty, O: Write>(
     b: &mut Backend<T, O>,
     browser: &Rc<RefCell<Browser>>,
     place: Result<Place>,
+    host: impl FnOnce(&mut Backend<T, O>, &str) -> io::Result<Option<String>>,
     window: impl FnOnce(Switched) -> Result<()>,
 ) -> io::Result<Option<String>> {
     match place {
         Err(e) => return Ok(Some(format!("{e:#}"))),
-        Ok(Place::Host(host)) => {
-            return Ok(Some(format!(
-                "switching to {host} comes with the remote switch; --here switches on this \
-                 machine"
-            )))
-        }
+        Ok(Place::Host(name)) => return host(b, &name),
         Ok(Place::NoDisplay) => return Ok(Some(NO_DISPLAY.to_string())),
         Ok(Place::Here) => {}
     }
@@ -2171,32 +2183,54 @@ fn keep_panics() {
 /// Shows the browser `start` opens in this terminal until it closes (10 §11 row 3) — with
 /// `SOPEN_CELLS`, until its receipt is written ([`Receipt`]) — the switch to `to` (§7) on F12,
 /// Alt+G or a hand-off box; then waits for what is still writing, as the window's
-/// [`browser::open`] does. A signal that ended it is the error ([`Signalled`]).
+/// [`browser::open`] does — in every browser a switch to HOST made too. A signal that ended it
+/// is the error ([`Signalled`]).
 pub fn open(start: browser::Start, hooks: &Hooks, to: Destination) -> Result<Outcome> {
     let mut signal = None;
     let shot = hooks.screenshot.clone();
     let limit = Duration::from_secs(super::watchdog_secs());
     let receipt = hooks.cells.clone().map(|path| Receipt::new(path, limit));
     let help = hooks.state.help;
-    let outcome = browser::open_on(start, hooks, |title, browser| {
-        signal = here(title, browser, &to, shot, receipt, help)?;
+    let fresh = to.fresh.clone();
+    let remote = remote::Remote::real(
+        to.state_dir.clone(),
+        Box::new(move || match &fresh {
+            Some(fresh) => fresh(),
+            None => anyhow::bail!("this run cannot make its browser again"),
+        }),
+    );
+    let ran = browser::open_on(start, hooks, |title, browser| {
+        signal = here(title, browser, &to, &remote, shot, receipt, help)?;
         Ok(())
-    })?;
+    });
+    let outcome = finish_made(&remote, ran)?;
     match signal {
         Some(n) => Err(Signalled(n).into()),
         None => Ok(outcome),
     }
 }
 
+/// After the run (`ran`, the first browser's outcome): whatever its end, what the browsers a
+/// switch to HOST made still write is waited for, and what they did joins the outcome.
+fn finish_made(remote: &remote::Remote, ran: Result<Outcome>) -> Result<Outcome> {
+    let made: Vec<Outcome> = remote.made.take().iter().map(|m| m.finish()).collect();
+    let mut outcome = ran?;
+    for made in made {
+        outcome.merge(made);
+    }
+    Ok(outcome)
+}
+
 /// The browser in this terminal; the signal that ended it, if one did. `shot` (the
 /// `SOPEN_SCREENSHOT` receipt): a window the switch opens is shot, then closes. `receipt`
 /// (`SOPEN_CELLS`): the terminal's screen is written once it has settled, the run ends, and the
 /// receipt's line is printed once the terminal is back. `help` (`SOPEN_STATE`'s `help=1`): F1 is
-/// pressed once the screen is ready, as in the window.
+/// pressed once the screen is ready, as in the window. `remote`: the switch to a HOST (§7.3).
 fn here(
     title: &str,
     browser: Browser,
     to: &Destination,
+    remote: &remote::Remote,
     shot: Option<std::path::PathBuf>,
     receipt: Option<Receipt>,
     help: bool,
@@ -2209,6 +2243,8 @@ fn here(
     let mut backend = Backend::new(Real::default(), out, ctx, truecolor);
     backend.receipt = receipt;
     backend.help_first = help;
+    let due = shared.clone();
+    backend.switch_due = Some(Box::new(move || due.borrow_mut().switch_due()));
     let mut switch = |b: &mut Backend<Real, _>| {
         let size = b.points();
         let hooks = Hooks {
@@ -2216,7 +2252,8 @@ fn here(
             screenshot: shot.clone(),
             ..Hooks::default()
         };
-        to_window(b, &shared, to.place(), |switched| {
+        let host = |b: &mut Backend<Real, _>, host: &str| remote::to_host(b, &shared, host, remote);
+        to_window(b, &shared, to.place(), host, |switched| {
             super::run_window(title, size, switched, &hooks)
         })
     };

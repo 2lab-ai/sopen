@@ -743,6 +743,12 @@ pub trait Window {
         crate::view_keys::State::Free
     }
 
+    /// Its unsaved edits are dropped, as its close prompt's Discard drops them (07 §10): the
+    /// journal kept for them (07 §3) goes — only that one, the journal this window recorded —
+    /// and the window closes from now on without asking. The switch to another machine's
+    /// Discard (10 §7.4) calls it, then closes the viewer. Nothing to discard by default.
+    fn discard(&mut self) {}
+
     /// What the window holds (07 §10): unsaved edits, a Save running — what a switch of views
     /// asks or waits for (08 §5, D2). Clean by default.
     fn hold(&mut self) -> crate::views::Hold {
