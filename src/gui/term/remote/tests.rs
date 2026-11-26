@@ -919,23 +919,19 @@ fn tw4_unsaved_edits_ask_before_the_switch() {
     drv.idle(&mut win, 2);
     assert!(has(&drv, question));
     drv.click_text_on_top(&mut win, "[ Save ]");
-    assert_eq!(first_byte(&fx), 0, "not saved yet");
-    drv.idle(&mut win, 1);
-    assert!(
-        !fx.b.borrow_mut().switch_due(),
-        "not due while the save runs"
-    );
+    // However fast the save lands (it runs on a worker), the switch is never due before it has:
+    // on every pass, due means saved.
     let mut due = false;
     for _ in 0..400 {
         drv.idle(&mut win, 1);
         if fx.b.borrow_mut().switch_due() {
+            assert_eq!(first_byte(&fx), 0x5A, "saved before it is due");
             due = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(due, "due once saved");
-    assert_eq!(first_byte(&fx), 0x5A, "saved before it is due");
     assert_eq!(fx.b.borrow_mut().before_switch("box"), Before::Go);
 
     // Discard: let go at once, the answer taken once by the switch that goes; the edits stay in
