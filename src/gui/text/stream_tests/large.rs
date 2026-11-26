@@ -6,7 +6,7 @@
 use super::*;
 use crate::remote::{Completion, Ranged, Refused, RemoteFs, Reply, Stat, Ticket, Wake};
 use crate::stream::Fetched;
-use eframe::egui::Event;
+use eframe::egui::{Event, Pos2};
 
 /// What the bytes of a file are, by offset.
 type Text = Arc<dyn Fn(u64, usize) -> Vec<u8> + Send + Sync>;
@@ -280,6 +280,11 @@ fn v12_end_costs_two_blocks_and_shows_byte_offsets_and_pgup_one_block_a_page() {
         let lines = size / LINE;
         let mut net = log_net(size);
         let (mut win, mut drv) = opened(&mut net, "big.log");
+        // 26 rows of text, the page this test's blocks are counted for: 30 rows of cells less
+        // the bar, the frame's two lines and the status row.
+        drv.resize(800.0, 30.0 * 16.0);
+        quiesce(&mut drv, &mut win, &mut net, 50);
+        assert_eq!(win.visible, 26);
         let x = text_x(&drv, "line 000000000000");
         let before = fetched(&net);
         let sent = net.reads().len();
@@ -690,14 +695,30 @@ fn lopsided(size: u64) -> Text {
 /// pointer at `y` on it stands for: the thumb's cell, centred on the pointer, along the track
 /// between the two arrows.
 fn bar_share(drv: &Driver, y: f32) -> (egui::Rect, f32) {
-    let (column, text) = drv
-        .texts()
-        .into_iter()
-        .find(|(_, _, t)| t.starts_with('↑'))
-        .map(|(r, _, t)| (r, t))
+    // The column of cells from the bar's ↑ to its ↓.
+    let p = crate::gui::chrome::PALETTE;
+    let column = crate::gui::cells::layers(&drv.ctx)
+        .iter()
+        .find_map(|l| {
+            let seen = l.seen();
+            let a = l.buf.area;
+            let bar =
+                |s: &crate::gui::cells::Seen| (s.fg, s.bg) == (Some(p.track), Some(p.track_back));
+            seen.iter().enumerate().find_map(|(dy, row)| {
+                let dx = row.iter().position(|s| s.symbol == "↑" && bar(s))?;
+                let down = (dy..seen.len()).find(|&k| seen[k][dx].symbol == "↓")?;
+                let cells = crate::gui::cells::Cells::new(
+                    a.x + dx as u16,
+                    a.y + dy as u16,
+                    1,
+                    (down - dy + 1) as u16,
+                );
+                Some(l.rect(cells))
+            })
+        })
         .expect("the scroll bar");
     let cell = crate::gui::chrome::CELL.y;
-    let cells = text.lines().count() as f32;
+    let cells = (column.height() / cell).round();
     let (top, room) = (column.top() + cell, cell * (cells - 2.0) - cell);
     (column, ((y - top - cell / 2.0) / room).clamp(0.0, 1.0))
 }
@@ -1473,18 +1494,15 @@ fn rows_past_the_lines_known_are_the_same_down_and_up() {
         let mut any = twin(tmp.path(), "any.txt", b"any\n");
         let mut drv = Driver::new(800.0, 500.0);
         drv.idle(&mut any, 1);
-        let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
-        let font = chrome::font();
-        let cell = drv.ctx.fonts_mut(|f| f.glyph_width(&font, '0'));
-        let room = 640.0;
+        // 640 points of the grid: 80 cells.
+        let room = 80;
         let mut memo = wrap::Memo::default();
         memo.reset(room);
         let mut w = wrap::Wrapper {
             doc: &mut doc,
             memo: &mut memo,
-            m: wrap::Measure::new(&drv.ctx, font, plain),
             width: room,
-            read: wrap::read_cap(room, cell),
+            read: wrap::read_cap(room),
         };
         // A read that is on its way is asked again once it has come.
         macro_rules! got {
@@ -1794,18 +1812,14 @@ fn a_cr_alone_past_a_restart_point_is_no_row_from_any_side() {
     let mut win = twin(tmp.path(), "cr.txt", body.as_bytes());
     let mut drv = Driver::new(800.0, 500.0);
     drv.until(&mut win, 60, |w| w.ready());
-    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
-    let font = chrome::font();
-    let cell = drv.ctx.fonts_mut(|f| f.glyph_width(&font, '0'));
     let room = win.room;
     let mut memo = wrap::Memo::default();
     memo.reset(room);
     let mut w = wrap::Wrapper {
         doc: &mut win.doc,
         memo: &mut memo,
-        m: wrap::Measure::new(&drv.ctx, font, plain),
         width: room,
-        read: wrap::read_cap(room, cell),
+        read: wrap::read_cap(room),
     };
     let line = w.line(2_559).unwrap();
     assert_eq!(line.start, start as u64);
@@ -2018,18 +2032,15 @@ fn a_byte_past_a_character_on_a_grid_point_is_in_the_piece_that_starts_with_it()
         let mut any = twin(tmp.path(), "any.txt", b"any\n");
         let mut drv = Driver::new(800.0, 500.0);
         drv.idle(&mut any, 1);
-        let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
-        let font = chrome::font();
-        let cell = drv.ctx.fonts_mut(|f| f.glyph_width(&font, '0'));
-        let room = 640.0;
+        // 640 points of the grid: 80 cells.
+        let room = 80;
         let mut memo = wrap::Memo::default();
         memo.reset(room);
         let mut w = wrap::Wrapper {
             doc: &mut doc,
             memo: &mut memo,
-            m: wrap::Measure::new(&drv.ctx, font, plain),
             width: room,
-            read: wrap::read_cap(room, cell),
+            read: wrap::read_cap(room),
         };
         macro_rules! got {
             ($op:expr) => {
@@ -2104,8 +2115,7 @@ fn unwrapped_end_on_a_tabbed_line_that_fits_is_the_end_of_the_file() {
     let mut win = twin(tmp.path(), "probe.txt", body(2 * TAB).as_bytes());
     let mut drv = Driver::new(800.0, 500.0);
     drv.until(&mut win, 60, |w| w.ready());
-    let cw = drv.ctx.fonts_mut(|f| f.glyph_width(&chrome::font(), '0'));
-    let (room, columns) = (win.room, (win.room / cw).floor() as usize);
+    let (room, columns) = (win.room, win.room);
     assert!(columns > 2 * TAB, "{columns}");
     // Exactly the window's width.
     let mut win = twin(tmp.path(), "tabs.txt", body(columns).as_bytes());

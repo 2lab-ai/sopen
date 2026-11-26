@@ -758,6 +758,11 @@ on the title row (`chrome.rs:805-832`) and F8's list of encodings as a cell dial
 - **T8's "over ssh" vs the owner's herdr path**, which has no ssh environment: T12 makes it the
   owner's `screen = "remote"`; the probe says whether herdr panes are viewed from elsewhere.
   *tui* §14.5 (video across machines) is settled by T8.
+- **T38 vs the printer's guess at chrome** (found reviewing X3-text, 2026-11-25). On the merged
+  base `term::chrome` takes a text file's `…`, and box lines not between letters (`├──`), for
+  sopen's own chrome and substitutes them in an ambiguous-wide terminal, though T38 says file
+  content does not change. Follow-up: the viewer marks its cells as content, so the printer
+  never substitutes them.
 - ***tui* §5's ambiguous list.** It names `░` as ambiguous; python3's `unicodedata` gives it N, so §10
   keeps it and substitutes the rest.
 - **§17's X3-binary row vs 01 §6a on the hex answer's label** (found building X3-binary). The row
