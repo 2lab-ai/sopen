@@ -2203,16 +2203,22 @@ pub fn open(start: browser::Start, hooks: &Hooks, to: Destination) -> Result<Out
         signal = here(title, browser, &to, &remote, shot, receipt, help)?;
         Ok(())
     });
-    // Whatever the run's end, what the browsers the switch made still write is waited for.
+    let outcome = finish_made(&remote, ran)?;
+    match signal {
+        Some(n) => Err(Signalled(n).into()),
+        None => Ok(outcome),
+    }
+}
+
+/// After the run (`ran`, the first browser's outcome): whatever its end, what the browsers a
+/// switch to HOST made still write is waited for, and what they did joins the outcome.
+fn finish_made(remote: &remote::Remote, ran: Result<Outcome>) -> Result<Outcome> {
     let made: Vec<Outcome> = remote.made.take().iter().map(|m| m.finish()).collect();
     let mut outcome = ran?;
     for made in made {
         outcome.merge(made);
     }
-    match signal {
-        Some(n) => Err(Signalled(n).into()),
-        None => Ok(outcome),
-    }
+    Ok(outcome)
 }
 
 /// The browser in this terminal; the signal that ended it, if one did. `shot` (the

@@ -758,16 +758,26 @@ pub fn switch_args(connection: Vec<OsString>, host: &str, words: Vec<String>) ->
 }
 
 /// A place HOST names, as this machine names it — [`source_for`]'s way back (10 §7.3): HOST's own
-/// path (`/abs`) is `HOST:/abs`; `<this machine>:/abs` (no user) is `/abs` again; any other
-/// machine's place is unchanged. `host` is HOST as ssh is given it, `[user@]host`.
+/// path (`/abs`) is `HOST:/abs`; a loopback place there (`localhost:/p`, `127.0.0.1:/p`,
+/// `[::1]:/p`) is HOST itself too — `[its user, else HOST's]@HOST:/p`, as `source_for` turns this
+/// machine's loopback into this machine's name; `<this machine>:/abs` (no user) is `/abs` again;
+/// any other machine's place is unchanged. `host` is HOST as ssh is given it, `[user@]host`.
 pub fn source_back(host: &str, source: &str, hostname: Option<&str>) -> Result<String> {
+    let (host_user, host_name) = split_user(host);
+    let host_label = match target::parse(&format!("{host_name}:/")) {
+        Ok(Target::Remote(spec)) => spec.label(),
+        _ => bail!("{host} is not a host"),
+    };
     match target::parse(source).map_err(anyhow::Error::msg)? {
         Target::Local(path) => {
-            let host = match target::parse(&format!("{host}:/")) {
-                Ok(Target::Remote(spec)) => spec.label(),
-                _ => bail!("{host} is not a host"),
-            };
-            Ok(format!("{host}:{}", path.to_string_lossy()))
+            let user = host_user.map(|u| format!("{u}@")).unwrap_or_default();
+            Ok(format!("{user}{host_label}:{}", path.to_string_lossy()))
+        }
+        Target::Remote(spec) if is_loopback(&spec.host) => {
+            let user = (spec.user.as_deref().or(host_user))
+                .map(|u| format!("{u}@"))
+                .unwrap_or_default();
+            Ok(format!("{user}{host_label}:{}", spec.path))
         }
         Target::Remote(spec) => {
             // This machine by the name `source_for` gave it, or by its full one; never loopback
@@ -783,6 +793,9 @@ pub fn source_back(host: &str, source: &str, hostname: Option<&str>) -> Result<S
     }
 }
 
+/// The longest line of HOST's standard error kept (the status row shows about a hundred cells).
+pub(crate) const ERR_LINE_MAX: usize = 4096;
+
 /// What HOST's half of the switch said, in its order ([`SwitchRun::said`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SwitchSaid {
@@ -796,7 +809,7 @@ pub(crate) enum SwitchSaid {
 
 impl SwitchSaid {
     /// The cue on a line of HOST's output, matched exactly as [`Cue::of`] matches the tunnel's —
-    /// only its end taken off; any other line is none.
+    /// only its end taken off (a `\r` too); any other line is none.
     fn cue(line: &str) -> Option<SwitchSaid> {
         let line = match line.strip_suffix('\n') {
             Some(line) => line.strip_suffix('\r').unwrap_or(line),
@@ -828,8 +841,88 @@ pub(crate) struct SwitchRun {
     child: std::process::Child,
     /// Dropped, ssh's input closes — after the state's line, whenever it is written.
     input: Option<std::sync::mpsc::Sender<()>>,
-    said: std::sync::mpsc::Receiver<SwitchSaid>,
+    heard: std::sync::Arc<std::sync::Mutex<SwitchHeard>>,
     readers: Vec<std::sync::mpsc::Receiver<()>>,
+}
+
+/// The longest line of HOST's standard output read: a state's cue is one JSON line of the state
+/// (10 §7.4), a few KiB; a longer line is cut there (a cue so cut does not read).
+const OUT_LINE_MAX: usize = 1 << 20;
+
+/// What HOST said and was not looked at yet — bounded, never a queue of its output: its last
+/// state's cue, its kept cue, its last standard-error line.
+#[derive(Debug, Default)]
+struct SwitchHeard {
+    state: Option<String>,
+    kept: bool,
+    err: Option<String>,
+}
+
+/// Reads `from` to its end a line at a time (`\n`; a line split across reads is one), each line
+/// cut to `max` bytes — what is past it until its end dropped — and given to `line`.
+fn bounded_lines(mut from: impl std::io::Read, max: usize, mut line: impl FnMut(&[u8])) {
+    let mut now = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match from.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        for &b in &chunk[..n] {
+            if b == b'\n' {
+                line(&now);
+                now.clear();
+            } else if now.len() < max {
+                now.push(b);
+            }
+        }
+    }
+    if !now.is_empty() {
+        line(&now);
+    }
+}
+
+/// HOST's standard output read for its cues alone ([`SwitchSaid::cue`]); any other line dropped.
+fn hear_out(from: impl std::io::Read, heard: &std::sync::Mutex<SwitchHeard>) {
+    bounded_lines(from, OUT_LINE_MAX, |line| {
+        let cue = SwitchSaid::cue(&String::from_utf8_lossy(line));
+        let mut heard = heard.lock().unwrap_or_else(|p| p.into_inner());
+        match cue {
+            Some(SwitchSaid::State(json)) => heard.state = Some(json),
+            Some(SwitchSaid::Kept) => heard.kept = true,
+            _ => {}
+        }
+    });
+}
+
+/// HOST's standard error read for its last line that is not blank, escapes taken out, cut to
+/// [`ERR_LINE_MAX`]; a cue there is a plain line.
+fn hear_err(from: impl std::io::Read, heard: &std::sync::Mutex<SwitchHeard>) {
+    bounded_lines(from, ERR_LINE_MAX, |line| {
+        let plain = without_escapes(line);
+        let plain = String::from_utf8_lossy(&plain).trim_end().to_string();
+        if !plain.trim().is_empty() {
+            heard.lock().unwrap_or_else(|p| p.into_inner()).err = Some(plain);
+        }
+    });
+}
+
+/// `hear` on `pipe` on a thread of its own; the receiver gets `()` at the pipe's end.
+fn hearing<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+    heard: std::sync::Arc<std::sync::Mutex<SwitchHeard>>,
+    hear: fn(R, &std::sync::Mutex<SwitchHeard>),
+) -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Some(pipe) = pipe {
+            hear(pipe, &heard);
+        }
+        let _ = tx.send(());
+    });
+    rx
 }
 
 impl Switch<'_> {
@@ -863,35 +956,30 @@ impl Switch<'_> {
             let _ = closed.recv();
             drop(stdin);
         });
-        let (tell, said) = std::sync::mpsc::channel();
-        let out_tell = tell.clone();
-        let out = relay(child.stdout.take(), std::io::sink, move |line| {
-            if let Some(cue) = SwitchSaid::cue(line) {
-                let _ = out_tell.send(cue);
-            }
-            false
-        });
-        let err = relay(child.stderr.take(), std::io::sink, move |line| {
-            let plain = without_escapes(line.as_bytes());
-            let plain = String::from_utf8_lossy(&plain).trim_end().to_string();
-            if !plain.trim().is_empty() {
-                let _ = tell.send(SwitchSaid::Err(plain));
-            }
-            false
-        });
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(SwitchHeard::default()));
+        let out = hearing(child.stdout.take(), heard.clone(), hear_out);
+        let err = hearing(child.stderr.take(), heard.clone(), hear_err);
         Ok(SwitchRun {
             child,
             input: Some(input),
-            said,
+            heard,
             readers: vec![out, err],
         })
     }
 }
 
 impl SwitchRun {
-    /// What HOST said since the last look, in order.
+    /// What HOST said since the last look: its state's cue (the last), its kept cue, its last
+    /// standard-error line — each at most once.
     pub(crate) fn said(&self) -> Vec<SwitchSaid> {
-        self.said.try_iter().collect()
+        let mut heard = self.heard.lock().unwrap_or_else(|p| p.into_inner());
+        let mut said = Vec::new();
+        said.extend(heard.err.take().map(SwitchSaid::Err));
+        said.extend(heard.state.take().map(SwitchSaid::State));
+        if std::mem::take(&mut heard.kept) {
+            said.push(SwitchSaid::Kept);
+        }
+        said
     }
 
     /// HOST's input ends (Ctrl+C here, 10 §7.3): it closes its window, or keeps one with
@@ -2063,6 +2151,91 @@ mod tests {
         assert_eq!(back("box", "me@here:/x"), "me@here:/x");
         assert_eq!(back("box", "other:/x"), "other:/x");
         assert_eq!(source_back("box", "here:/x", None).unwrap(), "here:/x");
+        // A loopback place on HOST is HOST itself: never this machine.
+        assert_eq!(back("box", "localhost:/y"), "box:/y");
+        assert_eq!(back("box", "127.0.0.1:/y"), "box:/y");
+        assert_eq!(back("box", "[::1]:/y"), "box:/y");
+        assert_eq!(back("box", "me@localhost:/y"), "me@box:/y");
+        assert_eq!(back("you@box", "localhost:/y"), "you@box:/y");
+        assert_eq!(back("you@box", "me@localhost:/y"), "me@box:/y");
+    }
+
+    /// X2-switch's review: what HOST says is bounded — no queue grows with its output. Only the
+    /// cues of its standard output are read (exactly: a leading space, the state's JSON without
+    /// its space, a cue inside a longer line are none), any other line dropped, a cue split
+    /// across two reads one line; of its standard error only the last line is kept, cut to
+    /// [`ERR_LINE_MAX`]; a cue there is a plain line.
+    #[test]
+    fn what_host_says_is_bounded_and_its_cues_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh = tmp.path().join("ssh");
+        executable(
+            &ssh,
+            "#!/bin/sh\n\
+             i=0; while [ $i -lt 3000 ]; do echo \"line $i\" >&2; i=$((i+1)); done\n\
+             echo sopen-xtools-kept >&2\n\
+             echo ' sopen-xtools-kept'\n\
+             echo 'sopen-xtools-state{\"v\":1}'\n\
+             echo 'x sopen-xtools-kept'\n\
+             head -c 2000000 /dev/zero | tr '\\000' a; echo\n\
+             printf 'sopen-xtools-st'; sleep 0.2; printf 'ate {\"v\":1}\\n'\n\
+             head -c 10000 /dev/zero | tr '\\000' b >&2; echo >&2\n",
+        );
+        let switch = Switch {
+            ssh: ssh.as_os_str(),
+            connection: vec![],
+            host: "box",
+            folder: "/x",
+            env: &[],
+            install_paths: "",
+        };
+        let mut run = switch.start("{}").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut said = Vec::new();
+        // Each look gives at most the last of each: a state, a kept cue, a stderr line.
+        let look = |run: &SwitchRun, said: &mut Vec<SwitchSaid>| {
+            let now = run.said();
+            let errs = now
+                .iter()
+                .filter(|s| matches!(s, SwitchSaid::Err(_)))
+                .count();
+            assert!(
+                now.len() <= 3 && errs <= 1,
+                "not a queue of HOST's lines: {now:?}"
+            );
+            said.extend(now);
+        };
+        loop {
+            look(&run, &mut said);
+            if run.ended().unwrap().is_some() {
+                look(&run, &mut said);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the stand-in ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let states: Vec<&SwitchSaid> = (said.iter())
+            .filter(|s| matches!(s, SwitchSaid::State(_)))
+            .collect();
+        assert_eq!(
+            states,
+            [&SwitchSaid::State("{\"v\":1}".into())],
+            "one cue, whole"
+        );
+        assert!(
+            !said.contains(&SwitchSaid::Kept),
+            "no kept cue: {:?}",
+            &said[..3]
+        );
+        let errs: Vec<&String> = (said.iter())
+            .filter_map(|s| match s {
+                SwitchSaid::Err(line) => Some(line),
+                _ => None,
+            })
+            .collect();
+        let last = errs.last().expect("its last stderr line");
+        assert_eq!(last.len(), ERR_LINE_MAX, "cut");
+        assert!(last.chars().all(|c| c == 'b'));
     }
 
     #[test]

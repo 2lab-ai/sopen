@@ -9,9 +9,11 @@
 //!   planner's plan (which the state does not carry yet) asks whether to switch without it — and
 //!   asks for the switch again once what held it is over ([`Browser::switch_due`], heard by the
 //!   loop), which decides anew: only the question's answer lets what it asked about go, never the
-//!   end of a job waited for. Save and Save As… press the viewer's own F5 and F7; Discard's edits
-//!   are dropped once the run has started ([`Browser::discard_for_switch`], `Window::discard`:
-//!   the viewer's own Discard), so HOST opens the file as stored.
+//!   end of a job waited for (a viewer closed while its save or export still writes among the
+//!   jobs). Save and Save As… press the viewer's own F5 and F7; with Discard HOST opens the file
+//!   as stored, and the viewer's edits stay through the run — dropped only once HOST's state has
+//!   come back and been given ([`Browser::discard_viewer`], `Window::discard`: the viewer's own
+//!   Discard); without it they are still here, and the line says so (X2-switch's review).
 //! - **The state out**: taken from the browser ([`Browser::take_state`]), its paths rewritten as
 //!   §4a rewrites SOURCE ([`Ways::out`]: this machine's `/abs` is `<this machine>:/abs`, HOST's
 //!   own `HOST:/abs` its `/abs`), one line on ssh's input, which then stays open. FOLDER is the
@@ -23,8 +25,10 @@
 //!   to delete: the whole reprint is what clears a cell-drawn one. Only Ctrl+C is read; every
 //!   other key goes unread, and a resize lays the browser out again under the dimming.
 //! - **Ctrl+C** closes ssh's input: HOST's input ends, and its window closes, or stays with
-//!   something to lose and says so ([`forward::SwitchSaid::Kept`]). While HOST answers, the box
-//!   says so ([`ending_line`]); **a second Ctrl+C ends this run's ssh client** — its own pid,
+//!   something to lose and says so ([`forward::SwitchSaid::Kept`]) — then HOST has let the
+//!   session go, but its script's shell holds it open while that window lives, so this run's ssh
+//!   client is ended at once (its pid alone) and the terminal comes back with the kept line.
+//!   While HOST answers, the box says so ([`ending_line`]); **a second Ctrl+C ends this run's ssh client** — its own pid,
 //!   never `ssh -O exit` on the master other sessions share — and otherwise ssh's own keepalives
 //!   (`ServerAliveInterval=10`, `ServerAliveCountMax=3`: about 30 s) end a dead link
 //!   (X2-switch's decision, 2026-11-27; reversible). A signal that ends the terminal's run ends
@@ -185,6 +189,10 @@ pub(crate) fn to_host<T: Tty, O: Write>(
         return Ok(None);
     }
     let state = shared.borrow().take_state(&b.ctx);
+    // Discard's answer: the viewer keeps its edits through the run, dropped only once HOST's
+    // state has come back and been given (`give_back`).
+    let discard = shared.borrow_mut().take_discard();
+    let discarded_file = (state.viewer.as_ref()).map(|v| show(state.host.as_deref(), &v.file));
     let cannot = |e: &dyn std::fmt::Display| format!("cannot switch to {host}: {e}");
     let started = Ways::new(host, state.host.as_deref(), remote.hostname.as_deref())
         .map_err(|e| cannot(&format!("{e:#}")))
@@ -212,13 +220,11 @@ pub(crate) fn to_host<T: Tty, O: Write>(
     let (ways, mut run) = match started {
         Ok(started) => started,
         Err(line) => {
-            shared.borrow_mut().switch_not_started();
-            return Ok(Some(line));
+            return Ok(Some(
+                kept_here(Some(line), discard, &discarded_file).unwrap_or_default(),
+            ))
         }
     };
-    // Discard's answer: the viewer's edits go now that the switch has started (the state has
-    // its file, as stored).
-    shared.borrow_mut().discard_for_switch(&b.ctx);
     let mut away = Away {
         host: host.to_string(),
         err: None,
@@ -226,13 +232,18 @@ pub(crate) fn to_host<T: Tty, O: Write>(
     };
     let mut cue = None;
     let mut kept = false;
-    // The browser as it goes — the question answered, a discarded viewer left — under the
-    // dimming: one pass, no input.
+    // The browser as it goes — the question answered — under the dimming: one pass, no input.
     b.pass(&mut Shared(shared.clone()), vec![])?;
     b.term.forget();
     draw_away(b, &away)?;
     let status = loop {
         let mut redraw = take_said(&run.said(), &mut away, &mut cue, &mut kept);
+        // HOST kept its window (unsaved edits) and let the session go; its script's shell still
+        // holds the session open while that window lives, so ssh would never end by itself:
+        // this run's client ends (its pid alone), and is reaped below.
+        if kept && cue.is_none() {
+            run.kill();
+        }
         match run.ended() {
             Ok(Some(status)) => {
                 take_said(&run.said(), &mut away, &mut cue, &mut kept);
@@ -272,21 +283,36 @@ pub(crate) fn to_host<T: Tty, O: Write>(
         Ok(status) => outcome(host, *status, cue.is_some(), kept, away.ending, &away.err),
         Err(e) => Some(format!("ssh to {host} could not be waited for: {e}")),
     };
-    let given = cue.map(|json| give_back(shared, remote, &ways, host, &json));
+    let given = cue.map(|json| give_back(shared, remote, &ways, host, &json, discard));
     if let Some(Err(why)) = &given {
         said = Some(match said {
             Some(line) => format!("{line} · {why}"),
             None => why.clone(),
         });
     }
-    // The state from before: the terminal lists again, as a browser given HOST's state does.
+    // The state from before: the terminal lists again, as a browser given HOST's state does —
+    // and Discard's edits are still the viewer's.
     if !matches!(given, Some(Ok(()))) {
         shared.borrow_mut().switch_back(&b.ctx);
+        said = kept_here(said, discard, &discarded_file);
     }
     // The terminal shows the browser again: printed whole, its unread input dropped (T28).
     b.term.forget();
     b.tty.drop_input();
     Ok(said)
+}
+
+/// `said`, and — when Discard was the answer but HOST's state did not come back — that the
+/// edits are still here.
+fn kept_here(said: Option<String>, discard: bool, file: &Option<String>) -> Option<String> {
+    let Some(file) = file.as_ref().filter(|_| discard) else {
+        return said;
+    };
+    let kept = format!("the edits to {file} are kept here");
+    Some(match said {
+        Some(line) => format!("{line} · {kept}"),
+        None => kept,
+    })
 }
 
 /// What the terminal shows while the window is on HOST.
@@ -427,6 +453,7 @@ fn give_back(
     ways: &Ways,
     host: &str,
     json: &str,
+    discard: bool,
 ) -> std::result::Result<(), String> {
     let state: SwitchState = switch_state::read(json, host)?;
     let state = state.rewritten(|place| ways.back(place))?;
@@ -434,7 +461,11 @@ fn give_back(
     let mut fresh = Browser::new(start);
     fresh.give_state(state)?;
     remote.made.borrow_mut().push(fresh.leftovers());
-    let old = std::mem::replace(&mut *shared.borrow_mut(), fresh);
+    let mut old = std::mem::replace(&mut *shared.borrow_mut(), fresh);
+    // Discard: now that HOST's state is this terminal's, the old viewer's edits go with it.
+    if discard {
+        old.discard_viewer();
+    }
     let left = old.leftovers();
     drop(old);
     left.settle();

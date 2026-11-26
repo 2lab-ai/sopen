@@ -53,6 +53,7 @@ fn stand_in(dir: &Path, body: &str) -> PathBuf {
         &ssh,
         &format!(
             "#!/bin/sh\n\
+             echo $$ > {ssh_pid}\n\
              for a in \"$@\"; do printf '%s\\n' \"$a\"; done > {args}\n\
              printf '%s\\n' \"${{SSH_ASKPASS_REQUIRE-unset}}\" > {askpass}\n\
              while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
@@ -61,6 +62,7 @@ fn stand_in(dir: &Path, body: &str) -> PathBuf {
              exec /bin/sh -c \"$*\"\n",
             args = file("ssh-args"),
             askpass = file("askpass"),
+            ssh_pid = file("ssh-pid"),
         ),
     );
     executable(
@@ -581,7 +583,9 @@ fn tw2_each_end_of_hosts_half_is_its_line_and_the_terminal_stays() {
 /// switch, with the kept line. Ctrl+C with the link cut instead: the lost-link line.
 #[test]
 fn tw2_ctrl_c_ends_hosts_input_and_the_terminal_comes_back_as_before() {
-    let body = "echo 'opening the window there' >&2; cat > /dev/null; echo sopen-xtools-kept";
+    // As HOST's window does: kept, it lives on, and the forward's script holds the session.
+    let body = "echo 'opening the window there' >&2; cat > /dev/null; echo sopen-xtools-kept; \
+                exec sleep 30";
     let fx = fixture_with(0, &[]);
     dual(&fx);
     let before = state_of(&fx);
@@ -611,7 +615,14 @@ fn tw2_ctrl_c_ends_hosts_input_and_the_terminal_comes_back_as_before() {
         (ctrl_q(), Some(after(&ran, &fx, &bytes, 1))),
     ];
     script(&tape, &fx, events);
+    let started = std::time::Instant::now();
     assert_eq!(run(&mut b, &fx, &remote, &ran), End::Closed);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "back once HOST says kept, not when its window ends: {:?}",
+        started.elapsed()
+    );
+    kill_recorded(tmp.path(), "sopen-pid");
     assert_eq!(
         *ran.said.borrow(),
         [Some(
@@ -709,6 +720,21 @@ fn a_second_ctrl_c_ends_this_runs_ssh() {
         // SAFETY: the pid this test's stand-in recorded.
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
+}
+
+/// The process whose pid the stand-in recorded in `name` (`sopen-pid`: a HOST sopen that outlives
+/// the ssh client), ended.
+fn kill_recorded(dir: &Path, name: &str) {
+    if let Some(pid) = lines(dir, name).first().and_then(|p| p.parse().ok()) {
+        // SAFETY: a pid this test's stand-in recorded.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+/// Whether the process `pid` is gone (reaped: not even a zombie).
+fn gone(pid: i32) -> bool {
+    // SAFETY: signal 0 only asks whether the process exists.
+    unsafe { libc::kill(pid, 0) != 0 }
 }
 
 /// A file operation copy holding until `release` says, `running` set once it runs.
@@ -912,7 +938,8 @@ fn tw4_unsaved_edits_ask_before_the_switch() {
     assert_eq!(first_byte(&fx), 0x5A, "saved before it is due");
     assert_eq!(fx.b.borrow_mut().before_switch("box"), Before::Go);
 
-    // Discard: let go at once; the edits go once the switch has started.
+    // Discard: let go at once, the answer taken once by the switch that goes; the edits stay in
+    // the viewer through the run (only HOST's state come back drops them, `give_back`).
     let (fx, mut drv, mut win) = hex_edited();
     assert_eq!(fx.b.borrow_mut().before_switch("box"), Before::Held);
     drv.idle(&mut win, 2);
@@ -921,30 +948,17 @@ fn tw4_unsaved_edits_ask_before_the_switch() {
     assert!(fx.b.borrow_mut().switch_due());
     assert_eq!(fx.b.borrow_mut().before_switch("box"), Before::Go);
     assert!(
-        fx.b.borrow_mut().would_lose(),
-        "not before the switch starts"
+        fx.b.borrow_mut().take_discard(),
+        "the switch goes with Discard"
     );
-    fx.b.borrow_mut().discard_for_switch(&drv.ctx);
+    assert!(!fx.b.borrow_mut().take_discard(), "once");
     drv.idle(&mut win, 2);
-    assert!(!fx.b.borrow_mut().would_lose(), "the edits dropped");
-    assert!(!has(&drv, "Esc or F3 back to the list"), "the viewer left");
+    assert!(
+        fx.b.borrow_mut().would_lose(),
+        "the edit still in the viewer"
+    );
     assert_eq!(first_byte(&fx), 0, "the file as stored");
-
-    // A switch that did not start forgets the answer: the edits stay, and it asks again.
-    let (fx, mut drv, mut win) = hex_edited();
-    assert_eq!(fx.b.borrow_mut().before_switch("box"), Before::Held);
-    drv.idle(&mut win, 2);
-    drv.click_text_on_top(&mut win, "[ Discard ]");
-    drv.idle(&mut win, 1);
-    assert!(fx.b.borrow_mut().switch_due());
-    assert_eq!(fx.b.borrow_mut().before_switch("box"), Before::Go);
-    fx.b.borrow_mut().switch_not_started();
-    fx.b.borrow_mut().discard_for_switch(&drv.ctx);
-    drv.idle(&mut win, 1);
-    assert!(
-        fx.b.borrow_mut().would_lose(),
-        "the edit is still in the viewer"
-    );
+    // Not let go again: the next switch asks again.
     assert_eq!(fx.b.borrow_mut().before_switch("box"), Before::Held);
 }
 
@@ -1097,20 +1111,18 @@ fn tw4_on_host_cancel_keeps_the_viewer_and_save_returns() {
     );
 }
 
-/// TW-4's Discard through the terminal: Tab to `[ Discard ]` and Space — the viewer drops its
-/// edits as its own Discard does (`Window::discard`: the journal it recorded removed), the switch
-/// goes with the file as stored, and comes back with HOST's state, the viewer open on the stored
-/// bytes; the file opened here again offers nothing to restore.
-#[test]
-fn tw4_through_the_terminal_discard_then_the_switch() {
+/// The journals of the edits kept under `edits` (`<cache>/.edits`): their `CURRENT` files.
+fn journals(edits: &Path) -> Vec<PathBuf> {
+    let all = walk(edits);
+    let journal = |p: &&PathBuf| p.to_string_lossy().ends_with("CURRENT");
+    all.iter().filter(journal).cloned().collect()
+}
+
+/// [`hex_edited`], the edit kept in its journal (07 §3: written on the schedule's tick), and
+/// where the journals are.
+fn hex_edited_and_kept() -> (Fx, Driver, Shared, PathBuf) {
     let (fx, mut drv, mut win) = hex_edited();
     let edits = Path::new(&fx.root).parent().unwrap().join("cache/.edits");
-    let journals = |edits: &Path| -> Vec<PathBuf> {
-        let all = walk(edits);
-        let journal = |p: &&PathBuf| p.to_string_lossy().ends_with("CURRENT");
-        all.iter().filter(journal).cloned().collect()
-    };
-    // The edit kept first (07 §3: its journal written on the schedule's tick).
     for _ in 0..400 {
         if !journals(&edits).is_empty() {
             break;
@@ -1119,6 +1131,29 @@ fn tw4_through_the_terminal_discard_then_the_switch() {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert_eq!(journals(&edits).len(), 1, "the edit is kept, before");
+    (fx, drv, win, edits)
+}
+
+/// The keys of the question's Discard: Tab to `[ Discard ]` (the text holds the keyboard first),
+/// and Space.
+fn discard_keys(bytes: &Bytes) -> Vec<(CEvent, Option<When>)> {
+    let now: fn() -> When = || Box::new(|| true);
+    vec![
+        (plain(KeyCode::F(12)), None),
+        (plain(KeyCode::Tab), Some(says(bytes, "[ Discard ]"))),
+        (plain(KeyCode::Tab), Some(now())),
+        (plain(KeyCode::Tab), Some(now())),
+        (plain(KeyCode::Char(' ')), Some(now())),
+    ]
+}
+
+/// TW-4's Discard through the terminal: the switch goes with the file as stored, the viewer's
+/// edits held through the run; HOST's state comes back and is given, and only then the viewer
+/// drops them as its own Discard does (`Window::discard`: the journal it recorded removed) — the
+/// viewer open on the stored bytes, the file opened here again offering nothing to restore.
+#[test]
+fn tw4_through_the_terminal_discard_then_the_switch() {
+    let (fx, _drv, _win, edits) = hex_edited_and_kept();
     let tmp = tempfile::tempdir().unwrap();
     // HOST hands its state back once Ctrl+C ends its input: the screen meanwhile can be read.
     let body = "cat > /dev/null; printf 'sopen-xtools-state %s\\n' \"$line\"";
@@ -1126,37 +1161,40 @@ fn tw4_through_the_terminal_discard_then_the_switch() {
     let remote = remote_for(tmp.path(), &tmp.path().join("sopen"), &fx.root);
     let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
     let ran = Rc::new(Ran::default());
-    let now: fn() -> When = || Box::new(|| true);
-    let away: Rc<RefCell<Option<String>>> = Rc::default();
+    type Away = Option<(String, usize)>;
+    let away: Rc<RefCell<Away>> = Rc::default();
     let meanwhile: When = {
         let (bytes, dir, away) = (bytes.clone(), tmp.path().to_path_buf(), away.clone());
+        let edits = edits.clone();
         Box::new(move || {
             let on = dir.join("state-in").exists() && shows(&bytes, "xtools is in a window");
             if on {
-                *away.borrow_mut() = Some(bytes.last_screen(100, 30).text());
+                let screen = bytes.last_screen(100, 30).text();
+                *away.borrow_mut() = Some((screen, journals(&edits).len()));
             }
             on
         })
     };
-    let events = vec![
-        (plain(KeyCode::F(12)), None),
-        (plain(KeyCode::Tab), Some(says(&bytes, "[ Discard ]"))),
-        (plain(KeyCode::Tab), Some(now())),
-        (plain(KeyCode::Tab), Some(now())),
-        (plain(KeyCode::Char(' ')), Some(now())),
+    let mut events = discard_keys(&bytes);
+    events.extend([
         (ctrl_c(), Some(meanwhile)),
         (ctrl_q(), Some(after(&ran, &fx, &bytes, 2))),
-    ];
+    ]);
     script(&tape, &fx, events);
     assert_eq!(run(&mut b, &fx, &remote, &ran), End::Closed);
     assert_eq!(*ran.said.borrow(), [None, None], "it went, and came back");
-    // Meanwhile the dimmed screen is the browser as it went: no question, no dropped edit.
-    let away = away.borrow().clone().expect("the screen meanwhile");
+    // Meanwhile the dimmed screen is the browser as it went — the question answered — and the
+    // edits are still held, journal and all.
+    let (away, kept) = away.borrow().clone().expect("the screen meanwhile");
     assert!(
         !away.contains("[ Discard ]"),
         "the question answered:\n{away}"
     );
-    assert!(!away.contains("5A 01 02"), "the edit dropped:\n{away}");
+    assert!(
+        away.contains("5A 01 02"),
+        "the edit held meanwhile:\n{away}"
+    );
+    assert_eq!(kept, 1, "its journal kept meanwhile");
     assert_eq!(first_byte(&fx), 0, "the file as stored");
     let sent = switch_state::read(&lines(tmp.path(), "state-in")[0], "HOST").unwrap();
     let viewer = sent.viewer.expect("HOST opens the viewer's file");
@@ -1191,6 +1229,43 @@ fn tw4_through_the_terminal_discard_then_the_switch() {
     );
     assert!(!has(&drv, "unsaved edits from"), "nothing offered");
     assert!(drv.find_text("[ Restore ]").is_none());
+}
+
+/// Discard, and HOST never hands its state back (ssh's own failure, 255): the edits were never
+/// HOST's to replace — the viewer still holds them, their journal kept, and the line says so.
+#[test]
+fn tw4_discard_without_hosts_state_keeps_the_edits() {
+    let (fx, _drv, _win, edits) = hex_edited_and_kept();
+    let tmp = tempfile::tempdir().unwrap();
+    let body = "echo 'ssh: connect to host box port 22: Connection refused' >&2; exit 255";
+    stand_in(tmp.path(), body);
+    let remote = remote_for(tmp.path(), &tmp.path().join("sopen"), &fx.root);
+    let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+    let ran = Rc::new(Ran::default());
+    let mut events = discard_keys(&bytes);
+    events.push((plain(KeyCode::F(1)), Some(after(&ran, &fx, &bytes, 2))));
+    script(&tape, &fx, events);
+    tape.0.borrow_mut().stop = Some(libc::SIGTERM);
+    assert_eq!(run(&mut b, &fx, &remote, &ran), End::Signal(libc::SIGTERM));
+    let file = format!("{}/0.bin", fx.root);
+    assert_eq!(
+        *ran.said.borrow(),
+        [
+            None,
+            Some(format!(
+                "could not reach box: ssh: connect to host box port 22: Connection refused — run \
+                 ssh box once in a shell to answer its questions · the edits to {file} are kept here"
+            ))
+        ]
+    );
+    let screen = ran.screen.borrow().clone().unwrap();
+    assert!(
+        screen.contains("0000(0000) 5A 01 02"),
+        "still held:\n{screen}"
+    );
+    assert_eq!(journals(&edits).len(), 1, "the journal kept");
+    assert!(fx.b.borrow_mut().would_lose(), "the edit in the viewer");
+    assert_eq!(first_byte(&fx), 0);
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {
@@ -1393,4 +1468,199 @@ fn without_a_cue_the_terminal_lists_again() {
     let screen = ran.screen.borrow().clone().unwrap();
     assert!(screen.contains("║made "), "listed again:\n{screen}");
     assert!(remote.made.borrow().is_empty(), "the browser from before");
+}
+
+/// A view digit the owner presses right after F12 — read before any pass has drawn the question
+/// — is the question's too: the view keys are a question's from the moment it comes up, so no
+/// view switches under it (no close prompt for one).
+#[test]
+fn a_view_key_right_after_f12_is_the_questions() {
+    let fx = fixture_with(0, &["0.bin"]);
+    let file = Path::new(&fx.root).join("0.bin");
+    std::fs::write(&file, (0..=255u8).collect::<Vec<u8>>()).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    stand_in(tmp.path(), "exit 0");
+    let remote = remote_for(tmp.path(), &tmp.path().join("sopen"), &fx.root);
+    let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+    let ran = Rc::new(Ran::default());
+    let now: fn() -> When = || Box::new(|| true);
+    let mut events = edit_through_the_terminal();
+    events.push((
+        plain(KeyCode::Esc),
+        Some(says(&bytes, "0000(0000) 5A 01 02")),
+    ));
+    events.push((
+        plain(KeyCode::F(12)),
+        Some(says(&bytes, "viewing — Enter edits")),
+    ));
+    // At once: the next input after the switch's pass.
+    events.push((plain(KeyCode::Char('3')), Some(now())));
+    events.push((plain(KeyCode::Esc), Some(says(&bytes, "[ Discard ]"))));
+    let printed = {
+        let bytes = bytes.clone();
+        Box::new(move || !shows(&bytes, "[ Discard ]")) as When
+    };
+    events.push((CEvent::FocusGained, Some(printed)));
+    script(&tape, &fx, events);
+    tape.0.borrow_mut().stop = Some(libc::SIGTERM);
+    assert_eq!(run(&mut b, &fx, &remote, &ran), End::Signal(libc::SIGTERM));
+    let screen = bytes.last_screen(100, 30).text();
+    assert!(
+        !screen.contains("before closing?"),
+        "no view switch:\n{screen}"
+    );
+    assert!(
+        screen.contains("viewing — Enter edits"),
+        "still the hex view:\n{screen}"
+    );
+    assert!(
+        screen.contains("0000(0000) 5A 01 02"),
+        "the edit kept:\n{screen}"
+    );
+}
+
+/// HOST's half: the viewer's prompt answered Cancel, the viewer then left there (its own prompt's
+/// Discard), and F12: the state handed back has no viewer — the one taken when the first prompt
+/// came up was dropped with its Cancel.
+#[test]
+fn tw4_on_host_a_viewer_left_after_cancel_is_not_handed_back() {
+    let fx = fixture_with(0, &["0.bin"]);
+    std::fs::write(
+        Path::new(&fx.root).join("0.bin"),
+        (0..=255u8).collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    let mut state = state_of(&fx);
+    state.mode = Mode::Dual;
+    state.panels[0].bar = Some("0.bin".into());
+    state.panels[1].bar = None;
+    state.viewer = None;
+    let line = format!("{}\n", state.line());
+    let sent = switch_host::read_state(&mut line.as_bytes()).unwrap();
+    let out = Bytes::default();
+    let cues = Cues::new(Box::new(out.clone()), Box::new(|| {}));
+    let tmp = tempfile::tempdir().unwrap();
+    let ran = switch_host::run_on(
+        start(tmp.path(), &fx.root, None),
+        &crate::gui::Hooks::default(),
+        sent,
+        Input::default(),
+        cues,
+        |_, mut w| {
+            let mut drv = Driver::new(1200.0, 480.0);
+            drv.as_shell();
+            let settle = |drv: &mut Driver, w: &mut switch_host::Switched| {
+                drv.until(w, 60, |w| w.ready());
+                drv.idle(w, 2);
+                drv.until(w, 60, |w| w.ready());
+            };
+            settle(&mut drv, &mut w);
+            drv.key(&mut w, Key::Enter, Modifiers::NONE);
+            settle(&mut drv, &mut w);
+            drv.key(&mut w, Key::F8, Modifiers::NONE);
+            drv.key(&mut w, Key::Enter, Modifiers::NONE);
+            drv.frame(&mut w, vec![egui::Event::Text("Z".into())], Modifiers::NONE);
+            drv.idle(&mut w, 1);
+            drv.key(&mut w, Key::F12, Modifiers::NONE);
+            drv.idle(&mut w, 2);
+            settle(&mut drv, &mut w);
+            drv.click_text_on_top(&mut w, "[ Cancel ]");
+            drv.idle(&mut w, 2);
+            // Esc ends the typing, Esc again leaves the viewer: its prompt, answered Discard.
+            drv.key(&mut w, Key::Escape, Modifiers::NONE);
+            drv.idle(&mut w, 1);
+            drv.key(&mut w, Key::Escape, Modifiers::NONE);
+            drv.idle(&mut w, 2);
+            settle(&mut drv, &mut w);
+            drv.click_text_on_top(&mut w, "[ Discard ]");
+            for _ in 0..200 {
+                drv.idle(&mut w, 1);
+                if drv.text_starting_with("0000(0000)").is_none()
+                    || !has(&drv, "Esc or F3 back to the list")
+                {
+                    break;
+                }
+            }
+            assert!(!has(&drv, "Esc or F3 back to the list"), "the viewer left");
+            assert!(!drv.window_closed, "the window stays");
+            drv.key(&mut w, Key::F12, Modifiers::NONE);
+            drv.idle(&mut w, 2);
+            assert!(drv.window_closed, "F12 returns");
+            Ok(())
+        },
+    );
+    ran.unwrap();
+    let text = out.text();
+    let json = text
+        .trim_end()
+        .strip_prefix("sopen-xtools-state ")
+        .unwrap_or_else(|| panic!("the cue: {text}"));
+    let back = switch_state::read(json, "HOST").unwrap();
+    assert_eq!(
+        back.viewer, None,
+        "the viewer left before F12 is not handed back"
+    );
+}
+
+/// What the browsers a switch made still write is finished after the run, whatever its end,
+/// and joins its outcome (`term::open`'s `finish_made`).
+#[test]
+fn the_browsers_a_switch_made_are_finished_after_the_run() {
+    for ended in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = remote_for(tmp.path(), &tmp.path().join("sopen"), "/");
+        let waited = Rc::new(Cell::new(false));
+        let seen = waited.clone();
+        remote
+            .made
+            .borrow_mut()
+            .push(browser::Leftovers::with_closing(Box::new(move |wait| {
+                seen.set(seen.get() || wait);
+                wait.then(|| crate::gui::Outcome {
+                    saved: true,
+                    ..Default::default()
+                })
+            })));
+        let ran = match ended {
+            true => Ok(crate::gui::Outcome::default()),
+            false => Err(anyhow::anyhow!("the run failed")),
+        };
+        let finished = super::super::finish_made(&remote, ran);
+        assert!(waited.get(), "waited for: ended {ended}");
+        assert!(remote.made.borrow().is_empty());
+        match ended {
+            true => assert!(finished.unwrap().saved, "its save in the outcome"),
+            false => assert!(finished.is_err()),
+        }
+    }
+}
+
+/// A signal that ends the terminal's run while the window is on HOST: the run ends by it, and
+/// this run's ssh client is ended and reaped with it (never left behind).
+#[test]
+fn a_signal_while_away_ends_the_run_and_its_ssh() {
+    let fx = fixture_with(0, &[]);
+    dual(&fx);
+    let tmp = tempfile::tempdir().unwrap();
+    stand_in(tmp.path(), "exec sleep 30");
+    let remote = remote_for(tmp.path(), &tmp.path().join("sopen"), &fx.root);
+    let (mut b, tape, _bytes) = backend(&fx, 100, 30, false);
+    let ran = Rc::new(Ran::default());
+    let events = vec![
+        (plain(KeyCode::F(12)), None),
+        // Read (and dropped) while away; then the signal comes.
+        (CEvent::FocusGained, Some(wrote(tmp.path(), "state-in"))),
+    ];
+    script(&tape, &fx, events);
+    tape.0.borrow_mut().stop = Some(libc::SIGTERM);
+    let started = std::time::Instant::now();
+    assert_eq!(run(&mut b, &fx, &remote, &ran), End::Signal(libc::SIGTERM));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    let ssh: i32 = lines(tmp.path(), "ssh-pid")[0].parse().unwrap();
+    assert!(gone(ssh), "the ssh client ended and reaped");
+    kill_recorded(tmp.path(), "sopen-pid");
 }

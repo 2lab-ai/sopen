@@ -638,11 +638,17 @@ impl Views {
 
     /// Everything the views hold goes with the viewer: the hidden windows (what they may still
     /// write settles after them), a view being made, the view keys.
-    pub(super) fn close(self, closing: &mut Vec<Closing>, workers: &mut Vec<JoinHandle<()>>) {
+    pub(super) fn close(
+        self,
+        closing: &mut Vec<Closing>,
+        workers: &mut Vec<JoinHandle<()>>,
+        file: &str,
+    ) {
         for kept in self.hidden {
             closing.push(Closing {
                 settle: kept.embedded.settle,
                 hold: kept.hold,
+                file: file.to_string(),
             });
         }
         if let Some(mut making) = self.making {
@@ -711,6 +717,19 @@ impl Browser {
         });
         if let Some(slot) = wanted {
             self.view_input(ctx, Input::Choose(slot));
+        }
+    }
+
+    /// The question before a switch to another machine came up between two passes (10 §7.4):
+    /// the view keys are a question's from the next input on, before any pass of it.
+    pub(super) fn views_question(&mut self) {
+        if let Some(viewer) = self.viewer.as_mut() {
+            let mut slot = viewer
+                .views
+                .slot
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            slot.state = view_keys::State::Question;
         }
     }
 
@@ -1069,9 +1088,11 @@ impl Browser {
                         })
                     };
                     if let Some((embedded, hold)) = closed {
+                        let file = super::show(self.label.as_deref(), &viewer.abs);
                         self.leftover.borrow_mut().closing.push(Closing {
                             settle: embedded.settle,
                             hold,
+                            file,
                         });
                     }
                 }
