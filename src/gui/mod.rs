@@ -682,6 +682,14 @@ pub trait Window {
         &[]
     }
 
+    /// Whether the window paints its screen in cells (10 §4), filling the room it is given: a
+    /// host frames it in cells too (the browser's preview side, X3-preview). One that does not
+    /// (the default) is egui's, a hand-off box in a terminal, and a host keeps egui's frame
+    /// around it.
+    fn paints_cells(&self) -> bool {
+        false
+    }
+
     /// The window becomes a preview in the file browser's opposite side (`true`), or a viewer
     /// again (`false`: the hand-over), 02 §4.2 and §4.4. A preview draws as inactive and without
     /// its own bars, takes no input, plays nothing, does not follow a growing file and keeps to

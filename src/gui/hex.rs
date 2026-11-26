@@ -4936,6 +4936,11 @@ impl super::Window for HexWindow {
         Some(self.cursor.at)
     }
 
+    /// Its screen is cells (X3-hex): a preview of it is framed in cells.
+    fn paints_cells(&self) -> bool {
+        true
+    }
+
     fn saves_landed(&self) -> u64 {
         self.saves_landed
     }

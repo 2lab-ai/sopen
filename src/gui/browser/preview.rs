@@ -31,6 +31,7 @@ use crate::gui::cells::{self, Buffer, Cells, Grid, Pen};
 #[cfg(test)]
 use crate::gui::Window;
 use crate::gui::{chrome, help};
+use crate::kind::Kind;
 use crate::remote::RemoteFs;
 use anyhow::Result;
 use eframe::egui::{self, Vec2};
@@ -107,6 +108,15 @@ enum Shown {
     Failed(String),
 }
 
+/// How the side is framed (10 §4): in cells, around a preview that paints cells and the lines of
+/// one being prepared; or by egui, around a preview egui draws and its lines — one hand-off box
+/// in a terminal, never a row of cells inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Frame {
+    Cells,
+    Egui,
+}
+
 /// What Enter or F3 on a file gets from the host (02 §4.4).
 pub(super) enum Taken {
     /// The finished preview, a viewer now: handed over.
@@ -135,6 +145,10 @@ pub(super) struct Host {
     /// The file the committed display shows a preview of.
     display: Option<Want>,
     shown: Option<Shown>,
+    /// How the side framed the last ready preview of the display's file: kept while that file is
+    /// prepared again ([`Host::refresh`]), so the side does not change frames meanwhile; cleared
+    /// when the display commits another file, or its page is made for another backend.
+    framed: Option<Frame>,
     /// The one preparation: running, or cancelled and not ended yet.
     prep: Option<Prep>,
     /// What the frozen side says of a preparation that was cancelled.
@@ -163,6 +177,7 @@ impl Host {
             drawn: false,
             display: None,
             shown: None,
+            framed: None,
             prep: None,
             last_progress: String::new(),
             budget: Box::new(Budget::preview),
@@ -283,6 +298,7 @@ impl Host {
         if display != self.display {
             // Committed: the old preview is dropped (its stream with it).
             self.shown = None;
+            self.framed = None;
             self.last_progress.clear();
             self.display = display;
         }
@@ -422,11 +438,14 @@ impl Host {
         if let Some(Shown::Ready(preview)) = &self.shown {
             if *preview.made_under() != here {
                 self.shown = None;
+                self.framed = None;
                 self.last_progress.clear();
             }
         }
         if let Some(prep) = self.prep.as_ref().filter(|p| p.pages != here) {
             prep.cancel.store(true, Ordering::Relaxed);
+            // What is prepared next is this backend's: its frame is decided again.
+            self.framed = None;
         }
     }
 
@@ -494,8 +513,10 @@ impl Host {
     /// what is known of its preparation. The frame and that line are cells — those `under` a
     /// dialog of the list's, and under the key help, blanked first (cells.rs: one buffer over
     /// another) — and a text or hex preview paints its own cells inside them. A preview egui
-    /// still draws (an image, a video, a sound, a page, the info card) keeps egui's frame until
-    /// X6: its side is egui's whole, one hand-off box in a terminal, never a box in a frame.
+    /// still draws (an image, a video, a sound, a page, the info card) keeps egui's frame, its
+    /// line egui's too, until X6: its side is egui's whole, one hand-off box in a terminal, never
+    /// a box in a frame. Which frame ([`Frame`]): a ready preview's own; else the last ready one's
+    /// of the same file (it is prepared again); else the file's name's ([`Host::frame_by_name`]).
     pub fn ui(&mut self, ui: &mut egui::Ui, grid: &Grid, side: Cells, under: &[Cells]) {
         let Some(want) = self.display.clone() else {
             return;
@@ -512,11 +533,23 @@ impl Host {
             Some(Shown::Failed(why)) => Some(why.clone()),
             None => Some(self.progress(&want)),
         };
-        let inner = match &self.shown {
-            Some(Shown::Ready(preview)) if !in_cells(preview) => {
-                chrome::panel_frame(&painter, rect, &title, false)
+        let frame = match &self.shown {
+            Some(Shown::Ready(preview)) if in_cells(preview) => Frame::Cells,
+            Some(Shown::Ready(_)) => Frame::Egui,
+            _ => match self.framed {
+                Some(frame) => frame,
+                None => self.frame_by_name(&ctx, &want.name),
+            },
+        };
+        let inner = match frame {
+            Frame::Egui => {
+                let inner = chrome::panel_frame(&painter, rect, &title, false);
+                if let Some(line) = &line {
+                    say_in_egui(ui, inner, line);
+                }
+                inner
             }
-            _ => {
+            Frame::Cells => {
                 let p = chrome::PALETTE;
                 let body = Pen::new(p.text, p.back);
                 let mut buf = Buffer::empty(side);
@@ -554,19 +587,39 @@ impl Host {
                 });
                 ctx.input_mut(|i| *i = saved);
                 self.drawn = true;
+                self.framed = Some(frame);
                 // 09 §4: the engine refused its page — the source in its place, at once. The
                 // page's server ended with the view it never had: the preview session comes
-                // back for the next preparation.
+                // back for the next preparation, which is the source's: its frame is decided
+                // again.
                 if let Some(why) = crate::gui::web::page::take_preview_failure(&ctx) {
                     self.page_failed = Some(why.clone());
                     self.refused = Some(why);
                     self.shown = None;
+                    self.framed = None;
                     self.last_progress.clear();
                     ctx.request_repaint();
                 }
             }
-            // Its line is in the frame's cells.
+            // Its line is in the frame, drawn above.
             Some(Shown::Failed(_)) | None => {}
+        }
+    }
+
+    /// The frame of a side whose file, named `name`, has no ready preview yet: egui's where
+    /// what is made of it is egui's by its name — a picture, a video or a sound by their
+    /// extension, a page file whose page shows here (09 §4) — and cells otherwise. A name that
+    /// does not tell (a picture with no extension, a file over the preview's limit that becomes
+    /// the info card) changes frames once, when its preview is ready.
+    fn frame_by_name(&self, ctx: &egui::Context, name: &str) -> Frame {
+        let egui = matches!(
+            crate::kind::by_extension(name),
+            Some(Kind::Image | Kind::Video | Kind::Audio)
+        ) || (crate::kind::page_file(name) && self.pages_here(ctx, name).shown());
+        if egui {
+            Frame::Egui
+        } else {
+            Frame::Cells
         }
     }
 
@@ -599,12 +652,22 @@ impl Host {
     }
 }
 
-/// Whether `preview` paints its own cells (10 §4): a byte view — the text and hex views, those
-/// with a byte place (08 §2) — in cells since X3-text and X3-hex, a page file's source among
-/// them (how a terminal previews a page, VM-8). An image, a video, a sound, a page and the info
-/// card are egui's until X6.
+/// Whether `preview` paints its own cells (10 §4, [`crate::gui::Window::paints_cells`]): the
+/// text and hex views, in cells since X3-text and X3-hex, a page file's source among them (how
+/// a terminal previews a page, VM-8). An image, a video, a sound, a page and the info card are
+/// egui's until X6.
 fn in_cells(preview: &Preview) -> bool {
-    preview.embedded.window.byte_place().is_some()
+    preview.embedded.window.paints_cells()
+}
+
+/// `text` at the top of `inner` in an egui frame, wrapped at its width by egui: in a terminal the
+/// side is one hand-off box, and no row of cells cuts it into strips.
+fn say_in_egui(ui: &egui::Ui, inner: egui::Rect, text: &str) {
+    let painter = ui.painter_at(inner);
+    let p = chrome::PALETTE;
+    let width = inner.width().max(chrome::CELL.x);
+    let galley = painter.layout(text.to_string(), chrome::mono(ui), p.text, width);
+    painter.galley(inner.min, galley, p.text);
 }
 
 /// `text` at the top of `inner`, wrapped by cells at its width (`dialog::wrap`: at a blank, a
@@ -651,7 +714,8 @@ mod tests {
         enabled: bool,
     }
 
-    struct Eager(Arc<Mutex<Got>>);
+    /// The stand-in, painting cells (`true`: its side is framed in cells) or not.
+    struct Eager(Arc<Mutex<Got>>, bool);
 
     impl Window for Eager {
         fn ui(&mut self, ui: &mut egui::Ui) {
@@ -672,6 +736,10 @@ mod tests {
 
         fn ready(&self) -> bool {
             true
+        }
+
+        fn paints_cells(&self) -> bool {
+            self.1
         }
     }
 
@@ -703,14 +771,18 @@ mod tests {
         }
     }
 
-    /// What a stand-in was told of being on screen, in order.
-    struct Told(Arc<Mutex<Vec<bool>>>);
+    /// What a stand-in was told of being on screen, in order; it paints cells or not.
+    struct Told(Arc<Mutex<Vec<bool>>>, bool);
 
     impl Window for Told {
         fn ui(&mut self, _: &mut egui::Ui) {}
 
         fn ready(&self) -> bool {
             true
+        }
+
+        fn paints_cells(&self) -> bool {
+            self.1
         }
 
         fn set_shown(&mut self, shown: bool) {
@@ -742,11 +814,24 @@ mod tests {
         }
     }
 
+    /// Whether the last pass framed the side (all of `drv`'s grid) in cells.
+    fn framed_in_cells(drv: &Driver) -> bool {
+        let all = Grid::over(drv.ctx.content_rect()).all();
+        cells::layers(&drv.ctx).iter().any(|l| l.buf.area == all)
+    }
+
     /// 06 §5 (W8a): a preview the host holds but does not draw — a viewer covers the panels —
     /// is told it is hidden (`Window::set_shown(false)`: a streamed one then stops polling),
-    /// once; drawn again, it is told so; and the hand-over makes it shown, whatever it was.
+    /// once; drawn again, it is told so; and the hand-over makes it shown, whatever it was —
+    /// framed in cells or by egui.
     #[test]
     fn a_preview_held_but_not_drawn_is_told_it_is_hidden() {
+        for cells in [false, true] {
+            told_when_hidden(cells);
+        }
+    }
+
+    fn told_when_hidden(cells: bool) {
         let told = Arc::new(Mutex::new(Vec::new()));
         let want = Want {
             path: "/d/a.txt".to_string(),
@@ -756,7 +841,7 @@ mod tests {
         let mut host = Host::new(connect, None, PathBuf::from("/nonexistent"));
         host.display = Some(want.clone());
         host.shown = Some(Shown::Ready(Box::new(Preview::standing_in(Embedded {
-            window: Box::new(Told(told.clone())),
+            window: Box::new(Told(told.clone(), cells)),
             settle: Box::new(|_| Some(Outcome::default())),
         }))));
         // As `sync` leaves it when a preparation's preview comes ready.
@@ -769,6 +854,7 @@ mod tests {
         let mut drv = Driver::new(500.0, 400.0);
         let said = || told.lock().unwrap().clone();
         drv.idle(&mut side, 5);
+        assert_eq!(framed_in_cells(&drv), cells, "its frame");
         assert_eq!(said(), [] as [bool; 0], "on screen: nothing to tell");
         side.panels = false;
         drv.idle(&mut side, 5);
@@ -789,9 +875,16 @@ mod tests {
 
     /// No key, typed text, click, drag or wheel reaches a previewed window, and its widgets
     /// are disabled — whatever the window itself would do with them; the frame's input is
-    /// whole again after its pass (the list's keys are read from it).
+    /// whole again after its pass (the list's keys are read from it). The same in both of the
+    /// side's frames: egui's, and cells around a window that paints cells.
     #[test]
     fn the_host_withholds_the_frames_input_from_a_preview() {
+        for cells in [false, true] {
+            withheld(cells);
+        }
+    }
+
+    fn withheld(cells: bool) {
         let got = Arc::new(Mutex::new(Got::default()));
         let want = Want {
             path: "/d/a.txt".to_string(),
@@ -801,7 +894,7 @@ mod tests {
         let mut host = Host::new(connect, None, PathBuf::from("/nonexistent"));
         host.display = Some(want.clone());
         host.shown = Some(Shown::Ready(Box::new(Preview::standing_in(Embedded {
-            window: Box::new(Eager(got.clone())),
+            window: Box::new(Eager(got.clone(), cells)),
             settle: Box::new(|_| Some(Outcome::default())),
         }))));
         let mut side = Side {
@@ -812,6 +905,7 @@ mod tests {
         let mut drv = Driver::new(500.0, 400.0);
         let centre = Pos2::new(250.0, 200.0);
         drv.idle(&mut side, 2);
+        assert_eq!(framed_in_cells(&drv), cells, "its frame");
         drv.key(&mut side, Key::Space, Modifiers::NONE);
         drv.frame(&mut side, vec![Event::Text("abc".into())], Modifiers::NONE);
         drv.click(&mut side, centre);

@@ -1,8 +1,9 @@
 //! The preview side in cells (10 §17, X3-preview): its frame titled with the file and its lines
 //! — the read's progress, `…`, why there is none — are cells, wrapped by cells; a text or hex
 //! preview paints its own cells inside the frame's, so a terminal shows no hand-off box there (a
-//! page file's preview there is its source, VM-8); an image's side stays egui's whole, one box in
-//! a terminal; and the window paints the cells a terminal shows (TS-1).
+//! page file's preview there is its source, VM-8); an image's or a sound's side stays egui's
+//! whole, one box in a terminal, from its first pass and across a refresh; and the window paints
+//! the cells a terminal shows (TS-1).
 
 use super::*;
 use crate::gui::cells::{self, Cells, Grid, Layer};
@@ -208,13 +209,10 @@ fn the_sides_frame_and_title_are_cells_and_the_preview_paints_inside_them() {
     );
 }
 
-/// While its file is read, the side says how far, in cells at the top of its frame; once the
-/// preparation is cancelled it is frozen with what it said, then `…`.
-#[test]
-fn the_progress_line_is_cells_with_its_percentage_then_its_ellipsis() {
-    let mut pane = pane_at("/d/big.bin", right);
-    let (_tx, rx) = mpsc::channel();
-    let (done, total) = (1 << 20, 4 << 20);
+/// A preparation of the pane's file, running — `done` of `total` bytes read — until the sender
+/// it returns is dropped.
+fn reading(pane: &mut Pane, done: u64, total: u64) -> mpsc::Sender<Result<Previewed>> {
+    let (tx, rx) = mpsc::channel();
     pane.host.prep = Some(Prep {
         want: pane.want.clone(),
         cancel: Arc::new(AtomicBool::new(false)),
@@ -225,6 +223,16 @@ fn the_progress_line_is_cells_with_its_percentage_then_its_ellipsis() {
         rx,
         worker: None,
     });
+    tx
+}
+
+/// While its file is read, the side says how far, in cells at the top of its frame; once the
+/// preparation is cancelled it is frozen with what it said, then `…`.
+#[test]
+fn the_progress_line_is_cells_with_its_percentage_then_its_ellipsis() {
+    let mut pane = pane_at("/d/big.bin", right);
+    let (done, total) = (1 << 20, 4 << 20);
+    let _tx = reading(&mut pane, done, total);
     let mut drv = Driver::new(SIZE.x, SIZE.y);
     drv.idle(&mut pane, 2);
     let side = right(&grid());
@@ -426,6 +434,115 @@ fn in_a_terminal_a_text_or_hex_preview_and_a_pages_source_show_no_hand_off_box()
         layer_at(&drv, grid().all()).is_none(),
         "no frame of cells under it"
     );
+}
+
+/// The terminal's screen of `drv`'s last pass: one hand-off box over all of the side, and no
+/// layer of cells there — `what` says which.
+fn one_box(drv: &Driver, what: &str) {
+    let screen = terminal_screen(drv);
+    assert_eq!(screen.hand_offs, [grid().all()], "{what}: one hand-off box");
+    assert!(
+        layer_at(drv, grid().all()).is_none(),
+        "{what}: no frame of cells"
+    );
+}
+
+/// An image's, a video's or a sound's side is egui's from its first pass (10 §17: its side is
+/// the hand-off box until X6): while its file is read and when its preparation failed, the
+/// frame and the line are egui's — one box in a terminal, never cells first and a box once it
+/// is ready.
+#[test]
+fn an_images_or_medias_side_is_one_box_while_it_is_read_and_when_it_fails() {
+    for name in ["photo.png", "clip.mp4", "song.wav"] {
+        let mut pane = pane_at(&format!("/d/{name}"), all);
+        let _tx = reading(&mut pane, 1 << 20, 4 << 20);
+        let mut drv = Driver::new(SIZE.x, SIZE.y);
+        crate::gui::mark_terminal(&drv.ctx);
+        drv.idle(&mut pane, 2);
+        one_box(&drv, name);
+        let line = format!("reading {name} 25%");
+        assert!(
+            drv.text_starting_with(&line).is_some(),
+            "{name}: its line, egui's"
+        );
+        pane.host.prep = None;
+        pane.host.shown = Some(Shown::Failed("no preview: it failed".to_string()));
+        drv.idle(&mut pane, 2);
+        one_box(&drv, &format!("{name}, failed"));
+    }
+}
+
+/// A picture ready, then its file changed (`refresh`): it is prepared again, and its side stays
+/// egui's meanwhile — one box in a terminal, never the cells of a side being read; a text
+/// file's side stays cells across the same.
+#[test]
+fn a_refresh_keeps_the_sides_frame_while_the_file_is_read_again() {
+    let files = [
+        ("photo.png", png(40, 30)),
+        ("notes.txt", b"plain notes\n".to_vec()),
+    ];
+    let (_tmp, mut pane) = pane_on(&files, "photo.png", all);
+    let mut drv = Driver::new(SIZE.x, SIZE.y);
+    crate::gui::mark_terminal(&drv.ctx);
+    drv.until(&mut pane, 20, |p| p.ready());
+    drv.idle(&mut pane, 2);
+    one_box(&drv, "ready");
+    let path = pane.want.path.clone();
+    pane.host.refresh(&path);
+    drv.idle(&mut pane, 1);
+    assert!(pane.host.busy(), "prepared again");
+    one_box(&drv, "read again");
+    drv.until(&mut pane, 20, |p| p.ready());
+    one_box(&drv, "ready again");
+    // The text file: cells, ready, read again and ready again.
+    let mut pane = pane_in(&_tmp, "notes.txt", all);
+    let mut drv = Driver::new(SIZE.x, SIZE.y);
+    crate::gui::mark_terminal(&drv.ctx);
+    drv.until(&mut pane, 20, |p| p.ready());
+    drv.idle(&mut pane, 2);
+    assert_eq!(terminal_screen(&drv).hand_offs, [], "ready: cells");
+    let path = pane.want.path.clone();
+    pane.host.refresh(&path);
+    drv.idle(&mut pane, 1);
+    assert!(pane.host.busy(), "prepared again");
+    assert_eq!(terminal_screen(&drv).hand_offs, [], "read again: cells");
+    let frame = layer_at(&drv, grid().all()).expect("the side in cells");
+    assert!(
+        said(&frame, inside(grid().all()))[0].starts_with("reading notes.txt"),
+        "its line in cells"
+    );
+}
+
+/// The bar moves to another file (the display commits it): its side's frame is decided again —
+/// a text file's cells while it is read after a picture's box, and back.
+#[test]
+fn another_file_on_display_decides_its_frame_again() {
+    let files = [
+        ("photo.png", png(40, 30)),
+        ("notes.txt", b"plain notes\n".to_vec()),
+    ];
+    let (tmp, mut pane) = pane_on(&files, "photo.png", all);
+    let notes = pane_in(&tmp, "notes.txt", all).want;
+    let photo = pane.want.clone();
+    let mut drv = Driver::new(SIZE.x, SIZE.y);
+    crate::gui::mark_terminal(&drv.ctx);
+    drv.until(&mut pane, 20, |p| p.ready());
+    drv.idle(&mut pane, 2);
+    one_box(&drv, "the picture, ready");
+    pane.want = notes;
+    drv.idle(&mut pane, 1);
+    assert!(pane.host.busy(), "the text file is read");
+    assert_eq!(
+        terminal_screen(&drv).hand_offs,
+        [],
+        "its side: cells at once"
+    );
+    assert!(layer_at(&drv, grid().all()).is_some(), "its frame of cells");
+    drv.until(&mut pane, 20, |p| p.ready());
+    drv.idle(&mut pane, 2);
+    pane.want = photo;
+    drv.idle(&mut pane, 1);
+    one_box(&drv, "the picture again, being read");
 }
 
 // ---------------------------------------------------------------------------------------------
