@@ -1552,11 +1552,11 @@ fn preview_parts(
     known.kind = Some(kind);
     // 09 §5–§6: a page file whose default view is its page shows it, where the window shows
     // pages; the decision reads an `.xml`'s head on this connection. Where it shows its source
-    // (a terminal, 10 T21) the viewer it becomes still has the page among its views; a window
-    // that shows the source (§4, `Pages::Source` with its line) has no page view, so nothing more
-    // is read for it.
+    // (a terminal, 10 T21) the viewer it becomes still has the page among its views — a page
+    // file by the name the list shows, as `Pages::here` asks; a window that shows the source
+    // (§4, `Pages::Source` with its line) has no page view, so nothing more is read for it.
     let page_view = !matches!(pages, Pages::Source(Some(_)));
-    if page_view && kind == Kind::Text && kind::page_file(crate::remote::split_parent(&real).1) {
+    if page_view && kind == Kind::Text && kind::page_file(&known.name) {
         budget.check(cancel)?;
         known.page.class = page_class_on(fs.as_mut(), &real)?;
     }

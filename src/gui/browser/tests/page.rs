@@ -166,6 +166,16 @@ fn enter_other(fx: &mut Fx, name: &str) {
     assert!(fx.b.viewer.is_some(), "{name}: {:?}", fx.b.status.text);
 }
 
+/// `1` as a terminal sends it, through the translator (`term_input`): its key, its text and its
+/// release in one pass, as the terminal backend passes them.
+fn term_one(drv: &mut Driver, b: &mut Browser) {
+    use crossterm::event::{Event as CEvent, KeyCode, KeyEvent, KeyModifiers};
+    let mut input = crate::gui::term_input::TermInput::new(cfg!(target_os = "macos"));
+    let key = CEvent::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    drv.frame(b, input.translate(&key), Modifiers::NONE);
+    drv.idle(b, 2);
+}
+
 /// `n` pressed as the keyboard sends it, then settled (a view made, or one loaded).
 fn digit(fx: &mut Fx, n: u8) {
     let key = [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4][usize::from(n)];
@@ -693,7 +703,9 @@ fn wv_d_in_a_terminal_the_page_is_a_hand_off_box() {
     assert!(fx.b.viewer.is_some());
     assert_eq!(fake.views(), 0, "no view in a terminal");
     assert_eq!(strip(&fx), "1 Page · 2 Hex · 3 Text");
-    digit(&mut fx, 1);
+    term_one(&mut fx.drv, &mut fx.b);
+    // The page view is made on a worker: once it is on screen.
+    fx.settle();
     let layers = crate::gui::cells::layers(&fx.drv.ctx);
     let screen = crate::gui::term::compose(&fx.drv.ctx, &layers, 125, 43);
     assert!(
@@ -805,7 +817,7 @@ fn wv_d_a_preview_handed_over_in_the_terminal_is_made_in_the_next_window() {
     // One: the terminal's preview read its source through the window's one preview session,
     // which the viewer keeps with that stream.
     assert_eq!(connects(), 1, "the preview session only");
-    t.press_typed(&mut fx.b, Key::Num1, "1");
+    term_one(&mut t, &mut fx.b);
     t.until(&mut fx.b, 20, |b| b.ready());
     let mut window = Driver::new(1000.0, 700.0);
     assert!(

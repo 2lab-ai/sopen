@@ -308,6 +308,35 @@ fn a_remote_page_previewed_in_the_terminal_holds_one_connection() {
     assert_eq!(connects(), 1, "the preview's stream, handed over");
 }
 
+/// A link whose name asks no page (`alias.txt` → `index.html`) opens as the window opens it —
+/// as text, `1 Text · 2 Hex · 3 Raw` on 1 (09 §5: the name decides whether a page is asked; T21:
+/// the same slots in both backends) — from the list and from its preview.
+#[test]
+fn a_link_whose_name_asks_no_page_opens_as_text_in_the_terminal() {
+    let (mut fx, fake) = pages(true);
+    std::os::unix::fs::symlink("index.html", format!("{}/alias.txt", fx.root)).unwrap();
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    fx.open("alias.txt");
+    assert_eq!(strip(&fx), "1 Text · 2 Hex · 3 Raw");
+    assert_eq!(on(&fx), Some(View::Text));
+    fx.key(Key::Escape);
+    fx.b.mode = view::Mode::Preview;
+    fx.drv.idle(&mut fx.b, 2);
+    fx.select("alias.txt");
+    fx.settle();
+    fx.key(Key::Enter);
+    fx.settle();
+    assert_eq!(
+        strip(&fx),
+        "1 Text · 2 Hex · 3 Raw",
+        "its preview handed over"
+    );
+    assert_eq!(on(&fx), Some(View::Text));
+    assert_eq!(fake.views(), 0);
+}
+
 /// TK-3 through the translator: in the terminal `1` → view 1 (the page's hand-off); Alt+9 (the
 /// TUI's F9, 10 T7) then `3` → its source again; F9 then `2` → Hex (viewing); Enter edits and
 /// `1` is then a typed nibble — no switch, the byte changed in memory, nothing written.

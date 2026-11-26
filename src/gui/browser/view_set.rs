@@ -216,8 +216,8 @@ pub(super) struct PageOpen {
     /// opened (its resolved name and head), never the name the list shows.
     pub class: PageClass,
     /// The opening made the page (`Pages::Page`), so the set opens on it. Else the source: in a
-    /// terminal with the page still one of its views (10 T21: `Screen::TERMINAL`), in a window
-    /// without it (D30's source, 09 §4).
+    /// terminal, for a page file by the name the list shows, with the page still one of its
+    /// views (10 T21: `Screen::TERMINAL`); otherwise without it (D30's source, 09 §4).
     pub shown: bool,
     /// The folder the browser was opened on (§3.1's root); `None` where nothing of the page was
     /// made — the page view finds it then as the browser does ([`Browser::start_making`]).
@@ -279,11 +279,14 @@ pub(super) fn open_paged(
     // The screen the opening made its first view for — the backend's own, since a preview is
     // handed over only in the backend it was made for (`preview::Host::fits`): the page where a
     // window made it; in a terminal, which draws none, the source with the window's slots (10
-    // T21: `Pages::here` made nothing of the page); else the source alone (09 §4).
+    // T21: `Pages::here` made nothing of the page) where a window would show the page — a page
+    // file by the name the list shows (09 §5), not a link to one under another name; else the
+    // source alone (09 §4).
     let screen = match (page.class, page.shown, terminal) {
-        (PageClass::Plain, ..) | (_, false, false) => Screen::NO_ENGINE,
+        (PageClass::Plain, ..) => Screen::NO_ENGINE,
         (_, true, _) => Screen::GUI,
-        (_, false, true) => Screen::TERMINAL,
+        (_, false, true) if crate::kind::page_file(&means.name) => Screen::TERMINAL,
+        (_, false, _) => Screen::NO_ENGINE,
     };
     let set = ViewSet::open(opening, screen).expect("a file has views");
     // A terminal's input sends its releases made (`term_input::RELEASES`), a window's its own.
