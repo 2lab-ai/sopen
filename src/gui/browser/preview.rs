@@ -20,15 +20,20 @@
 //!   closing cancels and does not wait ([`Host::cancel`]).
 //! - **Held, not drawn** (a viewer covers the panels): the preview is told
 //!   (`Window::set_shown(false)`), so a streamed one does not poll its file (06 §5).
+//! - **The side in cells** ([`Host::ui`], 10 §17's X3-preview): its frame titled with the file,
+//!   and the line of what is known of its preparation, wrapped by cells; a text or hex preview
+//!   paints its own cells inside the frame. A preview egui draws keeps egui's frame until X6.
 
+use super::ops::dialog;
 use super::prepare::{self, Budget, HandedOver, Pages, Preview, PreviewRequest, Previewed};
 use super::Connect;
-use crate::gui::chrome;
+use crate::gui::cells::{self, Buffer, Cells, Grid, Pen};
 #[cfg(test)]
 use crate::gui::Window;
+use crate::gui::{chrome, help};
 use crate::remote::RemoteFs;
 use anyhow::Result;
-use eframe::egui::{self, Pos2, Rect, Vec2};
+use eframe::egui::{self, Vec2};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -483,11 +488,15 @@ impl Host {
         self.prep.is_some()
     }
 
-    /// The side: its frame — single-lined, the side does not have the keyboard — titled with
-    /// the file, and in it the preview, drawn disabled with this pass's input withheld (02
-    /// §4.4: no key, click, drag or wheel reaches a previewed viewer), or what is known of its
-    /// preparation.
-    pub fn ui(&mut self, ui: &mut egui::Ui, rect: Rect) {
+    /// The side at cells `side` of `grid` (10 §4): its frame — single-lined, the side does not
+    /// have the keyboard — titled with the file, and in it the preview, drawn disabled with this
+    /// pass's input withheld (02 §4.4: no key, click, drag or wheel reaches a previewed viewer), or
+    /// what is known of its preparation. The frame and that line are cells — those `under` a
+    /// dialog of the list's, and under the key help, blanked first (cells.rs: one buffer over
+    /// another) — and a text or hex preview paints its own cells inside them. A preview egui
+    /// still draws (an image, a video, a sound, a page, the info card) keeps egui's frame until
+    /// X6: its side is egui's whole, one hand-off box in a terminal, never a box in a frame.
+    pub fn ui(&mut self, ui: &mut egui::Ui, grid: &Grid, side: Cells, under: &[Cells]) {
         let Some(want) = self.display.clone() else {
             return;
         };
@@ -496,8 +505,34 @@ impl Host {
             Some(label) => format!("{label}:{}", want.path),
             None => want.path.clone(),
         };
+        let rect = grid.rect(side);
         let painter = ui.painter_at(rect);
-        let inner = chrome::panel_frame(&painter, rect, &title, false);
+        let line = match &self.shown {
+            Some(Shown::Ready(_)) => None,
+            Some(Shown::Failed(why)) => Some(why.clone()),
+            None => Some(self.progress(&want)),
+        };
+        let inner = match &self.shown {
+            Some(Shown::Ready(preview)) if !in_cells(preview) => {
+                chrome::panel_frame(&painter, rect, &title, false)
+            }
+            _ => {
+                let p = chrome::PALETTE;
+                let body = Pen::new(p.text, p.back);
+                let mut buf = Buffer::empty(side);
+                let inner = cells::frame(&mut buf, side, &title, false);
+                if let Some(line) = &line {
+                    say(&mut buf, inner, line);
+                }
+                for r in under.iter().copied().chain(help::covered(&ctx, grid)) {
+                    cells::fill(&mut buf, r, body);
+                }
+                // The side's body under its cells, as the list fills its own.
+                painter.rect_filled(rect, 0.0, p.back);
+                cells::paint(&painter, grid.origin, &buf, None);
+                grid.rect(inner)
+            }
+        };
         match &mut self.shown {
             Some(Shown::Ready(preview)) => {
                 let saved = ctx.input(|i| i.clone());
@@ -530,14 +565,8 @@ impl Host {
                     ctx.request_repaint();
                 }
             }
-            Some(Shown::Failed(why)) => {
-                let why = why.clone();
-                say(ui, inner, &why);
-            }
-            None => {
-                let line = self.progress(&want);
-                say(ui, inner, &line);
-            }
+            // Its line is in the frame's cells.
+            Some(Shown::Failed(_)) | None => {}
         }
     }
 
@@ -570,17 +599,25 @@ impl Host {
     }
 }
 
-/// One line (wrapped at the side's width) at the top of the side.
-fn say(ui: &egui::Ui, inner: Rect, text: &str) {
-    let painter = ui.painter_at(inner);
-    let p = chrome::Palette::of(ui.visuals());
-    let galley = painter.layout(
-        text.to_string(),
-        chrome::mono(ui),
-        p.text,
-        inner.width().max(chrome::CELL.x),
-    );
-    painter.galley(Pos2::new(inner.left(), inner.top()), galley, p.text);
+/// Whether `preview` paints its own cells (10 §4): a byte view — the text and hex views, those
+/// with a byte place (08 §2) — in cells since X3-text and X3-hex, a page file's source among
+/// them (how a terminal previews a page, VM-8). An image, a video, a sound, a page and the info
+/// card are egui's until X6.
+fn in_cells(preview: &Preview) -> bool {
+    preview.embedded.window.byte_place().is_some()
+}
+
+/// `text` at the top of `inner`, wrapped by cells at its width (`dialog::wrap`: at a blank, a
+/// word longer than a row after its last whole glyph), as many rows as it has.
+fn say(buf: &mut Buffer, inner: Cells, text: &str) {
+    let p = chrome::PALETTE;
+    let room = usize::from(inner.width);
+    if room == 0 {
+        return;
+    }
+    for (y, row) in (inner.top()..inner.bottom()).zip(dialog::wrap(text, room)) {
+        cells::put(buf, inner.x, y, &row, room, Pen::new(p.text, p.back));
+    }
 }
 
 impl Drop for Host {
@@ -591,6 +628,9 @@ impl Drop for Host {
 }
 
 #[cfg(test)]
+mod cells_tests;
+
+#[cfg(test)]
 mod tests {
     //! The host's own isolation (02 §4.4), on a stand-in window that reacts to everything it is
     //! given: the merged viewers refuse input themselves once told they are previews, so only a
@@ -599,7 +639,7 @@ mod tests {
     use super::*;
     use crate::gui::testkit::Driver;
     use crate::gui::{Embedded, Outcome, Window};
-    use eframe::egui::{Event, Key, Modifiers};
+    use eframe::egui::{Event, Key, Modifiers, Pos2};
 
     /// What the stand-in was given, over all its passes.
     #[derive(Default, Debug, PartialEq)]
@@ -648,8 +688,8 @@ mod tests {
             let ctx = ui.ctx().clone();
             self.host
                 .sync(&ctx, Some(self.want.clone()), Some(&self.want.path));
-            let rect = ui.max_rect();
-            self.host.ui(ui, rect);
+            let grid = Grid::over(ui.max_rect());
+            self.host.ui(ui, &grid, grid.all(), &[]);
             self.after += ctx.input(|i| {
                 i.events
                     .iter()
@@ -692,8 +732,8 @@ mod tests {
             self.host
                 .sync(&ctx, Some(self.want.clone()), Some(&self.want.path));
             if self.panels {
-                let rect = ui.max_rect();
-                self.host.ui(ui, rect);
+                let grid = Grid::over(ui.max_rect());
+                self.host.ui(ui, &grid, grid.all(), &[]);
             }
         }
 

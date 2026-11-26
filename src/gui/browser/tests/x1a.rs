@@ -91,21 +91,34 @@ fn each_in_its_place(fx: &Fx, w: f32, h: f32) {
     );
 }
 
-/// A text preview at `side`: rows of cells, every one inside its host's frame (a cell in from
-/// the side, egui's) — the previewed file's, never the list's.
+/// A text preview at `side`: its host's frame a layer of cells over all of the side (X3-preview),
+/// and the preview's own rows of cells — every other layer there — inside that frame (a cell in
+/// from the side): the previewed file's, never the list's.
 fn preview_cells_inside(fx: &Fx, side: Rect) {
     let inside = Rect::from_min_max(side.min + chrome::CELL, side.max - chrome::CELL);
-    let rows = cells_in(fx, side);
-    assert!(!rows.is_empty(), "the preview's rows in cells");
-    for (r, text) in &rows {
+    let layers = cells::layers(&fx.drv.ctx);
+    let framed = |l: &cells::Layer| l.rect(l.buf.area) == side;
+    let frame = layers.iter().find(|l| framed(l));
+    let frame = frame.expect("the side's frame in cells");
+    let a = frame.buf.area;
+    assert_eq!(frame.buf[(a.left(), a.top())].symbol(), "┌", "single-lined");
+    let own: Vec<_> = (layers.iter())
+        .filter(|l| !framed(l) && l.rect(l.buf.area).intersect(side).area() > 0.0)
+        .collect();
+    assert!(!own.is_empty(), "the preview's rows in cells");
+    for l in own {
+        let r = l.rect(l.buf.area);
         assert!(
-            inside.expand(0.5).contains_rect(*r),
-            "{text:?} at {r:?} out of {inside:?}"
+            inside.expand(0.5).contains_rect(r),
+            "{r:?} out of {inside:?}"
         );
-        assert!(
-            !text.contains("Name"),
-            "the list's head in the preview: {text:?}"
-        );
+        for y in l.buf.area.top()..l.buf.area.bottom() {
+            let text = cells::row_text(&l.buf, y).0;
+            assert!(
+                !text.contains("Name"),
+                "the list's head in the preview: {text:?}"
+            );
+        }
     }
 }
 
@@ -131,9 +144,9 @@ impl Fx {
 }
 
 /// Q1 (TS-8): the list is cells over its whole side, the preview at the other side's cells —
-/// a text preview's rows cells inside its host's egui frame (X3-text) — and nothing either paints
-/// leaves its side — at 1000×700, at sizes off the cell grid, with a hex preview wider than a
-/// narrow side, and with the tree (the spike had no check for it).
+/// a text preview's rows cells inside its host's frame of cells (X3-text, X3-preview) — and
+/// nothing either paints leaves its side — at 1000×700, at sizes off the cell grid, with a hex
+/// preview wider than a narrow side, and with the tree (the spike had no check for it).
 #[test]
 fn q1_panes_on_cell_rects_clip_there_and_follow_a_resize() {
     let mut fx = fixture();
@@ -144,8 +157,8 @@ fn q1_panes_on_cell_rects_clip_there_and_follow_a_resize() {
     let list = cells_in(&fx, left);
     assert_eq!(list.len(), 40, "{list:?}");
     assert!(list.iter().all(|(r, _)| r.width() == left.width()));
-    // The preview at the right side's cells: its rows cells inside its host's frame (egui's,
-    // a cell in from the side), none of the list's.
+    // The preview at the right side's cells: its rows cells inside its host's frame (cells, a
+    // cell in from the side), none of the list's.
     assert_eq!(panes(&fx), [left, right]);
     preview_cells_inside(&fx, right);
     let line = fx.drv.find_text("plain notes").expect("the previewed text");
