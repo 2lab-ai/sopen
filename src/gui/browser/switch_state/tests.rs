@@ -452,6 +452,7 @@ fn paths_are_rewritten_out_and_back_by_the_callers_map() {
             anchor: Some(0),
             error: Some("a refusal".into()),
             entries: vec!["a.txt".into()],
+            unplaced: None,
         }),
         viewer: Some(ViewerState {
             file: "/w/two/a.txt".into(),
@@ -655,11 +656,11 @@ fn a_dialog_opens_only_on_its_own_entries() {
     assert!(b.b.ops.renaming().is_none(), "no rename on the new row");
 }
 
-/// A Copy target the map cannot place goes as nothing (the receiver's own target) with the
-/// reason as its refusal; the other paths are mapped as ever. A caret past the text is held to
-/// it before it moves (no overflow on `usize::MAX`).
+/// A Copy target the map cannot place is marked so (the receiver opens no dialog on it:
+/// [`an_unplaceable_target_reopens_no_move`]); the other paths are mapped as ever. A caret past
+/// the text is held to it before it moves (no overflow on `usize::MAX`).
 #[test]
-fn a_target_the_map_cannot_place_is_not_carried_bare() {
+fn a_target_the_map_cannot_place_is_marked() {
     let state = line(
         r#"{"v":1,"panels":[{"folder":"/w"},{"folder":"/x"}],
             "dialog":{"kind":"copy","text":"/elsewhere/t","caret":3,"anchor":0,"entries":["a"]}}"#,
@@ -672,10 +673,11 @@ fn a_target_the_map_cannot_place_is_not_carried_bare() {
         .expect("the folders map");
     assert_eq!(out.panels[0].folder, "/w");
     let d = out.dialog.expect("the dialog");
-    assert_eq!((d.text, d.caret, d.anchor), (None, None, None));
+    assert_eq!(d.unplaced.as_deref(), Some("/elsewhere/t: no way there"));
     assert_eq!(
-        d.error.as_deref(),
-        Some("/elsewhere/t: no way there — give the folder again")
+        d.text.as_deref(),
+        Some("/elsewhere/t"),
+        "never opened: kept as typed"
     );
 
     let mut far = state.clone();
@@ -813,4 +815,77 @@ fn a_revision_viewer_is_said_not_carried() {
         said.starts_with(&format!("{root}/notes.txt: a diff or a file at a revision")),
         "{said}"
     );
+}
+
+/// A Move whose target the map cannot place is not opened again — not on a target of the
+/// receiver's own, where its Enter would move the files — and the status row says why: Enter
+/// then moves nothing.
+#[test]
+fn an_unplaceable_target_reopens_no_move() {
+    let (_tmp, root) = root();
+    let state = line(&format!(
+        r#"{{"v":1,"panels":[{{"folder":"{root}","bar":"notes.txt"}},{{"folder":"{root}/alpha"}}],
+           "dialog":{{"kind":"move","text":"/elsewhere/t","caret":3,"entries":["notes.txt"]}}}}"#
+    ));
+    let out = state
+        .rewritten(|source| match source {
+            "/elsewhere/t" => anyhow::bail!("no way there"),
+            _ => Ok(source.to_string()),
+        })
+        .expect("the folders map");
+    let (mut b, _) = given(&root, None, out);
+    assert!(b.b.ops.open_dialog(&b.drv.ctx).is_none(), "no Move dialog");
+    let said = b.b.status_line().text;
+    assert_eq!(
+        said,
+        "move was not opened again: /elsewhere/t: no way there"
+    );
+    b.key(Key::Enter);
+    b.settle();
+    assert!(std::path::Path::new(&format!("{root}/notes.txt")).exists());
+    assert!(!std::path::Path::new(&format!("{root}/alpha/notes.txt")).exists());
+}
+
+/// The pass the putting back opens a dialog in drops that pass's keys: an Enter meant for the
+/// list confirms nothing the owner has not seen — not a Move, not a Delete that waits for no
+/// Trash check (Shift+F8: permanent). The dialog stays open, and the owner's next Enter is the
+/// first it takes.
+#[test]
+fn the_pass_a_dialog_reopens_in_confirms_nothing() {
+    for (kind, done) in [("move", "alpha/notes.txt"), ("delete_now", "")] {
+        let (_tmp, root) = root();
+        let state = line(&format!(
+            r#"{{"v":1,"panels":[{{"folder":"{root}","bar":"notes.txt"}},{{"folder":"{root}/alpha"}}],
+               "dialog":{{"kind":"{kind}","text":"{root}/alpha","entries":["notes.txt"]}}}}"#
+        ));
+        let mut b = fresh_given(&root, state);
+        b.drv.until(&mut b.b, 30, |b| {
+            b.given.as_ref().is_some_and(|g| g.step == Step::Dialog)
+        });
+        assert!(
+            b.b.ops.open_dialog(&b.drv.ctx).is_none(),
+            "{kind}: not open yet"
+        );
+        b.key(Key::Enter);
+        assert!(!b.b.ops.busy(), "{kind}: the pass's Enter started nothing");
+        let open = b.b.ops.open_dialog(&b.drv.ctx).map(|d| d.kind);
+        assert!(open.is_some(), "{kind}: the dialog stays open");
+        b.settle();
+        assert!(
+            std::path::Path::new(&format!("{root}/notes.txt")).exists(),
+            "{kind}"
+        );
+        b.key(Key::Enter);
+        b.settle();
+        assert!(
+            !std::path::Path::new(&format!("{root}/notes.txt")).exists(),
+            "{kind}: the next Enter goes"
+        );
+        if !done.is_empty() {
+            assert!(
+                std::path::Path::new(&format!("{root}/{done}")).exists(),
+                "{kind}"
+            );
+        }
+    }
 }

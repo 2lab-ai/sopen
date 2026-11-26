@@ -1859,6 +1859,7 @@ impl Ops {
                 anchor: at.map(|(anchor, _)| anchor),
                 error: error.cloned(),
                 entries: entries.to_vec(),
+                unplaced: None,
             }
         };
         if let Some(d) = &self.group {
@@ -1900,6 +1901,7 @@ impl Ops {
                 anchor: None,
                 error: None,
                 entries: d.names.clone(),
+                unplaced: None,
             });
         }
         let r = self.rename.as_ref()?;

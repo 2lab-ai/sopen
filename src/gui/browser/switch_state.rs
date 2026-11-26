@@ -17,7 +17,7 @@
 //!   ([`SwitchState::rewritten`]), from and to sopen's command-line form (`host:/abs`, or `/abs`
 //!   on this machine), as `forward::source_for` rewrites SOURCE (§7.3): the folders, the pinned
 //!   repository, the viewer's file and a Copy / Move target typed as an absolute place — one the
-//!   map cannot place goes as nothing, its reason the dialog's refusal.
+//!   map cannot place keeps the dialog from opening again, the status row saying why.
 //! - **Giving** ([`Browser::give_state`]), once, to a browser that has not had a pass yet: each
 //!   panel lists its folder with the bar on its entry, as `SOPEN_STATE`'s `open=`, `at=` and
 //!   `enc=` are handed on, and the rest follows a step a pass on the display the pass before
@@ -115,6 +115,11 @@ pub(crate) struct DialogState {
     /// on these; the folder-wide dialogs (select-group, make folder) have none.
     #[serde(default)]
     pub entries: Vec<String>,
+    /// A Copy / Move target the caller's map could not place, and why (`<text>: <why>`): the
+    /// dialog is not opened again — on the receiver's own target its Enter would move the files
+    /// elsewhere than the owner typed — and the status row says this instead.
+    #[serde(default)]
+    pub unplaced: Option<String>,
 }
 
 /// Which dialog: the key that opens it.
@@ -289,9 +294,9 @@ impl SwitchState {
 /// A Copy / Move target that reads as an absolute place (`host:/abs`, `/abs`), rewritten by
 /// `map`; its caret and selection — held to the text first — keep their characters where the
 /// change is at its start (a host put before it or taken off), else go to its end. One `map`
-/// cannot place is never carried as it was typed (it would name another machine's folder on
-/// the other side): the field goes as nothing, the receiver's own target, and the reason is the
-/// dialog's refusal. Anything else (a name, a path relative to the folder) is left as typed.
+/// cannot place is [`DialogState::unplaced`]: the receiver does not open the dialog again —
+/// neither on the text as typed (another machine's folder there) nor on a target of its own.
+/// Anything else (a name, a path relative to the folder) is left as typed.
 fn retarget(d: &mut DialogState, map: impl Fn(&str) -> anyhow::Result<String>) {
     let Some(text) = d.text.clone() else {
         return;
@@ -307,8 +312,7 @@ fn retarget(d: &mut DialogState, map: impl Fn(&str) -> anyhow::Result<String>) {
     let to = match map(&text) {
         Ok(to) => to,
         Err(e) => {
-            (d.text, d.caret, d.anchor) = (None, None, None);
-            d.error = Some(format!("{text}: {e:#} — give the folder again"));
+            d.unplaced = Some(format!("{text}: {e:#}"));
             return;
         }
     };
@@ -640,9 +644,13 @@ impl Browser {
             && self.panels[self.active].dir == state.panels[state.active].folder
     }
 
-    /// Why `d` is not opened again here, if it is not: the list is not the one it was taken in,
-    /// or what it acts on (the bar's entry, the selection) is not what it acted on there.
+    /// Why `d` is not opened again here, if it is not: its target could not be placed here, the
+    /// list is not the one it was taken in, or what it acts on (the bar's entry, the selection)
+    /// is not what it acted on there.
     fn dialog_refused(&self, state: &SwitchState, d: &DialogState) -> Option<String> {
+        if let Some(why) = &d.unplaced {
+            return Some(why.clone());
+        }
         let p = &self.panels[self.active];
         if !self.at_source(state) {
             return Some(format!(
@@ -723,6 +731,19 @@ impl Browser {
                         None => {
                             self.run(ctx, command(d.kind));
                             self.ops.give_dialog(d);
+                            // Not on screen before this pass: its keys were meant for the list
+                            // (an Enter would confirm it unseen). The owner's next are its first.
+                            ctx.input_mut(|i| {
+                                i.events.retain(|e| {
+                                    !matches!(
+                                        e,
+                                        egui::Event::Key { .. }
+                                            | egui::Event::Text(_)
+                                            | egui::Event::Ime(_)
+                                            | egui::Event::Paste(_)
+                                    )
+                                })
+                            });
                         }
                         Some(why) => {
                             let line = format!("{} was not opened again: {why}", word(d.kind));
