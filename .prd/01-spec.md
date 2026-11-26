@@ -669,8 +669,12 @@ sopen gone — nothing is read from or written to the session again, and the win
 would lose; with unsaved edits or a job that writes it stays, after the fixed line `sopen-xtools-kept`, until it is
 closed there, no longer showing `[TUI]`. The session can die at any time while something still writes (a report
 after the window, a Save's progress), so HOST's sopen relays its standard output and error to the session through
-pipes of its own: a relay whose session is gone drains what it is given, and no write in sopen fails; the relays pass
-on their last bytes, the cue among them, before sopen exits (at most 2 s more for a child still holding one).
+pipes of its own: a relay whose session is gone drains what it is given, and no write in sopen fails. Each relay is
+asked before the session is let go, and before sopen exits, to pass on all it was given and answer; so the kept line
+said just before the session is let go reaches it (at most 2 s), and the state's cue reaches a peer that reads it
+slowly (at most 30 s: a peer that keeps the session open and stops reading holds sopen's end that long, as it held
+its writes before the relays); a dead session answers at once. Then the relays have at most 2 s more to end, for a
+child still holding one of the pipes.
 
 On HOST, sopen is looked for on PATH, then in the usual Homebrew and cargo install paths; when there is none HOST
 prints `sopen is not installed on HOST (brew install 2lab-ai/tap/sopen-preview)` and the run exits 127. A

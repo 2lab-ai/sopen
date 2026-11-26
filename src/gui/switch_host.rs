@@ -21,10 +21,13 @@
 //! file operation's report after the window, a viewer's `waiting…`, a completion line in a pass.
 //! A write to its dead pipe fails, `println!` and `eprintln!` panic on that, and what still
 //! writes is cut short. So the run's standard output and error are relayed ([`relay_stdio`]):
-//! fds 1 and 2 are pipes, and a thread copies each to the session's stream, kept aside; once a
-//! write there fails, or the session is let go, the thread only drains its pipe. Nothing in sopen
-//! ever writes to a dead session, and [`end_of_run`] lets the relays pass on the last bytes — the
-//! cue among them — before sopen exits. Order within each stream is kept.
+//! fds 1 and 2 are pipes, and a thread copies each to the session's stream, which it keeps aside
+//! and alone writes to; once a write there fails it only drains its pipe. Nothing in sopen ever
+//! writes to a dead session. The relays answer requests ([`Ask`]): each first passes on all that
+//! is in its pipe, then answers — so letting the session go ([`Ask::LetGo`], at most 2 s) never
+//! drops the kept cue said just before it, and [`end_of_run`] ([`Ask::Flush`]) waits for the state
+//! cue to reach a slow peer, up to [`CUE_WAIT`]. A dead session fails the write at once, so it is
+//! answered at once. Order within each stream is kept.
 //!
 //! The cues are fixed lines, as [`crate::url::TUNNEL_OPEN`] is, written ignoring write errors
 //! ([`crate::url::write_cue`]).
@@ -36,7 +39,7 @@ use anyhow::{Context as _, Result};
 use eframe::egui;
 use std::cell::RefCell;
 use std::io::{BufRead, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, PoisonError};
@@ -173,20 +176,23 @@ impl Cues {
     }
 }
 
-/// The session let go: its input and the two streams the relays write to become `/dev/null`
-/// (the relays drain into it from then on). Without relays, fds 1 and 2 themselves.
+/// The session let go: each relay asked to pass on all it was given, then to stop writing to the
+/// session and close its stream there ([`Ask::LetGo`]) — waited for at most [`RELAY_WAIT`] — and
+/// the input put on `/dev/null`. Without relays, fds 1 and 2 on `/dev/null` too.
 fn let_go_of_the_session() {
     let _ = std::io::stdout().flush();
-    let session = RELAYS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .as_ref()
-        .map_or([1, 2], |r| r.session);
-    on_null([0].into_iter().chain(session));
+    let mut relays = RELAYS.lock().unwrap_or_else(PoisonError::into_inner);
+    match relays.as_mut() {
+        Some(relays) => {
+            relays.ask(Ask::LetGo, RELAY_WAIT);
+            on_null([0]);
+        }
+        None => on_null([0, 1, 2]),
+    }
 }
 
-/// `/dev/null` put on each of `fds`, this process's own: what is written there goes nowhere,
-/// what is read there has ended.
+/// `/dev/null` put on each of `fds`, this process's standard ones: what is written there goes
+/// nowhere, what is read there has ended. They stay inheritable, as standard streams are.
 fn on_null(fds: impl IntoIterator<Item = RawFd>) {
     let Ok(null) = std::fs::OpenOptions::new()
         .read(true)
@@ -207,22 +213,76 @@ fn on_null(fds: impl IntoIterator<Item = RawFd>) {
 /// The relays of this process's standard output and error while they run ([`relay_stdio`]).
 static RELAYS: Mutex<Option<Relays>> = Mutex::new(None);
 
-/// What [`end_of_run`] and [`let_go_of_the_session`] need of the relays.
+/// The way to each relay, and their word once they have ended.
 struct Relays {
-    /// The session's standard output and error, kept aside: never closed before sopen exits (a
-    /// relay may still write there), only put on `/dev/null` when the session is let go.
-    session: [RawFd; 2],
+    lines: Vec<Line>,
     /// A word from each relay once its pipe has ended and all it read is passed on.
     ended: mpsc::Receiver<()>,
 }
 
-/// How long [`end_of_run`] waits for the relays: a child that inherited fd 1 or 2 and still
-/// runs holds its pipe open past sopen's own end.
+impl Relays {
+    /// `ask` of every relay, each answered once done — or by its end — waited for at most `wait`
+    /// in all.
+    fn ask(&mut self, ask: Ask, wait: Duration) {
+        let answers: Vec<_> = self.lines.iter_mut().map(|line| line.ask(ask)).collect();
+        let deadline = Instant::now() + wait;
+        for answer in answers {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if let Err(mpsc::RecvTimeoutError::Timeout) = answer.recv_timeout(left) {
+                return;
+            }
+        }
+    }
+}
+
+/// How long letting the session go waits for the relays (on the window's thread, once), and
+/// [`end_of_run`] for them to end: a child that inherited fd 1 or 2 and still runs holds its pipe
+/// open past sopen's own end.
 const RELAY_WAIT: Duration = Duration::from_secs(2);
 
-/// Fds 1 and 2 put on pipes, each relayed by a thread of its own to the session's stream it
-/// replaces, kept aside (see the module's header). A child started from then on inherits the
-/// pipe as it inherited the session. Once per process; a second call does nothing.
+/// How long [`end_of_run`] waits for the relays to pass on what sopen wrote — the state's cue
+/// among it — to a session still read but slowly (a slow link). A peer that keeps the session open
+/// and stops reading holds sopen's end this long (as it held its writes before the relays).
+const CUE_WAIT: Duration = Duration::from_secs(30);
+
+/// What a relay is asked: first, always, to pass on all that is in its pipe now (children may
+/// still hold its write end: no waiting for its end), then nothing more ([`Ask::Flush`]) or to
+/// stop writing to the session and close its stream there ([`Ask::LetGo`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    Flush,
+    LetGo,
+}
+
+/// One request and where its answer goes: a relay that has ended drops it unanswered, which is
+/// an answer too (all it was given is passed on, or it never will be).
+struct Request {
+    ask: Ask,
+    answer: mpsc::Sender<()>,
+}
+
+/// The way to one relay: its requests, and the pipe whose byte wakes it from its `poll`.
+struct Line {
+    requests: mpsc::Sender<Request>,
+    wake: std::io::PipeWriter,
+}
+
+impl Line {
+    /// `ask` sent; its answer's receiver (one that has ended is answered at once).
+    fn ask(&mut self, ask: Ask) -> mpsc::Receiver<()> {
+        let (answer, answered) = mpsc::channel();
+        if self.requests.send(Request { ask, answer }).is_ok() {
+            // An error: the relay has ended, and its requests went with it.
+            let _ = self.wake.write_all(&[1]);
+        }
+        answered
+    }
+}
+
+/// Fds 1 and 2 put on pipes, each relayed by a thread of its own ([`relay`]) to the session's
+/// stream it replaces, which the relay keeps aside and alone writes to (see the module's header).
+/// A child started from then on inherits the pipe as it inherited the session. Once per process;
+/// a second call does nothing.
 pub(crate) fn relay_stdio() -> std::io::Result<()> {
     let mut relays = RELAYS.lock().unwrap_or_else(PoisonError::into_inner);
     if relays.is_some() {
@@ -230,24 +290,19 @@ pub(crate) fn relay_stdio() -> std::io::Result<()> {
     }
     let _ = std::io::stdout().flush();
     let (done, ended) = mpsc::channel();
-    let mut session = [-1; 2];
+    let mut lines = Vec::new();
     let mut ends = Vec::new();
-    for (i, fd) in [1, 2].into_iter().enumerate() {
+    for fd in [1, 2] {
         let (from, into) = std::io::pipe()?;
         // SAFETY: a copy of this process's own standard stream, close-on-exec: no child holds
-        // the session through it.
+        // the session through it. The relay owns it from here.
         let kept = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
         if kept < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        session[i] = kept;
-        let done = done.clone();
-        std::thread::Builder::new()
-            .name(format!("sopen-relay-{fd}"))
-            .spawn(move || {
-                relay(from, SessionFd(kept));
-                let _ = done.send(());
-            })?;
+        // SAFETY: `kept` is this process's, open, and owned by nothing else.
+        let session = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(kept) });
+        lines.push(start_relay(fd, from, session, done.clone())?);
         ends.push((into, fd));
     }
     // Only once both relays run does anything write into a pipe.
@@ -257,45 +312,144 @@ pub(crate) fn relay_stdio() -> std::io::Result<()> {
             libc::dup2(into.as_raw_fd(), fd);
         }
     }
-    *relays = Some(Relays { session, ended });
+    *relays = Some(Relays { lines, ended });
     Ok(())
 }
 
-/// One of the session's streams, kept aside, written to by its descriptor (never closed here).
-struct SessionFd(RawFd);
+/// A relay of `from` to `to` on a thread of its own (named for fd `fd`), which says `done` when
+/// it has ended; the way to ask it.
+fn start_relay<W: Write + Send + 'static>(
+    fd: RawFd,
+    from: std::io::PipeReader,
+    to: W,
+    done: mpsc::Sender<()>,
+) -> std::io::Result<Line> {
+    let (requests, asked) = mpsc::channel();
+    let (woken, wake) = std::io::pipe()?;
+    std::thread::Builder::new()
+        .name(format!("sopen-relay-{fd}"))
+        .spawn(move || {
+            relay(from, to, asked, woken);
+            let _ = done.send(());
+        })?;
+    Ok(Line { requests, wake })
+}
 
-impl Write for SessionFd {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // SAFETY: a write of `buf` to a descriptor this process owns.
-        let n = unsafe { libc::write(self.0, buf.as_ptr().cast(), buf.len()) };
-        if n < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
+/// Copies `from` to `to` until `from` ends, and answers what it is asked on `asked` (each request
+/// with a byte on `woken`): it passes on all that is in `from` now, then answers — after
+/// [`Ask::LetGo`] it writes nothing more and closes `to`. Once a write to `to` fails — the session
+/// gone — it only drains `from`, so whatever writes into it never sees an error. A slow peer holds
+/// it in its write; a request is answered after that.
+fn relay(
+    from: std::io::PipeReader,
+    to: impl Write,
+    asked: mpsc::Receiver<Request>,
+    woken: std::io::PipeReader,
+) {
+    let mut to = Some(to);
+    let mut from = from;
+    let mut woken = Some(woken);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: from.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                // A negative fd is not looked at: the way to ask is gone.
+                fd: woken.as_ref().map_or(-1, |w| w.as_raw_fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two pollfds of this process's own descriptors.
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
         }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        if fds[1].revents != 0 {
+            let mut bytes = [0u8; 64];
+            if let Some(w) = woken.as_mut() {
+                if matches!(w.read(&mut bytes), Ok(0) | Err(_)) {
+                    woken = None;
+                }
+            }
+            while let Ok(request) = asked.try_recv() {
+                let ended = pass_on_what_is_there(&mut from, &mut to, &mut chunk);
+                if request.ask == Ask::LetGo {
+                    to = None;
+                }
+                let _ = request.answer.send(());
+                if ended {
+                    return;
+                }
+            }
+        }
+        if fds[0].revents != 0 {
+            match from.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => pass_on(&mut to, &chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            }
+        }
     }
 }
 
-/// Copies `from` to `to` until `from` ends; once a write to `to` fails — the session gone — it
-/// only drains `from`, so whatever writes into it never sees an error.
-fn relay(mut from: impl Read, mut to: impl Write) {
-    let mut chunk = [0u8; 8192];
-    let mut live = true;
+/// Reads `from` while it has something now — no wait between reads — and passes it on; whether
+/// `from` has ended.
+fn pass_on_what_is_there(
+    from: &mut std::io::PipeReader,
+    to: &mut Option<impl Write>,
+    chunk: &mut [u8],
+) -> bool {
     loop {
-        match from.read(&mut chunk) {
-            Ok(0) => return,
-            Ok(n) => {
-                if live && to.write_all(&chunk[..n]).is_err() {
-                    live = false;
+        let mut fd = libc::pollfd {
+            fd: from.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one pollfd of this process's own descriptor, no wait.
+        match unsafe { libc::poll(&mut fd, 1, 0) } {
+            0 => return false,
+            n if n < 0 => {
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    return false;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return,
+            _ => match from.read(chunk) {
+                Ok(0) => return true,
+                Ok(n) => pass_on(to, &chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return true,
+            },
         }
+    }
+}
+
+/// `bytes` written to the session, unless it is gone: a failed write — the session's reader gone
+/// — closes it here, and nothing is written to it again.
+fn pass_on(to: &mut Option<impl Write>, bytes: &[u8]) {
+    #[cfg(test)]
+    test_delay();
+    if let Some(out) = to.as_mut() {
+        if out.write_all(bytes).is_err() {
+            *to = None;
+        }
+    }
+}
+
+/// Tests: each relay waits this long before a write it passes on (`SOPEN_TEST_RELAY_DELAY_MS`),
+/// as a slow peer holds it — read only in a test build.
+#[cfg(test)]
+fn test_delay() {
+    let ms = std::env::var("SOPEN_TEST_RELAY_DELAY_MS").ok();
+    if let Some(ms) = ms.and_then(|ms| ms.parse().ok()) {
+        std::thread::sleep(Duration::from_millis(ms));
     }
 }
 
@@ -310,17 +464,18 @@ impl Drop for EndOfRun {
 }
 
 /// The end of a `--state-stdin` run, `main`'s last step ([`EndOfRun`]; `gui::give_up` before its
-/// exit too): fds 1 and 2 put on `/dev/null`, so the pipes' write ends close, and the relays let
-/// finish passing on what they still hold — the cue among it — for at most [`RELAY_WAIT`].
-/// Nothing for any other run.
+/// exit too): each relay asked to pass on all sopen wrote — the cue among it — and waited for at
+/// most [`CUE_WAIT`]; then fds 1 and 2 put on `/dev/null`, so the pipes' write ends close, and the
+/// relays given at most [`RELAY_WAIT`] to end. Nothing for any other run.
 pub fn end_of_run() {
-    let Some(relays) = RELAYS.lock().unwrap_or_else(PoisonError::into_inner).take() else {
+    let Some(mut relays) = RELAYS.lock().unwrap_or_else(PoisonError::into_inner).take() else {
         return;
     };
     let _ = std::io::stdout().flush();
+    relays.ask(Ask::Flush, CUE_WAIT);
     on_null([1, 2]);
     let deadline = Instant::now() + RELAY_WAIT;
-    for _ in relays.session {
+    for _ in &relays.lines {
         let left = deadline.saturating_duration_since(Instant::now());
         if relays.ended.recv_timeout(left).is_err() {
             return;

@@ -638,32 +638,87 @@ fn the_button_goes_with_the_session() {
     assert_eq!(said.text(), format!("{KEPT_CUE}\n"));
 }
 
+/// The window in the wrappers `run_window` puts it in — the cells receipt's `Receipted` (no
+/// receipt asked) and the `Shell` eframe runs — so a pass reaches it through each of their hops.
+type Shelled = crate::gui::Shell<crate::gui::Receipted<Switched>>;
+
+fn shelled(w: Switched) -> Shelled {
+    crate::gui::Shell {
+        inner: crate::gui::Receipted {
+            inner: w,
+            dump: None,
+        },
+        scripted: false,
+        shot: None,
+        frames: 0,
+        started: std::time::Instant::now(),
+        focus_asked: None,
+        raise: crate::gui::Raise::Done,
+        press: crate::gui::Press::Done,
+        fkeys: None,
+        closed: Arc::default(),
+        web: None,
+    }
+}
+
+/// One pass of a hidden window as eframe runs it (`update_logic_only`: the shell's `logic` alone,
+/// in `run_logic`); whether it asked to close.
+fn hidden_pass(drv: &Driver, shell: &mut Shelled) -> bool {
+    let mut frame = eframe::Frame::_new_kittest();
+    let out = drv.ctx.run_logic(&egui::RawInput::default(), |ctx| {
+        eframe::App::logic(shell, ctx, &mut frame)
+    });
+    out.viewport_commands
+        .get(&egui::ViewportId::ROOT)
+        .is_some_and(|c| c.contains(&egui::ViewportCommand::Close))
+}
+
+/// A run of HOST's half on `root` at `state` whose window is in the shell's wrappers ([`shelled`]),
+/// driven by `drive`: what the run returned.
+fn host_shelled(
+    root: &str,
+    state: &SwitchState,
+    input: &Input,
+    said: &Said,
+    drive: impl FnOnce(&mut Driver, &mut Shelled),
+) -> Result<Outcome> {
+    let tmp = tempfile::tempdir().unwrap();
+    run_on(
+        start(tmp.path(), root, None),
+        &Hooks::default(),
+        sent(state),
+        input.clone(),
+        said.cues(),
+        |_, w| {
+            let mut shell = shelled(w);
+            let mut drv = driver();
+            drv.as_shell();
+            drive(&mut drv, &mut shell);
+            Ok(())
+        },
+    )
+}
+
 /// A hidden window is not drawn — eframe runs only the shell's `logic` then — yet it hears its
-/// input's end there: with nothing to lose it asks to close, with unsaved edits it says
-/// [`KEPT_CUE`] and stays.
+/// input's end there, through the shell and the receipt's wrapper: with nothing to lose it asks to
+/// close, with unsaved edits it says [`KEPT_CUE`] and stays.
 #[test]
 fn a_hidden_window_hears_the_input_end() {
     let (_tmp, root) = root();
-    let hidden = |drv: &mut Driver, w: &mut Switched| {
-        let out = drv
-            .ctx
-            .run_logic(&egui::RawInput::default(), |ctx| w.logic(ctx));
-        out.viewport_commands
-            .get(&egui::ViewportId::ROOT)
-            .is_some_and(|c| c.contains(&egui::ViewportCommand::Close))
-    };
     let input = Input::default();
     let said = Said::default();
-    let ran = host(
+    let ran = host_shelled(
         &root,
-        None,
         &at(&root, "notes.txt"),
         &input,
         &said,
-        |drv, w| {
-            settle(drv, w);
+        |drv, shell| {
+            settle(drv, &mut shell.inner.inner);
             input.end();
-            assert!(hidden(drv, w), "nothing to lose: it asks to close, undrawn");
+            assert!(
+                hidden_pass(drv, shell),
+                "nothing to lose: it asks to close, undrawn"
+            );
         },
     );
     ran.unwrap();
@@ -671,43 +726,134 @@ fn a_hidden_window_hears_the_input_end() {
     assert!(said.gone.get(), "the session is let go");
     let input = Input::default();
     let said = Said::default();
-    let ran = host(
+    let ran = host_shelled(
         &root,
-        None,
         &at(&root, "data.bin"),
         &input,
         &said,
-        |drv, w| {
+        |drv, shell| {
+            let w = &mut shell.inner.inner;
             settle(drv, w);
             edit_bytes(drv, w);
             input.end();
-            assert!(!hidden(drv, w), "kept");
+            assert!(!hidden_pass(drv, shell), "kept");
             assert_eq!(said.text(), format!("{KEPT_CUE}\n"), "said undrawn");
             assert!(said.gone.get(), "the session is let go");
-            drv.key(w, Key::W, Modifiers::COMMAND);
-            drv.idle(w, 2);
-            drv.click_text_on_top(w, "Discard");
-            drv.idle(w, 3);
-            assert!(drv.window_closed, "closed there");
         },
     );
     ran.unwrap();
     assert_eq!(said.text(), format!("{KEPT_CUE}\n"));
 }
 
+/// Set in a child of the cue tests below: which part of HOST's sopen it plays.
+const CUE_CHILD: &str = "SOPEN_TEST_CUE_CHILD";
+
+/// The state cue's line the "state" child says.
+fn a_state_cue() -> String {
+    format!("{STATE_CUE} {{\"v\":1}}")
+}
+
+/// The child's part, through the real relays ([`relay_stdio`]), cues ([`Cues::stdio`]), let go
+/// ([`let_go_of_the_session`]) and end ([`end_of_run`]): "kept" says the kept cue and lets the
+/// session go, as `keep()` does; "state" says a state cue and ends, as `run`'s caller does.
+fn play_host(part: &str) {
+    relay_stdio().expect("fds 1 and 2 relayed");
+    let mut cues = Cues::stdio();
+    match part {
+        "kept" => {
+            cues.say(KEPT_CUE);
+            cues.let_go();
+        }
+        _ => cues.say(&a_state_cue()),
+    }
+    end_of_run();
+}
+
+/// This test binary's `test` run as a child playing HOST's `part`, its relays holding each write
+/// `delay_ms` as a slow peer would; the other side reads its output to the end all along: what it
+/// read, and how the child ended.
+fn cue_child(test: &str, part: &str, delay_ms: u64) -> (String, std::process::ExitStatus) {
+    use std::io::Read as _;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CUE_CHILD, part)
+        .env("SOPEN_TEST_RELAY_DELAY_MS", delay_ms.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::BufReader::new(stdout).read_to_string(&mut text);
+        let _ = tx.send(text);
+    });
+    let read = rx.recv_timeout(std::time::Duration::from_secs(120));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the child did not end");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    (read.expect("its output ends"), status)
+}
+
+/// The kept cue reaches a session that is still read (the other side's input closed, its output
+/// still read: 10 §7.3's "stays open: it has unsaved edits"), though the relay holds it a while
+/// when the session is let go: the relay lets go only after passing on what it was given.
+#[test]
+fn the_kept_cue_reaches_the_session_before_it_is_let_go() {
+    if let Ok(part) = std::env::var(CUE_CHILD) {
+        return play_host(&part);
+    }
+    let (read, status) = cue_child(
+        "gui::switch_host::tests::the_kept_cue_reaches_the_session_before_it_is_let_go",
+        "kept",
+        300,
+    );
+    assert!(status.success(), "the child ended {status:?}");
+    // The test harness's `test … ... ` stands before it on its line.
+    assert!(
+        read.lines().any(|l| l.ends_with(KEPT_CUE)),
+        "read: {read:?}"
+    );
+}
+
+/// The state cue reaches a peer that takes 3 s to take it (a slow link): `end_of_run` waits for
+/// the relays to pass on all they were given — up to [`CUE_WAIT`] — not 2 s. An `end_of_run` that
+/// waits for nothing loses it too.
+#[test]
+fn the_state_cue_waits_for_a_slow_peer() {
+    if let Ok(part) = std::env::var(CUE_CHILD) {
+        return play_host(&part);
+    }
+    let (read, status) = cue_child(
+        "gui::switch_host::tests::the_state_cue_waits_for_a_slow_peer",
+        "state",
+        3000,
+    );
+    assert!(status.success(), "the child ended {status:?}");
+    let cue = a_state_cue();
+    assert!(read.lines().any(|l| l.ends_with(&cue)), "read: {read:?}");
+}
+
 /// A relay (the session's output, `--state-stdin`) whose session has gone drains: what is
-/// written into it — far more than a pipe holds — always goes through, and it ends at its
-/// input's end.
+/// written into it — far more than a pipe holds — always goes through, what it is asked is
+/// answered at once, and it ends at its input's end.
 #[test]
 fn a_relay_drains_once_its_session_is_gone() {
     let (gone, session) = std::io::pipe().unwrap();
     drop(gone);
     let (from, mut into) = std::io::pipe().unwrap();
     let (ended, relay_ended) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        relay(from, session);
-        let _ = ended.send(());
-    });
+    let mut line = start_relay(1, from, session, ended).unwrap();
     let (wrote, written) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let all = (0..256).try_for_each(|_| into.write_all(&[b'x'; 8192]));
@@ -717,9 +863,40 @@ fn a_relay_drains_once_its_session_is_gone() {
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the writes never stall");
     assert_eq!(all, Ok(()), "every write went through");
+    let answer = line.ask(Ask::Flush);
+    let answered = answer.recv_timeout(std::time::Duration::from_secs(10));
+    assert!(
+        !matches!(answered, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+        "answered at once"
+    );
     relay_ended
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the relay ends at its input's end");
+}
+
+/// A relay asked to let go passes on what it was given first — in order, all of it — then writes
+/// nothing more and closes its stream to the session (its reader sees the end); one asked only
+/// to flush goes on.
+#[test]
+fn a_relay_lets_go_only_after_passing_on_what_it_was_given() {
+    use std::io::Read as _;
+    let (mut peer, session) = std::io::pipe().unwrap();
+    let (from, mut into) = std::io::pipe().unwrap();
+    let (ended, _relay_ended) = std::sync::mpsc::channel();
+    let mut line = start_relay(1, from, session, ended).unwrap();
+    into.write_all(b"one\n").unwrap();
+    line.ask(Ask::Flush)
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("flushed");
+    into.write_all(b"two\n").unwrap();
+    line.ask(Ask::LetGo)
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("let go");
+    into.write_all(b"three\n").unwrap();
+    let mut read = String::new();
+    // The end comes from the relay's close: `into` is still open here.
+    peer.read_to_string(&mut read).unwrap();
+    assert_eq!(read, "one\ntwo\n");
 }
 
 /// Set in the child of [`a_dead_session_never_stops_what_still_writes`]: where its job lands.
