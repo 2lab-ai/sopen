@@ -864,3 +864,43 @@ fn r2_the_keep_field_always_has_cells_when_it_is_a_tab_stop() {
         unblock(&blocked);
     }
 }
+
+/// R3: the close prompt never moves under the pointer. Its own journal write held at its gate:
+/// on the prompt's first pass the box and its buttons are where they will stay — the row that
+/// names where Discard deletes the kept edits is reserved, saying they are being kept — and once
+/// the write has landed (the row naming the journal now) the box covers the same cells and each
+/// button the same rect.
+#[test]
+fn r3_the_prompt_box_does_not_move_when_its_write_lands() {
+    let mut ed = ed(&body());
+    let gate = Arc::new(AtomicBool::new(true));
+    // Let go if the test fails first: the window's end waits for the write.
+    let _open = Opens(gate.clone());
+    ed.win.generation_gate = Some(gate.clone());
+    ed.typed("AB");
+    assert!(!ed.win.close_requested());
+    assert!(ed.win.writing.is_some(), "the prompt's write, held");
+    ed.frames(1);
+    let buttons = ["[ Discard ]", "[ Cancel ]"];
+    let rects = |ed: &Ed| -> Vec<egui::Rect> {
+        buttons
+            .iter()
+            .map(|b| ed.drv.find_text(b).unwrap_or_else(|| panic!("{b}")))
+            .collect()
+    };
+    let (box_before, buttons_before) = (ed.win.questions_cover(), rects(&ed));
+    gate.store(false, Ordering::SeqCst);
+    ed.drv.until(&mut ed.win, 20, |w| w.ready());
+    ed.frames(1);
+    let dir = ed.win.journal_dir.clone().expect("kept");
+    let deletes = format!(
+        "Discard deletes the kept edits at {}",
+        crate::gui::binary::tilde(&dir)
+    );
+    assert!(
+        shown_wrapped(&ed.drv, &deletes),
+        "the row names the journal"
+    );
+    assert_eq!(ed.win.questions_cover(), box_before, "the box moved");
+    assert_eq!(rects(&ed), buttons_before, "a button moved");
+}

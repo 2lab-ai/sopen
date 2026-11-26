@@ -403,6 +403,8 @@ fn keys_in_a_viewer_never_move_the_list() {
     // Esc ends editing; the next one leaves.
     fx.key(Key::Escape);
     fx.key(Key::Escape);
+    // The hex window's own journal write lands and its prompt gains a row: settled first.
+    fx.settle();
     // The byte typed is an edit: the hex window asks.
     assert!(fx.drv.find_text("Unsaved changes").is_some());
     fx.drv.click_text(&mut fx.b, "[ Discard ]");
@@ -430,6 +432,8 @@ fn a_viewers_f_keys_join_the_browsers_row() {
         "F8 put the typing in the ASCII column"
     );
     fx.key(Key::F3);
+    // The hex window's own journal write lands and its prompt gains a row: settled first.
+    fx.settle();
     assert!(
         fx.drv.find_text("Unsaved changes").is_some(),
         "the hex window asks"
@@ -473,6 +477,8 @@ fn a_hosted_hex_viewers_f5_and_f6_work_and_respect_its_prompt() {
     // Esc ends editing; the next one, with that edit: the prompt; F5 under it saves nothing.
     fx.key(Key::Escape);
     fx.key(Key::Escape);
+    // The hex window's own journal write lands and its prompt gains a row: settled first.
+    fx.settle();
     assert!(fx.drv.find_text("Unsaved changes").is_some());
     fx.key(Key::F5);
     fx.drv.idle(&mut fx.b, 5);

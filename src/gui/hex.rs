@@ -2124,6 +2124,11 @@ fn prompt_id() -> egui::Id {
     egui::Id::unique("sopen-hex-unsaved")
 }
 
+/// The close prompt's title in its frame.
+const PROMPT_TITLE: &str = "Unsaved changes";
+/// The close prompt's row for where Discard deletes the kept edits, until they are kept.
+const KEEPING_EDITS: &str = "keeping the edits…";
+
 fn confirm_id() -> egui::Id {
     egui::Id::unique("sopen-hex-confirm")
 }
@@ -5090,12 +5095,45 @@ impl HexWindow {
             Part::Blank,
             Part::Buttons(buttons),
         ];
-        if let Some(dir) = &self.journal_dir {
+        let deletes = |dir: &Path| {
             let tilde = super::binary::tilde(dir);
-            let deletes = format!("Discard deletes the kept edits at {tilde}");
-            parts.push(Part::Text(deletes, Ink::Weak));
+            format!("Discard deletes the kept edits at {tilde}")
+        };
+        if let Some(dir) = &self.journal_dir {
+            parts.push(Part::Text(deletes(dir), Ink::Weak));
+            return Some(dialog::layout(grid, PROMPT_TITLE, PROMPT_WIDE, &parts));
         }
-        Some(dialog::layout(grid, "Unsaved changes", PROMPT_WIDE, &parts))
+        let keep = self.schedule.status();
+        if keep == Keep::Clean {
+            return Some(dialog::layout(grid, PROMPT_TITLE, PROMPT_WIDE, &parts));
+        }
+        // The edits not in the journal yet (its write on its way, or refused): the rows its
+        // line will take are reserved — measured on the folder's name as the write makes it,
+        // whose stamp and hex are of a fixed width — at the box's width with that line, so the
+        // box and its buttons never move under the pointer when the write lands; until then
+        // the first of them says the edits are being kept (or why they are not), dim.
+        let mut whole = parts.clone();
+        whole.push(Part::Text(deletes(&self.journal_to_be()), Ink::Weak));
+        let laid = dialog::layout(grid, PROMPT_TITLE, PROMPT_WIDE, &whole);
+        let inside = usize::from(laid.covers()[0].width.saturating_sub(4)).max(1);
+        let rows = dialog::wrap(&deletes(&self.journal_to_be()), inside).len();
+        let said = match keep {
+            Keep::NotKept(why) => format!("the edits are kept nowhere: {why}"),
+            _ => KEEPING_EDITS.to_string(),
+        };
+        parts.push(Part::Text(cells::fit_start(&said, inside), Ink::Weak));
+        parts.extend((1..rows).map(|_| Part::Blank));
+        Some(dialog::layout(grid, PROMPT_TITLE, inside, &parts))
+    }
+
+    /// The journal folder a first generation makes for this file, its stamp and hex as zeros:
+    /// `<cache>/.edits/<host>/<path>.journal-<YYYYMMDDTHHMMSSZ>-<8 hex>` (`Journal::create`),
+    /// of the same cells as the one it will make.
+    fn journal_to_be(&self) -> PathBuf {
+        let (host, abs, cache) = &self.home;
+        let mut path = crate::cache::edits_path(cache, host, abs).into_os_string();
+        path.push(".journal-00000000T000000Z-00000000");
+        PathBuf::from(path)
     }
 
     /// The first Save's question above 256 MiB laid out on `grid`; `None` while it is not up.

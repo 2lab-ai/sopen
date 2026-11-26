@@ -1057,7 +1057,10 @@ fn closing_with_unsaved_edits_asks() {
     fx.typed("00");
     assert!(!fx.win.close_requested());
     assert!(fx.win.prompt);
-    fx.drv.idle(&mut fx.win, 2);
+    // The prompt's own journal write lands and its box gains a row (where Discard deletes the
+    // kept edits): only then do its buttons stand where a click finds them.
+    fx.drv.until(&mut fx.win, 20, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 1);
     for label in ["[ Discard ]", "[ Cancel ]"] {
         assert!(fx.drv.find_text(label).is_some(), "{label}");
     }
@@ -2652,7 +2655,10 @@ fn read_only_with_unlisted_edits_asks_before_closing_and_retries() {
     assert!(fx.win.read_only.is_some());
     assert!(fx.lists().is_empty());
     assert!(!fx.win.close_requested(), "closed with unlisted edits");
-    fx.drv.idle(&mut fx.win, 2);
+    // The prompt's own journal write lands and its box gains a row (where Discard deletes the
+    // kept edits): only then do its buttons stand where a click finds them.
+    fx.drv.until(&mut fx.win, 20, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 1);
     for label in ["[ Discard ]", "[ Cancel ]"] {
         assert!(fx.drv.find_text(label).is_some(), "{label}");
     }
@@ -3135,6 +3141,10 @@ fn f3_on_a_dirty_window_brings_up_the_prompt_and_discard_closes() {
     fx.key(Key::F3, Modifiers::NONE);
     assert_eq!(fx.drv.refused_closes, 1, "an edit: the close is refused");
     assert!(!fx.drv.window_closed);
+    // The prompt's own journal write lands and its box gains a row (where Discard deletes the
+    // kept edits): only then do its buttons stand where a click finds them.
+    fx.drv.until(&mut fx.win, 20, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 1);
     assert!(fx.drv.find_text("Unsaved changes").is_some(), "the prompt");
     fx.drv.click_text(&mut fx.win, "[ Discard ]");
     fx.drv.idle(&mut fx.win, 1);
@@ -3197,7 +3207,11 @@ fn f5_f6_f8_respect_a_focused_field_the_prompt_a_save_and_read_only() {
     // The prompt is up.
     assert!(!fx.win.close_requested());
     assert!(fx.win.prompt);
-    fx.drv.idle(&mut fx.win, 2);
+    // The prompt's own journal write lands and its box gains a row (where Discard deletes the
+    // kept edits): only then do its buttons stand where a click finds them.
+    fx.drv.until(&mut fx.win, 20, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 1);
+
     let pane = fx.win.cursor.pane;
     for key in [Key::F5, Key::F6, Key::F8] {
         fx.key(key, Modifiers::NONE);
@@ -3232,6 +3246,10 @@ fn close_ask_brings_up_the_prompt_in_the_dialog_look() {
     fx.win.ask_close = true;
     fx.drv.idle(&mut fx.win, 3);
     assert!(fx.win.prompt);
+    // The prompt's own journal write lands and its box gains a row (where Discard deletes the
+    // kept edits): only then do its buttons stand where a click finds them.
+    fx.drv.until(&mut fx.win, 20, |w| w.ready());
+    fx.drv.idle(&mut fx.win, 1);
     assert!(!fx.win.ask_close, "asked once");
     let p = chrome::PALETTE;
     let title = cell_row_of(&fx.drv, " Unsaved changes ").expect("its title");
