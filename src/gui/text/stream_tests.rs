@@ -8,7 +8,7 @@ use super::*;
 use crate::gui::testkit::{command, Driver};
 use crate::remote::{fake, Asked, Change, Clock, FakeControl, FakeFile, Fault, Link};
 use crate::stream::{Engine, Opening, Settings, State as Streamed, BLOCK};
-use eframe::egui::{Key, Modifiers};
+use eframe::egui::{Key, Modifiers, Pos2, Rect};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -897,8 +897,8 @@ fn a_failed_page_read_keeps_the_screen_and_says_why() {
         );
         assert_eq!(rows(&win), before, "the screen stays");
         assert!(win.ready(), "a failed read is not a pending one");
-        // The next pass says why, and reads again.
-        drv.idle(&mut win, 1);
+        // The status row of that pass says why (it is laid out after the page's read); the
+        // next pass reads again.
         assert!(says(&drv, HUNG_UP), "{:?}", painted(&drv));
         drv.idle(&mut win, 2);
         assert!(!says(&drv, HUNG_UP), "{:?}", painted(&drv));
@@ -2200,7 +2200,9 @@ fn a_full_page_at_the_indexed_end_is_read_again_only_if_its_last_line_grew() {
                     let mut win = net.window("notes.txt");
                     win.wrap = wrap;
                     // The page that ends with the last line block 0 has.
-                    let rows_fit = 26;
+                    // 500 points: 31 rows of cells, the bar, the frame's two lines and the status row
+                    // left out.
+                    let rows_fit = 27;
                     win.jump = Some(Jump::Byte(((in_block - rows_fit) * line) as u64));
                     let mut drv = Driver::new(800.0, 500.0);
                     run(&mut drv, &mut win, &mut net, "the first screen", |w, _| {
@@ -2883,7 +2885,8 @@ fn a_pass_read_a_byte_at_a_time_picks_as_a_whole_block_does() {
         };
         let inner = stream.pass.take().expect("the pass's reader");
         stream.pass = Some(Box::new(Trickle { inner, most: 1 }));
-        let mut drv = Driver::new(800.0, 500.0);
+        // Wide enough for the first line on one row: its 44 syllables take 88 cells.
+        let mut drv = Driver::new(1000.0, 500.0);
         run(&mut drv, &mut win, &mut net, "the index", |w, _| {
             w.doc.whole() && w.ready()
         });
@@ -2941,7 +2944,8 @@ fn a_pass_that_ends_short_of_the_sample_indexes_what_it_read() {
         };
         let inner = stream.pass.take().expect("the pass's reader");
         stream.pass = Some(Box::new(Short { inner, end }));
-        let mut drv = Driver::new(800.0, 500.0);
+        // Wide enough for the first line on one row: its 44 syllables take 88 cells.
+        let mut drv = Driver::new(1000.0, 500.0);
         for _ in 0..400 {
             drv.idle(&mut win, 1);
             if !net.reply() {

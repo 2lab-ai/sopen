@@ -150,8 +150,9 @@ fn ea3_cp949_inside_and_past_the_16_mib_index_reads_as_the_whole_file_decode() {
         assert!(!win.ready());
         let rows = win.page.as_ref().unwrap().rows.len();
         assert_eq!(check_rows(&win, &w_ii, "(ii) before"), rows);
+        // (The status row is cut to its cells: its start.)
         assert!(
-            says(&drv, "CP949: no character boundary known here"),
+            says(&drv, "CP949: no character boundary"),
             "{:?}",
             painted(&drv)
         );
@@ -198,11 +199,13 @@ fn ea3_cp949_inside_and_past_the_16_mib_index_reads_as_the_whole_file_decode() {
         let rows = win.page.as_ref().unwrap().rows.len();
         assert_eq!(check_rows(&win, &w_iii, "(iii)"), rows, "all marks");
         assert!(win.phase_read.is_none() && win.doc.phases.wanted.is_none());
+        // The status row says why, cut to its cells after the place: its start shows.
+        let said = win.status_line().1.text;
         assert!(
-            says(&drv, "CP949: no character boundary known here"),
-            "{:?}",
-            painted(&drv)
+            said.starts_with("CP949: no character boundary known here"),
+            "{said}"
         );
+        assert!(says(&drv, "CP949: n"), "{:?}", painted(&drv));
         for key in [Key::PageUp, Key::PageDown, Key::PageDown] {
             drv.key(&mut win, key, Modifiers::NONE);
             run(&mut drv, &mut win, &mut net, "(iii) paging", settled);
