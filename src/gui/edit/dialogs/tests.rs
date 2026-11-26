@@ -490,28 +490,41 @@ fn a_given_up_save_or_a_new_exit_drops_the_waiting_one() {
     assert_eq!(v.take_chosen(), vec![]);
 }
 
-/// The binding as ED-layout will run it: each pass's keys and text given to the editor's
-/// keys first, its exit commands to [`EditView::leave`], then the view's pass — and the events
-/// the pass leaves for whatever comes after it.
+/// The binding as ED-layout will run it, keeping the contract: each pass's inputs given to
+/// the editor's keys in their order until a dialog is up — its exit commands to
+/// [`EditView::leave`] — every event it gave removed from the pass, then the view's pass; and
+/// the events the pass leaves for whatever comes after it.
 struct Bound(EditView, Vec<Event>);
 
 impl crate::gui::Window for Bound {
     fn ui(&mut self, ui: &mut egui::Ui) {
-        for e in ui.ctx().input(|i| i.events.clone()) {
-            let press = match e {
+        let events = ui.ctx().input_mut(|i| std::mem::take(&mut i.events));
+        let mut left = Vec::new();
+        let mut stopped = false;
+        for e in events {
+            stopped |= self.0.asking();
+            let press = match &e {
+                _ if stopped => None,
                 Event::Key {
                     key,
                     physical_key,
                     pressed: true,
                     modifiers,
                     ..
-                } => Press::Key {
-                    key,
-                    physical: physical_key,
-                    modifiers,
-                },
-                Event::Text(t) => Press::Text(t),
-                _ => continue,
+                } => Some(Press::Key {
+                    key: *key,
+                    physical: *physical_key,
+                    modifiers: *modifiers,
+                }),
+                Event::Text(t) => Some(Press::Text(t.clone())),
+                Event::Copy => Some(Press::Copy),
+                Event::Cut => Some(Press::Cut),
+                Event::Paste(t) => Some(Press::Paste(t.clone())),
+                _ => None,
+            };
+            let Some(press) = press else {
+                left.push(e);
+                continue;
             };
             let exit = match self.0.press(&press) {
                 Command::Leave => Some(Exit::Leave),
@@ -524,6 +537,7 @@ impl crate::gui::Window for Bound {
                 self.0.leave(exit);
             }
         }
+        ui.ctx().input_mut(|i| i.events = left);
         crate::gui::Window::ui(&mut self.0, ui);
         self.1 = ui.ctx().input(|i| i.events.clone());
     }
@@ -532,8 +546,7 @@ impl crate::gui::Window for Bound {
     }
 }
 
-/// The key that opens a dialog never answers it in the same pass, its keys given to the
-/// editor before the dialogs' pass: F10 leaves the bar up, then F S saves; the Esc that leads
+/// The key that opens a dialog never answers it in the same pass (the binding's contract): F10 leaves the bar up, then F S saves; the Esc that leads
 /// to an exit leaves the prompt up, on Cancel. While anything is up no key or text is left in
 /// the pass for what comes after the view.
 #[test]
@@ -1608,4 +1621,258 @@ fn r1_go_to_bounds_an_empty_needle_and_a_replacement_holding_it() {
     assert!(!v.asking(), "it ended");
     assert_eq!(doc(&v), b"aa aa\n");
     assert!(status_row(&drv).contains("replaced 2"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix-check (9979a34): each finding's test, failing without its fix.
+
+/// MUST 1 (the binding's contract): an event the binding gave to the editor's keys is never
+/// read again by the dialog it opened — E and L typed, then F10 in one pass leaves the bar up
+/// and runs no Delete line.
+#[test]
+fn fc_typed_letters_before_f10_are_not_the_bars() {
+    let mut b = Bound(view("abc\n"), vec![]);
+    let mut drv = Driver::new(640.0, 400.0);
+    let mut events = typing(Key::E, "e");
+    events.extend(typing(Key::L, "l"));
+    events.push(down(Key::F10, Modifiers::NONE));
+    drv.frame(&mut b, events, Modifiers::NONE);
+    assert_eq!(doc(&b.0), b"elabc\n", "typed, and no line deleted");
+    assert!(
+        matches!(b.0.dialogs.up, Up::Menu { open: false, .. }),
+        "the bar up"
+    );
+}
+
+/// MUST 1: with the last search a Replace, Y typed then Ctrl+L in one pass types the y and asks
+/// at the next match — the Y is not its answer.
+#[test]
+fn fc_a_typed_y_before_ctrl_l_does_not_answer_the_replace() {
+    let mut b = Bound(view("a b a\n"), vec![]);
+    let mut drv = Driver::new(640.0, 400.0);
+    b.0.press(&ctrl(Key::F));
+    type_in(&mut drv, &mut b.0, "a");
+    drv.key(&mut b, Key::Tab, Modifiers::NONE);
+    type_in(&mut drv, &mut b.0, "A");
+    drv.key(&mut b, Key::Enter, Modifiers::NONE);
+    drv.key(&mut b, Key::Enter, Modifiers::NONE);
+    assert_eq!(b.0.editor().shown(), Some(0..1));
+    drv.key(&mut b, Key::Escape, Modifiers::NONE);
+    assert!(!b.0.asking());
+    let mut events = typing(Key::Y, "y");
+    events.push(down(Key::L, Modifiers::COMMAND));
+    drv.frame(&mut b, events, Modifiers::NONE);
+    assert_eq!(doc(&b.0), b"ay b a\n", "y typed, nothing replaced");
+    assert!(matches!(&b.0.dialogs.up, Up::Replace { at, .. } if *at == (5..6)));
+}
+
+/// MUST 1: Enter typed, then Ctrl+Q in one pass: the newline is typed and the close prompt
+/// stays up, on Cancel — the same Enter does not press it.
+#[test]
+fn fc_an_enter_before_ctrl_q_does_not_press_the_prompt() {
+    let mut b = Bound(view("abc\n"), vec![]);
+    let mut drv = Driver::new(640.0, 400.0);
+    let events = vec![
+        down(Key::Enter, Modifiers::NONE),
+        down(Key::Q, Modifiers::COMMAND),
+    ];
+    drv.frame(&mut b, events, Modifiers::NONE);
+    assert_eq!(doc(&b.0), b"\nabc\n");
+    assert!(b.0.asking(), "the prompt up");
+    assert!(focused(&drv, "[ Cancel ]"));
+}
+
+/// MUST 1: two Escs in one pass with `^K` armed — the first disarms, the second asks to leave —
+/// leave the prompt up: the second is not taken for an answer to it.
+#[test]
+fn fc_two_escs_with_ctrl_k_armed_leave_the_prompt_up() {
+    let mut b = Bound(view("abc\n"), vec![]);
+    let mut drv = Driver::new(640.0, 400.0);
+    b.0.press(&Press::Text("x".into()));
+    b.0.press(&ctrl(Key::K));
+    let esc = || down(Key::Escape, Modifiers::NONE);
+    drv.frame(&mut b, vec![esc(), esc()], Modifiers::NONE);
+    assert!(b.0.asking(), "the prompt up");
+    assert!(focused(&drv, "[ Cancel ]"));
+    assert_eq!(b.0.keys.armed(), Armed::None);
+}
+
+/// MUST 1: the dialogs read only what the binding left: F10 then F10 in one pass — the first
+/// given to the editor's keys, the second left for the bar — closes the bar again (no event is
+/// taken for the opener's).
+#[test]
+fn fc_f10_twice_in_one_pass_opens_and_closes_the_bar() {
+    let mut b = Bound(view("abc\n"), vec![]);
+    let mut drv = Driver::new(640.0, 400.0);
+    let f10 = || down(Key::F10, Modifiers::NONE);
+    drv.frame(&mut b, vec![f10(), f10()], Modifiers::NONE);
+    assert!(!b.0.asking(), "the second F10 closed the bar");
+}
+
+/// MUST 2: an item chosen by its letter key takes that key's text with it: F10 S F opens Find
+/// with its needle as it was, not holding `f`; F10 S G opens Go to empty.
+#[test]
+fn fc_a_menu_letters_text_does_not_go_into_the_field_it_opens() {
+    let mut v = view("abc\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&Press::key(Key::F10, Modifiers::NONE));
+    drv.press_typed(&mut v, Key::S, "s");
+    drv.press_typed(&mut v, Key::F, "f");
+    assert_eq!(
+        find_state(&v),
+        Some((String::new(), String::new(), Field::Needle))
+    );
+    drv.key(&mut v, Key::Escape, Modifiers::NONE);
+    v.press(&Press::key(Key::F10, Modifiers::NONE));
+    drv.press_typed(&mut v, Key::S, "s");
+    drv.press_typed(&mut v, Key::G, "g");
+    assert!(matches!(&v.dialogs.up, Up::GoTo(t) if t.is_empty()));
+}
+
+/// S2: while a Save runs, Replace's row says so, and Y replaces nothing.
+#[test]
+fn fc_replaces_row_says_a_save_runs() {
+    let mut v = view("a b a\n");
+    let mut drv = Driver::new(1000.0, 400.0);
+    v.press(&ctrl(Key::F));
+    type_in(&mut drv, &mut v, "a");
+    drv.key(&mut v, Key::Tab, Modifiers::NONE);
+    type_in(&mut drv, &mut v, "A");
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    v.set_file(file(true));
+    drv.idle(&mut v, 1);
+    let row = status_row(&drv);
+    assert!(
+        row.trim()
+            .starts_with("saving — editing resumes when the save is done · N skips it"),
+        "{row}"
+    );
+    drv.press_typed(&mut v, Key::Y, "y");
+    assert_eq!(doc(&v), b"a b a\n");
+    assert!(v.asking());
+}
+
+/// S4: a menu opened by a click disarms a waiting `^K`, as a prompt from outside does.
+#[test]
+fn fc_a_menu_opened_by_a_click_disarms_the_keys() {
+    let mut v = view("abc\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut v, 1);
+    v.press(&ctrl(Key::K));
+    assert_eq!(v.keys.armed(), Armed::Block);
+    let at = cells::find(&cells::layers(&drv.ctx), "Search")[0];
+    let l = &cells::layers(&drv.ctx)[at.layer];
+    drv.click(&mut v, l.rect(at.cells).center());
+    assert!(v.asking());
+    assert_eq!(v.keys.armed(), Armed::None);
+}
+
+/// S5: keys held for a field's second turn are not given to a box an outside open puts in
+/// its place: the held Enter does not cancel a conflict dialog in its first pass.
+#[test]
+fn fc_held_keys_do_not_reach_a_box_opened_from_outside() {
+    let mut v = view("abc\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&ctrl(Key::F));
+    drv.idle(&mut v, 1);
+    let tab = || down(Key::Tab, Modifiers::NONE);
+    let mut events = typing(Key::A, "a");
+    events.extend([tab(), tab(), tab()]);
+    events.extend(typing(Key::B, "b"));
+    events.push(down(Key::Enter, Modifiers::NONE));
+    drv.frame(&mut v, events, Modifiers::NONE);
+    assert!(!v.dialogs.held.is_empty(), "the needle's second turn waits");
+    v.press(&Press::Text("x".into()));
+    v.landed(&conflict(true));
+    drv.frame(&mut v, vec![], Modifiers::NONE);
+    assert!(matches!(v.dialogs.up, Up::Conflict { .. }), "still up");
+    assert!(focused(&drv, "[ Cancel ]"));
+}
+
+/// S6: Cut is in the pass's order like a key: Cut then Tab on Replace… cuts the needle's
+/// selection only, not the replacement Tab moves to.
+#[test]
+fn fc_a_cut_reaches_one_field() {
+    let mut v = view("ab ab\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&ctrl(Key::F));
+    type_in(&mut drv, &mut v, "ab");
+    drv.key(&mut v, Key::Tab, Modifiers::NONE);
+    type_in(&mut drv, &mut v, "x");
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    drv.key(&mut v, Key::Escape, Modifiers::NONE);
+    v.press(&Press::key(Key::F10, Modifiers::NONE));
+    drv.press_typed(&mut v, Key::S, "s");
+    drv.press_typed(&mut v, Key::R, "r");
+    assert!(matches!(&v.dialogs.up, Up::Find(f) if f.replace.as_deref() == Some("x")));
+    drv.frame(
+        &mut v,
+        vec![Event::Cut, down(Key::Tab, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    let Up::Find(f) = &v.dialogs.up else {
+        panic!("Find's fields")
+    };
+    assert_eq!((f.needle.as_str(), f.replace.as_deref()), ("", Some("x")));
+}
+
+/// S7: after a backward Replace that passed over a match into its replacement, no block is
+/// left over the replacement, and the caret is where the replacement starts.
+#[test]
+fn fc_a_skipped_backward_match_leaves_no_block() {
+    let mut v = view("aab");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.editor_mut().place(3, false);
+    v.press(&ctrl(Key::F));
+    type_in(&mut drv, &mut v, "ab");
+    drv.key(&mut v, Key::Tab, Modifiers::NONE);
+    type_in(&mut drv, &mut v, "b");
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    type_in(&mut drv, &mut v, "b");
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    drv.press_typed(&mut v, Key::Y, "y");
+    assert_eq!(doc(&v), b"ab");
+    assert_eq!((v.editor().shown(), v.editor().caret()), (None, 1));
+}
+
+/// GPT's: the Save-copy snapshot belongs to its save — a cancelled one leaves none for a later
+/// copy's exit to be held by; a menu's Save copy takes one.
+#[test]
+fn fc_the_copy_snapshot_is_its_saves() {
+    let mut v = view("abc\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&Press::Text("x".into()));
+    v.set_file(FileState {
+        can_replace: false,
+        ..file(false)
+    });
+    assert!(!v.leave(Exit::Close));
+    drv.idle(&mut v, 1);
+    for _ in 0..3 {
+        drv.key(&mut v, Key::Tab, Modifiers::SHIFT);
+    }
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    assert_eq!(v.take_commands(), vec![Command::SaveCopy]);
+    v.gave_up();
+    // A later copy, by its key, holds the edit since: its exit goes once it lands.
+    v.press(&Press::Text("y".into()));
+    v.set_file(file(true));
+    assert!(!v.leave(Exit::Close));
+    v.elsewhere("saved a copy at notes.edited.txt".into());
+    assert_eq!(v.take_chosen(), vec![Chosen::Go(Exit::Close)]);
+    // The menu's Save copy takes the document as it is: an edit after it holds the exit.
+    let mut v = view("abc\n");
+    v.press(&Press::Text("x".into()));
+    v.press(&Press::key(Key::F10, Modifiers::NONE));
+    drv.press_typed(&mut v, Key::F, "f");
+    drv.press_typed(&mut v, Key::C, "c");
+    assert_eq!(v.take_commands(), vec![Command::SaveCopy]);
+    v.press(&Press::Text("z".into()));
+    v.set_file(file(true));
+    assert!(!v.leave(Exit::Close));
+    v.elsewhere("saved a copy at notes.edited.txt".into());
+    assert_eq!(v.take_chosen(), vec![], "z is in no file");
+    assert!(v.asking());
 }

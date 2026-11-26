@@ -36,6 +36,10 @@
 //!   (Save, leaving, the switch) handed back to the binding (ED-layout), as are the frame's `[↕]`
 //!   and the `^S` prompt's `[Save]` clicked ([`EditView::take_commands`]). F10's menus, Find, Go
 //!   to and the prompts are [`dialogs`]' (ED-dialogs): while one is up the keys go to it alone.
+//!   **The binding's contract**: each pass, the binding gives the pass's inputs to `press` in
+//!   their order until [`EditView::asking`] says a dialog is up, removes from the pass every
+//!   event it gave, then calls [`EditView::dialogs_ui`] — so the dialogs see only the events
+//!   after those, and no event is acted on twice.
 
 use super::cells::{self, Buffer, Cells, Grid, Pen, Position};
 use super::chrome::{self, cga, FKey, Strip};
@@ -933,7 +937,9 @@ impl EditView {
     /// What the binding is to do that a click, a menu or a prompt here asked for: Save from the
     /// `^S` prompt's `[Save]`; a menu's Save, Save as…, Save copy, Reload, VS Code / Zed, Exit
     /// and Paste; the close prompt's and the conflict dialog's Save, Save copy and Save As…
-    /// (oldest first). What else a prompt chose is [`EditView::take_chosen`]'s.
+    /// (oldest first). A menu's Copy and Cut come back already done here — the clip taken, a
+    /// Cut's text deleted — for the binding to put on the clipboard only. What else a prompt
+    /// chose is [`EditView::take_chosen`]'s.
     pub fn take_commands(&mut self) -> Vec<Command> {
         std::mem::take(&mut self.commands)
     }
@@ -948,6 +954,10 @@ impl EditView {
     /// handed back: Save, leaving and the rest are the binding's. While a menu, a field or a
     /// prompt is up ([`EditView::asking`]) it takes every key, so this takes none — but a focus
     /// report or a resize still tells the keys, which forget Shift known then (E31).
+    ///
+    /// The contract (the module's "Keys"): the binding stops giving a pass's inputs here once
+    /// [`EditView::asking`] is true, and removes from the pass each event it gave before it
+    /// calls [`EditView::dialogs_ui`], which reads only the rest.
     pub fn press(&mut self, press: &Press) -> Command {
         if self.asking() {
             if matches!(press, Press::Focus | Press::Resize) {
@@ -955,7 +965,6 @@ impl EditView {
             }
             return Command::Nothing;
         }
-        self.dialogs.pressed(press);
         let command = self.keys.press(press);
         if !matches!(command, Command::Nothing | Command::Typing) {
             self.said = command.line(&self.name).map(Said::Warned);
@@ -1783,7 +1792,9 @@ impl EditView {
 impl Window for EditView {
     /// The editor as a screen of its own (its tests; ED-layout puts its parts in the browser's
     /// rows and beside the column): the title row, the edit window, the status row and the F-key
-    /// row, a grid of cells painted once.
+    /// row, a grid of cells painted once. It gives no input to [`EditView::press`] itself: a host
+    /// keeps the contract (the module's "Keys") — the pass's inputs to `press` until a dialog is
+    /// up, those events removed — before this runs [`EditView::dialogs_ui`] on what is left.
     fn ui(&mut self, ui: &mut egui::Ui) {
         chrome::key_panel_cells(ui, "sopen-edit-keys", KEYS);
         egui::CentralPanel::default()

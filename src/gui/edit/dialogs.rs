@@ -27,9 +27,11 @@
 //!   state each leaves (a field's text before the Enter after it, a menu's letter before the
 //!   item's), each stage handing what follows to the next; none goes further, and
 //!   [`EditView::press`] takes none but a focus report or a resize (E31's Shift known).
-//! - **The binding's order**: each pass gives its keys to [`EditView::press`] first, then runs
-//!   [`EditView::dialogs_ui`] — so a dialog a key opens reads the keys after it in the same
-//!   pass, and drops that key's own event (an F10 never closes its own bar).
+//! - **The binding's contract**: each pass gives its inputs to [`EditView::press`] in their
+//!   order until [`EditView::asking`] is true, removes every event it gave from the pass, then
+//!   runs [`EditView::dialogs_ui`] — so the dialogs read only the events after those: a dialog a
+//!   key opens reads the keys after that key, and no event is acted on twice (an F10 never
+//!   closes its own bar, an Enter typed before Ctrl+Q never presses the prompt it brings).
 //! - **No edits while a Save runs** (E24): [`EditView::press`], the menus, Replace and the
 //!   encoding question's Type refuse them, with §9.1's line; moves and Find still work.
 //! - **Exits** (§6.4, §9.6): the binding gives each to [`EditView::leave`]. With unsaved edits
@@ -43,7 +45,7 @@ use super::{EditView, MENUS};
 use crate::edit::arm::{self, Armed, Backend, BlockOp, Command};
 use crate::edit::buffer::Piece;
 use crate::edit::file::Saved;
-use crate::edit::ops::{Answer, Options, Said, Search};
+use crate::edit::ops::{Answer, Block, Options, Said, Search, Sel};
 use crate::gui::browser::ops::dialog::{self, Button, Ink, Inputs, Part};
 use crate::gui::cells::{self, Buffer, Cells, Grid, Pen, Position};
 use crate::gui::chrome::{self, cga, CELL};
@@ -218,18 +220,11 @@ pub(super) struct Dialogs {
     shown: Option<egui::Id>,
     /// A field opened or moved to: it takes the keyboard, its text selected.
     focus: bool,
-    /// The key (and its modifiers) of the editor's last press, until the dialogs' next pass.
-    pressed: Option<(Key, Modifiers)>,
-    /// The key a dialog was opened by (an F10, the Esc that led to an exit): its event is
-    /// dropped from the pass it opens in, so it never answers the dialog too — an F10 closing
-    /// its own bar, an Esc cancelling the prompt it brought. This needs the binding's order:
-    /// each pass gives its keys to [`EditView::press`] first, then runs
-    /// [`EditView::dialogs_ui`], so the opener's event is the pass's first like it.
-    opener: Option<(Key, Modifiers)>,
     /// Keys a field had no second turn for in their pass: the next pass reads them first.
     held: Vec<egui::Event>,
-    /// The document when the close prompt's Save copy or Save As… went out: an edit after it
-    /// is in neither file, so the exit asks again ([`EditView::elsewhere`]).
+    /// The document when a Save copy or Save As… (the close prompt's or a menu's) went out,
+    /// until that save reports: an edit after it is in neither file, so an exit that waited for
+    /// it asks again ([`EditView::elsewhere`]).
     copied: Option<Vec<Piece>>,
 }
 
@@ -249,27 +244,18 @@ impl Dialogs {
             last: None,
             shown: None,
             focus: false,
-            pressed: None,
-            opener: None,
             held: Vec::new(),
             copied: None,
         }
     }
 
-    /// The editor's keys took `press` (its key kept for a dialog it may open).
-    pub(super) fn pressed(&mut self, press: &arm::Press) {
-        self.pressed = match press {
-            arm::Press::Key { key, modifiers, .. } => Some((*key, *modifiers)),
-            _ => None,
-        };
-    }
-
     /// `up` opened from outside the dialogs' pass (a key, an exit, a Save's end): new, so a box
-    /// it shows opens on Cancel even where the same box was up the pass before.
+    /// it shows opens on Cancel even where the same box was up the pass before, and keys held
+    /// for a field it replaces are not its.
     fn open(&mut self, up: Up) {
         self.up = up;
-        self.opener = self.pressed;
         self.shown = None;
+        self.held.clear();
     }
 
     /// A Save runs, as the binding last said.
@@ -452,15 +438,18 @@ fn key_letter(key: Key) -> Option<char> {
     }
 }
 
-/// The pass's keys, text, pastes and input-method events, taken out of it in their order (the
-/// rest stay): what a field's engine is given segment by segment, so one committed composition
-/// reaches one field.
+/// The pass's keys, text, pastes, clipboard requests and input-method events, taken out of it
+/// in their order (the rest stay): what a field's engine is given segment by segment, so one
+/// committed composition, one Cut or one Copy reaches one field.
 fn take_keys(ctx: &egui::Context) -> Vec<egui::Event> {
     ctx.input_mut(|i| {
         let all = std::mem::take(&mut i.events);
         let (keys, rest) = all.into_iter().partition(|e| {
             use egui::Event as E;
-            matches!(e, E::Key { .. } | E::Text(_) | E::Paste(_) | E::Ime(_))
+            matches!(
+                e,
+                E::Key { .. } | E::Text(_) | E::Paste(_) | E::Ime(_) | E::Copy | E::Cut
+            )
         });
         i.events = rest;
         keys
@@ -470,6 +459,17 @@ fn take_keys(ctx: &egui::Context) -> Vec<egui::Event> {
 /// `events` given back to the pass, for what is up after the dialog that left them.
 fn put_keys(ctx: &egui::Context, events: Vec<egui::Event>) {
     ctx.input_mut(|i| i.events.extend(events));
+}
+
+/// The events after one that was read, handed on: when that was a letter key (`after_key`),
+/// the text egui sends with it goes with it — F10 S F opens Find with its needle as it was, not
+/// holding `f`.
+fn after_its_text(events: impl Iterator<Item = egui::Event>, after_key: bool) -> Vec<egui::Event> {
+    let mut rest = events.peekable();
+    if after_key && matches!(rest.peek(), Some(egui::Event::Text(_))) {
+        rest.next();
+    }
+    rest.collect()
 }
 
 /// One key or text event of the pass as the dialogs read it, in the pass's order.
@@ -600,8 +600,9 @@ impl EditView {
         false
     }
 
-    /// A prompt opened from outside the keys (an exit, a Save's end): a `^K` or `^S` waiting
-    /// for its key is disarmed first, so the key after the prompt's Cancel is not its letter.
+    /// A dialog opened from outside the keys (an exit, a Save's end, a click on a menu's name):
+    /// a `^K` or `^S` waiting for its key is disarmed first, so the key after it is not its
+    /// letter.
     fn prompt(&mut self, up: Up) {
         if self.keys.armed() != Armed::None {
             // Esc disarms either arming, untyped (`edit::arm::decide`).
@@ -616,6 +617,7 @@ impl EditView {
     /// owner must read first, as the hex window keeps open for them.
     pub fn landed(&mut self, saved: &Saved) {
         self.dialogs.file.running = false;
+        self.dialogs.copied = None;
         let exit = self.dialogs.pending.take();
         let notes = match saved {
             Saved::Conflict {
@@ -676,6 +678,7 @@ impl EditView {
     pub fn not_saved(&mut self, why: String) {
         self.dialogs.file.running = false;
         self.dialogs.pending = None;
+        self.dialogs.copied = None;
         self.said = Some(Said::Refused(why));
     }
 
@@ -684,6 +687,7 @@ impl EditView {
     pub fn gave_up(&mut self) {
         self.dialogs.file.running = false;
         self.dialogs.pending = None;
+        self.dialogs.copied = None;
     }
 
     /// The dialog a command opens: F10's bar, Find's or Go to's field, Find again; and the
@@ -707,7 +711,6 @@ impl EditView {
             _ => {}
         }
         if self.dialogs.up == Up::None && self.ed.question().is_some() {
-            self.dialogs.opener = self.dialogs.pressed;
             self.dialogs.shown = None;
         }
     }
@@ -717,6 +720,10 @@ impl EditView {
     /// fields and prompts; the box up, the cells under it blanked first; and every key of the
     /// pass taken while anything is up. The caret to paint: a field's while one has the keys,
     /// none while a menu or a box does, else `caret`.
+    ///
+    /// It reads the pass's events as the binding left them: per the contract, every event the
+    /// binding gave to [`EditView::press`] this pass is already removed, so what is here is
+    /// the dialogs' alone.
     pub fn dialogs_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -727,19 +734,6 @@ impl EditView {
     ) -> Option<Position> {
         let ctx = ui.ctx().clone();
         let wide = cells::ambiguous_wide(&ctx);
-        if let Some((key, mods)) = self.dialogs.opener.take() {
-            // The opener's own event: the first like it in the pass (the binding's order).
-            ctx.input_mut(|i| {
-                let at = i.events.iter().position(|e| {
-                    matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. }
-                        if *k == key && *modifiers == mods)
-                });
-                if let Some(at) = at {
-                    i.events.remove(at);
-                }
-            });
-        }
-        self.dialogs.pressed = None;
         if !self.dialogs.held.is_empty() {
             let held = std::mem::take(&mut self.dialogs.held);
             ctx.input_mut(|i| i.events.splice(0..0, held).for_each(drop));
@@ -788,12 +782,13 @@ impl EditView {
             let at = grid.rect(Cells::new(x, y, w, 1));
             let name = ui.interact(at, id("menu-name").with(i), egui::Sense::CLICK);
             if name.clicked() {
+                // As from outside the keys: a waiting `^K` or `^S` is disarmed.
                 let item = first_on(i, self.dialogs.backend);
-                self.dialogs.up = Up::Menu {
+                self.prompt(Up::Menu {
                     at: i,
                     open: true,
                     item,
-                };
+                });
             }
         }
     }
@@ -823,6 +818,10 @@ impl EditView {
                     MENUS[*at],
                     letters.join(" ")
                 )
+            }
+            // While a Save runs Y is refused (E24): the row says so.
+            Up::Replace { .. } if self.dialogs.file.running => {
+                format!("{SAVING} · N skips it · Esc stops")
             }
             Up::Replace { .. } => REPLACE_ASK.to_string(),
             _ => return,
@@ -1187,7 +1186,8 @@ impl EditView {
 
     /// The next match asked about, or the end said. Backward, a match that ends past `bound` —
     /// where the earliest replacement made starts — would take some of what was written, and
-    /// is passed over.
+    /// is passed over; where nothing follows, the caret and the block are as before it (no
+    /// block left over the replacement).
     fn next_match(
         &mut self,
         search: Search,
@@ -1196,9 +1196,11 @@ impl EditView {
         mut again: bool,
         bound: Option<u64>,
     ) {
+        let before = self.ed.sel();
+        let mut skipped = false;
         loop {
             match self.edit(|ed, _| ed.find(&search, again)) {
-                Some(at) if bound.is_some_and(|b| at.end > b) => again = true,
+                Some(at) if bound.is_some_and(|b| at.end > b) => (again, skipped) = (true, true),
                 Some(at) => {
                     self.dialogs.up = Up::Replace {
                         search,
@@ -1209,8 +1211,16 @@ impl EditView {
                     };
                     return;
                 }
-                None if count == 0 => return self.said = Some(not_found(&search)),
-                None => return self.said = Some(replaced(count)),
+                None => {
+                    if skipped {
+                        self.restore(before);
+                    }
+                    self.said = Some(match count {
+                        0 => not_found(&search),
+                        n => replaced(n),
+                    });
+                    return;
+                }
             }
         }
     }
@@ -1266,7 +1276,28 @@ impl EditView {
                 break;
             }
         }
-        put_keys(ctx, events.collect());
+        put_keys(ctx, after_its_text(events, after_key));
+    }
+
+    /// The caret and the block put back as `sel` had them, through the editor's own block
+    /// markers (Ctrl+K B, K, H): no edit, no undo step. No block becomes an empty one at the
+    /// caret, which shows nothing.
+    fn restore(&mut self, sel: Sel) {
+        self.edit(|ed, _| {
+            let b = sel.block.unwrap_or(Block {
+                begin: sel.caret,
+                end: sel.caret,
+                hidden: false,
+            });
+            ed.place(b.begin, false);
+            ed.block(BlockOp::Begin);
+            ed.place(b.end, false);
+            ed.block(BlockOp::End);
+            if b.hidden {
+                ed.block(BlockOp::Hide);
+            }
+            ed.place(sel.caret, false);
+        });
     }
 
     /// While a Save runs no edit is made (E24): `true`, and the status row says why.
@@ -1349,7 +1380,7 @@ impl EditView {
             }
             if let Some(i) = chosen {
                 self.choose(at, i);
-                put_keys(ctx, events.collect());
+                put_keys(ctx, after_its_text(events, after_key));
                 return;
             }
         }
@@ -1365,7 +1396,13 @@ impl EditView {
             return;
         };
         match item.act {
-            Act::Bind(command) => self.commands.push(command),
+            Act::Bind(command) => {
+                if matches!(command, Command::SaveCopy | Command::SaveAs) {
+                    // What the copy holds, until it reports (`elsewhere`).
+                    self.dialogs.copied = Some(self.ed.buffer().pieces().to_vec());
+                }
+                self.commands.push(command);
+            }
             Act::Edit(command) if super::changes(&command) && self.saving() => {}
             Act::Edit(command) => {
                 self.said = None;
@@ -1667,10 +1704,8 @@ impl EditView {
             (Choice::Overwrite, Up::Conflict { .. }) => self.dialogs.chosen.push(Chosen::Overwrite),
             (Choice::SaveAs, Up::Conflict { .. }) => commands.push(Command::SaveAs),
             (Choice::Reload, Up::Reload) => self.dialogs.chosen.push(Chosen::Reload),
-            (Choice::Type, Up::None) if self.saving() => {
-                // Asked again once the save is done.
-                self.dialogs.shown = None;
-            }
+            // Refused while a Save runs: the question stays up.
+            (Choice::Type, Up::None) if self.saving() => {}
             (Choice::Type, Up::None) => {
                 let said = self.edit(|ed, _| ed.answer(Answer::Type));
                 self.said = said;
