@@ -22,6 +22,7 @@
 pub(crate) mod dialog;
 
 use super::panel::{self, Panel};
+use super::switch_state::{DialogKind, DialogState};
 use crate::fileops::{Answer, Clash, Item, ItemOutcome, Progress, Reply, Report};
 use crate::gui::cells::{Buffer, Cells, Grid, Position};
 use crate::gui::chrome;
@@ -799,6 +800,9 @@ fn report_close_id() -> egui::Id {
 struct Keyboard {
     ids: Vec<egui::Id>,
     opened: bool,
+    /// The field's selection on its first pass instead of the one asked — `(anchor, caret)` in
+    /// characters — when the dialog came with the switch's state (10 §7.4).
+    given: Option<(usize, usize)>,
 }
 
 /// The keys a pass of a dialog acts on, taken (consumed) before its widgets see them.
@@ -815,12 +819,13 @@ impl Keyboard {
     fn begin(&mut self, ctx: &egui::Context, field: egui::Id, text: &str, select: usize) -> Keys {
         if !std::mem::replace(&mut self.opened, true) {
             let mut state = egui::text_edit::TextEditState::load(ctx, field).unwrap_or_default();
-            let end = select.min(text.chars().count());
+            let n = text.chars().count();
+            let (from, to) = self.given.take().unwrap_or((0, select));
             state
                 .cursor
                 .set_char_range(Some(egui::text::CCursorRange::two(
-                    egui::text::CCursor::new(0),
-                    egui::text::CCursor::new(end),
+                    egui::text::CCursor::new(from.min(n)),
+                    egui::text::CCursor::new(to.min(n)),
                 )));
             state.store(ctx, field);
         }
@@ -1831,6 +1836,104 @@ impl Ops {
             .or(self.copy.as_ref().map(|d| d.target.as_str()))
             .or(self.make.as_ref().map(|d| d.name.as_str()))
             .or(self.rename.as_ref().map(|r| r.text.as_str()))
+    }
+
+    /// The owner's dialog that is open — the select-group, Copy / Move, make-folder or delete
+    /// dialog, else the rename field — as the switch carries it (10 §7.4): what it is, its
+    /// field's text, caret and selection (egui's edit state of the field), and its refusal. A
+    /// job's question and its report are the job's, which never crosses (§7.4: no jobs).
+    pub fn open_dialog(&self, ctx: &egui::Context) -> Option<DialogState> {
+        let caret = |id: egui::Id| {
+            let range = egui::text_edit::TextEditState::load(ctx, id)?
+                .cursor
+                .char_range()?;
+            Some((range.secondary.index.0, range.primary.index.0))
+        };
+        let given = |kind, text: &str, id, error: Option<&String>| {
+            let at = caret(id);
+            DialogState {
+                kind,
+                text: Some(text.to_string()),
+                caret: at.map(|(_, caret)| caret),
+                anchor: at.map(|(anchor, _)| anchor),
+                error: error.cloned(),
+            }
+        };
+        if let Some(d) = &self.group {
+            let kind = if d.select {
+                DialogKind::Select
+            } else {
+                DialogKind::Unselect
+            };
+            return Some(given(kind, &d.pattern, group_id().with("pattern"), None));
+        }
+        if let Some(d) = &self.copy {
+            let kind = match d.kind {
+                Transfer::Copy => DialogKind::Copy,
+                Transfer::Move => DialogKind::Move,
+            };
+            return Some(given(kind, &d.target, copy_field_id(), d.error.as_ref()));
+        }
+        if let Some(d) = &self.make {
+            let id = make_folder_id().with("name");
+            return Some(given(DialogKind::MakeFolder, &d.name, id, d.error.as_ref()));
+        }
+        if let Some(d) = &self.delete {
+            let kind = match d.bin {
+                Bin::Asked => DialogKind::DeleteNow,
+                _ => DialogKind::Delete,
+            };
+            return Some(DialogState {
+                kind,
+                text: None,
+                caret: None,
+                anchor: None,
+                error: None,
+            });
+        }
+        let r = self.rename.as_ref()?;
+        Some(given(
+            DialogKind::Rename,
+            &r.text,
+            rename_id(),
+            r.error.as_ref(),
+        ))
+    }
+
+    /// The dialog the browser has just opened, as the key would have, takes what `given` carried
+    /// (10 §7.4): its field's text, the caret and selection on its first pass, its refusal.
+    /// `false`: no dialog of that kind is open (the browser refused to open it here).
+    pub fn give_dialog(&mut self, given: &DialogState) -> bool {
+        let text = given.text.clone();
+        let caret = given.caret.map(|c| (given.anchor.unwrap_or(c), c));
+        let error = given.error.clone();
+        let (field, keyboard, refusal) = match given.kind {
+            DialogKind::Select | DialogKind::Unselect => match self.group.as_mut() {
+                Some(d) => (&mut d.pattern, &mut d.keyboard, None),
+                None => return false,
+            },
+            DialogKind::Copy | DialogKind::Move => match self.copy.as_mut() {
+                Some(d) => (&mut d.target, &mut d.keyboard, Some(&mut d.error)),
+                None => return false,
+            },
+            DialogKind::MakeFolder => match self.make.as_mut() {
+                Some(d) => (&mut d.name, &mut d.keyboard, Some(&mut d.error)),
+                None => return false,
+            },
+            DialogKind::Rename => match self.rename.as_mut() {
+                Some(r) => (&mut r.text, &mut r.keyboard, Some(&mut r.error)),
+                None => return false,
+            },
+            DialogKind::Delete | DialogKind::DeleteNow => return self.delete.is_some(),
+        };
+        if let Some(text) = text {
+            *field = text;
+        }
+        keyboard.given = caret;
+        if let Some(refusal) = refusal {
+            *refusal = error;
+        }
+        true
     }
 
     /// The entry the rename field is open on, if any (its row draws [`Ops::rename_field`]).

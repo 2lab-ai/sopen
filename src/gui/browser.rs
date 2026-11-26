@@ -39,6 +39,7 @@ pub(crate) use ops::shown_wrapped;
 mod panel;
 mod prepare;
 mod preview;
+pub(crate) mod switch_state;
 mod tree;
 pub(crate) mod view;
 mod view_set;
@@ -832,6 +833,9 @@ pub(crate) struct Browser {
     /// own), and the check running for the delete dialog that is open.
     trash_check: TrashCheck,
     trash_wait: Option<TrashWait>,
+    /// The switch's state this browser was given (10 §7.4), while what it asks for is still
+    /// being put back ([`switch_state`]): the browser has not settled until it is.
+    given: Option<switch_state::Given>,
 }
 
 impl Drop for Browser {
@@ -979,6 +983,7 @@ impl Browser {
             git,
             trash_check: trash_check(),
             trash_wait: None,
+            given: None,
         };
         browser.list(None, start.abs, None, None);
         browser
@@ -1498,6 +1503,8 @@ impl Browser {
         let panels = panel.map_or(vec![0, 1], |p| vec![p]);
         let (entries, free) = match result {
             Ok(listed) => listed,
+            // A given state's folder that does not list here: its nearest parent that does.
+            Err(e) if self.given_unlisted(ctx, panel, &dir, &e) => return,
             Err(e) => {
                 for i in panels {
                     self.list_errors[i] = Some(format!("{e:#}"));
@@ -1528,6 +1535,7 @@ impl Browser {
                 // The entry is gone (moved away, renamed elsewhere): the bar stays on its row.
                 panel.highlight = row.min(panel.entries.len().saturating_sub(1));
             }
+            self.given_listed(i, &dir);
         }
         // A listing is not a bar move: what it changes commits at once (02 §3.1). A folder whose
         // detection failed (an answer it could not read, a lost channel) is asked again on this
@@ -2656,11 +2664,13 @@ impl Browser {
         Status::info(LIST_HINT)
     }
 
-    /// Nothing is on its way: no listing, no opening, the display committed and its preview
-    /// on screen, the viewer ready, no file operation running unasked (one waiting at its
-    /// name-in-the-way question has settled: only an answer moves it).
+    /// Nothing is on its way: no switch state still being put back, no listing, no opening, the
+    /// display committed and its preview on screen, the viewer ready, no file operation running
+    /// unasked (one waiting at its name-in-the-way question has settled: only an answer moves
+    /// it).
     fn settled(&self) -> bool {
         self.painted
+            && self.given.is_none()
             && self.listing.is_empty()
             && self.opening.is_none()
             && !self.uncommitted
@@ -2705,6 +2715,8 @@ impl Window for Browser {
             self.list_keys(&ctx);
         }
         self.resolve(&ctx);
+        // A given switch state's next step, once the display it builds on is committed.
+        self.given_pass(&ctx);
         self.git_follow(&ctx);
         // The F-key row is the key table's, by the context and the mode (04 §2).
         let in_git = self.git_focused().is_some();
