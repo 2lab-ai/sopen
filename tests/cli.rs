@@ -1689,12 +1689,8 @@ fn target_runs_sopen_there_over_ssh_and_keeps_its_exit_code() {
         ["exec".to_string(), q("env"), q(&hook), q("sh"), q("-c")],
         "{words:#?}"
     );
-    // The file is on the target itself: its path there, opened there with --here — and, an image
-    // by its name, in a window there (`--gui`, 10 §7.3).
-    assert_eq!(
-        ssh.sopen_argv().unwrap(),
-        ["--here", "--gui", "--", "/tmp/a b.png"]
-    );
+    // The file is on the target itself: its path there, opened there with --here.
+    assert_eq!(ssh.sopen_argv().unwrap(), ["--here", "--", "/tmp/a b.png"]);
     // HOST refused a write: a conflict in this machine's log too.
     let log = usage_lines(tmp.path());
     assert_eq!(log[0]["forwarded"], true);
@@ -1710,7 +1706,7 @@ fn target_runs_sopen_there_over_ssh_and_keeps_its_exit_code() {
         &[("PATH", &ssh.path), ("SOPEN_TARGET_BIN", bin)],
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(ssh.sopen_argv().unwrap(), ["--here", "--gui", "--", odd]);
+    assert_eq!(ssh.sopen_argv().unwrap(), ["--here", "--", odd]);
 
     // A local file is fetched by the target from this machine; hooks travel, local paths stay.
     let blob = tmp.path().join("blob.bin");
@@ -1753,8 +1749,7 @@ fn target_runs_sopen_there_over_ssh_and_keeps_its_exit_code() {
     let n = ssh.connection().len();
     assert_eq!(argv[n..n + 2], ["-T", "-o"], "{argv:#?}");
 
-    // `--hex` travels to the target's sopen, with the dialog's hooks — and `--gui`: the hex
-    // window is a window.
+    // `--hex` travels to the target's sopen, with the dialog's hooks.
     let out = sopen(
         tmp.path(),
         &["--target", HOST, "--hex", &format!("{HOST}:/tmp/a.bin")],
@@ -1768,7 +1763,7 @@ fn target_runs_sopen_there_over_ssh_and_keeps_its_exit_code() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(
         ssh.sopen_argv().unwrap(),
-        ["--here", "--gui", "--hex", "--", "/tmp/a.bin"]
+        ["--here", "--hex", "--", "/tmp/a.bin"]
     );
     let argv = ssh.argv().unwrap();
     for hook in [
@@ -1801,20 +1796,19 @@ fn target_runs_sopen_there_over_ssh_and_keeps_its_exit_code() {
     assert!(!log.contains(HOST), "{log}");
 }
 
-/// `--gui` on a forward (10 §7.3, T35; X2-gui): passed when the owner gave it, with `--hex`, or
-/// when the kind this machine sees needs a window — a folder, an image, video or audio, a binary.
-/// Never for text, which keeps HOST's editor (§11 row 5), nor where the kind cannot be seen from
-/// here (a remote name that does not decide it: HOST picks by kind), nor with `--app` or for an
-/// address (§11 rows 1 and 4).
+/// `--gui` on a forward (10 §7.3, T35; X2-gui), until XF: passed only when the owner gave it
+/// (decided 2026-11-26) — whatever the kind, a hook keeping the run without a window included —
+/// never with `--app` (a usage error) nor for an address (§11 rows 1 and 4). Without it a run is
+/// today's, HOST picking by kind; the kinds a sender sees are `seen_kind`'s, tested in the
+/// binary, for XF's automatic `--gui`.
 #[test]
-fn a_target_run_passes_gui_when_the_kind_it_sees_needs_a_window() {
+fn a_target_run_passes_gui_only_when_given() {
     let tmp = tempfile::tempdir().unwrap();
     let ssh = FakeSsh::new(tmp.path());
     let bin = ssh.sopen.to_str().unwrap();
     let short = sopen::forward::short_hostname().expect("this machine has a host name");
     std::fs::create_dir(tmp.path().join("dir")).unwrap();
     std::fs::write(tmp.path().join("notes.txt"), "text\n").unwrap();
-    std::fs::write(tmp.path().join("plain"), "text by its bytes\n").unwrap();
     std::fs::write(tmp.path().join("blob"), [0u8, 1, 2, 0]).unwrap();
     std::fs::write(tmp.path().join("a.mp3"), b"").unwrap();
     let path = |name: &str| tmp.path().join(name).to_str().unwrap().to_string();
@@ -1822,7 +1816,7 @@ fn a_target_run_passes_gui_when_the_kind_it_sees_needs_a_window() {
         let real = std::fs::canonicalize(tmp.path().join(name)).unwrap();
         format!("{short}:{}", real.display())
     };
-    let ran = |args: &[&str]| -> Vec<String> {
+    let ran = |args: &[&str], hook: (&str, &str)| -> Vec<String> {
         ssh.forget();
         let args: Vec<&str> = ["--target", HOST]
             .into_iter()
@@ -1831,11 +1825,16 @@ fn a_target_run_passes_gui_when_the_kind_it_sees_needs_a_window() {
         let out = sopen(
             tmp.path(),
             &args,
-            &[("PATH", &ssh.path), ("SOPEN_TARGET_BIN", bin)],
+            &[("PATH", &ssh.path), ("SOPEN_TARGET_BIN", bin), hook],
         );
-        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{args:?} {hook:?}: {}",
+            text(&out.stderr)
+        );
         ssh.sopen_argv().expect("sopen ran on the target")
     };
+    let plain = ("SOPEN_EDITOR_WAIT", "3");
     let with = |gui: bool, source: &str| -> Vec<String> {
         let mut want = vec!["--here".to_string()];
         if gui {
@@ -1844,32 +1843,51 @@ fn a_target_run_passes_gui_when_the_kind_it_sees_needs_a_window() {
         want.extend(["--".to_string(), source.to_string()]);
         want
     };
-    // A local SOURCE is seen as a local open sees it: by its stat and its bytes.
-    assert_eq!(ran(&[&path("dir")]), with(true, &there("dir")));
-    assert_eq!(ran(&[&path("a.mp3")]), with(true, &there("a.mp3")));
-    assert_eq!(ran(&[&path("blob")]), with(true, &there("blob")));
-    assert_eq!(ran(&[&path("notes.txt")]), with(false, &there("notes.txt")));
-    assert_eq!(ran(&[&path("plain")]), with(false, &there("plain")));
-    // A remote one by its name alone, where the name decides the kind.
-    assert_eq!(ran(&["other:/m/a.mp4"]), with(true, "other:/m/a.mp4"));
+    let image = format!("{HOST}:/srv/img.png");
+    // No kind brings it: a folder, an image, an mp3, a binary, text, a name that decides nothing.
+    for (source, as_there) in [
+        (path("dir"), there("dir")),
+        (path("a.mp3"), there("a.mp3")),
+        (path("blob"), there("blob")),
+        (path("notes.txt"), there("notes.txt")),
+        (image.clone(), "/srv/img.png".to_string()),
+        (format!("{HOST}:/srv/data"), "/srv/data".to_string()),
+    ] {
+        assert_eq!(ran(&[&source], plain), with(false, &as_there), "{source}");
+        assert_eq!(
+            ran(&["--gui", &source], plain),
+            with(true, &as_there),
+            "{source}"
+        );
+    }
+    // Nor `--hex`, nor a hook — the owner's `--gui` goes with any of them.
     assert_eq!(
-        ran(&[&format!("{HOST}:/srv/a.txt")]),
-        with(false, "/srv/a.txt")
+        ran(&["--hex", &image], plain),
+        ["--here", "--hex", "--", "/srv/img.png"]
     );
     assert_eq!(
-        ran(&[&format!("{HOST}:/srv/data")]),
-        with(false, "/srv/data")
+        ran(&["--gui", "--hex", &image], plain),
+        ["--here", "--gui", "--hex", "--", "/srv/img.png"]
     );
-    // The owner's `--gui` goes whatever the kind; `--hex` brings it too.
-    let text_there = format!("{HOST}:/srv/a.txt");
-    assert_eq!(ran(&["--gui", &text_there]), with(true, "/srv/a.txt"));
+    for hook in [
+        ("SOPEN_LIST", "1"),
+        ("SOPEN_AUTOSAVE", "1"),
+        ("SOPEN_SCREENSHOT", "/tmp/shot.png"),
+    ] {
+        assert_eq!(
+            ran(&[&image], hook),
+            with(false, "/srv/img.png"),
+            "{hook:?}"
+        );
+        assert_eq!(
+            ran(&["--gui", &image], hook),
+            with(true, "/srv/img.png"),
+            "{hook:?}"
+        );
+    }
+    // `--app` never; with `--gui` it is a usage error.
     assert_eq!(
-        ran(&["--hex", &path("notes.txt")]),
-        ["--here", "--gui", "--hex", "--", &there("notes.txt")]
-    );
-    // `--app` never, a binary or not (its own row); with `--gui` it is a usage error.
-    assert_eq!(
-        ran(&["--app", "X", &path("blob")]),
+        ran(&["--app", "X", &path("blob")], plain),
         ["--here", "--app", "X", "--", &there("blob")]
     );
     ssh.forget();
@@ -1900,62 +1918,6 @@ fn a_target_run_passes_gui_when_the_kind_it_sees_needs_a_window() {
     );
 }
 
-/// A forward adds `--gui` of its own only for a window run (decided 2026-11-26): a run the hooks
-/// keep without a window — `SOPEN_LIST`, `SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`, a binary's
-/// `SOPEN_CHOICE=save` or `cancel` — gets it only when the owner gave it. A screenshot, or a
-/// binary's `SOPEN_CHOICE=hex`, is a window.
-#[test]
-fn a_run_without_a_window_gets_gui_only_when_given() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ssh = FakeSsh::new(tmp.path());
-    let bin = ssh.sopen.to_str().unwrap();
-    std::fs::write(tmp.path().join("blob"), [0u8, 1, 2, 0]).unwrap();
-    let blob = tmp.path().join("blob").to_str().unwrap().to_string();
-    let image = format!("{HOST}:/srv/img.png");
-    let gui_passed = |args: &[&str], hook: (&str, &str)| -> bool {
-        ssh.forget();
-        let args: Vec<&str> = ["--target", HOST]
-            .into_iter()
-            .chain(args.iter().copied())
-            .collect();
-        let out = sopen(
-            tmp.path(),
-            &args,
-            &[("PATH", &ssh.path), ("SOPEN_TARGET_BIN", bin), hook],
-        );
-        assert!(
-            out.status.success(),
-            "{args:?} {hook:?}: {}",
-            text(&out.stderr)
-        );
-        let argv = ssh.sopen_argv().expect("sopen ran on the target");
-        argv.iter().any(|a| a == "--gui")
-    };
-    for hook in [
-        ("SOPEN_LIST", "1"),
-        ("SOPEN_LIST", "git"),
-        ("SOPEN_AUTOSAVE", "1"),
-        ("SOPEN_AUTOEXPORT", "1"),
-    ] {
-        assert!(!gui_passed(&[&image], hook), "{hook:?}");
-        assert!(gui_passed(&["--gui", &image], hook), "{hook:?}");
-    }
-    // `--hex` saved without a window: the same.
-    assert!(!gui_passed(&["--hex", &image], ("SOPEN_AUTOSAVE", "1")));
-    // The binary dialog answered without a window, or with the hex window.
-    for choice in ["save", "cancel"] {
-        let hook = ("SOPEN_CHOICE", choice);
-        assert!(!gui_passed(&[&blob], hook), "{choice}");
-        assert!(gui_passed(&["--gui", &blob], hook), "{choice}");
-    }
-    assert!(gui_passed(&[&blob], ("SOPEN_CHOICE", "hex")));
-    // `--hex` opens the hex window whatever the dialog's answer would have been.
-    assert!(gui_passed(&["--hex", &blob], ("SOPEN_CHOICE", "save")));
-    // A screenshot is a window run; an image's `SOPEN_CHOICE` is no dialog's answer.
-    assert!(gui_passed(&[&image], ("SOPEN_SCREENSHOT", "/tmp/shot.png")));
-    assert!(gui_passed(&[&image], ("SOPEN_CHOICE", "save")));
-}
-
 /// The line sopen says when the target's sopen does not know `--gui` (X2-gui).
 fn older_line() -> String {
     format!("sopen: sopen on {HOST} is older and does not know --gui; running it there again without it")
@@ -1972,7 +1934,13 @@ fn an_older_sopen_on_the_target_gets_the_run_again_without_gui() {
     std::fs::create_dir(&dir).unwrap();
     let out = sopen(
         tmp.path(),
-        &["--target", HOST, "--hex", &format!("{HOST}:/srv/a.bin")],
+        &[
+            "--target",
+            HOST,
+            "--gui",
+            "--hex",
+            &format!("{HOST}:/srv/a.bin"),
+        ],
         &[
             ("PATH", &ssh.path),
             ("SOPEN_TARGET_BIN", ssh.sopen.to_str().unwrap()),
@@ -2012,7 +1980,7 @@ fn an_older_sopen_on_the_target_gets_the_run_again_without_gui() {
     let _ = std::fs::remove_file(ssh.dir.join("calls"));
     let out = sopen(
         tmp.path(),
-        &["--target", HOST, dir.to_str().unwrap()],
+        &["--target", HOST, "--gui", dir.to_str().unwrap()],
         &[
             ("PATH", &ssh.path),
             ("SOPEN_TARGET_BIN", ssh.sopen.to_str().unwrap()),
@@ -2047,7 +2015,7 @@ fn another_usage_error_on_the_target_is_not_retried() {
         let _ = std::fs::remove_file(ssh.dir.join("calls"));
         let out = sopen(
             tmp.path(),
-            &["--target", HOST, &source],
+            &["--target", HOST, "--gui", &source],
             &[
                 ("PATH", &ssh.path),
                 ("SOPEN_TARGET_BIN", ssh.sopen.to_str().unwrap()),
@@ -2064,6 +2032,90 @@ fn another_usage_error_on_the_target_is_not_retried() {
             assert!(err.starts_with(&format!("{line}\n")), "{err}");
         }
     }
+}
+
+/// The run is made again only on evidence that HOST's sopen refused `--gui` before it did
+/// anything (X2-gui, 2026-11-26): exit 2, clap's line the first HOST wrote on its stderr (blank
+/// lines and colours aside), nothing on its stdout. A sopen that does something first and says so
+/// — a line on its stdout, or another line on its stderr before clap's — then exits 2 with that
+/// line is HOST's answer as it is: run once, its side effect once.
+#[test]
+fn a_target_that_did_something_before_the_line_is_not_run_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let ran = tmp.path().join("ran");
+    let wrapper = tmp.path().join("wrapper-sopen");
+    let clap = "error: unexpected argument '--gui' found";
+    for (said, retried) in [
+        (
+            format!("printf 'wrote it\\n'; printf \"\\n{clap}\\n\" >&2"),
+            false,
+        ),
+        (format!("printf \"fetching a.png\\n{clap}\\n\" >&2"), false),
+        (
+            format!("printf \"\\n\\n{clap}\\n\\nUsage: sopen\\n\" >&2"),
+            true,
+        ),
+    ] {
+        let _ = std::fs::remove_file(&ran);
+        let _ = std::fs::remove_file(ssh.dir.join("calls"));
+        // On the second run (no `--gui`) it opens as a newer sopen would: exit 0.
+        executable(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nprintf 'x\\n' >> '{ran}'\n\
+                 for a in \"$@\"; do if [ \"$a\" = --gui ]; then {said}; exit 2; fi; done\nexit 0\n",
+                ran = ran.display()
+            ),
+        );
+        let out = sopen(
+            tmp.path(),
+            &["--target", HOST, "--gui", &format!("{HOST}:/srv/dir")],
+            &[
+                ("PATH", &ssh.path),
+                ("SOPEN_TARGET_BIN", wrapper.to_str().unwrap()),
+            ],
+        );
+        let err = text(&out.stderr);
+        let runs = std::fs::read_to_string(&ran).unwrap().lines().count();
+        let calls = ssh_calls(&ssh).len();
+        if retried {
+            assert_eq!(out.status.code(), Some(0), "{said}: {err}");
+            assert_eq!((calls, runs), (2, 2), "{said}: {err}");
+            assert!(err.ends_with(&format!("{}\n", older_line())), "{err}");
+        } else {
+            assert_eq!(out.status.code(), Some(2), "{said}: {err}");
+            assert_eq!((calls, runs), (1, 1), "{said}: {err}");
+            assert!(!err.contains("is older"), "{said}: {err}");
+            assert!(err.contains(clap), "{said}: {err}");
+        }
+    }
+}
+
+/// HOST's sopen given `--gui` with no display there says §7.1's line; this side passes it on after
+/// `on HOST: `, so it is not taken for this machine's, and leaves with HOST's exit 1.
+#[test]
+fn hosts_no_display_line_is_said_as_hosts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let line =
+        "sopen: no display here — sopen config target <host>, or --target, opens the window \
+                on another machine";
+    let wrapper = tmp.path().join("no-display-sopen");
+    executable(
+        &wrapper,
+        &format!("#!/bin/sh\nprintf '%s\\n' '{line}' >&2\nexit 1\n"),
+    );
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, "--gui", &format!("{HOST}:/srv/dir")],
+        &[
+            ("PATH", &ssh.path),
+            ("SOPEN_TARGET_BIN", wrapper.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr), format!("on {HOST}: {line}\n"));
 }
 
 /// `--gui` asks for the window where SOURCE opens; here, with no display, that is §7.1's line and

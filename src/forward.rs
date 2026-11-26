@@ -340,9 +340,9 @@ fn script(host: &str, install_paths: &str) -> String {
 pub struct Flags<'a> {
     /// `--app APP` (10 §11 row 1).
     pub app: Option<&'a str>,
-    /// `--gui` (10 §11 row 2, T35): the owner gave it, or the kind this side sees needs a
-    /// window; never with `app` nor for an address. An older sopen on HOST that does not know it
-    /// gets the run again without it ([`run`]).
+    /// `--gui` (10 §11 row 2, T35): the owner gave it (from XF also when the kind this side sees
+    /// needs a window: `AUTO_GUI` in `src/main.rs`); never with `app` nor for an address. An
+    /// older sopen on HOST that refuses it at parse time gets the run again without it ([`run`]).
     pub gui: bool,
     /// `--hex`.
     pub hex: bool,
@@ -494,8 +494,10 @@ pub fn run(host: &str, source: &str, flags: Flags, state_dir: &Path) -> Result<u
         ssh
     };
     if flags.gui {
-        let (status, said) = watched(ssh(flags), tty)?;
-        if !older(status.code(), said) {
+        let out: Sink = || Box::new(std::io::stdout());
+        let err: Sink = || Box::new(std::io::stderr());
+        let (status, refused) = watched(ssh(flags), tty, host, out, err)?;
+        if !older(status.code(), refused) {
             return exit_code(host, status);
         }
         eprintln!(
@@ -517,49 +519,91 @@ pub fn run(host: &str, source: &str, flags: Flags, state_dir: &Path) -> Result<u
 /// says it (clap 4; coloured when its stderr is a terminal, as under `ssh -t`).
 const UNKNOWN_GUI: &str = "error: unexpected argument '--gui' found";
 
-/// HOST's answer to a run with `--gui` says its sopen is older: exit 2 *and* clap's line for an
-/// unknown `--gui` ([`UNKNOWN_GUI`]). Any other exit 2 — a usage error of its own, a sopen older
-/// still that does not know `--here` — is HOST's answer as it is.
-fn older(code: Option<i32>, said: bool) -> bool {
-    code == Some(2) && said
+/// HOST's answer to a run with `--gui` says its sopen is older, and refused it before doing
+/// anything: exit 2 *and* `refused` — [`UNKNOWN_GUI`] the first line HOST wrote on its stderr,
+/// nothing on its stdout ([`watched`]), as clap's rejection at parse time leaves it. Any other
+/// exit 2 — a usage error of its own, a sopen older still that does not know `--here`, a run that
+/// said something first — is HOST's answer as it is.
+fn older(code: Option<i32>, refused: bool) -> bool {
+    code == Some(2) && refused
 }
 
-/// Runs `ssh` with the stream that carries HOST's stderr — ssh's stdout under `-t` (`tty`: the
-/// terminal there takes both), else its stderr — piped through this side and passed on as it
-/// comes, watched for [`UNKNOWN_GUI`]; the other stream is this side's as it is. Returns ssh's
-/// status and whether that line came.
-fn watched(mut ssh: Command, tty: bool) -> Result<(ExitStatus, bool)> {
+/// Where one of HOST's streams goes on this side.
+type Sink = fn() -> Box<dyn std::io::Write>;
+
+/// Runs `ssh` with HOST's output piped through this side ([`Relay`]) to `out` and `err`, and
+/// returns ssh's status and whether HOST's sopen refused `--gui` at parse time: under `-t`
+/// (`tty`) the terminal there takes HOST's stdout and stderr both, ssh's stdout, whose first line
+/// must be [`UNKNOWN_GUI`]; under `-T` that must be the first line of ssh's stderr, and its stdout
+/// empty.
+fn watched(
+    mut ssh: Command,
+    tty: bool,
+    host: &str,
+    out: Sink,
+    err: Sink,
+) -> Result<(ExitStatus, bool)> {
     use std::process::Stdio;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    match tty {
-        true => ssh.stdout(Stdio::piped()),
-        false => ssh.stderr(Stdio::piped()),
-    };
+    ssh.stdout(Stdio::piped());
+    if !tty {
+        ssh.stderr(Stdio::piped());
+    }
     let mut child = ssh
         .spawn()
         .context("cannot run ssh (is OpenSSH installed?)")?;
-    let said = std::sync::Arc::new(AtomicBool::new(false));
-    let done = match tty {
-        true => watch(child.stdout.take(), std::io::stdout, said.clone()),
-        false => watch(child.stderr.take(), std::io::stderr, said.clone()),
-    };
+    let (out_seen, out_done) = watch(child.stdout.take(), out, host);
+    let on_err = (!tty).then(|| watch(child.stderr.take(), err, host));
     let status = child.wait().context("ssh did not run to its end")?;
-    // Its end, unless a descendant of ssh still holds it (a ProxyCommand keeps ssh's stderr).
-    ended(None, done);
-    Ok((status, said.load(Ordering::SeqCst)))
+    let (err_seen, err_done) = match on_err {
+        Some((seen, done)) => (Some(seen), Some(done)),
+        None => (None, None),
+    };
+    // Their ends, unless a descendant of ssh still holds one (a ProxyCommand keeps ssh's stderr).
+    ended(err_done, out_done);
+    let out_seen = *out_seen.lock().unwrap_or_else(|e| e.into_inner());
+    let refused = match err_seen {
+        None => out_seen.first == Some(true),
+        Some(err_seen) => {
+            let err_seen = *err_seen.lock().unwrap_or_else(|e| e.into_inner());
+            err_seen.first == Some(true) && !out_seen.wrote
+        }
+    };
+    Ok((status, refused))
 }
 
-/// Copies `pipe` to `sink()` as it comes and sets `said` once a line of it is [`UNKNOWN_GUI`]
-/// ([`Scan`]); the receiver gets `()` at the pipe's end.
-fn watch<W: std::io::Write + 'static>(
+/// What one of HOST's streams has shown so far.
+#[derive(Debug, Clone, Copy, Default)]
+struct Seen {
+    /// Whether its first line that is not blank is [`UNKNOWN_GUI`] (`None`: none yet).
+    first: Option<bool>,
+    /// A byte came.
+    wrote: bool,
+}
+
+/// Copies `pipe` to `sink()` through a [`Relay`] for `host`, as it comes; the shared [`Seen`]
+/// follows it, and the receiver gets `()` at the pipe's end.
+fn watch(
     pipe: Option<impl std::io::Read + Send + 'static>,
-    sink: fn() -> W,
-    said: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> std::sync::mpsc::Receiver<()> {
+    sink: Sink,
+    host: &str,
+) -> (
+    std::sync::Arc<std::sync::Mutex<Seen>>,
+    std::sync::mpsc::Receiver<()>,
+) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Seen::default()));
+    let shared = seen.clone();
+    let mut relay = Relay::new(host);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let pass = |bytes: &[u8], relay: &Relay| {
+            if !bytes.is_empty() {
+                let mut sink = sink();
+                let _ = sink.write_all(bytes);
+                let _ = sink.flush();
+            }
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = relay.seen;
+        };
         if let Some(mut pipe) = pipe {
-            let mut scan = Scan::default();
             let mut bytes = [0u8; 8192];
             loop {
                 let n = match pipe.read(&mut bytes) {
@@ -568,57 +612,107 @@ fn watch<W: std::io::Write + 'static>(
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
-                let mut sink = sink();
-                let _ = sink.write_all(&bytes[..n]);
-                let _ = sink.flush();
-                scan.take(&bytes[..n]);
-                if scan.seen {
-                    said.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
+                let passed = relay.take(&bytes[..n]);
+                pass(&passed, &relay);
             }
-            scan.end();
-            if scan.seen {
-                said.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
+            let rest = relay.end();
+            pass(&rest, &relay);
         }
         let _ = tx.send(());
     });
-    rx
+    (seen, rx)
 }
 
-/// Looks for [`UNKNOWN_GUI`] at the start of a line of one stream — a line ending at `\n` or
-/// `\r` (a terminal's `\r\n`), its ANSI escape sequences (clap's colours) taken off.
-#[derive(Default)]
-struct Scan {
-    /// The current line so far, kept up to [`Scan::KEPT`] bytes: past that, and coloured, it is
-    /// still longer than clap's line.
+/// One of HOST's streams on its way here: passed on as it comes, but for a line that may still be
+/// HOST's no-display line (`sopen: ` and [`crate::gui::term::NO_DISPLAY`]), held until it is —
+/// then passed on after `on HOST: `, so it is not read as this machine's — or cannot be; and its
+/// first line that is not blank is read for [`UNKNOWN_GUI`] ([`Seen`]). A line ends at `\n` or
+/// `\r` (a terminal's `\r\n`); ANSI escape sequences (clap's colours) do not count.
+struct Relay {
+    /// `on HOST: `.
+    on_host: String,
+    /// `sopen: ` and the no-display line.
+    no_display: String,
+    /// The start of the current line, not passed on yet: it may still be the no-display line.
+    held: Vec<u8>,
+    /// The current line cannot be (or is) the no-display line: the rest of it passes.
+    passing: bool,
+    /// The current line so far, up to [`Relay::KEPT`] bytes (past that, coloured, it is longer
+    /// than clap's line), for [`Seen::first`].
     line: Vec<u8>,
-    seen: bool,
+    seen: Seen,
 }
 
-impl Scan {
+impl Relay {
     const KEPT: usize = 512;
 
-    fn take(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            if b == b'\n' || b == b'\r' {
-                self.end();
-            } else if self.line.len() < Self::KEPT {
-                self.line.push(b);
-            }
+    fn new(host: &str) -> Self {
+        Self {
+            on_host: format!("on {host}: "),
+            no_display: format!("sopen: {}", crate::gui::term::NO_DISPLAY),
+            held: Vec::new(),
+            passing: false,
+            line: Vec::new(),
+            seen: Seen::default(),
         }
     }
 
-    /// The current line has ended (or the stream has).
-    fn end(&mut self) {
-        self.seen |= without_escapes(&self.line).starts_with(UNKNOWN_GUI);
+    /// Takes the next bytes; returns those to pass on now.
+    fn take(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            self.seen.wrote = true;
+            if b == b'\n' || b == b'\r' {
+                self.line_end();
+                out.append(&mut self.held);
+                out.push(b);
+                self.passing = false;
+                continue;
+            }
+            if self.line.len() < Self::KEPT {
+                self.line.push(b);
+            }
+            if self.passing {
+                out.push(b);
+                continue;
+            }
+            self.held.push(b);
+            // Bytes, not text: a character cut between two reads is still a prefix.
+            let plain = without_escapes(&self.held);
+            let line = self.no_display.as_bytes();
+            if plain.starts_with(line) {
+                out.extend_from_slice(self.on_host.as_bytes());
+                out.append(&mut self.held);
+                self.passing = true;
+            } else if !line.starts_with(&plain) {
+                out.append(&mut self.held);
+                self.passing = true;
+            }
+        }
+        out
+    }
+
+    /// The current line has ended: the first that is not blank is clap's or not.
+    fn line_end(&mut self) {
+        if self.seen.first.is_none() {
+            let plain = without_escapes(&self.line);
+            if !plain.iter().all(u8::is_ascii_whitespace) {
+                self.seen.first = Some(plain.starts_with(UNKNOWN_GUI.as_bytes()));
+            }
+        }
         self.line.clear();
+    }
+
+    /// The stream's end: what is still held passes, and its last line counts.
+    fn end(&mut self) -> Vec<u8> {
+        self.line_end();
+        std::mem::take(&mut self.held)
     }
 }
 
-/// `bytes` as text without its ANSI escape sequences: a CSI (`ESC [`, parameters, one final
-/// byte in `@`–`~`) whole, any other `ESC` with the byte after it.
-fn without_escapes(bytes: &[u8]) -> String {
+/// `bytes` without their ANSI escape sequences: a CSI (`ESC [`, parameters, one final byte in
+/// `@`–`~`) whole, any other `ESC` with the byte after it.
+fn without_escapes(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -637,7 +731,7 @@ fn without_escapes(bytes: &[u8]) -> String {
         // The final byte, or the one after a lone ESC.
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1708,11 +1802,12 @@ mod tests {
     /// X2-gui: a sopen on HOST older than `--gui` refuses it as clap refuses any argument it does
     /// not know. The line is the locked clap's own, rendered from a command without `--gui` —
     /// plain, as `ssh -T` passes HOST's stderr, and coloured with `\r\n`, as a terminal there
-    /// (`ssh -t`) gets it — and is found at a line's start, in chunks of any size, after other
-    /// lines. The same line for another flag, or not at a line's start, is not it; and the
-    /// answer is an older sopen only with exit 2 as well.
+    /// (`ssh -t`) gets it — and counts only as the first line that is not blank, in chunks of any
+    /// size: after another line it is not parse-time evidence. The same line for another flag,
+    /// or not at a line's start, is not it; and the answer is an older sopen only with exit 2.
+    /// Everything passes as it came.
     #[test]
-    fn hosts_unknown_gui_line_is_found_plain_or_coloured() {
+    fn hosts_unknown_gui_line_counts_only_as_its_first() {
         let before = clap::Command::new("sopen")
             .arg(
                 clap::Arg::new("here")
@@ -1727,63 +1822,111 @@ mod tests {
         let plain = e.render().to_string();
         let coloured = e.render().ansi().to_string().replace('\n', "\r\n");
         assert!(coloured.contains('\x1b'), "{coloured:?}");
-        let seen = |bytes: &[u8], chunk: usize| {
-            let mut scan = Scan::default();
+        let first = |bytes: &[u8], chunk: usize| {
+            let mut relay = Relay::new("box");
+            let mut passed = Vec::new();
             for part in bytes.chunks(chunk) {
-                scan.take(part);
+                passed.extend(relay.take(part));
             }
-            scan.end();
-            scan.seen
+            passed.extend(relay.end());
+            assert_eq!(passed, bytes, "passed as it came");
+            relay.seen.first == Some(true)
         };
         for text in [&plain, &coloured] {
             for chunk in [1, 7, 4096] {
-                assert!(
-                    seen(text.as_bytes(), chunk),
-                    "{text:?} in chunks of {chunk}"
-                );
-                let after = format!("a line\nprogress 10%\r{text}");
-                assert!(
-                    seen(after.as_bytes(), chunk),
-                    "{after:?} in chunks of {chunk}"
-                );
+                assert!(first(text.as_bytes(), chunk), "{text:?} by {chunk}");
+                let blank_first = format!("\n \r\n\x1b[0m\n{text}");
+                assert!(first(blank_first.as_bytes(), chunk), "{blank_first:?}");
+                let after = format!("fetching a.png\n{text}");
+                assert!(!first(after.as_bytes(), chunk), "{after:?} by {chunk}");
+                let progress = format!("progress 10%\r{text}");
+                assert!(!first(progress.as_bytes(), chunk), "{progress:?}");
             }
         }
         let other = refused(&["sopen", "--here", "--state-stdin", "--", "/x"]);
         let other = other.render().to_string();
-        assert!(!seen(other.as_bytes(), 4096), "{other}");
-        assert!(!seen(
+        assert!(!first(other.as_bytes(), 4096), "{other}");
+        assert!(!first(
             b"note: error: unexpected argument '--gui' found\n",
-            4096
+            9
         ));
-        assert!(!seen(b"error: unexpected argument '--guide' found\n", 4096));
-        assert!(!seen(b"", 1));
+        assert!(!first(b"error: unexpected argument '--guide' found\n", 9));
+        assert!(!first(b"", 1));
         assert!(older(Some(2), true));
-        for (code, said) in [
+        for (code, refused) in [
             (Some(2), false),
             (Some(1), true),
             (Some(0), true),
             (None, true),
         ] {
-            assert!(!older(code, said), "{code:?} {said}");
+            assert!(!older(code, refused), "{code:?} {refused}");
         }
     }
 
-    /// The watch on HOST's stream sets its flag once the line has come, and only then.
+    /// HOST's no-display line (`sopen: ` and §7.1's line) passes with `on HOST: ` before it, so it
+    /// is not read as this machine's — plain or under a terminal there, in chunks of any size;
+    /// every other line, one that starts like it included, passes as it came.
     #[test]
-    fn the_watch_says_whether_hosts_line_came() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let watched = |bytes: &[u8]| {
-            let said = std::sync::Arc::new(AtomicBool::new(false));
-            let pipe = std::io::Cursor::new(bytes.to_vec());
-            let done = watch(Some(pipe), std::io::sink, said.clone());
-            done.recv_timeout(Duration::from_secs(10)).unwrap();
-            said.load(Ordering::SeqCst)
+    fn hosts_no_display_line_says_it_is_hosts() {
+        let relayed = |bytes: &[u8], chunk: usize| {
+            let mut relay = Relay::new("box");
+            let mut passed = Vec::new();
+            for part in bytes.chunks(chunk) {
+                passed.extend(relay.take(part));
+            }
+            passed.extend(relay.end());
+            String::from_utf8(passed).unwrap()
         };
-        assert!(watched(
-            b"x\nerror: unexpected argument '--gui' found\n\nUsage: sopen\n"
+        let line = format!("sopen: {}", crate::gui::term::NO_DISPLAY);
+        for chunk in [1, 5, 4096] {
+            for end in ["\n", "\r\n", ""] {
+                let text = format!("a\n{line}{end}b\n");
+                assert_eq!(
+                    relayed(text.as_bytes(), chunk),
+                    format!("a\non box: {line}{end}b\n"),
+                    "by {chunk}"
+                );
+            }
+            for same in [
+                "sopen: no display for the file browser (DISPLAY / WAYLAND_DISPLAY unset)\n",
+                "sopen: no display here\n",
+                "x sopen: no display here — sopen config target <host>\n",
+                "sopen: 한글 ü\n",
+                "",
+            ] {
+                assert_eq!(relayed(same.as_bytes(), chunk), same, "by {chunk}");
+            }
+        }
+    }
+
+    /// `watched` reads the right stream on each side of `tty` (X2-gui): under `-t` ssh's stdout
+    /// (HOST's terminal takes both of its streams), under `-T` ssh's stderr with its stdout
+    /// empty. Swapping the two arms, or taking a line on HOST's stdout under `-T` for a refusal,
+    /// fails here.
+    #[test]
+    fn watched_reads_hosts_stderr_where_it_comes() {
+        let sink: Sink = || Box::new(std::io::sink());
+        let clap = r#"printf "error: unexpected argument '--gui' found\r\n""#;
+        let run = |script: String, tty: bool| {
+            let mut sh = Command::new("/bin/sh");
+            sh.arg("-c").arg(script).stdin(std::process::Stdio::null());
+            if tty {
+                // Not watched under `-t`: kept off the test's own stderr.
+                sh.stderr(std::process::Stdio::null());
+            }
+            let (status, refused) = watched(sh, tty, "box", sink, sink).unwrap();
+            assert_eq!(status.code(), Some(2));
+            refused
+        };
+        assert!(run(format!("{clap}; exit 2"), true));
+        assert!(!run(format!("{clap} >&2; exit 2"), true));
+        assert!(run(format!("{clap} >&2; exit 2"), false));
+        assert!(!run(format!("{clap}; exit 2"), false));
+        assert!(!run(
+            format!("printf 'did it\\n'; {clap} >&2; exit 2"),
+            false
         ));
-        assert!(!watched(b"error: unexpected argument '--here' found\n"));
-        assert!(!watched(b"opened\n"));
+        assert!(!run(format!("printf 'did it\\n'; {clap}; exit 2"), true));
     }
 
     // -----------------------------------------------------------------------------------------

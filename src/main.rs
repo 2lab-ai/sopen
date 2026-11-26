@@ -598,13 +598,11 @@ fn run_source(
     sopen::debug!("opening {there} on {host}");
     let flags = forward::Flags {
         app: app_name,
-        gui: forward_gui(
-            gui,
-            app_name.is_some(),
-            hex,
-            gui::Hooks::from_env().ok().as_ref(),
-            || seen_kind(source),
-        ),
+        gui: forward_gui(gui, app_name.is_some(), || {
+            auto_gui(hex, gui::Hooks::from_env().ok().as_ref(), || {
+                seen_kind(source)
+            })
+        }),
         hex,
         browser: false,
     };
@@ -776,24 +774,27 @@ fn window_here(display: bool) -> Result<()> {
     Ok(())
 }
 
-/// Whether a forward passes `--gui` (10 §7.3, T35; X2-gui): the owner gave it; or, for a window
-/// run, `--hex` or the kind this machine sees (`seen`, asked only then) opens in a window — a
-/// folder, an image, video or audio, a binary. Text keeps HOST's editor (§11 row 5:
-/// [`route`]'s `Editor`); a kind not seen goes without it and HOST picks by kind. A run the
-/// hooks (`hooks`, this side's: they travel to HOST) keep without a window — `SOPEN_LIST`,
-/// `SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`, a binary dialog answered `save` or `cancel` — is no
-/// window run (decided 2026-11-26), nor is one whose hooks cannot be read here (HOST says
-/// why). Never with `--app` (row 1).
-fn forward_gui(
-    gui: bool,
-    app: bool,
-    hex: bool,
-    hooks: Option<&gui::Hooks>,
-    seen: impl FnOnce() -> Option<Kind>,
-) -> bool {
-    if app || gui {
-        return !app;
-    }
+/// The forward's automatic `--gui` ([`auto_gui`]), which XF turns on (10 §17 XF). Until then a
+/// forward passes `--gui` only when the owner gave it (decided 2026-11-26): an automatic one
+/// would turn HOST's fallbacks without a display — a folder to the editor, a file fetched and
+/// its path printed — into exit 1, against §11 row 6, while before the flip HOST already opens
+/// a window for a window kind when it can.
+const AUTO_GUI: bool = false;
+
+/// Whether a forward passes `--gui` (10 §7.3, T35; X2-gui): the owner gave it, or — once
+/// [`AUTO_GUI`] is on — `auto` says so. Never with `--app` (§11 row 1).
+fn forward_gui(gui: bool, app: bool, auto: impl FnOnce() -> bool) -> bool {
+    !app && (gui || (AUTO_GUI && auto()))
+}
+
+/// XF's automatic `--gui`, behind [`AUTO_GUI`]: for a window run, `--hex` or the kind this
+/// machine sees (`seen`, asked only then) opens in a window — a folder, an image, video or
+/// audio, a binary. Text keeps HOST's editor (§11 row 5: [`route`]'s `Editor`); a kind not seen
+/// goes without it and HOST picks by kind. A run the hooks (`hooks`, this side's: they travel
+/// to HOST) keep without a window — `SOPEN_LIST`, `SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`, a binary
+/// dialog answered `save` or `cancel` — is no window run (2026-11-26), nor is one whose hooks
+/// cannot be read here (HOST says why).
+fn auto_gui(hex: bool, hooks: Option<&gui::Hooks>, seen: impl FnOnce() -> Option<Kind>) -> bool {
     let Some(hooks) = hooks else { return false };
     if hooks.list || hooks.list_git || hooks.autosave || hooks.autoexport {
         return false;
@@ -1975,12 +1976,12 @@ mod tests {
         assert_eq!(folder_run(&shot, true), FolderRun::Browser);
     }
 
-    /// X2-gui: a forward passes `--gui` for the kinds that open in a window — a folder, an
-    /// image, an mp3, a binary — and with `--hex` or the owner's `--gui`; never for text, a kind
-    /// not seen from here (a remote name that does not decide it, a local special file) or with
-    /// `--app`. A local SOURCE is seen by its stat and bytes, a remote one by its name only.
+    /// X2-gui, until XF: a forward passes `--gui` only when the owner gave it ([`AUTO_GUI`] off);
+    /// `--app` never. XF's automatic rule is tested as it stands: the kinds a sender sees
+    /// ([`seen_kind`]: a local SOURCE by its stat and bytes, a remote one by its name only) and
+    /// which of them, in a window run, bring `--gui` ([`auto_gui`]).
     #[test]
-    fn a_forward_passes_gui_for_the_kinds_it_sees_need_a_window() {
+    fn a_forward_passes_gui_when_given_and_xf_has_the_rule_by_kind() {
         let tmp = tempfile::tempdir().unwrap();
         let at = |name: &str| tmp.path().join(name).to_str().unwrap().to_string();
         std::fs::create_dir(tmp.path().join("dir")).unwrap();
@@ -1989,6 +1990,18 @@ mod tests {
         std::fs::write(tmp.path().join("blob"), [0u8, 1, 2, 0]).unwrap();
         std::fs::write(tmp.path().join("notes.txt"), "text\n").unwrap();
         std::fs::write(tmp.path().join("plain"), "text by its bytes\n").unwrap();
+
+        // Until XF: the owner's `--gui` alone, never with `--app`.
+        let never = || -> bool { panic!("the automatic rule was asked") };
+        assert!(forward_gui(true, false, never));
+        assert!(!forward_gui(true, true, never));
+        assert!(!forward_gui(false, true, never));
+        // XF turns the automatic one on (`AUTO_GUI`), with its docs: then this line changes.
+        assert!(
+            !forward_gui(false, false, || true),
+            "automatic --gui before XF"
+        );
+
         let seen = |source: &str| seen_kind(source);
         assert_eq!(seen(&at("dir")), Some(Kind::Directory));
         assert_eq!(seen(&at("a.png")), Some(Kind::Image));
@@ -2004,10 +2017,11 @@ mod tests {
         assert_eq!(seen("box:/srv/archive.zip"), None);
         assert_eq!(seen("box:"), None);
 
+        // XF's rule: the kinds that open in a window, and `--hex`; not text, not a kind unseen.
         let never = || -> Option<Kind> { panic!("the kind was looked at") };
         let none = gui::Hooks::default();
         let window = Some(&none);
-        let passes = |source: &str| forward_gui(false, false, false, window, || seen_kind(source));
+        let passes = |source: &str| auto_gui(false, window, || seen_kind(source));
         for window in ["dir", "a.png", "a.mp3", "blob"] {
             assert!(passes(&at(window)), "{window}");
         }
@@ -2015,15 +2029,9 @@ mod tests {
         for no in [at("notes.txt"), at("plain"), "box:/srv/data".to_string()] {
             assert!(!passes(&no), "{no}");
         }
-        // The owner's `--gui` and `--hex` decide without a look at the kind.
-        assert!(forward_gui(true, false, false, window, never));
-        assert!(forward_gui(false, false, true, window, never));
-        assert!(forward_gui(true, false, true, window, never));
-        // `--app` never, whatever else.
-        assert!(!forward_gui(false, true, false, window, never));
-        assert!(!forward_gui(true, true, true, window, never));
+        assert!(auto_gui(true, window, never));
 
-        // A run the hooks keep without a window (decided 2026-11-26): `--gui` only when given.
+        // A run the hooks keep without a window gets none (2026-11-26).
         let image = || Some(Kind::Image);
         let binary = || Some(Kind::Other);
         for windowless in [
@@ -2045,18 +2053,8 @@ mod tests {
             },
         ] {
             let hooks = Some(&windowless);
-            assert!(
-                !forward_gui(false, false, false, hooks, image),
-                "{windowless:?}"
-            );
-            assert!(
-                !forward_gui(false, false, true, hooks, never),
-                "{windowless:?}"
-            );
-            assert!(
-                forward_gui(true, false, false, hooks, never),
-                "{windowless:?}"
-            );
+            assert!(!auto_gui(false, hooks, image), "{windowless:?}");
+            assert!(!auto_gui(true, hooks, never), "{windowless:?}");
         }
         // The binary dialog: answered without a window by save and cancel, with one by hex;
         // `--hex` is the hex window whatever the answer; an image has no dialog to answer.
@@ -2066,23 +2064,19 @@ mod tests {
         };
         for choice in [gui::Choice::Save, gui::Choice::Cancel] {
             let hooks = answered(choice);
-            assert!(!forward_gui(false, false, false, Some(&hooks), binary));
-            assert!(forward_gui(true, false, false, Some(&hooks), never));
-            assert!(forward_gui(false, false, true, Some(&hooks), never));
-            assert!(forward_gui(false, false, false, Some(&hooks), image));
+            assert!(!auto_gui(false, Some(&hooks), binary));
+            assert!(auto_gui(true, Some(&hooks), never));
+            assert!(auto_gui(false, Some(&hooks), image));
         }
-        let hex = answered(gui::Choice::Hex);
-        assert!(forward_gui(false, false, false, Some(&hex), binary));
-        // A screenshot is a window.
+        assert!(auto_gui(false, Some(&answered(gui::Choice::Hex)), binary));
+        // A screenshot is a window; hooks this side cannot read bring none (HOST says why).
         let shot = gui::Hooks {
             screenshot: Some(PathBuf::from("/tmp/shot.png")),
             ..Default::default()
         };
-        assert!(forward_gui(false, false, false, Some(&shot), image));
-        // Hooks this side cannot read: no `--gui` of its own (HOST says what is wrong).
-        assert!(!forward_gui(false, false, false, None, image));
-        assert!(!forward_gui(false, false, true, None, never));
-        assert!(forward_gui(true, false, false, None, never));
+        assert!(auto_gui(false, Some(&shot), image));
+        assert!(!auto_gui(false, None, image));
+        assert!(!auto_gui(true, None, never));
     }
 
     /// `--gui` with the window here (10 §11 row 2): with no display, §7.1's line, exit 1 (not a
