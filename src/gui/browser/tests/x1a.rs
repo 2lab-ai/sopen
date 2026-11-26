@@ -91,22 +91,50 @@ fn each_in_its_place(fx: &Fx, w: f32, h: f32) {
     );
 }
 
-/// A text preview at `side`: rows of cells, every one inside its host's frame (a cell in from
-/// the side, egui's) — the previewed file's, never the list's.
-fn preview_cells_inside(fx: &Fx, side: Rect) {
+/// A text preview of the file `name` at `side`: exactly one layer of cells over all of the side —
+/// its host's frame (X3-preview), single-lined, `name` in its top border — and every other layer
+/// there, the preview's own, inside that frame (a cell in from the side); its cells seen there,
+/// not blanks alone; nothing of the list's (its `Name` head) in any of them.
+fn preview_cells_inside(fx: &Fx, side: Rect, name: &str) {
     let inside = Rect::from_min_max(side.min + chrome::CELL, side.max - chrome::CELL);
-    let rows = cells_in(fx, side);
-    assert!(!rows.is_empty(), "the preview's rows in cells");
-    for (r, text) in &rows {
-        assert!(
-            inside.expand(0.5).contains_rect(*r),
-            "{text:?} at {r:?} out of {inside:?}"
-        );
-        assert!(
-            !text.contains("Name"),
-            "the list's head in the preview: {text:?}"
-        );
+    let layers = cells::layers(&fx.drv.ctx);
+    let framed: Vec<usize> = (0..layers.len())
+        .filter(|&i| layers[i].rect(layers[i].buf.area) == side)
+        .collect();
+    assert_eq!(framed.len(), 1, "one layer over all of the side: its frame");
+    let frame = &layers[framed[0]];
+    let a = frame.buf.area;
+    assert_eq!(frame.buf[(a.left(), a.top())].symbol(), "┌", "single-lined");
+    let top = cells::row_text(&frame.buf, a.top()).0;
+    assert!(
+        top.contains(name),
+        "{name} in the frame's top border: {top:?}"
+    );
+    for (i, l) in layers.iter().enumerate() {
+        let r = l.rect(l.buf.area);
+        if r.intersect(side).area() <= 0.0 {
+            continue;
+        }
+        if i != framed[0] {
+            assert!(
+                inside.expand(0.5).contains_rect(r),
+                "{r:?} out of {inside:?}"
+            );
+        }
+        for y in l.buf.area.top()..l.buf.area.bottom() {
+            let text = cells::row_text(&l.buf, y).0;
+            assert!(
+                !text.contains("Name"),
+                "the list's head on the preview's side: {text:?}"
+            );
+        }
     }
+    let seen = cells_in(fx, inside);
+    assert!(
+        seen.iter().any(|(_, text)| !text.trim().is_empty()),
+        "the preview's rows in cells, seen inside the frame: {} rows, all blank",
+        seen.len()
+    );
 }
 
 /// The rows of cells inside `area`, as the column query reads them.
@@ -131,9 +159,9 @@ impl Fx {
 }
 
 /// Q1 (TS-8): the list is cells over its whole side, the preview at the other side's cells —
-/// a text preview's rows cells inside its host's egui frame (X3-text) — and nothing either paints
-/// leaves its side — at 1000×700, at sizes off the cell grid, with a hex preview wider than a
-/// narrow side, and with the tree (the spike had no check for it).
+/// a text preview's rows cells inside its host's frame of cells (X3-text, X3-preview) — and
+/// nothing either paints leaves its side — at 1000×700, at sizes off the cell grid, with a hex
+/// preview wider than a narrow side, and with the tree (the spike had no check for it).
 #[test]
 fn q1_panes_on_cell_rects_clip_there_and_follow_a_resize() {
     let mut fx = fixture();
@@ -144,10 +172,10 @@ fn q1_panes_on_cell_rects_clip_there_and_follow_a_resize() {
     let list = cells_in(&fx, left);
     assert_eq!(list.len(), 40, "{list:?}");
     assert!(list.iter().all(|(r, _)| r.width() == left.width()));
-    // The preview at the right side's cells: its rows cells inside its host's frame (egui's,
-    // a cell in from the side), none of the list's.
+    // The preview at the right side's cells: its rows cells inside its host's frame (cells, a
+    // cell in from the side), none of the list's.
     assert_eq!(panes(&fx), [left, right]);
-    preview_cells_inside(&fx, right);
+    preview_cells_inside(&fx, right, "notes.txt");
     let line = fx.drv.find_text("plain notes").expect("the previewed text");
     assert!(right.contains_rect(line), "{line:?} inside {right:?}");
     each_in_its_place(&fx, 1000.0, 700.0);
@@ -159,7 +187,7 @@ fn q1_panes_on_cell_rects_clip_there_and_follow_a_resize() {
     fx.select("main.rs");
     fx.rested();
     assert_eq!(fx.b.active, 1);
-    preview_cells_inside(&fx, left);
+    preview_cells_inside(&fx, left, "main.rs");
     assert_eq!(cells_in(&fx, right).len(), 40);
     each_in_its_place(&fx, 1000.0, 700.0);
     // Sizes off the grid: both sides on whole cells, the pane following its side.

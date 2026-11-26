@@ -6519,6 +6519,11 @@ impl Window for TextWindow {
         }
     }
 
+    /// Its screen is cells (X3-text): a preview of it is framed in cells.
+    fn paints_cells(&self) -> bool {
+        true
+    }
+
     /// The first byte of the top row (08 §2's place).
     fn byte_place(&self) -> Option<u64> {
         Some(self.top + if self.wrap { self.top_off } else { 0 })
