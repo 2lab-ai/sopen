@@ -304,7 +304,7 @@ fn d14_a_view_closed_by_its_prompts_save_gives_the_session_back() {
     fx.key(Key::F9);
     digit(&mut fx, 1);
     assert!(fx.drv.find_text("Unsaved changes").is_some(), "the prompt");
-    fx.drv.click_text_on_top(&mut fx.b, "Save");
+    fx.drv.click_text_on_top(&mut fx.b, "[ Save ]");
     fx.drv.until(&mut fx.b, 20, |b| {
         b.ready() && std::fs::read(&file).unwrap()[0] == 0x41
     });
@@ -728,8 +728,10 @@ fn d10_a_video_none_of_whose_frames_decode_gives_way_to_hex() {
                 && b.ready()
         });
         fx.drv.idle(&mut fx.b, 2);
-        assert!(shows(&fx, "no frame"), "{label:?}: the reason on Hex");
-        assert!(shows(&fx, "the file is shown as bytes"), "{label:?}");
+        // The reason is a row of cells under the grid, wrapped by cells (X3-questions).
+        let said = wrapped_rows(&fx);
+        assert!(said.contains("no frame"), "{label:?}: the reason on Hex");
+        assert!(said.contains("the file is shown as bytes"), "{label:?}");
         assert!(on_strip(&fx, "2 Hex"), "{label:?}");
         digit(&mut fx, 1);
         assert!(on_strip(&fx, "2 Hex"), "{label:?}: 1 stays on Hex");
@@ -1035,3 +1037,12 @@ fn va6_f1_lists_the_view_keys() {
 }
 
 use crate::views::View;
+
+/// The screen's rows of cells, each trimmed, joined by a blank: a text wrapped by cells reads
+/// whole in it.
+fn wrapped_rows(fx: &Fx) -> String {
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, fx.drv.ctx.content_rect().size());
+    let rows = fx.drv.column(screen);
+    let rows: Vec<&str> = rows.iter().map(|(_, r)| r.trim()).collect();
+    rows.join(" ")
+}

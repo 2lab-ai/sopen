@@ -225,11 +225,11 @@ fn va2_hex_viewing_types_nothing_and_editing_asks_before_a_switch() {
         fx.drv.find_text("Unsaved changes").is_some(),
         "the edit asks first"
     );
-    fx.drv.click_text(&mut fx.b, "Cancel");
+    fx.drv.click_text(&mut fx.b, "[ Cancel ]");
     fx.settle();
     assert!(hex_row(&fx, "41 50 4E 47"), "Cancel: Hex, the edit kept");
     digit(&mut fx, 1);
-    fx.drv.click_text(&mut fx.b, "Discard");
+    fx.drv.click_text(&mut fx.b, "[ Discard ]");
     fx.settle();
     assert!(!fx.drv.pictures().is_empty(), "Discard: the picture");
     assert_eq!(std::fs::read(&file).unwrap(), before, "nothing written");
@@ -413,7 +413,7 @@ fn va2_the_prompts_save_lands_then_view_1_shows_the_file_saved() {
     fx.key(Key::F9);
     digit(&mut fx, 1);
     assert!(fx.drv.find_text("Unsaved changes").is_some(), "the prompt");
-    fx.drv.click_text_on_top(&mut fx.b, "Save");
+    fx.drv.click_text_on_top(&mut fx.b, "[ Save ]");
     fx.drv.until(&mut fx.b, 20, |b| {
         b.ready() && std::fs::read(&file).unwrap()[0] == 0x41
     });
@@ -927,7 +927,13 @@ fn a_refused_make_after_a_discard_is_said_on_the_list() {
             "{name}: the prompt"
         );
         refuse.store(true, Ordering::SeqCst);
-        fx.drv.click_text_on_top(&mut fx.b, "Discard");
+        // The image's prompt is egui's; the hex window's is cells (X3-questions).
+        let discard = if name == "photo.png" {
+            "Discard"
+        } else {
+            "[ Discard ]"
+        };
+        fx.drv.click_text_on_top(&mut fx.b, discard);
         fx.settle();
         fx.drv.idle(&mut fx.b, 2);
         assert!(fx.b.viewer.is_none(), "{name}: back at the list");

@@ -22,9 +22,17 @@
 //! window and the terminal show the same cells (TS-4). In a terminal that draws a glyph of
 //! ambiguous width in two cells ([`cells::ambiguous_wide`], which the terminal backend sets) the
 //! ASCII column's CP437 glyphs of width A are 10 §10's stand-ins — `+ - = | # ^ v < >`, and `.`
-//! for the letters the table leaves ([`column_glyph`]). The rows below the
-//! grid (notices, the recovery and refusal rows, the read-only path) and the window's questions
-//! are still egui's.
+//! for the letters the table leaves ([`column_glyph`]).
+//!
+//! The rows below the grid and the window's questions are cells too (X3-questions): the lines to
+//! read whole, the read-only window's keep row with its path field, a refusal's offer, the live
+//! question about a temp and the recovery rows, each text wrapped by cells and each control a
+//! `[ button ]` as the toolbar's; the close prompt, the first Save's question above 256 MiB,
+//! Write in place and Save As are `ops::dialog` boxes between the window's top and its own
+//! F-key row (hosted, the browser's title and status rows). Cells have no hover: what a hover
+//! said is a row (where Discard deletes the kept edits, why a row's buttons wait). A row's
+//! controls are reached by Tab past the ASCII column (Shift+Tab before the hex one), Tab and
+//! Shift+Tab walking them; Enter or Space presses one, Esc gives the keyboard back to the grid.
 //!
 //! As the file browser's preview (02 §4.2, [`super::Window::set_preview`]) the window shows its
 //! first rows without toolbar, status row or cursor, takes no input and never takes the keyboard.
@@ -37,7 +45,7 @@ mod file;
 
 pub use file::{Base, Checking, HexFile, Rebind, Repaint, Saved};
 
-use super::browser::ops::dialog;
+use super::browser::ops::dialog::{self, Button, Ink, Inputs, Part};
 use super::cells::{self, Buffer, Cells, Grid, Pen, Position};
 use super::chrome::{self, HEX_KEYS};
 use super::image::{AT_A_REVISION, CANNOT_REPLACE};
@@ -47,7 +55,7 @@ use crate::journal::{self, Journal, Keep, Schedule};
 use crate::remote::{patch, Fingerprint, HASH_CHECK_MAX};
 use crate::stream::{Bytes, Mark, ReadError, Reader, Source, Waiting};
 use anyhow::{anyhow, bail, Result};
-use eframe::egui::{self, Color32, Key, Rect, Sense, Vec2};
+use eframe::egui::{self, Key, Rect, Sense, Vec2};
 use file::{LeftTemp as LeftTempRef, Request, Row, Saving, Streamed, Way};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -63,8 +71,8 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 #[allow(unused_imports)]
 use {
-    super::Origin, crate::remote::WriteOutcome, anyhow::Context as _, file::CHUNK,
-    std::time::SystemTime,
+    super::Origin, crate::remote::WriteOutcome, anyhow::Context as _, eframe::egui::Color32,
+    file::CHUNK, std::time::SystemTime,
 };
 
 /// Bytes per row.
@@ -1679,7 +1687,7 @@ type Generated = (u64, std::result::Result<Option<PathBuf>, String>);
 type Removed = (Option<PathBuf>, std::result::Result<String, String>);
 
 /// What a recovery row's button asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RowAction {
     Restore,
     Later,
@@ -1917,6 +1925,23 @@ pub(super) struct HexWindow {
     /// Saves started so far (tests: a key starts exactly one).
     #[cfg(test)]
     pub(super) save_starts: usize,
+    /// Where the window's questions stand (10 §6): its rect less its own F-key rows — hosted,
+    /// the browser's area between its title and status rows. Set at each pass.
+    area: Rect,
+    /// A control of the rows below the grid had the keyboard at the end of the last pass: the
+    /// view keys' Question, as a dialog's (every key is the rows').
+    row_focus: bool,
+    /// What the questions of the last pass covered, their boxes and shadows (points), and of
+    /// this one so far: the window's cells under them are blanked before they are painted
+    /// ([`HexWindow::blank_under`]).
+    under: Vec<Rect>,
+    covering: Vec<Rect>,
+    /// The context of the last pass (the window's or the terminal's): what a background
+    /// generation's end repaints.
+    wake: Option<egui::Context>,
+    /// Enter or Space that pressed a control of the rows below the grid, while it stays down
+    /// ([`HexWindow::drop_held`]).
+    held: Option<Key>,
 }
 
 impl Drop for HexWindow {
@@ -1954,6 +1979,23 @@ pub(super) fn bare_key(ctx: &egui::Context, key: Key) -> bool {
         });
         i.events.len() != before
     })
+}
+
+/// A control was pressed in this pass, by a click or by Enter or Space on it: those keys are
+/// spent, so a question it opens in the same pass (Save As…) never takes them for its own.
+fn spend_presses(ctx: &egui::Context) {
+    ctx.input_mut(|i| {
+        i.events.retain(|e| {
+            !matches!(
+                e,
+                egui::Event::Key {
+                    key: Key::Enter | Key::Space,
+                    pressed: true,
+                    ..
+                }
+            ) && !matches!(e, egui::Event::Text(t) if t == " ")
+        })
+    });
 }
 
 fn grid_id() -> egui::Id {
@@ -2046,6 +2088,21 @@ fn blank_under_help(ctx: &egui::Context, grid: &Grid, buf: &mut Buffer) {
     }
 }
 
+/// The cells of `on` that `r` (points, on the same 8 × 16 lattice) stands on, cut to it.
+fn cells_on(on: &Grid, r: Rect) -> Cells {
+    let at = |v: f32, cell: f32, n: u16| (v / cell).round().clamp(0.0, f32::from(n)) as u16;
+    let (from, to) = (r.min - on.origin, r.max - on.origin);
+    let (x0, y0) = (
+        at(from.x, chrome::CELL.x, on.cols),
+        at(from.y, chrome::CELL.y, on.rows),
+    );
+    let (x1, y1) = (
+        at(to.x, chrome::CELL.x, on.cols),
+        at(to.y, chrome::CELL.y, on.rows),
+    );
+    Cells::new(x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
+}
+
 /// A stand-in run before each link of writing the list (tests).
 #[cfg(test)]
 type KeepLink = Box<dyn FnMut(super::binary::LinkStep, &Path) -> std::io::Result<()> + Send>;
@@ -2053,6 +2110,205 @@ type KeepLink = Box<dyn FnMut(super::binary::LinkStep, &Path) -> std::io::Result
 /// The read-only window's "Write the list there" path field.
 fn keep_id() -> egui::Id {
     egui::Id::unique("sopen-hex-keep-to")
+}
+
+/// The fewest cells the keep row's path field has.
+const KEEP_FEWEST: u16 = 12;
+
+/// The questions' nominal widths in cells, the egui dialogs' (420, 440 and 460 points).
+const PROMPT_WIDE: usize = 52;
+const CONFIRM_WIDE: usize = 55;
+const IN_PLACE_WIDE: usize = 57;
+
+fn prompt_id() -> egui::Id {
+    egui::Id::unique("sopen-hex-unsaved")
+}
+
+/// The close prompt's title in its frame.
+const PROMPT_TITLE: &str = "Unsaved changes";
+/// The close prompt's row for where Discard deletes the kept edits, until they are kept.
+const KEEPING_EDITS: &str = "keeping the edits…";
+
+fn confirm_id() -> egui::Id {
+    egui::Id::unique("sopen-hex-confirm")
+}
+
+fn in_place_id() -> egui::Id {
+    egui::Id::unique("sopen-hex-in-place")
+}
+
+/// What a control of the rows below the grid does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Press {
+    /// "Keep edits…": the list of the edits among sopen's kept edits.
+    KeepEdits,
+    /// "Write the list there": the list at the keep row's path.
+    WriteList,
+    /// A refusal's Write in place… (its dialog) and Save As… (07 §4.1).
+    InPlace,
+    OfferSaveAs,
+    /// The live question about a temp (07 §3.1): Remove it (`true`) or Keep it.
+    Left(bool),
+    /// A recovery row's button, the row by its identity ([`row_key`]), never its place: the row
+    /// that moves up when the one above goes never takes that one's controls or keyboard.
+    Row(u64, RowAction),
+}
+
+/// A control of the rows below the grid: its label, what it does, whether it does it now.
+struct Control {
+    label: &'static str,
+    press: Press,
+    on: bool,
+}
+
+/// One row of cells below the grid ([`HexWindow::below`]), laid out for its width: what it
+/// draws is all of what acts there, and what acts is a Tab stop ([`HexWindow::below_controls`]).
+enum Below {
+    /// A text, wrapped already, in its pen.
+    Text(String, Pen),
+    /// Buttons at their first cells, and a `│` at its cell (between a question's answers and a
+    /// recovery row's own buttons, on one row of cells).
+    Buttons(Vec<(u16, Control)>, Option<u16>),
+    /// The read-only window's: `[ Keep edits… ]` and its path field, `field` cells wide, then
+    /// `[ Write the list there ]` — on this row (`write`), or alone on the next
+    /// ([`Below::KeepWrite`]) where this one has no room for it. Where not even a cell of the
+    /// field fits beside the button (`field` 0), the field is a row of its own first
+    /// ([`Below::KeepField`]).
+    Keep {
+        field: u16,
+        write: bool,
+    },
+    KeepField(u16),
+    KeepWrite,
+}
+
+fn below_id(press: Press) -> egui::Id {
+    egui::Id::unique("sopen-hex-below").with(press)
+}
+
+/// A button's cells: `[ label ]`.
+fn button_cells(label: &str) -> u16 {
+    cells::width(label) as u16 + 4
+}
+
+/// Whether a button at cell `x` of a row `cols` wide shows a cell (it is cut at the row's end):
+/// only one that shows is drawn, acts, and is a Tab stop.
+fn shows(x: u16, cols: u16) -> bool {
+    x < cols
+}
+
+/// `controls` on rows `cols` cells wide, from cell 1, two blanks apart — a `│` with a blank
+/// either side before the one at `rule` — and a button that does not fit after another on the
+/// next row (a rule at a row's start is left out). One wider than the row stands alone, cut.
+fn placed(controls: Vec<Control>, rule: Option<usize>, cols: u16) -> Vec<Below> {
+    let (mut out, mut row, mut bar, mut x) = (vec![], vec![], None, 1u16);
+    for (k, c) in controls.into_iter().enumerate() {
+        let w = button_cells(c.label);
+        let ruled = Some(k) == rule;
+        let need = w + if ruled { 3 } else { 0 };
+        if !row.is_empty() && x.saturating_add(need) > cols {
+            out.push(Below::Buttons(std::mem::take(&mut row), bar.take()));
+            x = 1;
+        }
+        if ruled && !row.is_empty() {
+            bar = Some(x);
+            x += 3;
+        }
+        row.push((x, c));
+        x = x.saturating_add(w + 2);
+    }
+    if !row.is_empty() {
+        out.push(Below::Buttons(row, bar));
+    }
+    out
+}
+
+/// A recovery row's identity: its journal's folder, its temp's path, its undo file's or its
+/// note's line — what its controls are keyed on ([`Press::Row`]).
+fn row_key(row: &Row) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match row {
+        Row::Edits { orphan, .. } | Row::Kept { orphan, .. } => {
+            ("journal", orphan.dir()).hash(&mut h)
+        }
+        Row::Undo { line, .. } => ("undo", line).hash(&mut h),
+        Row::Temp { path, .. } => ("temp", path).hash(&mut h),
+        Row::Note(line) => ("note", line).hash(&mut h),
+    }
+    h.finish()
+}
+
+/// The recovery rows as their controls see them: each one's identity and whether it asks about
+/// a temp. A press that changes it gives the keyboard back to the grid.
+fn rows_seen(rows: &[Row]) -> Vec<(u64, bool)> {
+    let asks = |row: &Row| match row {
+        Row::Edits { temp, .. } | Row::Kept { temp, .. } => temp.is_some(),
+        _ => false,
+    };
+    rows.iter().map(|r| (row_key(r), asks(r))).collect()
+}
+
+/// Whether a row below the grid holds `[ Write the list there ]`: the keep row where it has room,
+/// or the row of its own after it. `None`: not the keep row's.
+fn row_write(row: &Below) -> Option<bool> {
+    match row {
+        Below::Keep { write, .. } => Some(*write),
+        Below::KeepWrite => Some(true),
+        _ => None,
+    }
+}
+
+/// A journal's question about a temp, and a temp's row: Remove it, Keep it.
+const ASK: [(&str, RowAction); 2] = [
+    ("Remove it", RowAction::Remove),
+    ("Keep it", RowAction::Keep),
+];
+
+/// A recovery row's line, its journal's question about a temp, and its own buttons.
+fn recovery_row(
+    row: &Row,
+) -> (
+    &str,
+    Option<&LeftTempRef>,
+    &'static [(&'static str, RowAction)],
+) {
+    match row {
+        Row::Edits {
+            line, check, temp, ..
+        } => (
+            line,
+            temp.as_ref(),
+            match check {
+                journal::Restore::Apply { .. } => &[
+                    ("Restore", RowAction::Restore),
+                    ("Later", RowAction::Later),
+                    ("Discard", RowAction::Discard),
+                ],
+                journal::Restore::Ask => &[
+                    ("Restore anyway", RowAction::Restore),
+                    ("Later", RowAction::Later),
+                    ("Discard", RowAction::Discard),
+                ],
+                _ => &[("Later", RowAction::Later), ("Discard", RowAction::Discard)],
+            },
+        ),
+        Row::Kept { line, temp, .. } => (
+            line,
+            temp.as_ref(),
+            &[("Later", RowAction::Later), ("Discard", RowAction::Discard)],
+        ),
+        Row::Undo { line, .. } => (
+            line,
+            None,
+            &[
+                ("Load as edits", RowAction::Load),
+                ("Later", RowAction::Later),
+            ],
+        ),
+        Row::Temp { line, .. } => (line, None, &ASK),
+        Row::Note(line) => (line, None, &[("OK", RowAction::Later)]),
+    }
 }
 
 impl HexWindow {
@@ -2167,6 +2423,12 @@ impl HexWindow {
             at_revision: false,
             #[cfg(test)]
             save_starts: 0,
+            area: Rect::NOTHING,
+            row_focus: false,
+            under: Vec::new(),
+            covering: Vec::new(),
+            wake: None,
+            held: None,
         }
     }
 
@@ -2882,14 +3144,7 @@ impl HexWindow {
             self.status = Status::info(format!("restored {}", plural_bytes(n as u64)));
         }
         let now = Instant::now();
-        let rev = self.doc.rev();
-        if rev != self.journal_rev {
-            self.journal_rev = rev;
-            let kept = self.journal_dir.is_some() || self.writing.is_some();
-            if kept || self.doc.changed_count() > 0 {
-                self.schedule.changed(rev, now);
-            }
-        }
+        self.note_revision(now);
         if self.job.is_none() && self.writing.is_none() && self.schedule.is_due(now) {
             self.write_generation(false);
         }
@@ -2898,10 +3153,27 @@ impl HexWindow {
         }
     }
 
+    /// The document's revision, given to the schedule once it changed (with edits, or a journal
+    /// holding some): what the next generation holds.
+    fn note_revision(&mut self, now: Instant) {
+        let rev = self.doc.rev();
+        if rev != self.journal_rev {
+            self.journal_rev = rev;
+            let kept = self.journal_dir.is_some() || self.writing.is_some();
+            if kept || self.doc.changed_count() > 0 {
+                self.schedule.changed(rev, now);
+            }
+        }
+    }
+
     /// Writes the next generation — now, waiting for it (focus loss, close, a Save's start), or
     /// in the background. The journal is made by the first one.
     fn write_generation(&mut self, wait: bool) {
+        // Nothing to write (an edit undone before the tick, restored bytes still landing): what
+        // was due is dropped, or the tick would ask for a repaint every pass and the prompt never
+        // settle. The next change of the document is due again.
         if !self.wants_generation() {
+            self.schedule.taking();
             return;
         }
         // One at a time: a generation on its way is waited for before the next.
@@ -2916,8 +3188,14 @@ impl HexWindow {
             self.generation_written(rev, result);
         } else {
             let (tx, rx) = mpsc::channel();
+            // Its end repaints the window: the status row says `kept at`, and the close prompt
+            // where Discard deletes the kept edits (a receipt waits for it).
+            let wake = self.wake.clone();
             std::thread::spawn(move || {
                 let _ = tx.send((rev, work()));
+                if let Some(ctx) = wake {
+                    ctx.request_repaint();
+                }
             });
             self.writing = Some(rx);
         }
@@ -3370,87 +3648,421 @@ impl HexWindow {
         }
     }
 
-    /// The recovery rows, one line each with its buttons (buttons, not letter keys: a letter
-    /// types a byte). A journal's row that asks about a temp shows that question under its line,
-    /// with Remove it and Keep it; its Restore and Discard wait for the answer.
-    fn recovery_rows(&mut self, ui: &mut egui::Ui) {
-        let error = ui.visuals().error_fg_color;
-        let mut asked = None;
-        let busy = self.job.is_some() || self.removing.is_some();
-        const ASK: &[(&str, RowAction)] = &[
-            ("Remove it", RowAction::Remove),
-            ("Keep it", RowAction::Keep),
-        ];
-        for (i, row) in self.rows.iter().enumerate() {
-            let (line, temp, buttons): (&str, Option<&LeftTempRef>, &[(&str, RowAction)]) =
-                match row {
-                    Row::Edits {
-                        line, check, temp, ..
-                    } => (
-                        line,
-                        temp.as_ref(),
-                        match check {
-                            journal::Restore::Apply { .. } => &[
-                                ("Restore", RowAction::Restore),
-                                ("Later", RowAction::Later),
-                                ("Discard", RowAction::Discard),
-                            ],
-                            journal::Restore::Ask => &[
-                                ("Restore anyway", RowAction::Restore),
-                                ("Later", RowAction::Later),
-                                ("Discard", RowAction::Discard),
-                            ],
-                            _ => &[("Later", RowAction::Later), ("Discard", RowAction::Discard)],
-                        },
-                    ),
-                    Row::Kept { line, temp, .. } => (
-                        line,
-                        temp.as_ref(),
-                        &[("Later", RowAction::Later), ("Discard", RowAction::Discard)],
-                    ),
-                    Row::Undo { line, .. } => (
-                        line,
-                        None,
-                        &[
-                            ("Load as edits", RowAction::Load),
-                            ("Later", RowAction::Later),
-                        ],
-                    ),
-                    Row::Temp { line, .. } => (line, None, ASK),
-                    Row::Note(line) => (line, None, &[("OK", RowAction::Later)]),
-                };
-            super::disclosures(ui, &[(line.to_string(), error)]);
-            if let Some(temp) = temp {
-                super::disclosures(ui, &[(temp.line.clone(), error)]);
+    // ---- the rows below the grid, in cells (X3-questions) ----
+
+    /// The rows below the grid in `room` cells (10 §6), top to bottom: the lines to read whole
+    /// (the stream's warning, what open said, the read-only line, the last write's notices) in
+    /// the error colour, wrapped by cells; the read-only window's keep row while the edits are
+    /// listed nowhere; a refusal's words with Write in place… and Save As… (07 §4.1); the live
+    /// question about a temp with Remove it and Keep it (07 §3.1); then the recovery rows (07 §3,
+    /// §5.1) — a line each, a journal's question about a temp under it, its buttons (buttons,
+    /// not letter keys: a letter types a byte), the question's answers first. Cells have no
+    /// hover: why a row's buttons are off is a dim row under them.
+    fn below(&self, cols: u16) -> Vec<Below> {
+        let room = usize::from(cols.saturating_sub(2).max(1));
+        let p = chrome::PALETTE;
+        let (error, dim) = (Pen::new(p.error, p.back), Pen::new(p.dim, p.back));
+        let mut out = vec![];
+        let text = |out: &mut Vec<Below>, line: &str, pen: Pen| {
+            for line in line.lines() {
+                let rows = dialog::wrap(line, room);
+                out.extend(rows.into_iter().map(|row| Below::Text(row, pen)));
             }
-            ui.horizontal(|ui| {
-                if temp.is_some() {
-                    for (label, action) in ASK {
-                        if ui.add_enabled(!busy, egui::Button::new(*label)).clicked() {
-                            asked = Some((i, *action));
+        };
+        let warning = self.stream_warning();
+        let lines = (warning.iter())
+            .chain(&self.opened)
+            .chain(&self.read_only)
+            .chain(&self.notices);
+        for line in lines {
+            text(&mut out, line, error);
+        }
+        if self.read_only.is_some() && self.retained.is_none() {
+            // `[ Keep edits… ]`, the field, `[ Write the list there ]` on one row where the
+            // field keeps its fewest cells; else the last on the next row — and the field on a
+            // row of its own where not a cell of it fits beside the button.
+            let at = 1 + button_cells("Keep edits…") + 2;
+            let after = 2 + button_cells("Write the list there") + 1;
+            if cols >= at + KEEP_FEWEST + after {
+                let field = cols - at - after;
+                out.push(Below::Keep { field, write: true });
+            } else if cols > at + 1 {
+                let field = cols - at - 1;
+                out.push(Below::Keep {
+                    field,
+                    write: false,
+                });
+                out.push(Below::KeepWrite);
+            } else {
+                out.push(Below::Keep {
+                    field: 0,
+                    write: false,
+                });
+                out.push(Below::KeepField(cols.saturating_sub(2)));
+                out.push(Below::KeepWrite);
+            }
+        }
+        let free = self.job.is_none() && !self.dialog_up();
+        let control = |label: &'static str, press: Press, on: bool| Control { label, press, on };
+        if let Some(why) = &self.offer {
+            text(&mut out, &format!("not saved: {why}"), error);
+            let all = vec![
+                control("Write in place…", Press::InPlace, free),
+                control("Save As…", Press::OfferSaveAs, free),
+            ];
+            out.extend(placed(all, None, cols));
+        }
+        if let Some(left) = &self.left {
+            text(&mut out, &left.line, error);
+            let free = free && self.answering.is_none();
+            let all = vec![
+                control("Remove it", Press::Left(true), free),
+                control("Keep it", Press::Left(false), free),
+            ];
+            out.extend(placed(all, None, cols));
+        }
+        let busy = self.job.is_some() || self.removing.is_some();
+        for row in &self.rows {
+            let key = row_key(row);
+            let (line, temp, buttons) = recovery_row(row);
+            text(&mut out, line, error);
+            let mut all = vec![];
+            if let Some(temp) = temp {
+                text(&mut out, &temp.line, error);
+                for (label, action) in ASK {
+                    all.push(control(label, Press::Row(key, action), !busy));
+                }
+            }
+            let waits = |action| {
+                temp.is_some() && matches!(action, RowAction::Restore | RowAction::Discard)
+            };
+            for &(label, action) in buttons {
+                all.push(control(
+                    label,
+                    Press::Row(key, action),
+                    !busy && !waits(action),
+                ));
+            }
+            let rule = temp.is_some().then_some(ASK.len());
+            out.extend(placed(all, rule, cols));
+            if temp.is_some() && buttons.iter().any(|&(_, a)| waits(a)) {
+                let why = "Restore and Discard wait: first answer the question about the \
+                           interrupted save's file";
+                text(&mut out, why, dim);
+            }
+        }
+        if !self.rows.is_empty() && self.job.is_some() {
+            text(
+                &mut out,
+                "the rows' buttons are off: a save is running",
+                dim,
+            );
+        }
+        out
+    }
+
+    /// The controls of the rows below the grid, `cols` cells wide, that act now, in the order
+    /// Tab walks them — exactly those [`HexWindow::below_ui`] draws and lets act there: each
+    /// button that is on, and the keep row's path field between its two buttons.
+    fn below_controls(&self, cols: u16) -> Vec<egui::Id> {
+        let mut out = vec![];
+        for row in &self.below(cols) {
+            match row {
+                Below::Text(..) => {}
+                Below::Buttons(all, _) => {
+                    let on = all.iter().filter(|(x, c)| c.on && shows(*x, cols));
+                    out.extend(on.map(|(_, c)| below_id(c.press)));
+                }
+                Below::Keep { field, .. } => {
+                    if shows(1, cols) {
+                        out.push(below_id(Press::KeepEdits));
+                    }
+                    if *field > 0 {
+                        out.push(keep_id());
+                    }
+                }
+                Below::KeepField(field) => {
+                    if *field > 0 {
+                        out.push(keep_id());
+                    }
+                }
+                Below::KeepWrite => {}
+            }
+            if matches!(row_write(row), Some(true)) && shows(1, cols) {
+                out.push(below_id(Press::WriteList));
+            }
+        }
+        out
+    }
+
+    /// The rows below the grid at `ui`'s cells: their texts, their `[ buttons ]` — two blanks
+    /// apart, a `│` between a question's answers and the row's own; the bar's colours on the one
+    /// with the keyboard, the dialog's weak colour on one that is off, as the toolbar's — each an
+    /// egui control at its cells, and the keep row's path field (`ops::dialog`'s). What a click,
+    /// or Enter or Space on the focused one, pressed.
+    fn below_ui(&mut self, ui: &mut egui::Ui, rows: &[Below]) -> Option<Press> {
+        let ctx = ui.ctx().clone();
+        let p = chrome::PALETTE;
+        let grid = Grid::over(ui.max_rect());
+        let mut buf = Buffer::empty(grid.all());
+        cells::fill(&mut buf, grid.all(), Pen::new(p.text, p.back));
+        let cols = grid.cols;
+        let (mut pressed, mut caret) = (None, None);
+        // A button at cell `x` of row `y`, cut at the row's end (one wider than the row stands
+        // alone there, [`placed`]): drawn, and acting at the cells it shows.
+        let mut button = |ui: &mut egui::Ui, buf: &mut Buffer, x: u16, y: u16, c: &Control| {
+            let w = button_cells(c.label).min(cols.saturating_sub(x));
+            if w == 0 {
+                return;
+            }
+            let id = below_id(c.press);
+            let sense = if c.on { Sense::click() } else { Sense::hover() };
+            let resp = ui.interact(grid.rect(Cells::new(x, y, w, 1)), id, sense);
+            if c.on && resp.clicked() {
+                pressed = Some(c.press);
+            }
+            let pen = if !c.on {
+                Pen::new(p.dialog_weak, p.dialog_back)
+            } else if ctx.memory(|m| m.has_focus(id)) {
+                Pen::new(p.bar_text, p.bar)
+            } else {
+                Pen::new(p.dialog_text, p.dialog_back)
+            };
+            cells::put(buf, x, y, &format!("[ {} ]", c.label), w.into(), pen);
+        };
+        let keep = Control {
+            label: "Keep edits…",
+            press: Press::KeepEdits,
+            on: true,
+        };
+        let write = Control {
+            label: "Write the list there",
+            press: Press::WriteList,
+            on: true,
+        };
+        for (y, row) in (0u16..).zip(rows) {
+            match row {
+                Below::Text(text, pen) => {
+                    let room = usize::from(cols.saturating_sub(2));
+                    cells::put(&mut buf, 1, y, text, room, *pen);
+                }
+                Below::Buttons(all, rule) => {
+                    if let Some(x) = rule {
+                        cells::put(&mut buf, *x, y, "│", 1, Pen::new(p.text, p.back));
+                    }
+                    for (x, c) in all {
+                        button(ui, &mut buf, *x, y, c);
+                    }
+                }
+                Below::Keep { field, write: here } => {
+                    button(ui, &mut buf, 1, y, &keep);
+                    let at = 1 + button_cells(keep.label) + 2;
+                    let field = Cells::new(at, y, *field, 1);
+                    if field.width > 0 {
+                        caret = caret.or(self.keep_field(ui, &grid, &mut buf, field));
+                    }
+                    if *here {
+                        button(ui, &mut buf, field.right() + 2, y, &write);
+                    }
+                }
+                Below::KeepField(field) => {
+                    let field = Cells::new(1, y, *field, 1);
+                    if field.width > 0 {
+                        caret = caret.or(self.keep_field(ui, &grid, &mut buf, field));
+                    }
+                }
+                Below::KeepWrite => button(ui, &mut buf, 1, y, &write),
+            }
+        }
+        self.blank_under(&ctx, &grid, &mut buf);
+        cells::paint(
+            &ui.painter_at(grid.rect(grid.all())),
+            grid.origin,
+            &buf,
+            caret,
+        );
+        pressed
+    }
+
+    /// The key that pressed a control below the grid ([`HexWindow::held`]), while it stays
+    /// down: its presses — a held key's are its auto-repeats — and, for Space, the text each one
+    /// sends are taken from the pass, so they never type into the grid the keyboard went back to
+    /// (or press what has it now). Let go — its release in this pass, or no longer down — it is
+    /// forgotten, and what comes after the release stays.
+    fn drop_held(&mut self, ctx: &egui::Context) {
+        let Some(key) = self.held else {
+            return;
+        };
+        ctx.input_mut(|i| {
+            let released = i.events.iter().position(
+                |e| matches!(e, egui::Event::Key { key: k, pressed: false, .. } if *k == key),
+            );
+            let end = released.unwrap_or(i.events.len());
+            let mut k = 0;
+            i.events.retain(|e| {
+                let before = k < end;
+                k += 1;
+                let held = match e {
+                    egui::Event::Key {
+                        key: k,
+                        pressed: true,
+                        ..
+                    } => *k == key,
+                    egui::Event::Text(t) => key == Key::Space && t == " ",
+                    _ => false,
+                };
+                !(before && held)
+            });
+            if released.is_some() || !i.key_down(key) {
+                self.held = None;
+            }
+        });
+    }
+
+    /// The keep row's path field at cells `at` of `buf` (on `grid`): its engine and its cells
+    /// (`ops::dialog`'s), and the caret's cell while it has the keyboard.
+    fn keep_field(
+        &mut self,
+        ui: &mut egui::Ui,
+        grid: &Grid,
+        buf: &mut Buffer,
+        at: Cells,
+    ) -> Option<Position> {
+        let ctx = ui.ctx().clone();
+        dialog::field(ui, grid, at, keep_id(), &mut self.keep_to, |e| e);
+        let focused = ctx.memory(|m| m.has_focus(keep_id()));
+        dialog::field_cells(&ctx, buf, at, keep_id(), &self.keep_to, focused)
+    }
+
+    /// What a control of the rows below the grid asked for.
+    fn below_press(&mut self, ctx: &egui::Context, press: Press) {
+        match press {
+            Press::KeepEdits => self.keep_edits(),
+            Press::WriteList => self.keep_edits_at(),
+            Press::InPlace => {
+                let changes = self.doc.changes();
+                let undo = self
+                    .file
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .undo_path(self.session, self.baseline);
+                self.in_place_ask = Some(patch::in_place_question(
+                    &self.home.0,
+                    &self.home.1,
+                    changes.len(),
+                    &undo,
+                ));
+            }
+            Press::OfferSaveAs => self.open_save_as(false),
+            Press::Left(remove) => self.answer_left(ctx, remove),
+            Press::Row(key, action) => {
+                let Some(i) = self.rows.iter().position(|r| row_key(r) == key) else {
+                    return;
+                };
+                let before = rows_seen(&self.rows);
+                self.row_action(i, action);
+                // The rows changed under the control that had the keyboard (a row went, a
+                // question was answered): the keyboard goes back to the grid, never to a
+                // control that comes into that place.
+                if rows_seen(&self.rows) != before {
+                    ctx.memory_mut(|m| m.request_focus(grid_id()));
+                }
+            }
+        }
+    }
+
+    /// The keys of the rows below the grid (`controls`, in Tab's order). From the grid, Tab past
+    /// the ASCII column — or anywhere, read-only, where nothing is typed — gives the keyboard to
+    /// the first control, Shift+Tab before the hex column to the last. While a control has it,
+    /// Tab and Shift+Tab walk them — past the last back to the grid's hex column, before the
+    /// first to its ASCII column — Esc gives it back to the grid, and Enter or Space press the
+    /// control (egui's click on a focused one); no other key acts. Each is taken from egui's own
+    /// focus moves, which would walk the toolbar too. Returns whether a control has the keyboard.
+    fn below_keys(&mut self, ctx: &egui::Context, controls: &[egui::Id]) -> bool {
+        let lock = egui::EventFilter {
+            tab: true,
+            horizontal_arrows: true,
+            vertical_arrows: true,
+            escape: true,
+        };
+        let focused = ctx.memory(|m| m.focused());
+        let at = focused.and_then(|f| controls.iter().position(|c| *c == f));
+        // A control that had the keyboard until egui's own Esc took it at the start of this pass
+        // (its lock is set from its second pass on).
+        let left = || (controls.iter()).any(|c| ctx.memory(|m| m.had_focus_last_frame(*c)));
+        let take = |shift: bool| {
+            ctx.input_mut(|i| {
+                let at = i.events.iter().position(|e| {
+                    matches!(e, egui::Event::Key { key: Key::Tab, pressed: true, modifiers, .. }
+                        if modifiers.shift == shift && !modifiers.command && !modifiers.alt)
+                });
+                at.map(|at| i.events.remove(at)).is_some()
+            })
+        };
+        let focus = |id: egui::Id| {
+            ctx.memory_mut(|m| {
+                m.request_focus(id);
+                m.move_focus(egui::FocusDirection::None);
+            })
+        };
+        // A key's auto-repeat never presses a control: only a press of its own does — also in
+        // the pass in which Tab brings the keyboard to one (the control has it at once, and is
+        // drawn later in the pass). Typed text is its `Text`, which this leaves.
+        if !controls.is_empty() {
+            ctx.input_mut(|input| {
+                input.events.retain(|e| {
+                    !matches!(
+                        e,
+                        egui::Event::Key {
+                            key: Key::Enter | Key::Space,
+                            pressed: true,
+                            repeat: true,
+                            ..
                         }
-                    }
-                    ui.separator();
-                }
-                for (label, action) in buttons {
-                    let waits =
-                        temp.is_some() && matches!(action, RowAction::Restore | RowAction::Discard);
-                    let button = ui
-                        .add_enabled(!busy && !waits, egui::Button::new(*label))
-                        .on_disabled_hover_text(if waits {
-                            "first answer the question about the interrupted save's file"
-                        } else {
-                            "a save is running"
-                        });
-                    if button.clicked() {
-                        asked = Some((i, *action));
-                    }
-                }
+                    )
+                })
             });
         }
-        if let Some((i, action)) = asked {
-            self.row_action(i, action);
+        let Some(i) = at else {
+            if focused.is_none() && left() && bare_key(ctx, Key::Escape) {
+                focus(grid_id());
+                return true;
+            }
+            if focused != Some(grid_id()) || controls.is_empty() {
+                return false;
+            }
+            let typing = !self.locked();
+            if (!typing || self.cursor.pane == Pane::Ascii) && take(false) {
+                focus(controls[0]);
+                return true;
+            }
+            if (!typing || self.cursor.pane == Pane::Hex) && take(true) {
+                focus(controls[controls.len() - 1]);
+                return true;
+            }
+            return false;
+        };
+        ctx.memory_mut(|m| m.set_focus_lock_filter(controls[i], lock));
+        if take(false) {
+            match controls.get(i + 1) {
+                Some(next) => focus(*next),
+                None => {
+                    focus(grid_id());
+                    self.place(self.cursor.at, Pane::Hex);
+                }
+            }
+        } else if take(true) {
+            match i.checked_sub(1) {
+                Some(before) => focus(controls[before]),
+                None => {
+                    focus(grid_id());
+                    self.place(self.cursor.at, Pane::Ascii);
+                }
+            }
+        } else if bare_key(ctx, Key::Escape) {
+            focus(grid_id());
         }
+        true
     }
 
     // ---- Save As (07 §7) ----
@@ -3515,7 +4127,7 @@ impl HexWindow {
             self.save_as = None;
             return;
         }
-        let ended = modal.show(ctx);
+        let ended = modal.show_on(ctx, Grid::over(self.area));
         let (close_after, edits) = (*close_after, edits.clone());
         match ended {
             Some(save_as::Ended::Saved { line, notes, .. }) => {
@@ -3647,36 +4259,12 @@ impl HexWindow {
         self.read_only = Some(line);
     }
 
-    /// The row under the read-only line while the edits are not kept anywhere.
-    fn keep_row(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui
-                .button("Keep edits…")
-                .on_hover_text("writes the list of your edits among sopen's kept edits")
-                .clicked()
-            {
-                self.keep_edits();
-            }
-            let room = (ui.available_width() - 170.0).max(120.0);
-            ui.add(
-                chrome::field(&mut self.keep_to)
-                    .id(keep_id())
-                    .desired_width(room),
-            );
-            if ui
-                .button("Write the list there")
-                .on_hover_text("a new file at that path, never over an existing one")
-                .clicked()
-            {
-                self.keep_edits_at();
-            }
-        });
-    }
-
     /// Keys for the whole window. `goto_owns` = the Go to field has this frame's typing (it is
     /// focused, was clicked, lost focus on Enter, or Cmd/Ctrl+G gave it the keyboard): then no
-    /// byte is typed and no key moves the cursor.
-    fn keys(&mut self, ctx: &egui::Context, goto_owns: bool) {
+    /// byte is typed and no key moves the cursor. `controls`: the rows below the grid's, which
+    /// take the keyboard from the grid by Tab ([`HexWindow::below_keys`]) and keep every key
+    /// while they have it.
+    fn keys(&mut self, ctx: &egui::Context, goto_owns: bool, controls: &[egui::Id]) {
         use super::command_key;
         // Esc stops a streamed Save between its requests (07 §4.2 step 5): its temp is removed
         // and the target is untouched. A request already sent finishes on the server first.
@@ -3686,7 +4274,13 @@ impl HexWindow {
         {
             self.saving.cancel.store(true, Ordering::SeqCst);
         }
-        if self.locked() || self.dialog_up() {
+        if self.prompt || self.close_ok || self.dialog_up() {
+            return;
+        }
+        if !goto_owns && self.below_keys(ctx, controls) {
+            return;
+        }
+        if self.locked() {
             return;
         }
         // Save As first (07 §7): egui's shortcut check below would take Alt+Cmd/Ctrl+S for
@@ -3965,7 +4559,7 @@ impl HexWindow {
             );
             x += w + 2;
         }
-        blank_under_help(&ctx, &grid, &mut buf);
+        self.blank_under(&ctx, &grid, &mut buf);
         cells::paint(
             &ui.painter_at(grid.rect(grid.all())),
             grid.origin,
@@ -4169,7 +4763,7 @@ impl HexWindow {
             let color = if *failed { p.error } else { p.text };
             kept_at = Some(put(&mut buf, &mut x, line, Pen::new(color, p.back)));
         }
-        blank_under_help(&ctx, &grid, &mut buf);
+        self.blank_under(&ctx, &grid, &mut buf);
         cells::paint(
             &ui.painter_at(grid.rect(grid.all())),
             grid.origin,
@@ -4257,8 +4851,12 @@ impl HexWindow {
         let resp = ui.interact(rows_rect, grid_id(), sense);
         let bar_resp = ui.interact(bar, grid_id().with("bar"), sense);
         // The grid holds the keyboard (arrows and Tab act on the cursor, not on focus), except
-        // while a field (Go to, the read-only path field) or the close prompt has it.
-        if !goto_focused && !self.prompt && !self.preview {
+        // while a field (Go to, the read-only path field), a row's control or a question has it.
+        if self.prompt || self.dialog_up() {
+            // A question has the keyboard: the grid's lock (Tab, the arrows, Esc) is not in
+            // the way of its Tab.
+            ctx.memory_mut(|m| m.surrender_focus(grid_id()));
+        } else if !goto_focused && !self.preview {
             if ctx.memory(|m| m.focused()) != Some(grid_id()) {
                 resp.request_focus();
             }
@@ -4428,7 +5026,7 @@ impl HexWindow {
         self.rows_painted = rows;
         let at = (max_top > 0).then(|| (self.top_row as f64 / max_top as f64) as f32);
         cells::scroll_bar(&mut buf, bar_cells.x, bar_cells.y, bar_cells.height, at);
-        blank_under_help(&ctx, &grid, &mut buf);
+        self.blank_under(&ctx, &grid, &mut buf);
         cells::paint(&ui.painter_at(outer), grid.origin, &buf, caret);
         self.layout = Some(Layout {
             rows: rows_rect,
@@ -4440,134 +5038,260 @@ impl HexWindow {
         self.painted = true;
     }
 
-    /// `Save the changes to host:/abs before closing?` — Save (Save copy where Save is off) ·
-    /// Save As… · Discard · Cancel (07 §10).
-    fn close_prompt(&mut self, ctx: &egui::Context) {
-        // A file at a revision has nothing to ask about (its Discard removes the journal).
-        if self.at_revision {
-            self.prompt = false;
-        }
-        if !self.prompt {
-            return;
-        }
-        let id = egui::Id::unique("sopen-hex-unsaved");
-        let modal = super::chrome::dialog(ctx, id, "Unsaved changes", |ui| {
-            ui.set_width(420.0);
-            let read_only = self.read_only.is_some();
-            ui.label(if read_only {
-                format!(
-                    "Your edits to {} are kept nowhere and cannot be saved here; close anyway?",
-                    self.title
-                )
-            } else {
-                format!("Save the changes to {} before closing?", self.title)
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if read_only {
-                } else if self.can_replace && ui.button("Save").clicked() {
-                    self.prompt = false;
-                    self.start(ctx, JobKind::Save { close_after: true });
-                }
-                if !read_only && !self.can_replace && ui.button("Save copy").clicked() {
-                    self.prompt = false;
-                    self.start(ctx, JobKind::SaveCopy { close_after: true });
-                }
-                if !read_only && ui.button("Save As…").clicked() {
-                    self.prompt = false;
-                    self.open_save_as(true);
-                }
-                let discard = ui.button("Discard");
-                let discard = match &self.journal_dir {
-                    Some(dir) => discard.on_hover_text(format!(
-                        "deletes the kept edits at {}",
-                        super::binary::tilde(dir)
-                    )),
-                    None => discard,
-                };
-                if discard.clicked() {
-                    self.prompt = false;
-                    self.discard = true;
-                    self.close_ok = true;
-                    super::request_close(ctx);
-                }
-                if ui.button("Cancel").clicked() {
-                    self.prompt = false;
-                }
-            });
-        });
-        if modal.should_close() {
-            self.prompt = false;
+    /// Where the window's questions stand (10 §6): its grid between its top and its own F-key
+    /// rows — hosted, the browser's between its title and status rows.
+    fn dialog_grid(&self) -> Grid {
+        Grid::over(self.area)
+    }
+
+    /// A question shown in this pass covers `layout`'s box and shadow (the end of the pass
+    /// checks it against what was blanked under it).
+    fn cover(&mut self, layout: &dialog::Layout, grid: &Grid) {
+        let rects = layout.covers().into_iter().map(|c| grid.rect(c));
+        self.covering.extend(rects);
+    }
+
+    /// The cells of `buf` (on `grid`) under F1's help and under the questions up blanked first — one buffer of cells laid over another (cells.rs) — so a wide glyph half
+    /// under a box's edge (a Hangul name) goes as a terminal erases it.
+    fn blank_under(&self, ctx: &egui::Context, grid: &Grid, buf: &mut Buffer) {
+        blank_under_help(ctx, grid, buf);
+        let p = chrome::PALETTE;
+        for r in &self.under {
+            cells::fill(buf, cells_on(grid, *r), Pen::new(p.text, p.back));
         }
     }
 
-    /// The first Save of a file above 256 MiB (07 §4.5): what its checks cannot see, asked once
-    /// a session. Enter saves.
-    fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(kind) = self.confirm else {
-            return;
-        };
-        let (enter, escape) = ctx.input_mut(|i| {
-            (
-                i.consume_key(egui::Modifiers::NONE, Key::Enter),
-                i.consume_key(egui::Modifiers::NONE, Key::Escape),
+    /// The close prompt laid out on `grid` as it stands now; `None` while it is not up.
+    fn prompt_layout(&self, grid: Grid) -> Option<dialog::Layout> {
+        if !self.prompt || self.at_revision {
+            return None;
+        }
+        let read_only = self.read_only.is_some();
+        let question = if read_only {
+            format!(
+                "Your edits to {} are kept nowhere and cannot be saved here; close anyway?",
+                self.title
             )
-        });
-        let (mut save, mut cancel) = (enter, escape);
-        let id = egui::Id::unique("sopen-hex-confirm");
+        } else {
+            format!("Save the changes to {} before closing?", self.title)
+        };
+        let id = prompt_id();
+        let mut buttons = vec![];
+        if !read_only && self.can_replace {
+            buttons.push(Button::new("Save", id.with("save")));
+        }
+        if !read_only && !self.can_replace {
+            buttons.push(Button::new("Save copy", id.with("copy")));
+        }
+        if !read_only {
+            buttons.push(Button::new("Save As…", id.with("save as")));
+        }
+        buttons.extend([
+            Button::new("Discard", id.with("discard")),
+            Button::new("Cancel", id.with("cancel")),
+        ]);
+        let mut parts = vec![
+            Part::Text(question, Ink::Text),
+            Part::Blank,
+            Part::Buttons(buttons),
+        ];
+        let deletes = |dir: &Path| {
+            let tilde = super::binary::tilde(dir);
+            format!("Discard deletes the kept edits at {tilde}")
+        };
+        if let Some(dir) = &self.journal_dir {
+            parts.push(Part::Text(deletes(dir), Ink::Weak));
+            return Some(dialog::layout(grid, PROMPT_TITLE, PROMPT_WIDE, &parts));
+        }
+        let keep = self.schedule.status();
+        if keep == Keep::Clean {
+            return Some(dialog::layout(grid, PROMPT_TITLE, PROMPT_WIDE, &parts));
+        }
+        // The edits not in the journal yet (its write on its way, or refused): the rows its
+        // line will take are reserved — measured on the folder's name as the write makes it,
+        // whose stamp and hex are of a fixed width — at the box's width with that line, so the
+        // box and its buttons never move under the pointer when the write lands; until then
+        // the first of them says the edits are being kept (or why they are not), dim.
+        let mut whole = parts.clone();
+        whole.push(Part::Text(deletes(&self.journal_to_be()), Ink::Weak));
+        let laid = dialog::layout(grid, PROMPT_TITLE, PROMPT_WIDE, &whole);
+        let inside = usize::from(laid.covers()[0].width.saturating_sub(4)).max(1);
+        let rows = dialog::wrap(&deletes(&self.journal_to_be()), inside).len();
+        let said = match keep {
+            Keep::NotKept(why) => format!("the edits are kept nowhere: {why}"),
+            _ => KEEPING_EDITS.to_string(),
+        };
+        parts.push(Part::Text(cells::fit_start(&said, inside), Ink::Weak));
+        parts.extend((1..rows).map(|_| Part::Blank));
+        Some(dialog::layout(grid, PROMPT_TITLE, inside, &parts))
+    }
+
+    /// The journal folder a first generation makes for this file, its stamp and hex as zeros:
+    /// `<cache>/.edits/<host>/<path>.journal-<YYYYMMDDTHHMMSSZ>-<8 hex>` (`Journal::create`),
+    /// of the same cells as the one it will make.
+    fn journal_to_be(&self) -> PathBuf {
+        let (host, abs, cache) = &self.home;
+        let mut path = crate::cache::edits_path(cache, host, abs).into_os_string();
+        path.push(".journal-00000000T000000Z-00000000");
+        PathBuf::from(path)
+    }
+
+    /// The first Save's question above 256 MiB laid out on `grid`; `None` while it is not up.
+    fn confirm_layout(&self, grid: Grid) -> Option<dialog::Layout> {
+        self.confirm?;
+        let id = confirm_id();
         let text = format!(
             "Save to {} ({})? sopen checks its size, modification time and the pages under your \
              edits. A program writing to the file while it saves can lose that write.",
             self.title,
             crate::human(self.doc.size())
         );
-        let modal = super::chrome::dialog(ctx, id, "Save", |ui| {
-            ui.set_width(440.0);
-            ui.label(text);
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                save |= ui.button("Save (Enter)").clicked();
-                cancel |= ui.button("Cancel").clicked();
-            });
-        });
-        if save {
+        let parts = [
+            Part::Text(text, Ink::Text),
+            Part::Blank,
+            Part::Buttons(vec![
+                Button::new("Save (Enter)", id.with("save")),
+                Button::new("Cancel", id.with("cancel")),
+            ]),
+        ];
+        Some(dialog::layout(grid, "Save", CONFIRM_WIDE, &parts))
+    }
+
+    /// Write in place's dialog laid out on `grid`; `None` while it is not up.
+    fn in_place_layout(&self, grid: Grid) -> Option<dialog::Layout> {
+        let question = self.in_place_ask.as_ref()?;
+        let id = in_place_id();
+        let mut parts: Vec<Part> = (question.lines())
+            .map(|l| Part::Text(l.to_string(), Ink::Text))
+            .collect();
+        parts.extend([
+            Part::Blank,
+            Part::Buttons(vec![
+                Button::new("Write in place", id.with("write")),
+                Button::new("Cancel", id.with("cancel")),
+            ]),
+        ]);
+        Some(dialog::layout(
+            grid,
+            "Write in place",
+            IN_PLACE_WIDE,
+            &parts,
+        ))
+    }
+
+    /// What the questions up now cover on the window's grid, their boxes and shadows (points):
+    /// the window's cells under them are blanked before they are painted, in the pass that
+    /// shows them.
+    fn questions_cover(&self) -> Vec<Rect> {
+        let grid = self.dialog_grid();
+        let mut out: Vec<Cells> = [
+            self.prompt_layout(grid),
+            self.confirm_layout(grid),
+            self.in_place_layout(grid),
+        ]
+        .iter()
+        .flatten()
+        .flat_map(dialog::Layout::covers)
+        .collect();
+        if let Some((modal, ..)) = &self.save_as {
+            out.extend(modal.covers(grid));
+        }
+        out.into_iter().map(|c| grid.rect(c)).collect()
+    }
+
+    /// `Save the changes to host:/abs before closing?` — `[ Save ]` (`[ Save copy ]` where Save
+    /// is off) · `[ Save As… ]` · `[ Discard ]` · `[ Cancel ]` (07 §10), in cells (10 §6, through
+    /// `ops::dialog`): Tab walks the buttons, Enter or Space presses the one with the keyboard,
+    /// Esc (or a click outside) is Cancel. Where Discard deletes the kept edits is a row under
+    /// the buttons (cells have no hover). Read-only, with the edits kept nowhere: Discard ·
+    /// Cancel.
+    fn close_prompt(&mut self, ctx: &egui::Context) {
+        // A file at a revision has nothing to ask about (its Discard removes the journal).
+        if self.at_revision {
+            self.prompt = false;
+        }
+        let grid = self.dialog_grid();
+        let Some(layout) = self.prompt_layout(grid) else {
+            return;
+        };
+        self.cover(&layout, &grid);
+        let id = prompt_id();
+        let shown = dialog::show(ctx, id, &layout, Inputs::default());
+        if shown.controls.iter().any(|c| shown.clicked(*c)) {
+            spend_presses(ctx);
+        }
+        if shown.clicked(id.with("save")) {
+            self.prompt = false;
+            self.start(ctx, JobKind::Save { close_after: true });
+        } else if shown.clicked(id.with("copy")) {
+            self.prompt = false;
+            self.start(ctx, JobKind::SaveCopy { close_after: true });
+        } else if shown.clicked(id.with("save as")) {
+            self.prompt = false;
+            self.open_save_as(true);
+        } else if shown.clicked(id.with("discard")) {
+            self.prompt = false;
+            self.discard = true;
+            self.close_ok = true;
+            super::request_close(ctx);
+        } else if shown.clicked(id.with("cancel")) || shown.modal.should_close() {
+            self.prompt = false;
+        }
+    }
+
+    /// The first Save of a file above 256 MiB (07 §4.5): what its checks cannot see, asked once
+    /// a session, in cells. Enter saves — unless a button has the keyboard, which takes it as
+    /// its own click — Esc cancels.
+    fn confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(kind) = self.confirm else {
+            return;
+        };
+        let id = confirm_id();
+        let (save_id, cancel_id) = (id.with("save"), id.with("cancel"));
+        let focused = ctx.memory(|m| m.focused());
+        let on_button = focused.is_some_and(|f| f == save_id || f == cancel_id);
+        let enter = !on_button && bare_key(ctx, Key::Enter);
+        let escape = bare_key(ctx, Key::Escape);
+        let grid = self.dialog_grid();
+        let Some(layout) = self.confirm_layout(grid) else {
+            return;
+        };
+        self.cover(&layout, &grid);
+        let shown = dialog::show(ctx, id, &layout, Inputs::default());
+        if enter || shown.clicked(save_id) {
             self.confirm = None;
             self.confirmed = true;
             self.start(ctx, kind);
-        } else if cancel || modal.should_close() {
+        } else if escape || shown.clicked(cancel_id) || shown.modal.should_close() {
             self.confirm = None;
         }
     }
 
-    /// Write in place (07 §4.4): only behind this dialog, from a refusal's row.
+    /// Write in place (07 §4.4): only behind this dialog, from a refusal's row; in cells, Esc
+    /// cancels.
     fn in_place_dialog(&mut self, ctx: &egui::Context) {
-        let Some(question) = self.in_place_ask.clone() else {
+        let id = in_place_id();
+        let (write_id, cancel_id) = (id.with("write"), id.with("cancel"));
+        let grid = self.dialog_grid();
+        let Some(layout) = self.in_place_layout(grid) else {
             return;
         };
-        let escape = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
-        let (mut write, mut cancel) = (false, escape);
-        let id = egui::Id::unique("sopen-hex-in-place");
-        let modal = super::chrome::dialog(ctx, id, "Write in place", |ui| {
-            ui.set_width(460.0);
-            ui.label(question);
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                write |= ui.button("Write in place").clicked();
-                cancel |= ui.button("Cancel").clicked();
-            });
-        });
-        if write {
+        let escape = bare_key(ctx, Key::Escape);
+        self.cover(&layout, &grid);
+        let shown = dialog::show(ctx, id, &layout, Inputs::default());
+        if shown.clicked(write_id) {
             self.in_place_ask = None;
             self.start(ctx, JobKind::InPlace);
-        } else if cancel || modal.should_close() {
+        } else if escape || shown.clicked(cancel_id) || shown.modal.should_close() {
             self.in_place_ask = None;
         }
     }
 
-    /// A refusal's row (07 §4.1): its words, Write in place… and Save As….
-    /// A live session's question about a temp (07 §3.1): Remove it or Keep it; the next Save
-    /// waits for the answer, since the record that holds the question is that Save's to replace.
-    fn left_row(&mut self, ui: &mut egui::Ui) {
+    /// The live session's answer to its question about a temp (07 §3.1), once it is back: the
+    /// question ends, or the status row says why not. (Its row, Remove it or Keep it, is one of
+    /// the rows below the grid; the next Save waits for the answer, since the record that holds
+    /// the question is that Save's to replace.)
+    fn poll_left(&mut self) {
         if let Some(rx) = &self.answering {
             match rx.try_recv() {
                 Ok(Ok(line)) => {
@@ -4582,27 +5306,6 @@ impl HexWindow {
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => self.answering = None,
             }
-        }
-        let Some(left) = &self.left else {
-            return;
-        };
-        let error = ui.visuals().error_fg_color;
-        super::disclosures(ui, &[(left.line.clone(), error)]);
-        let free = self.job.is_none() && self.answering.is_none() && !self.dialog_up();
-        let mut answer = None;
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(free, egui::Button::new("Remove it"))
-                .clicked()
-            {
-                answer = Some(true);
-            }
-            if ui.add_enabled(free, egui::Button::new("Keep it")).clicked() {
-                answer = Some(false);
-            }
-        });
-        if let Some(remove) = answer {
-            self.answer_left(ui.ctx(), remove);
         }
     }
 
@@ -4632,41 +5335,6 @@ impl HexWindow {
             "removing…"
         } else {
             "keeping it…"
-        });
-    }
-
-    fn offer_row(&mut self, ui: &mut egui::Ui) {
-        let Some(why) = self.offer.clone() else {
-            return;
-        };
-        let error = ui.visuals().error_fg_color;
-        super::disclosures(ui, &[(format!("not saved: {why}"), error)]);
-        let free = self.job.is_none() && !self.dialog_up();
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(free, egui::Button::new("Write in place…"))
-                .on_hover_text("writes the changed bytes into the file itself — not atomic")
-                .clicked()
-            {
-                let changes = self.doc.changes();
-                let undo = self
-                    .file
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .undo_path(self.session, self.baseline);
-                self.in_place_ask = Some(patch::in_place_question(
-                    &self.home.0,
-                    &self.home.1,
-                    changes.len(),
-                    &undo,
-                ));
-            }
-            if ui
-                .add_enabled(free, egui::Button::new("Save As…"))
-                .clicked()
-            {
-                self.open_save_as(false);
-            }
         });
     }
 
@@ -4710,8 +5378,14 @@ impl super::Window for HexWindow {
                 .show(ui, |ui| self.grid(ui, false));
             return;
         }
+        let whole = ui.max_rect();
+        self.wake = Some(ctx.clone());
+        self.drop_held(&ctx);
+        // Under the questions up (the area as last laid out): the toolbar's cells.
+        self.under = self.questions_cover();
         self.start_recovery(&ctx);
         self.poll_recovery();
+        self.poll_left();
         // Losing the keyboard focus writes the edits at once (07 §3).
         let focused = ctx.input(|i| i.focused);
         if self.focused && !focused && self.job.is_none() {
@@ -4750,10 +5424,16 @@ impl super::Window for HexWindow {
         let goto_owns = cmd_g || goto_has || goto_took;
         // The F-key row, the window's last (on its own: the browser around it has the row).
         super::own_keys(ui, HEX_KEYS);
-        // The read-only window's path field (laid out below, with the rows) owns the typing of
-        // a frame it had the keyboard in, as the Go to field does.
-        let keep_had = ctx.memory(|m| m.focused()) == Some(keep_id());
-        self.keys(&ctx, goto_owns || keep_had);
+        // The questions stand between the window's top and its own F-key rows.
+        let above_keys = ui.available_rect_before_wrap().bottom();
+        self.area = Rect::from_min_max(whole.min, egui::pos2(whole.right(), above_keys));
+        // The rows below the grid's controls, Tab's way into them; one with the keyboard (the
+        // read-only window's path field among them) keeps this frame's keys.
+        let cols = (ui.available_width() / chrome::CELL.x).floor() as u16;
+        let controls = self.below_controls(cols);
+        self.keys(&ctx, goto_owns, &controls);
+        // A question the keys opened or answered: the rest of the window's cells under it.
+        self.under = self.questions_cover();
         // A report that lands while the button is down waits until it is let go. Its rows sit
         // below the grid: they take rows off its bottom, never move its top or its rows.
         if !ctx.input(|i| i.pointer.primary_down()) {
@@ -4767,40 +5447,34 @@ impl super::Window for HexWindow {
             .resizable(false)
             .exact_size(chrome::CELL.y)
             .show(ui, |ui| self.status_bar(ui));
-        let error = ui.visuals().error_fg_color;
-        let warning = self.stream_warning();
-        let lines: Vec<(String, Color32)> = warning
-            .iter()
-            .chain(&self.opened)
-            .chain(&self.read_only)
-            .chain(&self.notices)
-            .map(|n| (n.clone(), error))
-            .collect();
-        let keep_row = self.read_only.is_some() && self.retained.is_none();
-        let recovery = !self.rows.is_empty()
-            || self.offer.is_some()
-            || self.left.is_some()
-            || self.answering.is_some();
-        if !lines.is_empty() || keep_row || recovery {
-            egui::Panel::bottom("disclosures").show(ui, |ui| {
-                ui.add_space(2.0);
-                super::disclosures(ui, &lines);
-                if keep_row {
-                    self.keep_row(ui);
-                }
-                self.offer_row(ui);
-                self.left_row(ui);
-                self.recovery_rows(ui);
-                ui.add_space(2.0);
-            });
+        // The rows below the grid, whole rows of cells.
+        let rows = self.below(cols);
+        if !rows.is_empty() {
+            let pressed = egui::Panel::bottom("disclosures")
+                .frame(egui::Frame::NONE)
+                .show_separator_line(false)
+                .resizable(false)
+                .exact_size(rows.len() as f32 * chrome::CELL.y)
+                .show(ui, |ui| self.below_ui(ui, &rows))
+                .inner;
+            if let Some(press) = pressed {
+                // Pressed by Enter or Space (not a click): that key is held back until let go.
+                let by_key = [Key::Enter, Key::Space]
+                    .into_iter()
+                    .find(|k| ctx.input(|i| i.key_pressed(*k)));
+                spend_presses(&ctx);
+                self.below_press(&ctx, press);
+                self.held = by_key.or(self.held);
+            }
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
-                // A field that took the keyboard this frame (a click into the path field) keeps
-                // it: the grid does not take it back.
-                let field_owns = goto_owns || ctx.memory(|m| m.focused()) == Some(keep_id());
-                self.grid(ui, field_owns)
+                // A field or a row's control that has the keyboard (a click into the path field
+                // this frame) keeps it: the grid does not take it back.
+                let focused = ctx.memory(|m| m.focused());
+                let row_owns = focused.is_some_and(|f| self.below_controls(cols).contains(&f));
+                self.grid(ui, goto_owns || row_owns)
             });
         self.poll_job(&ctx);
         self.tick_pass();
@@ -4809,19 +5483,40 @@ impl super::Window for HexWindow {
         self.confirm_dialog(&ctx);
         self.in_place_dialog(&ctx);
         self.show_save_as(&ctx);
+        if let Some((modal, ..)) = &self.save_as {
+            let grid = self.dialog_grid();
+            let rects: Vec<Rect> = modal
+                .covers(grid)
+                .into_iter()
+                .map(|c| grid.rect(c))
+                .collect();
+            self.covering.extend(rects);
+        }
+        // A question opened or moved after the window's cells were painted: the next pass
+        // blanks the cells under it (or under it no more).
+        let covered = std::mem::take(&mut self.covering);
+        if covered != self.under {
+            ctx.request_repaint();
+        }
+        let focused = ctx.memory(|m| m.focused());
+        self.row_focus = focused.is_some_and(|f| self.below_controls(cols).contains(&f));
     }
 
     /// Over a stream (06 §11): once the state's patches are in and the screen's bytes have
     /// arrived or failed — or, with `loading=1`, at the first frame with rows, those still
     /// loading shot as they are.
     /// And once what an earlier session left has been listed (its rows on screen). Under
-    /// `SOPEN_SAVE_AS` (a receipt), once that Save As holds or has ended.
+    /// `SOPEN_SAVE_AS` (a receipt), once that Save As holds or has ended. With the close prompt
+    /// up, once the edits are in a generation: the prompt then says where Discard deletes them
+    /// (a row more, which moves its box), and the status row where they are kept.
     fn ready(&self) -> bool {
         let save_as = match &self.save_as {
             Some((modal, ..)) => !modal.busy() || self.save_as_held.load(Ordering::SeqCst),
             None => self.save_as_hook.is_none(),
         };
-        self.painted
+        let asked = !self.prompt || (self.writing.is_none() && self.schedule.due().is_none());
+        asked
+            && self.painted
             && self.job.is_none()
             && self.state_patches.is_empty()
             && self.reloading.is_none()
@@ -4890,7 +5585,7 @@ impl super::Window for HexWindow {
     /// keys' Question; else the hex view's viewing or editing (D35), read-only for a revision or
     /// a file turned read-only, saving while a Save Esc stops runs.
     fn view_state(&mut self) -> crate::view_keys::State {
-        if self.prompt || self.dialog_up() {
+        if self.prompt || self.dialog_up() || self.row_focus {
             return crate::view_keys::State::Question;
         }
         crate::view_keys::State::Hex(crate::view_keys::Hex {
@@ -4994,6 +5689,19 @@ impl super::Window for HexWindow {
         // Restored bytes still landing are edits written nowhere yet.
         if !self.doc.unsaved() && self.state_patches.is_empty() {
             return true;
+        }
+        // Closing keeps the edits at once (07 §3), on a worker — the frame never waits for the
+        // journal — rather than at the schedule's next tick: the prompt says where Discard
+        // deletes them as soon as it can, and the window is not settled until it does
+        // ([`Window::ready`]). Not while an answer about a temp holds the journal: the
+        // schedule's tick keeps them once it is back.
+        if !self.prompt {
+            self.note_revision(Instant::now());
+            let keeping = self.schedule.status() == Keep::Keeping;
+            let free = self.job.is_none() && self.answering.is_none() && self.removing.is_none();
+            if keeping && free && self.writing.is_none() {
+                self.write_generation(false);
+            }
         }
         self.prompt = true;
         false

@@ -3135,8 +3135,13 @@ fn enter_on_a_video_with_no_frame_opens_on_hex_with_the_reason() {
                     .as_ref()
                     .is_some_and(|v| v.views.set.on_screen() == Some(crate::views::View::Hex))
         });
-        assert!(shows(&fx, "no frame"), "the reason on Hex");
-        assert!(shows(&fx, "the file is shown as bytes"));
+        // The reason is a row of cells under the grid, wrapped by cells (X3-questions).
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, fx.drv.ctx.content_rect().size());
+        let rows = fx.drv.column(screen);
+        let said: Vec<&str> = rows.iter().map(|(_, r)| r.trim()).collect();
+        let said = said.join(" ");
+        assert!(said.contains("no frame"), "the reason on Hex");
+        assert!(said.contains("the file is shown as bytes"));
         assert_none_left(&base(&fx));
     });
 }
