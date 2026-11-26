@@ -649,16 +649,20 @@ within 2 s, else 1 with `… ended while ssh stayed for the browser's connection
 
 Message 23 makes xtools one cell-grid core with a terminal and a GUI backend (*XR-T* §0; 10). A page,
 like an image or a video, is GUI-only content: the GUI backend hosts the page view as a pixel region
-at its cell rectangle, and in a terminal a page file shows its source (the source is view 1 there).
-Whether a picture-capable terminal (kitty, iTerm2, sixel) shows a snapshot of the page, and the
-terminal form of every key here, are 10's. `sopen URL` with only a terminal: §4's no-display rule.
+at its cell rectangle. In a terminal a page file keeps 08's slots and opens on its source (10 T21,
+08 §9): HTML, HTM and styled XML on 3, view 1 the page; plain XML and RSS on 1, already their source
+(§5). A picture-capable terminal (kitty, iTerm2, sixel) shows no snapshot of the page: the engine
+runs inside a window (§2). The terminal form of every key here is 10's. `sopen URL` with only a
+terminal: §4's no-display rule.
 
-**The interim, until 10's X3** (WV-D): in `sopen --tui` a page file keeps 08's slots and opens on
-its page, which the terminal shows as a hand-off box (10 §11) — its frame and rows are cells; no
-engine is asked in a terminal — and F12's window makes the view there; a window that goes takes
-its view down and the next one makes it again (a remote page on the connection its server gave
-back, else connected again). Opening on 3, the source, with view 1 a one-row hand-off, is X3's
-(10 T21, TP-5).
+**The page view in a terminal** (WV-D, VM-8) is a hand-off box (10 §11) — its frame and rows are
+cells; no engine is asked in a terminal — until 10's X6 draws its one-row hand-off (`the page is
+drawn in the window — F12`). In a terminal the opening and the preview make the source and nothing
+of the page (`Pages::here`: no server, no connection for it), so the viewer opens on 3; a page
+file's preview made before a switch is made again, so a hand-over opens as a fresh open does in
+either backend; `1` makes the page view, its server connecting on its own, and F12's window makes the view there; a window that goes takes its view
+down and the next one makes it again (a remote page on the connection its server gave back, else
+connected again).
 
 ## 9. Decisions
 

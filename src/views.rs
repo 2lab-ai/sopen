@@ -166,34 +166,51 @@ impl PageClass {
     }
 }
 
-/// What the screen the set is shown on can draw (08 §9; 09 §4, §8).
+/// What the screen the set is shown on does with 09's page view (08 §3, §9; 09 §4, §8; 10 T21).
+/// An image and a video open on 1 on every screen: a terminal shows them as its picture, half
+/// blocks at worst (10 §8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Screen {
-    /// Images and video: false in a terminal that draws no pictures. Then view 1 of an image or
-    /// a video says why and the file opens on Hex (§9).
-    pub pictures: bool,
-    /// 09's page view: a web engine is here and the page view has landed. Without it HTML, HTM
-    /// and XML are 1 Text · 2 Hex · 3 Raw (D30; 09 §4's fallback, 09 §8's terminal).
+    /// 09's page view is one of a page file's views: a web engine that contains a file view
+    /// is here, or the screen is a terminal, whose page view is a hand-off to the window. Without
+    /// it HTML, HTM and XML are 1 Text · 2 Hex · 3 Raw (D30; 09 §4's fallback).
     pub pages: bool,
+    /// The page view draws the page, so a page file opens on it. A terminal draws none, so there
+    /// HTML, HTM and styled XML open on their source, 3 (10 T21).
+    pub draws_pages: bool,
 }
 
 impl Screen {
-    /// Today's egui windows with a web engine that contains a file view (09's page view, WV-D).
+    /// A window with a web engine that contains a file view (09's page view, WV-D).
     pub const GUI: Screen = Screen {
-        pictures: true,
         pages: true,
+        draws_pages: true,
     };
     /// A window where file pages show their source (09 §4: no engine here, or one that does not
     /// contain a file view): HTML, HTM and XML are 1 Text · 2 Hex · 3 Raw (D30).
     pub const NO_ENGINE: Screen = Screen {
-        pictures: true,
         pages: false,
+        draws_pages: false,
     };
-    /// A terminal that draws no pictures.
+    /// The terminal backend (10 T21): the window's slots, so a key means the same view in both
+    /// and the state's `view` too; a page file opens on its source, 3, view 1 the page's
+    /// hand-off.
     pub const TERMINAL: Screen = Screen {
-        pictures: false,
-        pages: false,
+        pages: true,
+        draws_pages: false,
     };
+
+    /// The slot a file of `opening` opens on here: 1, but 3 — its source — for a page file
+    /// whose page is view 1 on a screen that does not draw it (10 T21). D10's Hex, view 2,
+    /// overrides either ([`ViewSet::open`]).
+    pub fn first_slot(self, opening: &Opening) -> Slot {
+        let page_first = opening.kind == Kind::Text && opening.page == PageClass::PageFirst;
+        if page_first && self.pages && !self.draws_pages {
+            Slot::Three
+        } else {
+            Slot::One
+        }
+    }
 }
 
 /// How the views reach the file's bytes (08 §6, D13).
@@ -211,15 +228,13 @@ pub enum Reach {
 }
 
 /// Why view 1 cannot show the file, so the set opens on 2 with this as its first row, and 1
-/// says it on the status row (D10, §9).
+/// says it on the status row (D10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Why {
     /// The decoder's words: an image that does not decode, a video none of whose frames decode.
     Undecodable(String),
     /// Empty media (0 bytes).
     Empty,
-    /// The screen draws no pictures (a terminal, §9).
-    NoPictures,
 }
 
 impl fmt::Display for Why {
@@ -227,9 +242,6 @@ impl fmt::Display for Why {
         match self {
             Why::Undecodable(e) => write!(f, "{e}; the file is shown as bytes"),
             Why::Empty => f.write_str("the file is empty (0 bytes); it is shown as bytes"),
-            Why::NoPictures => {
-                f.write_str("this screen draws no pictures; the file is shown as bytes")
-            }
         }
     }
 }
@@ -483,33 +495,29 @@ fn slots_of(kind: Kind, page: PageClass, screen: Screen) -> Option<[Option<View>
     })
 }
 
-/// D10 and §9: why view 1 of this file cannot show it, known at open.
-fn unshown_at_open(opening: &Opening, screen: Screen) -> Option<Why> {
-    let pictured = matches!(opening.kind, Kind::Image | Kind::Video);
-    if !(pictured || opening.kind == Kind::Audio) {
+/// D10: why view 1 of this file cannot show it, known at open.
+fn unshown_at_open(opening: &Opening) -> Option<Why> {
+    if !matches!(opening.kind, Kind::Image | Kind::Video | Kind::Audio) {
         return None;
     }
     if opening.stat.size == 0 {
         Some(Why::Empty)
-    } else if let Some(e) = &opening.undecodable {
-        Some(Why::Undecodable(e.clone()))
-    } else if pictured && !screen.pictures {
-        Some(Why::NoPictures)
     } else {
-        None
+        opening.undecodable.clone().map(Why::Undecodable)
     }
 }
 
 impl ViewSet {
-    /// The set of a file just opened, on its first view — the one the opening makes: slot 1's,
-    /// or Hex when view 1 cannot show the file (D10, §9; [`ViewSet::unshown`] is then the hex
-    /// view's first row). `None` for a folder, which is listed, not opened.
+    /// The set of a file just opened, on its first view — the one the opening makes: the slot
+    /// [`Screen::first_slot`] names, or Hex when view 1 cannot show the file (D10;
+    /// [`ViewSet::unshown`] is then the hex view's first row). `None` for a folder, which is
+    /// listed, not opened.
     pub fn open(opening: Opening, screen: Screen) -> Option<ViewSet> {
         let slots = slots_of(opening.kind, opening.page, screen)?;
-        let unshown = unshown_at_open(&opening, screen);
+        let unshown = unshown_at_open(&opening);
         let first = match unshown {
             Some(_) => View::Hex,
-            None => slots[0]?,
+            None => slots[screen.first_slot(&opening).index()]?,
         };
         let mut set = ViewSet {
             reach: opening.reach,
@@ -546,7 +554,7 @@ impl ViewSet {
         self.on_screen
     }
 
-    /// Why view 1 cannot show the file (D10, §9), from the opening or from [`Input::Failed`].
+    /// Why view 1 cannot show the file (D10), from the opening or from [`Input::Failed`].
     pub fn unshown(&self) -> Option<&Why> {
         self.unshown.as_ref()
     }
@@ -679,7 +687,7 @@ impl ViewSet {
         let Some(target) = self.slot(slot) else {
             return;
         };
-        // D10, §9: view 1 says why it cannot show the file, and the set stays where it is.
+        // D10: view 1 says why it cannot show the file, and the set stays where it is.
         if let (Slot::One, Some(why)) = (slot, &self.unshown) {
             out.push(Effect::Say(why.to_string()));
             return;

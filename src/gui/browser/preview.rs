@@ -52,6 +52,8 @@ pub(super) struct Prep {
     /// A remote read's progress.
     pub done: Arc<AtomicU64>,
     pub total: Arc<AtomicU64>,
+    /// The answer of [`Pages::here`] it runs under.
+    pages: Pages,
     rx: Receiver<Result<Previewed>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -299,6 +301,7 @@ impl Host {
                 Ended::Died => {}
             }
         }
+        self.follow_backend(ctx);
         // The next starts only now: the worker before it has ended. And only for a file the
         // bar is still on.
         let wanted = self
@@ -330,6 +333,7 @@ impl Host {
         // 09 §4–§6, on the frame: whether a page file shows its page here.
         let opened_on = self.opened_on.clone();
         let pages = Pages::here(ctx, &want.name, opened_on, self.page_failed.as_ref());
+        let under = pages.clone();
         let (d, t, stop, limits, waker, path) = (
             done.clone(),
             total.clone(),
@@ -380,15 +384,53 @@ impl Host {
             budget,
             done,
             total,
+            pages: under,
             rx,
             worker: Some(worker),
         });
     }
 
+    /// How a page file named `name` opens in `ctx`'s backend, as this host asks it.
+    fn pages_here(&self, ctx: &egui::Context, name: &str) -> Pages {
+        let opened_on = self.opened_on.clone();
+        Pages::here(ctx, name, opened_on, self.page_failed.as_ref())
+    }
+
+    /// Whether `previewed`, of the file named `name`, was prepared as `ctx`'s backend prepares
+    /// it: any file but a page file, or a page file under the same [`Pages::here`] answer (a
+    /// window's page or source, a terminal's source: 10 T21).
+    pub fn fits(&self, ctx: &egui::Context, name: &str, previewed: &Previewed) -> bool {
+        !crate::kind::page_file(name) || *previewed.made_under() == self.pages_here(ctx, name)
+    }
+
+    /// 10 T21: a page file's preview is the one `ctx`'s backend makes. One made under another
+    /// answer (the backend switched since) is dropped, and a preparation under it stopped, so
+    /// the preview is made again here — what Enter hands over is what an open here would make.
+    fn follow_backend(&mut self, ctx: &egui::Context) {
+        let Some(want) = self.display.as_ref() else {
+            return;
+        };
+        if !crate::kind::page_file(&want.name) {
+            return;
+        }
+        let here = self.pages_here(ctx, &want.name);
+        if let Some(Shown::Ready(preview)) = &self.shown {
+            if *preview.made_under() != here {
+                self.shown = None;
+                self.last_progress.clear();
+            }
+        }
+        if let Some(prep) = self.prep.as_ref().filter(|p| p.pages != here) {
+            prep.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Enter or F3 on the file at `path` (02 §4.4): what the host has of it is taken away —
     /// the finished preview as a viewer, a card, or the running preparation with its
-    /// budget lifted. A preparation of another file is cancelled.
-    pub fn take(&mut self, path: &str) -> Taken {
+    /// budget lifted. A preparation of another file is cancelled, and so is a page file's
+    /// preview made for the other backend (`ctx`'s answer is another: 10 T21).
+    pub fn take(&mut self, ctx: &egui::Context, path: &str) -> Taken {
+        self.follow_backend(ctx);
         let shows = self.display.as_ref().is_some_and(|w| w.path == path);
         if shows {
             match self.shown.take() {
@@ -698,7 +740,7 @@ mod tests {
         side.panels = false;
         drv.idle(&mut side, 3);
         assert_eq!(said(), [false, true, false]);
-        let Taken::Viewer(_viewer) = side.host.take("/d/a.txt") else {
+        let Taken::Viewer(_viewer) = side.host.take(&drv.ctx, "/d/a.txt") else {
             panic!("not handed over")
         };
         assert_eq!(said(), [false, true, false, true], "a viewer is shown");
