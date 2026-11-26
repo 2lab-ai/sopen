@@ -1713,9 +1713,11 @@ fn hover_says(fx: &mut Fx, label: &str, tip: &str) {
         fx.drv.find_text(tip).is_none(),
         "{tip:?} up before the hover"
     );
-    let at = fx
-        .drv
-        .find_text(label)
+    // The toolbar's, highest: the F-key row's 5Save reads `Save` too (cells).
+    let at = (fx.drv.texts().into_iter())
+        .filter(|(_, _, t)| t == label)
+        .map(|(r, _, _)| r)
+        .min_by(|a, b| a.top().total_cmp(&b.top()))
         .unwrap_or_else(|| panic!("no {label:?} on screen"));
     fx.drv.move_to(&mut fx.win, at.center());
     for _ in 0..90 {

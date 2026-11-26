@@ -244,7 +244,18 @@ fn save_button_and_command_s_save_to_disk() {
     fx.select((0.0, 0.0), (120.0, 80.0));
     fx.key(Key::C, Modifiers::NONE);
     fx.drv.idle(&mut fx.win, 1);
-    fx.drv.click_text(&mut fx.win, "Save");
+    // The toolbar's Save, the highest: the F-key row's 5Save (cells) reads `Save` too.
+    let save = (fx.drv.texts().into_iter())
+        .filter(|(_, _, t)| t == "Save")
+        .map(|(r, _, _)| r)
+        .min_by(|a, b| a.top().total_cmp(&b.top()))
+        .expect("the toolbar's Save");
+    let row = fx.drv.find_text("Exit").expect("the F-key row");
+    assert!(
+        save.bottom() <= row.top(),
+        "the toolbar's, not the F-key row's"
+    );
+    fx.drv.click(&mut fx.win, save.center());
     wait_for_save(&mut fx);
     assert!(
         fx.win.status.text.starts_with("saved "),

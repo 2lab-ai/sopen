@@ -1237,7 +1237,7 @@ fn es3_a_file_changed_after_the_kill_restores_and_save_asks() {
             .save(&mut back.editor, &mut LocalFs::new())
             .unwrap();
         assert!(
-            matches!(saved, Saved::Conflict { overwrite, .. } if overwrite == !deleted),
+            matches!(saved, Saved::Conflict { overwrite, .. } if overwrite != deleted),
             "{deleted}: {saved:?}"
         );
     }

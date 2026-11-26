@@ -16,24 +16,18 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
 
 | ID | Status | What | Who |
 |---|---|---|---|
-| XW-help2 | 🟡 review | F1's help in cells in both backends: TS-1 with the help open; XW-term's interim status line removed; branch `feat/xw-help-cells` | coder |
-| X2-gui | 🔴 open | 10 §17's X2: `--gui`, forwarded when asked or when the kind the sender sees needs a window (a text file keeps the editor); an older HOST gets the run again without it (decided 2026-11-25) | coder |
+| X2-gui | 🟡 running | 10 §17's X2: `--gui`, forwarded when asked or when the kind the sender sees needs a window (a text file keeps the editor); an older HOST gets the run again without it (decided 2026-11-25) | coder |
 | X2-state | 🔴 open | 10 §17's X2: the switch's state, `"v": 1`, taken from one browser and given to another | coder |
 | X2-host | 🔴 open | 10 §17's X2: HOST's half, `--state-stdin`, the `sopen-xtools-state` and `sopen-xtools-kept` cues | coder |
 | X2-switch | 🔴 open | 10 §17's X2: the TUI's half over ssh, §7.3's outcomes, the question before switching; ships X2 | coder |
-| XW-receipts | 🟡 review | 10 §17's X3: `SOPEN_CELLS=<path>` in both backends and TS-6, which XW-term left out by decision; the receipt of every X3 screen; branch `feat/xw-receipts` | coder |
-| X3-text | 🔴 open | 10 §17's X3: the text viewer and its preview in cells, wrapped by cells | coder |
-| X3-hex | 🔴 open | 10 §17's X3: the hex viewer in cells. Carried from #108's review: point the hex tests' `drawn()` at `texts()` once hex paints cells (`galleys()` then holds one-character glyphs), and note that `rects()` will list cell backgrounds and the caret | coder |
+| X3-text | 🟡 review | 10 §17's X3: the text viewer and its preview in cells, wrapped by cells; branch `feat/x3-text` (its CP437 stand-ins land after X3-hex) | coder |
 | X3-questions | 🔴 open | 10 §17's X3: the hex window's questions and rows, and Save As, in cells | coder |
 | X3-preview | 🔴 open | 10 §17's X3: the preview side's frame and progress line in cells | coder |
-| X3-binary | 🔴 open | 10 §17's X3: the binary dialog in cells | coder |
+| X3-binary | 🟡 running | 10 §17's X3: the binary dialog in cells; branch `feat/x3-binary` | coder |
 | VM-8 | 🔴 open | 10 §17's X3 (08 §13's row): 08's slots kept in the terminal (T21), the view keys through the translator. Carried: `src/view_keys.rs`'s module doc names `term_input::RELEASES`, which `view_set.rs` already applies; VM-8 builds on that. Carried from the cut: VM-8 makes `Screen::TERMINAL` follow T21 (today it opens an image or a video on Hex, `views.rs:186-190, 481-496`) | coder |
-| VM-7b | 🔴 open | 08 §13's follow-up row: views of one remote file share its stream and a hidden view keeps no save connection (D13, D14; back within 06 §6's budget), D25's reload half, D10 for empty media and undecodable video, VA-5, VA-6 | coder |
 | VM-D0 | 🔴 open | 08 §13: 04 §2 and K-R1 brought to the shipped code | orchestrator |
-| WV-D | 🟡 running | 09 §12: the page view in the browser (`.html`/`.htm`/`.xml` as pages in the preview and the viewer, the fallback); branch `feat/wv-d-page-view` | coder |
 | WV-rest | 🔴 open | 09 §12's WV-C2, WV-B, WV-E2 and WV-F, in its order (X-W1, WV-0, WV-E1, WV-C and WV-A are closed) | coder |
-| ED-ops | 🟡 review | 12 §16: the editor's commands over the buffer (caret, block, clipboard, armings, find and replace, paste, the encoding question); branch `feat/ed-ops` | coder |
-| ED-units | 🔴 open | 12 §16's units: ED-save (no screen); then ED-screen, ED-dialogs, ED-layout (ships X5), ED-git, ED-route, after their 10 units (ED-buf and ED-enc are closed) | coder |
+| ED-units | 🔴 open | 12 §16's units after ED-buf, ED-enc, ED-ops and ED-save (closed): ED-screen, ED-dialogs, ED-layout (ships X5), ED-git, ED-route, after their 10 units | coder |
 
 ## Follow-ups found on the way (not units yet)
 
@@ -43,11 +37,14 @@ Open units, in each document's order. Closed units are in [`loop.done.md`](loop.
 | F-numpad | 🔴 open | The Ctrl+numpad digit alias reads the physical key first (`src/gui/mod.rs`, `fkey_events`) | coder |
 | F-keynames | 🔴 open | Key names outside help still mix forms: "Cmd/Ctrl+R" literals, "⌘/Ctrl" hovers, README line 95; 01, 02 and 03 write `Cmd/Ctrl+Z` | coder |
 | F-ci-macos | 🔴 open | A merge to main runs `ci.yml` twice on macOS: CI's own push run and Preview's `gate` (`preview.yml` calls `ci.yml`). Dropping CI's push trigger for main, so that Preview's gate is the one run, would halve the macOS checks per merge while runners are short | orchestrator |
-| F-timing | 🔴 open | Wall-clock bounds that fail under a loaded full run and pass alone, seen 2026-11-25: `gui::image::robustness_tests::malformed_headers_never_panic_the_header_read` (one interlaced-PNG case took 2.86 s against `CASE_LIMIT` 2 s, Linux load ~12; alone 5/5), `s3::g_r5_a_waiting_hook…` (no hook pid within 10 s) and `git::tests::runner::a_record_or_an_output_past_its_bound_is_stopped` (each once at load 33–45; alone 5/5 and 3/3), and `s5::d2_the_first_frame_and_the_screens_info_lines_arrive_in_time` (first frame 618 ms in ED-buf's Linux full run; alone 3/3). Bound the work, not the wall clock, as #101–#103 did | coder |
+| F-timing | 🔴 open | Wall-clock bounds that fail under a loaded full run and pass alone, seen 2026-11-25: `gui::image::robustness_tests::malformed_headers_never_panic_the_header_read` (one interlaced-PNG case took 2.86 s against `CASE_LIMIT` 2 s, Linux load ~12; alone 5/5), `s3::g_r5_a_waiting_hook…` (no hook pid within 10 s) and `git::tests::runner::a_record_or_an_output_past_its_bound_is_stopped` (each once at load 33–45; alone 5/5 and 3/3), and `s5::d2_the_first_frame_and_the_screens_info_lines_arrive_in_time` (first frame 618 ms in ED-buf's Linux full run; alone 3/3). Bound the work, not the wall clock, as #101–#103 did; `fnkeys::tests::r3_a_dead_watchdog_is_replaced_before_the_next_acquisition` (macOS runner, #139: acquired with a dead watchdog; the replacement became ready before the next focus) | coder |
 | F-cell-select | 🔴 open | Text drawn in cells (the list since #119, the dialogs since XW-dialogs) cannot be selected or copied; main's egui labels could (`selectable_labels`), e.g. a report's failure reason or the clash question's path. A cell selection with Cmd/Ctrl+C, the same in the window and the terminal (where the terminal's own selection works only with mouse reporting off) | coder |
 | F-list-perf | 🔴 open | The list in cells costs 0.71 ms a frame in release against main's 0.23 ms (2,000 entries, 1000×700 at 2×; #119): one galley per glyph. One galley per run of one-cell glyphs measured 0.47 ms; it needs 10 §4's "its glyph at its own cell, never through egui's text layout" amended, `cells.rs` paint and its tests, and the kit's `glyphs`/`placed` | coder |
 | F-handoff-cover | 🔴 open | A hand-off box partly under a cell dialog or the help is narrowed to the uncovered strip (`│F12 sh…│`, XW-help's receipt); show it whole or not at all | coder |
 | F-tty-spin | 🔴 open | A hang-up in the middle of a split escape sequence, or during the first entry's keyboard query, can still spin inside crossterm 0.29's mio reader (XW-term's review); crossterm's `use-dev-tty` feature returns on an empty read | coder |
+| F-git-kill | 🔴 open | A local `git version` child ended by SIGKILL, once in 20 TUI runs while the test gate ran in parallel, 0 in 20 idle (XW-receipts' receipts): not a stop sopen asked for (`Ending::Signal`, `git/history.rs`); the sender is unknown — memory pressure or a process-group kill by number | coder |
+| F-edsave-rest | 🔴 open | ED-save fix-check notes: when the swap-back cannot be recorded the record is cleared (keep it, as for `Kept` with nothing moved, so the next Save moves the other version to its visible name); `move_new`'s link-then-unlink fallback has no test | coder |
+| F-content-chrome | 🔴 open | 10's Tensions: the printer treats a text file's `…` and box lines not between letters as chrome and substitutes them in an ambiguous-wide terminal (T38: content must not change); mark viewer cells as content | coder |
 
 ## Build facts
 
