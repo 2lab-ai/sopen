@@ -14,6 +14,7 @@ pub mod binary;
 pub mod browser;
 pub mod cells;
 pub mod chrome;
+pub mod edit;
 pub mod fonts;
 mod help;
 pub mod hex;
