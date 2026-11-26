@@ -3542,15 +3542,19 @@ impl Highlight {
         Ok(Some(runs))
     }
 
-    /// The source changed from line `line` on, `mark` being its kept state at or before that
-    /// line (the editor's buffer, 12 §8): the states after `mark` go, and are made again as pages
-    /// ask for them. A stop line found at or after `line` goes too: the cut line may be shorter
-    /// now, or elsewhere.
-    pub(super) fn edited(&mut self, line: u64, mark: usize) {
+    /// The source changed from a line at or after its kept state `mark` on (the editor's
+    /// buffer, 12 §8): the states after `mark` go, and are made again as pages ask for them. The
+    /// stop line goes too, wherever it is — the cut line may be shorter now, and the viewer's
+    /// stop past 16 MiB moves with any edit — and the walk finds it again (R2 6). Only a source
+    /// that finds its stop is edited; the text document's never is.
+    pub(super) fn edited(&mut self, mark: usize) {
         self.states.truncate(mark + 1);
-        if self.stop >= line {
-            self.stop = u64::MAX;
-        }
+        self.stop = u64::MAX;
+    }
+
+    /// The line highlighting stops at, as far as the walks found it (`u64::MAX`: none found).
+    pub(super) fn stop(&self) -> u64 {
+        self.stop
     }
 
     /// The states kept now (EH-3's measure, the tests).

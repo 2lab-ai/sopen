@@ -813,40 +813,48 @@ fn a_dropped_worker_gives_its_slot_back() {
     }
 }
 
-/// R1 MUST 3: a reply the worker made for the document before an edit that moved lines (Enter)
-/// is never laid on the document after it: the rows keep their own colours, moved with them.
+/// R1 MUST 3 (made deterministic in round 2): a reply the worker made for the document before
+/// an edit that moved lines (Enter) is never laid on the document after it — the reply is the
+/// test's own, sent once the edit is made — and the rows keep their own colours, moved with them.
 #[test]
 fn a_reply_for_an_older_document_is_never_painted() {
     let text: Vec<String> = (0..300)
-        .map(|i| match i {
-            11 => "// MARKER".to_string(),
-            i if i % 2 == 0 => format!("fn f{i}() {{}}"),
-            i => format!("// note {i}"),
+        .map(|i| match i % 2 {
+            0 => format!("fn f{i}() {{}}"),
+            _ => format!("// note {i}"),
         })
         .collect();
     let mut v = view(&text.join("\n"), "stale.rs");
-    let (hook, hold, reached, go) = holding_hook("MARKER");
-    v.hook = Some(hook);
     let mut drv = Driver::new(640.0, 400.0);
     drv.until(&mut v, 30, |v| v.ready());
-    // An ask the worker holds on line 12 (the page is lines 1–20): an edit far below it.
-    hold.store(true, Ordering::SeqCst);
+    // The page a worker answers for this document, made here.
+    let mut hl = Highlight::new(v.syntax.unwrap(), PALETTE.text, u64::MAX).unwrap();
+    let rows = v.rows as usize;
+    let runs = (hl.page(&mut BufLines::new(v.snap()), 0, rows, &|| false))
+        .unwrap()
+        .unwrap();
+    // A worker of the test's: its replies are the test's to send.
+    let (tx, done) = mpsc::channel();
+    v.hl.worker = Some(Worker {
+        mail: Arc::default(),
+        done,
+        latest: Arc::default(),
+        stop: Arc::default(),
+        parsed: Arc::default(),
+    });
+    // An ask of this document, the page at line 1: an edit far below it.
     go_to_line(&mut v, 250);
     v.press(&Press::Text("z".into()));
     v.ed.place(0, false);
     v.follow = true;
     drv.idle(&mut v, 1);
-    reached
-        .recv_timeout(Duration::from_secs(30))
-        .expect("the worker held on line 12");
-    // Enter at line 1 before any pass: every line moves one down; then the old page arrives.
+    let asked = v.hl.gen;
+    // Enter at line 1 before any pass: every line moves one down; then that ask's reply arrives.
     v.press(&Press::key(Key::Enter, Modifiers::NONE));
-    hold.store(false, Ordering::SeqCst);
-    go.send(()).unwrap();
-    std::thread::sleep(Duration::from_millis(500));
+    tx.send(old_reply(asked, rows, runs)).unwrap();
     drv.idle(&mut v, 1);
-    let l = screen(&drv);
     // (Line 2, the text Enter moved off line 1, is plain until the worker answers: R1 S8.)
+    let l = screen(&drv);
     assert!(text_of(&l, 6, 5).starts_with("fn f2() {}"));
     assert_eq!(
         glyph_colors(&l, 6, 5)[0],
@@ -858,7 +866,17 @@ fn a_reply_for_an_older_document_is_never_painted() {
         comment.iter().all(|&c| c == cga::CYAN),
         "line 3: {comment:?}"
     );
-    drv.until(&mut v, 30, |v| v.ready());
+}
+
+/// The reply a worker sends for the page of `rows` lines at line 1 asked under `gen`.
+fn old_reply(gen: u64, rows: usize, runs: Vec<Runs>) -> Done {
+    Done::Page {
+        gen,
+        top: 0,
+        count: rows,
+        runs,
+        stop: u64::MAX,
+    }
 }
 
 /// R1 MUST 4: the caret on a wide glyph at the right edge brings the whole glyph into view, and
@@ -1030,18 +1048,12 @@ fn a_failed_highlighter_leaves_every_row_plain() {
     }
 }
 
-/// R1 S5: highlighting stops where the viewer's does — at the last of its index marks at or below
-/// 16 MiB (a mark every 256 lines, or at the first line start a span past the last) — not at
-/// the last line starting below 16 MiB.
-#[test]
-fn highlighting_stops_where_the_viewers_does() {
-    // `/*`, then lines of 4,000 `x`: all comment, cheap to parse. Line k starts at
-    // 3 + 4,001 (k − 1).
-    let lines = 4_300u64;
-    let body = format!(
-        "/*\n{}",
-        format!("{}\n", "x".repeat(4000)).repeat(lines as usize)
-    );
+/// A Rust file past 16 MiB that the viewer stops short of 16 MiB: `/*`, then 4,300 lines of
+/// 4,000 `x` (all comment, cheap to parse; line k starts at 3 + 4,001 (k − 1)); and the line of
+/// the viewer's last index mark at or below 16 MiB — a mark every 256 lines, or at the first
+/// line start a span (64 KiB) past the last.
+fn past_16_mib() -> (String, u64) {
+    let body = format!("/*\n{}", format!("{}\n", "x".repeat(4000)).repeat(4_300));
     let start = |k: u64| if k == 0 { 0 } else { 3 + 4001 * (k - 1) };
     let (mut last, mut k) = (0u64, 0u64);
     let stop = loop {
@@ -1057,16 +1069,31 @@ fn highlighting_stops_where_the_viewers_does() {
         stop + 5 < (HIGHLIGHT_MAX - 3) / 4001,
         "the viewer stops short of 16 MiB"
     );
+    (body, stop)
+}
+
+/// Whether line `line` of `v` is drawn all in `want` (and draws something), once highlighting
+/// has answered with the caret on it.
+fn line_is(drv: &mut Driver, v: &mut EditView, line: u64, want: Color32) -> Result<(), String> {
+    go_to_line(v, line);
+    drv.until(v, 60, |v| v.ready());
+    let (y, x) = place_of(v, line);
+    let colors = glyph_colors(&screen(drv), x, y);
+    match !colors.is_empty() && colors.iter().all(|&c| c == want) {
+        true => Ok(()),
+        false => Err(format!("line {line}: {colors:?}")),
+    }
+}
+
+/// R1 S5: highlighting stops where the viewer's does — at the last of its index marks at or below
+/// 16 MiB — not at the last line starting below 16 MiB.
+#[test]
+fn highlighting_stops_where_the_viewers_does() {
+    let (body, stop) = past_16_mib();
     let mut v = view(&body, "after.rs");
     let mut drv = Driver::new(640.0, 400.0);
-    for (line, comment) in [(stop - 1, true), (stop + 3, false)] {
-        go_to_line(&mut v, line);
-        drv.until(&mut v, 60, |v| v.ready());
-        let (y, x) = place_of(&v, line);
-        let colors = glyph_colors(&screen(&drv), x, y);
-        let want = if comment { cga::CYAN } else { PALETTE.text };
-        assert!(colors.iter().all(|&c| c == want), "line {line}: {colors:?}");
-    }
+    line_is(&mut drv, &mut v, stop - 1, cga::CYAN).unwrap();
+    line_is(&mut drv, &mut v, stop + 3, PALETTE.text).unwrap();
 }
 
 /// R1 S6: in an ambiguous-wide terminal a control character's glyph is the viewer's stand-in.
@@ -1159,4 +1186,166 @@ fn the_save_prompt_shortens_the_name() {
         ),
         "{status}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 2 (e1d9c7c).
+
+/// R2 1: a reply that ends at a new stop takes its whole page: text over `LINE_MAX` typed into
+/// the first line, and every row after it goes plain (EH-2) — none keeps its old colours.
+#[test]
+fn rows_past_a_new_stop_go_plain() {
+    let mut v = view(&rust(100), "stop.rs");
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.until(&mut v, 30, |v| v.ready());
+    let plain = PALETTE.text;
+    assert!(
+        glyph_colors(&screen(&drv), 6, 3).contains(&cga::LIGHT_CYAN),
+        "line 2's string"
+    );
+    v.ed.place(0, false);
+    v.press(&Press::Text("x".repeat(LINE_MAX + 100)));
+    v.ed.place(0, false);
+    v.follow = true;
+    drv.until(&mut v, 30, |v| v.ready());
+    let l = screen(&drv);
+    let rows: Vec<Vec<Color32>> = (3..22)
+        .map(|y| glyph_colors(&l, 6, y))
+        .filter(|c| !c.is_empty())
+        .collect();
+    assert!(rows.len() >= 15, "{} rows with text", rows.len());
+    for colors in rows {
+        assert!(colors.iter().all(|&c| c == plain), "{colors:?}");
+    }
+}
+
+/// The cells of rows `rows` of `l`: symbol and colours, and the caret.
+fn drawn(
+    l: &cells::Layer,
+    rows: std::ops::Range<usize>,
+) -> (Vec<Vec<cells::Seen>>, Option<Position>) {
+    (l.seen()[rows].to_vec(), l.caret)
+}
+
+/// What a fresh view of `v`'s document draws — no checkpoints — with `v`'s caret, top and
+/// column: its text rows' cells and its caret.
+fn fresh(drv: &mut Driver, v: &EditView) -> (Vec<Vec<cells::Seen>>, Option<Position>) {
+    let mut bytes = Vec::new();
+    v.ed.buffer().read(0..v.ed.buffer().len(), &mut bytes);
+    let mut f = view(&String::from_utf8(bytes).unwrap(), &v.name);
+    f.ed.place(v.ed.caret(), false);
+    (f.top, f.left, f.rows, f.cols, f.follow) = (v.top, v.left, v.rows, v.cols, false);
+    drv.idle(&mut f, 1);
+    drawn(&screen(drv), 2..22)
+}
+
+/// R2 3: the checkpoints kept across an edit earlier on a long line already walked, and across
+/// a block move that keeps the length and the line count, draw what a fresh view draws.
+#[test]
+fn kept_checkpoints_draw_what_a_fresh_view_draws() {
+    // Mixed widths — a wide glyph among letters, no tab (a tab would set a stale column right
+    // again at the next multiple of 4) — so a stale checkpoint shows elsewhere.
+    let unit = "ab한cd";
+    let mut v = view(&format!("{}\nend\n", unit.repeat(40_000)), "mixed.txt");
+    let mut drv = Driver::new(640.0, 400.0);
+    let end = Press::key(Key::End, Modifiers::NONE);
+    v.press(&end);
+    drv.idle(&mut v, 1);
+    assert!(!v.walked.0.is_empty(), "the line walked keeps checkpoints");
+    // An edit early on it, the caret back at its end.
+    v.ed.place(98, false);
+    v.press(&Press::Text("한한".into()));
+    v.press(&end);
+    drv.idle(&mut v, 1);
+    let kept = drawn(&screen(&drv), 2..22);
+    assert_eq!(kept, fresh(&mut drv, &v), "after an edit at byte 98");
+    // A block move far along the line: the length and the line count stay.
+    let (len, lines) = (v.ed.buffer().len(), v.ed.buffer().lines());
+    v.ed.place(98, false);
+    v.press(&ctrl(Key::K));
+    v.press(&Press::key(Key::B, Modifiers::NONE));
+    v.ed.place(104, false);
+    v.press(&ctrl(Key::K));
+    v.press(&Press::key(Key::K, Modifiers::NONE));
+    v.ed.place(104 + 7 * 28_571, false);
+    v.press(&ctrl(Key::K));
+    v.press(&Press::key(Key::V, Modifiers::NONE));
+    assert_eq!((v.ed.buffer().len(), v.ed.buffer().lines()), (len, lines));
+    let mut moved = Vec::new();
+    v.ed.buffer().read(98..104, &mut moved);
+    assert_eq!(moved, "ab한c".as_bytes(), "the pair moved off byte 98");
+    // The caret between the block's two places, where every column moved by the pair's four.
+    v.ed.place(98 + 7 * 21_428, false);
+    v.follow = true;
+    drv.idle(&mut v, 1);
+    let kept = drawn(&screen(&drv), 2..22);
+    assert_eq!(kept, fresh(&mut drv, &v), "after the block move");
+}
+
+/// R2 4: an edit that keeps the caret still brings its character into view — Del pulls `가`
+/// onto the last column — and Overwrite's cover stays inside the text, never over the scroll bar.
+#[test]
+fn an_edit_that_keeps_the_caret_follows_it() {
+    let mut v = view(&format!("{}x가\n", "a".repeat(72)), "del.txt");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.ed.place(72, false);
+    v.follow = true;
+    drv.idle(&mut v, 1);
+    assert_eq!(screen(&drv).caret, Some(Position::new(78, 2)));
+    v.press(&Press::key(Key::Delete, Modifiers::NONE));
+    drv.idle(&mut v, 1);
+    let l = screen(&drv);
+    let caret = l.caret.expect("the caret on screen");
+    let under = &l.seen()[usize::from(caret.y)][usize::from(caret.x)];
+    assert_eq!(under.symbol, "가", "the caret's character under it");
+    // `가` at the last column, cut there (the text put so by hand), in Overwrite.
+    (v.left, v.follow) = (0, false);
+    v.press(&Press::key(Key::Insert, Modifiers::NONE));
+    drv.idle(&mut v, 1);
+    let l = screen(&drv);
+    let bar = l.rect(Cells::new(79, 2, 1, 1));
+    let foot = egui::Rect::from_min_max(egui::pos2(bar.left(), bar.bottom() - 2.0), bar.max);
+    let rects = drv.rects();
+    let over = |r: &egui::Rect| r.intersect(foot).area() > 0.0;
+    let last = rects
+        .iter()
+        .rposition(|(r, _, _)| over(r))
+        .expect("the bar");
+    assert_eq!(
+        rects[last].1, PALETTE.track_back,
+        "the scroll bar's own colour on top"
+    );
+}
+
+/// R2 5: combining marks are counted per row: glyphs each followed by just under a stride of
+/// marks still cost a row about a stride.
+#[test]
+fn marks_are_counted_per_row() {
+    let run = "\u{301}".repeat(30_000);
+    let line: String = (0..10)
+        .map(|i| format!("{}{run}", char::from(b'a' + i)))
+        .collect();
+    let mut v = view(&format!("{line}\nnext\n"), "runs.txt");
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut v, 1);
+    DECODED.with(|n| n.set(0));
+    drv.idle(&mut v, 1);
+    let decoded = DECODED.with(std::cell::Cell::get);
+    assert!(decoded <= 4 * STRIDE, "{decoded} bytes decoded in a frame");
+}
+
+/// R2 6: an edit past the stop line finds the stop again: cutting the file below 16 MiB colours
+/// the lines past the viewer's old stop.
+#[test]
+fn an_edit_past_the_stop_finds_it_again() {
+    let (body, stop) = past_16_mib();
+    let mut v = view(&body, "cut.rs");
+    let mut drv = Driver::new(640.0, 400.0);
+    line_is(&mut drv, &mut v, stop + 3, PALETTE.text).unwrap();
+    let from = v.ed.buffer().line_start(stop + 7).unwrap();
+    v.ed.place(from, false);
+    v.press(&Press::key(Key::End, Modifiers::COMMAND | Modifiers::SHIFT));
+    v.press(&Press::key(Key::Delete, Modifiers::NONE));
+    assert!(v.ed.buffer().len() <= HIGHLIGHT_MAX);
+    line_is(&mut drv, &mut v, stop + 3, cga::CYAN).unwrap();
 }

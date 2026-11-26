@@ -24,7 +24,7 @@
 //!   taking [`MARKS`] combining marks: `edit::ops`' column rule, so the cell the caret is drawn
 //!   in is the column ↑ ↓ keep. A long line is walked from checkpoints every [`STRIDE`] bytes,
 //!   kept across an edit before the place it changed, so a row or the caret deep in it decodes
-//!   about a stride; a run of marks longer than a stride ends a row.
+//!   about a stride; more than a stride of marks ends a row.
 //! - **The caret** is two scan lines in Insert and its character's cells, their colours swapped,
 //!   in Overwrite (§4's [추정] choice), in both backends — the window's foot covered there
 //!   ([`EditView::paint`]); a terminal adds its cursor.
@@ -443,7 +443,15 @@ struct Ask {
 }
 
 enum Done {
-    Page { gen: u64, top: u64, runs: Vec<Runs> },
+    /// The page of `count` lines at `top` asked under `gen`: the runs of the lines the worker
+    /// read, and where highlighting stops.
+    Page {
+        gen: u64,
+        top: u64,
+        count: usize,
+        runs: Vec<Runs>,
+        stop: u64,
+    },
     Failed(String),
 }
 
@@ -552,14 +560,16 @@ impl Worker {
                         }
                     };
                     if let Some(line) = ask.edit {
-                        hl.edited(line, src.mark_before(line));
+                        hl.edited(src.mark_before(line));
                     }
                     let gen = ask.gen;
                     match hl.page(src, ask.top.0, ask.count, &|| cancel()) {
                         Ok(Some(runs)) => send(Done::Page {
                             gen,
                             top: ask.top.0,
+                            count: ask.count,
                             runs,
+                            stop: hl.stop(),
                         }),
                         Ok(None) => {}
                         Err(e) if e.is::<Superseded>() => {}
@@ -930,6 +940,8 @@ impl EditView {
         let delta = b.lines() as i64 - lines as i64;
         self.version += 1;
         self.walked.edited(at);
+        // An edit that keeps the caret (Del, Ctrl+T) may still move its character (R2 4).
+        self.follow = true;
         // A page asked of the document before this edit is never laid on it (R1 MUST 3): the
         // worker drops it, and the view takes no reply asked before now.
         self.hl.gen += 1;
@@ -991,9 +1003,10 @@ impl EditView {
         // An index from the line's start: only a line that has no checkpoint is highlighted.
         let mut i = 0;
         let mut out = Vec::new();
-        // Where the column last moved, and the marks since: a cell takes [`MARKS`] of them, and
-        // a run of them longer than a stride ends the row (R1 MUST 6).
-        let (mut moved, mut marks) = (from.0, 0);
+        // The marks: a cell takes [`MARKS`] of them, and more than a stride of them in the row
+        // ends it (R1 MUST 6, counted per row: R2 5) — the bytes of the runs before, and where
+        // the run now started.
+        let (mut run, mut mark_bytes, mut marks) = (None::<u64>, 0, 0);
         walk(
             self.ed.buffer(),
             &mut self.walked,
@@ -1004,10 +1017,15 @@ impl EditView {
                     return false;
                 }
                 if w > 0 {
-                    (moved, marks) = (at, 0);
-                } else if at - moved > STRIDE {
-                    return false;
+                    if let Some(start) = run.take() {
+                        mark_bytes += at - start;
+                    }
+                    marks = 0;
                 } else {
+                    let start = *run.get_or_insert(at);
+                    if mark_bytes + (at - start) > STRIDE {
+                        return false;
+                    }
                     marks += 1;
                 }
                 let shown = col + w > left || (w == 0 && col >= left);
@@ -1120,7 +1138,17 @@ impl EditView {
         let mut failed = None;
         while let Ok(done) = worker.done.try_recv() {
             match done {
-                Done::Page { gen, top, runs } if gen == self.hl.gen => {
+                Done::Page {
+                    gen,
+                    top,
+                    count,
+                    runs,
+                    stop,
+                } if gen == self.hl.gen => {
+                    // The reply is the whole page's: its rows it did not carry — past a stop
+                    // its read ended at — and anything past the stop are plain (R2 1).
+                    let (carried, end) = (top + runs.len() as u64, top + count as u64);
+                    (self.hl.lines).retain(|&n, _| n < stop && !(carried..end).contains(&n));
                     for (k, line) in runs.into_iter().enumerate() {
                         let text = line.iter().flat_map(|(_, t)| t.chars()).collect();
                         let colors = (line.iter())
@@ -1254,8 +1282,10 @@ impl EditView {
         let caret = shown.then(|| self.composing(buf, text, at));
         self.ime(&ctx, grid, text, caret.unwrap_or(at));
         if let Some(at) = caret.filter(|_| self.ed.overwrite() && self.preedit.is_empty()) {
-            // Overwrite: the character's cells, both of a wide one, their colours swapped.
-            for x in at.x..(at.x + self.caret_w).min(text.right()) {
+            // Overwrite: the character's cells, both of a wide one, their colours swapped — in
+            // the text, never over the scroll bar (R2 4), and the cover the same.
+            self.caret_w = self.caret_w.min(text.right() - at.x);
+            for x in at.x..at.x + self.caret_w {
                 let cell = &mut buf[(x, at.y)];
                 let (fg, bg) = (cell.fg, cell.bg);
                 (cell.fg, cell.bg) = (bg, fg);
