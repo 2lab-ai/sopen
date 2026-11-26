@@ -13,7 +13,9 @@
 //!   shadow): the close prompt (§9.6: 07 §10's four choices), the conflict dialog (§9.2) and its
 //!   Reload's question, and the encoding question (§7.2, read from [`Editor::question`] each
 //!   pass). Each opens with the keyboard on `[ Cancel ]` (E6): Enter presses the button that has
-//!   it, Esc is Cancel, ← → Tab and Shift+Tab move it, and a letter answers nothing.
+//!   it, Esc is Cancel, ← → Tab and Shift+Tab move it — but not in the pass it opens in, nor
+//!   when the same box opens again from outside — and a letter answers nothing. One opened from
+//!   outside (an exit, a Save's end) disarms a waiting `^K` or `^S`.
 //! - **The menus** (F10, or a click on a name in the title row): the bar on a name — ← →, a
 //!   name's letter, Enter or ↓ drops its items — then the items as a box under the name (the
 //!   kit's, laid on a grid of its own size there), the bar's row with the keyboard (↑ ↓; ← → the
@@ -21,23 +23,31 @@
 //!   F10 E R redoes in either input source; the status row names the letters (*editor* §2.3).
 //!   Esc closes the innermost. Items with no command yet are off: Delete to line end and
 //!   Matching bracket have no operation in `edit::ops`, and the Git menu is ED-git's.
-//! - **While anything here is up it has every key**: the pass's keys go to it and no further,
-//!   and [`EditView::press`] takes none but a focus report or a resize (E31's Shift known).
+//! - **While anything here is up it has every key**, read in the pass's order against the
+//!   state each leaves (a field's text before the Enter after it, a menu's letter before the
+//!   item's), each stage handing what follows to the next; none goes further, and
+//!   [`EditView::press`] takes none but a focus report or a resize (E31's Shift known).
+//! - **The binding's order**: each pass gives its keys to [`EditView::press`] first, then runs
+//!   [`EditView::dialogs_ui`] — so a dialog a key opens reads the keys after it in the same
+//!   pass, and drops that key's own event (an F10 never closes its own bar).
+//! - **No edits while a Save runs** (E24): [`EditView::press`], the menus, Replace and the
+//!   encoding question's Type refuse them, with §9.1's line; moves and Find still work.
 //! - **Exits** (§6.4, §9.6): the binding gives each to [`EditView::leave`]. With unsaved edits
 //!   the close prompt asks; a running Save holds the exit until it reports (07 §10). What was
 //!   chosen comes back as [`Chosen`] — or, for Save, Save copy and Save As…, as the command
 //!   ([`EditView::take_commands`]), whose end [`EditView::landed`], [`EditView::elsewhere`],
-//!   [`EditView::not_saved`] or [`EditView::gave_up`] reports, the exit going once a Save lands.
-//!   The key that opened a dialog is dropped from the pass it opens in.
+//!   [`EditView::not_saved`] or [`EditView::gave_up`] reports, the exit going once a Save lands
+//!   (a Save copy or Save As… only while the document is what it wrote).
 
 use super::{EditView, MENUS};
-use crate::edit::arm::{self, Backend, BlockOp, Command};
+use crate::edit::arm::{self, Armed, Backend, BlockOp, Command};
+use crate::edit::buffer::Piece;
 use crate::edit::file::Saved;
 use crate::edit::ops::{Answer, Options, Said, Search};
 use crate::gui::browser::ops::dialog::{self, Button, Ink, Inputs, Part};
 use crate::gui::cells::{self, Buffer, Cells, Grid, Pen, Position};
 use crate::gui::chrome::{self, cga, CELL};
-use eframe::egui::{self, Key};
+use eframe::egui::{self, Key, Modifiers};
 use std::ops::Range;
 use std::path::PathBuf;
 
@@ -92,6 +102,9 @@ pub struct FileState {
 /// The status row's line while an exit waits for a running Save.
 pub const WAITS: &str = "saving — the editor goes on when the save is done";
 
+/// The status row's line for an edit refused while a Save runs (E24, §9.1).
+pub const SAVING: &str = "saving — editing resumes when the save is done";
+
 /// Replace's question at each match, on the status row.
 const REPLACE_ASK: &str = "Replace this one? Y replaces it · N skips it · Esc stops";
 
@@ -117,12 +130,14 @@ pub(super) enum Up {
         item: usize,
     },
     Find(Find),
-    /// Replace's question at the match `at`, `count` replaced so far.
+    /// Replace's question at the match `at`, `count` replaced so far; backward, `bound` is where
+    /// the earliest replacement starts — a match ending past it would take some of it.
     Replace {
         search: Search,
         text: String,
         at: Range<u64>,
         count: usize,
+        bound: Option<u64>,
     },
     GoTo(String),
     /// The close prompt, for this exit.
@@ -156,6 +171,39 @@ enum Field {
     Options,
 }
 
+/// A field of the status row: Go to's, or one of Find's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    GoTo,
+    Needle,
+    Replace,
+    Options,
+}
+
+fn slot_id(slot: Slot) -> egui::Id {
+    id(match slot {
+        Slot::GoTo => "goto",
+        Slot::Needle => "needle",
+        Slot::Replace => "replace",
+        Slot::Options => "options",
+    })
+}
+
+/// Where the status row's labels and fields stand.
+struct Row {
+    labels: Vec<(u16, &'static str)>,
+    fields: Vec<(Slot, Cells)>,
+}
+
+/// A key that moves on from a status-row field: Enter, Tab, Shift+Tab or Esc.
+fn moves_on(e: &egui::Event) -> bool {
+    let r = read(e, &mut false);
+    r.is(Key::Enter, false)
+        || r.is(Key::Tab, false)
+        || r.is(Key::Tab, true)
+        || r.is(Key::Escape, false)
+}
+
 /// The dialogs' state on the view.
 pub(super) struct Dialogs {
     up: Up,
@@ -170,13 +218,19 @@ pub(super) struct Dialogs {
     shown: Option<egui::Id>,
     /// A field opened or moved to: it takes the keyboard, its text selected.
     focus: bool,
-    /// The key of the editor's last press, until the dialogs' next pass.
-    pressed: Option<Key>,
-    /// The key a dialog was opened by (an F10, the Esc that led to an exit): dropped from the
-    /// pass it opens in, so the same event never answers it too — an F10 closing its own bar,
-    /// an Esc cancelling the prompt it brought — whether the binding gives its keys to
-    /// [`EditView::press`] before or after the dialogs' pass.
-    opener: Option<Key>,
+    /// The key (and its modifiers) of the editor's last press, until the dialogs' next pass.
+    pressed: Option<(Key, Modifiers)>,
+    /// The key a dialog was opened by (an F10, the Esc that led to an exit): its event is
+    /// dropped from the pass it opens in, so it never answers the dialog too — an F10 closing
+    /// its own bar, an Esc cancelling the prompt it brought. This needs the binding's order:
+    /// each pass gives its keys to [`EditView::press`] first, then runs
+    /// [`EditView::dialogs_ui`], so the opener's event is the pass's first like it.
+    opener: Option<(Key, Modifiers)>,
+    /// Keys a field had no second turn for in their pass: the next pass reads them first.
+    held: Vec<egui::Event>,
+    /// The document when the close prompt's Save copy or Save As… went out: an edit after it
+    /// is in neither file, so the exit asks again ([`EditView::elsewhere`]).
+    copied: Option<Vec<Piece>>,
 }
 
 impl Dialogs {
@@ -197,21 +251,30 @@ impl Dialogs {
             focus: false,
             pressed: None,
             opener: None,
+            held: Vec::new(),
+            copied: None,
         }
     }
 
     /// The editor's keys took `press` (its key kept for a dialog it may open).
     pub(super) fn pressed(&mut self, press: &arm::Press) {
         self.pressed = match press {
-            arm::Press::Key { key, .. } => Some(*key),
+            arm::Press::Key { key, modifiers, .. } => Some((*key, *modifiers)),
             _ => None,
         };
     }
 
-    /// `up` opened from outside the dialogs' pass (a key, an exit, a Save's end).
+    /// `up` opened from outside the dialogs' pass (a key, an exit, a Save's end): new, so a box
+    /// it shows opens on Cancel even where the same box was up the pass before.
     fn open(&mut self, up: Up) {
         self.up = up;
         self.opener = self.pressed;
+        self.shown = None;
+    }
+
+    /// A Save runs, as the binding last said.
+    pub(super) fn running(&self) -> bool {
+        self.file.running
     }
 
     /// The menu F10's bar is on, while the bar or its items are up (the title row shows it).
@@ -389,53 +452,71 @@ fn key_letter(key: Key) -> Option<char> {
     }
 }
 
-/// This pass's letters, taken (§5.5, E10): a letter key with no Ctrl, ⌘ or Alt by its physical
-/// key first — the text egui sends after it dropped — or typed text that is one letter or a
-/// 2-set jamo (a terminal's, or the input method's).
-fn letters(ctx: &egui::Context) -> Vec<char> {
+/// The pass's keys, text, pastes and input-method events, taken out of it in their order (the
+/// rest stay): what a field's engine is given segment by segment, so one committed composition
+/// reaches one field.
+fn take_keys(ctx: &egui::Context) -> Vec<egui::Event> {
     ctx.input_mut(|i| {
-        let mut out = Vec::new();
-        let mut after_key = false;
-        i.events.retain(|e| match e {
-            egui::Event::Key {
-                key,
-                physical_key,
-                pressed: true,
-                modifiers,
-                ..
-            } => {
-                after_key = false;
-                if modifiers.ctrl || modifiers.command || modifiers.mac_cmd || modifiers.alt {
-                    return true;
-                }
-                match physical_key
-                    .and_then(key_letter)
-                    .or_else(|| key_letter(*key))
-                {
-                    Some(l) => {
-                        out.push(l);
-                        after_key = true;
-                        false
-                    }
-                    None => true,
-                }
-            }
-            egui::Event::Text(text) => {
-                if std::mem::take(&mut after_key) {
-                    return false;
-                }
-                match arm::letter(text) {
-                    Some(l) => {
-                        out.push(l);
-                        false
-                    }
-                    None => true,
-                }
-            }
-            _ => true,
+        let all = std::mem::take(&mut i.events);
+        let (keys, rest) = all.into_iter().partition(|e| {
+            use egui::Event as E;
+            matches!(e, E::Key { .. } | E::Text(_) | E::Paste(_) | E::Ime(_))
         });
-        out
+        i.events = rest;
+        keys
     })
+}
+
+/// `events` given back to the pass, for what is up after the dialog that left them.
+fn put_keys(ctx: &egui::Context, events: Vec<egui::Event>) {
+    ctx.input_mut(|i| i.events.extend(events));
+}
+
+/// One key or text event of the pass as the dialogs read it, in the pass's order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Read {
+    /// A key pressed that types no letter here: Enter, Esc, Tab, an arrow, F10, Backspace, a
+    /// letter key with Ctrl, ⌘ or Alt.
+    Key(Key, Modifiers),
+    /// A letter (§5.5, E10): a letter key with no Ctrl, ⌘ or Alt by its physical key first —
+    /// the text egui sends after it then dropped — or typed text that is one letter or a 2-set
+    /// jamo (a terminal's, the input method's).
+    Letter(char),
+    /// A release, other text, a paste.
+    Other,
+}
+
+impl Read {
+    /// `key` with no modifier, or with Shift alone (`shift`).
+    fn is(self, key: Key, shift: bool) -> bool {
+        match self {
+            Read::Key(k, m) => k == key && if shift { m.shift_only() } else { m.is_none() },
+            _ => false,
+        }
+    }
+}
+
+/// Reads `e`; `after_key`: the event before it was a letter key, whose typed text this may be.
+fn read(e: &egui::Event, after_key: &mut bool) -> Read {
+    match e {
+        egui::Event::Key {
+            key,
+            physical_key,
+            pressed: true,
+            modifiers,
+            ..
+        } => {
+            let held = modifiers.ctrl || modifiers.command || modifiers.mac_cmd || modifiers.alt;
+            let letter = (physical_key.and_then(key_letter))
+                .or_else(|| key_letter(*key))
+                .filter(|_| !held);
+            *after_key = letter.is_some();
+            letter.map_or(Read::Key(*key, *modifiers), Read::Letter)
+        }
+        egui::Event::Text(_) if std::mem::take(after_key) => Read::Other,
+        egui::Event::Text(text) => arm::letter(text).map_or(Read::Other, Read::Letter),
+        _ => Read::Other,
+    }
 }
 
 /// The options field's letters for `o`.
@@ -515,8 +596,19 @@ impl EditView {
         if self.ed.buffer().is_saved() {
             return true;
         }
-        self.dialogs.open(Up::Close(exit));
+        self.prompt(Up::Close(exit));
         false
+    }
+
+    /// A prompt opened from outside the keys (an exit, a Save's end): a `^K` or `^S` waiting
+    /// for its key is disarmed first, so the key after the prompt's Cancel is not its letter.
+    fn prompt(&mut self, up: Up) {
+        if self.keys.armed() != Armed::None {
+            // Esc disarms either arming, untyped (`edit::arm::decide`).
+            self.keys
+                .press(&arm::Press::key(Key::Escape, Modifiers::NONE));
+        }
+        self.dialogs.open(up);
     }
 
     /// A Save ended (`Session::save`, `overwrite`): its line on the status row; a conflict opens
@@ -533,7 +625,7 @@ impl EditView {
                 overwrite,
             } => {
                 self.said = Some(Said::Refused(saved.line()));
-                self.dialogs.open(Up::Conflict {
+                self.prompt(Up::Conflict {
                     line: line.clone(),
                     notes: notes.clone(),
                     staged: staged.clone(),
@@ -551,7 +643,7 @@ impl EditView {
         self.said = Some(Said::Warned(saved.line()));
         let Some(exit) = exit else { return };
         if !self.ed.buffer().is_saved() {
-            self.dialogs.open(Up::Close(exit));
+            self.prompt(Up::Close(exit));
         } else if notes {
             self.said = Some(Said::Warned(format!(
                 "not closed: read this first · {}",
@@ -562,13 +654,21 @@ impl EditView {
         }
     }
 
-    /// A Save copy or a Save As landed, `line` saying where: the exit waiting for it goes (the
-    /// edits are in that file).
+    /// A Save copy or a Save As landed, `line` saying where: the exit waiting for it goes, the
+    /// edits being in that file — unless the document changed after it went out (E24), when
+    /// the close prompt asks again.
     pub fn elsewhere(&mut self, line: String) {
         self.dialogs.file.running = false;
         self.said = Some(Said::Warned(line));
-        if let Some(exit) = self.dialogs.pending.take() {
+        let copied = self.dialogs.copied.take();
+        let Some(exit) = self.dialogs.pending.take() else {
+            return;
+        };
+        let same = copied.is_none_or(|p| p.as_slice() == self.ed.buffer().pieces());
+        if same || self.ed.buffer().is_saved() {
             self.dialogs.chosen.push(Chosen::Go(exit));
+        } else {
+            self.prompt(Up::Close(exit));
         }
     }
 
@@ -608,6 +708,7 @@ impl EditView {
         }
         if self.dialogs.up == Up::None && self.ed.question().is_some() {
             self.dialogs.opener = self.dialogs.pressed;
+            self.dialogs.shown = None;
         }
     }
 
@@ -626,35 +727,37 @@ impl EditView {
     ) -> Option<Position> {
         let ctx = ui.ctx().clone();
         let wide = cells::ambiguous_wide(&ctx);
-        if let Some(key) = self.dialogs.opener.take() {
+        if let Some((key, mods)) = self.dialogs.opener.take() {
+            // The opener's own event: the first like it in the pass (the binding's order).
             ctx.input_mut(|i| {
-                i.events.retain(
-                    |e| !matches!(e, egui::Event::Key { key: k, pressed: true, .. } if *k == key),
-                )
+                let at = i.events.iter().position(|e| {
+                    matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. }
+                        if *k == key && *modifiers == mods)
+                });
+                if let Some(at) = at {
+                    i.events.remove(at);
+                }
             });
         }
         self.dialogs.pressed = None;
+        if !self.dialogs.held.is_empty() {
+            let held = std::mem::take(&mut self.dialogs.held);
+            ctx.input_mut(|i| i.events.splice(0..0, held).for_each(drop));
+        }
         self.title_clicks(ui, grid, rows.0, wide);
         if !self.asking() {
             self.dialogs.shown = None;
             return caret;
         }
+        // The pass's keys in their order, each stage handing what follows to the next: a menu
+        // item may open Find or Go to, a field's Enter the Replace question, a Replace the
+        // encoding question's box.
+        self.menu_keys(&ctx);
         let caret = match self.dialogs.up {
             Up::Find(_) | Up::GoTo(_) => self.fields(ui, grid, buf, rows.1),
-            Up::Replace { .. } => {
-                self.replace_keys(&ctx);
-                None
-            }
-            Up::Menu { open: false, .. } => {
-                self.bar_keys(&ctx);
-                None
-            }
-            Up::Menu { open: true, .. } => {
-                self.menu_keys(&ctx);
-                None
-            }
             _ => None,
         };
+        self.replace_keys(&ctx);
         self.status_words(buf, rows.1, grid.cols, wide);
         self.dialogs.shown = self.boxed(&ctx, grid, buf, rows, wide);
         // Every key of the pass is the dialog's: none reaches the editor or the binding.
@@ -735,9 +838,13 @@ impl EditView {
         cells::put(buf, 1, y, &cells::fit_start(&words, room), room, pen);
     }
 
-    /// Go to's and Find's fields on the status row `y`: their keys first (Enter, Esc, Tab), then
-    /// each field's engine at its cells and the row drawn. The caret of the field that has the
-    /// keyboard.
+    /// Go to's and Find's fields on the status row `y`, the pass's keys read in their order:
+    /// what comes before an Enter, a Tab or an Esc goes to the field that has the keyboard (a
+    /// text field's engine, or `Options:`'s letters), then that key moves on — so `o` then
+    /// Enter in one pass finds with the `o` (a terminal's paste or fast typing comes in one
+    /// pass). A text field's engine runs once a pass: keys for its second turn wait for the next
+    /// pass. What follows a field that closed is given back for what is up then. The row drawn,
+    /// and the caret of the field with the keyboard.
     fn fields(
         &mut self,
         ui: &mut egui::Ui,
@@ -746,50 +853,194 @@ impl EditView {
         y: u16,
     ) -> Option<Position> {
         let ctx = ui.ctx().clone();
-        let p = chrome::PALETTE;
-        let pen = Pen::new(p.text, p.back);
-        cells::fill(buf, Cells::new(0, y, grid.cols, 1), pen);
-        let enter = take(&ctx, Key::Enter, false);
-        let esc = take(&ctx, Key::Escape, false);
-        let tab = take(&ctx, Key::Tab, false);
-        let back = take(&ctx, Key::Tab, true);
-        if tab || back {
-            // Tab is the fields' own: egui moves no focus for it.
-            ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
-        }
-        let label = |buf: &mut Buffer, x: &mut u16, text: &str| {
-            let room = usize::from(grid.cols.saturating_sub(*x + 1));
-            *x += cells::put(buf, *x, y, text, room, pen) as u16;
-        };
-        match std::mem::take(&mut self.dialogs.up) {
-            Up::GoTo(mut text) => {
-                if esc {
-                    return None;
+        // Tab is the fields' own: egui moves no focus for it.
+        ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+        let mut events = take_keys(&ctx);
+        let mut ran: Vec<Slot> = Vec::new();
+        loop {
+            let Some(slot) = self.slot() else {
+                // The field closed: what follows is for what is up now.
+                put_keys(&ctx, events);
+                return None;
+            };
+            let cut = events.iter().position(moves_on).unwrap_or(events.len());
+            let after = events.split_off(cut);
+            let segment = std::mem::replace(&mut events, after);
+            if slot != Slot::Options && ran.contains(&slot) {
+                if !segment.is_empty() {
+                    // Its engine has run this pass: the rest waits for the next.
+                    self.dialogs.held = segment.into_iter().chain(events).collect();
+                    ctx.request_repaint();
+                    break;
                 }
-                if enter {
-                    self.go_to(&text);
-                    return None;
-                }
-                let mut x = 1;
-                label(buf, &mut x, "Go to line: ");
-                let at = Cells::new(x, y, 12.min(grid.cols.saturating_sub(x + 1)), 1);
-                let caret = self.text_field(ui, grid, buf, at, id("goto"), &mut text, true);
-                self.dialogs.up = Up::GoTo(text);
-                caret
+            } else {
+                self.feed(ui, grid, y, slot, segment);
+                ran.push(slot);
             }
-            Up::Find(mut f) => {
-                if esc {
-                    return None;
+            if events.is_empty() {
+                break;
+            }
+            let key = events.remove(0);
+            self.move_on(&key);
+        }
+        self.fields_cells(&ctx, grid, buf, y)
+    }
+
+    /// The field that has the keyboard, while Go to's or Find's are up.
+    fn slot(&self) -> Option<Slot> {
+        match &self.dialogs.up {
+            Up::GoTo(_) => Some(Slot::GoTo),
+            Up::Find(f) => Some(match f.field {
+                Field::Needle => Slot::Needle,
+                Field::Replace => Slot::Replace,
+                Field::Options => Slot::Options,
+            }),
+            _ => None,
+        }
+    }
+
+    /// A text field's text.
+    fn slot_text(&mut self, slot: Slot) -> Option<&mut String> {
+        match (&mut self.dialogs.up, slot) {
+            (Up::GoTo(text), Slot::GoTo) => Some(text),
+            (Up::Find(f), Slot::Needle) => Some(&mut f.needle),
+            (Up::Find(f), Slot::Replace) => f.replace.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// Where the status row's labels and fields stand, as what is up lays them on a row `cols`
+    /// wide: Go to's one field; Find's `Find:`, `Replace:` once it is a Replace, `Options:` —
+    /// the text fields sharing what the row leaves, each at most 30 cells.
+    fn row(&self, cols: u16, y: u16) -> Row {
+        let mut row = Row {
+            labels: Vec::new(),
+            fields: Vec::new(),
+        };
+        let fit = |x: u16, w: u16| Cells::new(x, y, w.min(cols.saturating_sub(x + 1)), 1);
+        let mut x = 1u16;
+        let label = |row: &mut Row, x: &mut u16, text: &'static str| {
+            row.labels.push((*x, text));
+            *x += cells::width(text) as u16;
+        };
+        match &self.dialogs.up {
+            Up::GoTo(_) => {
+                label(&mut row, &mut x, "Go to line: ");
+                row.fields.push((Slot::GoTo, fit(x, 12)));
+            }
+            Up::Find(f) => {
+                let replacing = f.replace.is_some();
+                let fixed =
+                    2 + 6 + 10 + usize::from(OPTIONS_CELLS) + if replacing { 10 } else { 0 };
+                let room = usize::from(cols).saturating_sub(fixed);
+                let each = (room / if replacing { 2 } else { 1 }).clamp(4, 30) as u16;
+                label(&mut row, &mut x, "Find: ");
+                let at = fit(x, each);
+                row.fields.push((Slot::Needle, at));
+                x += at.width;
+                if replacing {
+                    label(&mut row, &mut x, " Replace: ");
+                    let at = fit(x, each);
+                    row.fields.push((Slot::Replace, at));
+                    x += at.width;
                 }
+                label(&mut row, &mut x, " Options: ");
+                row.fields.push((Slot::Options, fit(x, OPTIONS_CELLS)));
+            }
+            _ => {}
+        }
+        row
+    }
+
+    /// `segment` (keys and text, in order) to the field `slot`: `Options:` takes Turbo's letters
+    /// by the physical key (E10) and Backspace; a text field's engine (`ops::dialog`'s) has the
+    /// keyboard — its text selected when it has just taken it — and reads them. Only that field
+    /// holds egui's focus.
+    fn feed(
+        &mut self,
+        ui: &mut egui::Ui,
+        grid: &Grid,
+        y: u16,
+        slot: Slot,
+        segment: Vec<egui::Event>,
+    ) {
+        let ctx = ui.ctx().clone();
+        for other in [Slot::GoTo, Slot::Needle, Slot::Replace] {
+            let id = slot_id(other);
+            if other != slot && ctx.memory(|m| m.has_focus(id)) {
+                ctx.memory_mut(|m| m.surrender_focus(id));
+            }
+        }
+        if slot == Slot::Options {
+            let Up::Find(f) = &mut self.dialogs.up else {
+                return;
+            };
+            let mut after_key = false;
+            for e in &segment {
+                match read(e, &mut after_key) {
+                    Read::Letter(l) if OPTION_LETTERS.contains(l) && !f.options.contains(l) => {
+                        f.options.push(l)
+                    }
+                    r if r.is(Key::Backspace, false) => {
+                        f.options.pop();
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        let at = self
+            .row(grid.cols, y)
+            .fields
+            .into_iter()
+            .find(|(s, _)| *s == slot);
+        let Some((_, at)) = at else {
+            return;
+        };
+        let id = slot_id(slot);
+        let select = std::mem::take(&mut self.dialogs.focus);
+        let Some(text) = self.slot_text(slot) else {
+            return;
+        };
+        if select {
+            let mut state = egui::text_edit::TextEditState::load(&ctx, id).unwrap_or_default();
+            let n = egui::text::CCursor::new(text.chars().count());
+            let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), n);
+            state.cursor.set_char_range(Some(all));
+            state.store(&ctx, id);
+        }
+        if !ctx.memory(|m| m.has_focus(id)) {
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
+        if at.width == 0 {
+            return;
+        }
+        put_keys(&ctx, segment);
+        dialog::field(ui, grid, at, id, text, |e| e);
+        // What the engine read goes no further.
+        drop(take_keys(&ctx));
+    }
+
+    /// A key that moves on from a field: Enter goes on (Find: to `Replace:` or `Options:`, and
+    /// from there runs it; Go to: there), Tab and Shift+Tab move between Find's fields — Tab from
+    /// `Find:` making it a Replace — and Esc closes.
+    fn move_on(&mut self, key: &egui::Event) {
+        let r = read(key, &mut false);
+        let (enter, tab, back) = (
+            r.is(Key::Enter, false),
+            r.is(Key::Tab, false),
+            r.is(Key::Tab, true),
+        );
+        match std::mem::take(&mut self.dialogs.up) {
+            _ if r.is(Key::Escape, false) => {}
+            Up::GoTo(text) if enter => self.go_to(&text),
+            Up::Find(mut f) => {
                 let before = f.field;
                 if enter {
                     f.field = match f.field {
                         Field::Needle if f.replace.is_some() => Field::Replace,
                         Field::Needle | Field::Replace => Field::Options,
-                        Field::Options => {
-                            self.run_find(f);
-                            return None;
-                        }
+                        Field::Options => return self.run_find(f),
                     };
                 } else if tab {
                     f.field = match f.field {
@@ -809,124 +1060,58 @@ impl EditView {
                     };
                 }
                 self.dialogs.focus |= f.field != before;
-                if f.field == Field::Options {
-                    // Turbo's letters by the physical key, the input method off (E10).
-                    for l in letters(&ctx) {
-                        if OPTION_LETTERS.contains(l) && !f.options.contains(l) {
-                            f.options.push(l);
-                        }
-                    }
-                    if take(&ctx, Key::Backspace, false) {
-                        f.options.pop();
-                    }
-                }
-                let caret = self.find_cells(ui, grid, buf, y, &mut f);
                 self.dialogs.up = Up::Find(f);
-                caret
             }
-            other => {
-                self.dialogs.up = other;
-                None
-            }
+            other => self.dialogs.up = other,
         }
     }
 
-    /// Find's row: `Find:` and its field, `Replace:` and its once it is a Replace, `Options:`
-    /// and its letters; the fields share what the row leaves, each at most 30 cells.
-    fn find_cells(
-        &mut self,
-        ui: &mut egui::Ui,
+    /// The status row with Go to's or Find's labels and fields: the text fields as their
+    /// engines hold them, `Options:`'s letters; the caret of the field that has the keyboard.
+    fn fields_cells(
+        &self,
+        ctx: &egui::Context,
         grid: &Grid,
         buf: &mut Buffer,
         y: u16,
-        f: &mut Find,
     ) -> Option<Position> {
         let p = chrome::PALETTE;
         let pen = Pen::new(p.text, p.back);
-        let labels = ["Find: ", " Replace: ", " Options: "];
-        let replacing = f.replace.is_some();
-        let fixed = 2 + cells::width(labels[0]) + cells::width(labels[2]) + 7;
-        let fixed = fixed
-            + if replacing {
-                cells::width(labels[1])
-            } else {
-                0
-            };
-        let room = usize::from(grid.cols).saturating_sub(fixed);
-        let each = (room / if replacing { 2 } else { 1 }).clamp(4, 30) as u16;
-        let mut x = 1;
-        let put = |buf: &mut Buffer, x: &mut u16, text: &str| {
-            let room = usize::from(grid.cols.saturating_sub(*x + 1));
-            *x += cells::put(buf, *x, y, text, room, pen) as u16;
-        };
-        let fit = |x: u16, w: u16| Cells::new(x, y, w.min(grid.cols.saturating_sub(x + 1)), 1);
-        put(buf, &mut x, labels[0]);
-        let needle_at = fit(x, each);
-        x += needle_at.width;
-        let mut caret = self.text_field(
-            ui,
-            grid,
-            buf,
-            needle_at,
-            id("needle"),
-            &mut f.needle,
-            f.field == Field::Needle,
-        );
-        if let Some(text) = f.replace.as_mut() {
-            put(buf, &mut x, labels[1]);
-            let at = fit(x, each);
-            x += at.width;
-            let chosen = f.field == Field::Replace;
-            let c = self.text_field(ui, grid, buf, at, id("replace"), text, chosen);
-            caret = caret.or(c);
+        cells::fill(buf, Cells::new(0, y, grid.cols, 1), pen);
+        let row = self.row(grid.cols, y);
+        for (x, text) in row.labels {
+            let room = usize::from(grid.cols.saturating_sub(x + 1));
+            cells::put(buf, x, y, text, room, pen);
         }
-        put(buf, &mut x, labels[2]);
-        let at = fit(x, OPTIONS_CELLS);
-        let field = Pen::new(p.field_text, cga::BLACK);
-        cells::fill(buf, at, field);
-        cells::put(buf, at.x, y, &f.options, usize::from(at.width), field);
-        if f.field == Field::Options && at.width > 0 {
-            let w = (f.options.len() as u16).min(at.width - 1);
-            caret = Some(Position::new(at.x + w, y));
+        let active = self.slot();
+        let mut caret = None;
+        for (slot, at) in row.fields {
+            if at.width == 0 {
+                continue;
+            }
+            let text = match (&self.dialogs.up, slot) {
+                (Up::GoTo(text), Slot::GoTo) => text,
+                (Up::Find(f), Slot::Needle) => &f.needle,
+                (Up::Find(f), Slot::Replace) => f.replace.as_ref().expect("a Replace"),
+                (Up::Find(f), Slot::Options) => {
+                    let field = Pen::new(p.field_text, cga::BLACK);
+                    cells::fill(buf, at, field);
+                    cells::put(buf, at.x, y, &f.options, usize::from(at.width), field);
+                    if active == Some(Slot::Options) {
+                        let w = (f.options.len() as u16).min(at.width - 1);
+                        caret = Some(Position::new(at.x + w, y));
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            let id = slot_id(slot);
+            let focused = active == Some(slot) && ctx.memory(|m| m.has_focus(id));
+            if let Some(c) = dialog::field_cells(ctx, buf, at, id, text, focused) {
+                caret = Some(c);
+            }
         }
         caret
-    }
-
-    /// A text field `id` at cells `at` holding `text` (`ops::dialog`'s): while `chosen` it has
-    /// the keyboard — its text selected when it has just taken it — else it lets it go. Its
-    /// caret, while it has the keyboard.
-    #[allow(clippy::too_many_arguments)]
-    fn text_field(
-        &mut self,
-        ui: &mut egui::Ui,
-        grid: &Grid,
-        buf: &mut Buffer,
-        at: Cells,
-        id: egui::Id,
-        text: &mut String,
-        chosen: bool,
-    ) -> Option<Position> {
-        let ctx = ui.ctx().clone();
-        if chosen {
-            if std::mem::take(&mut self.dialogs.focus) {
-                let mut state = egui::text_edit::TextEditState::load(&ctx, id).unwrap_or_default();
-                let n = egui::text::CCursor::new(text.chars().count());
-                let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), n);
-                state.cursor.set_char_range(Some(all));
-                state.store(&ctx, id);
-            }
-            if !ctx.memory(|m| m.has_focus(id)) {
-                ctx.memory_mut(|m| m.request_focus(id));
-            }
-        } else if ctx.memory(|m| m.has_focus(id)) {
-            ctx.memory_mut(|m| m.surrender_focus(id));
-        }
-        if at.width == 0 {
-            return None;
-        }
-        dialog::field(ui, grid, at, id, text, |e| e);
-        let focused = chosen && ctx.memory(|m| m.has_focus(id));
-        dialog::field_cells(&ctx, buf, at, id, text, focused)
     }
 
     /// Go to line `text` (from 1): the caret to its start; a word that is no line number says
@@ -980,13 +1165,15 @@ impl EditView {
     }
 
     /// A Find — the match the block, the caret at its end — or a Replace: all at once with N,
-    /// else asking at each match; `again`: from the caret (Ctrl+L, the next match).
+    /// else asking at each match; `again`: from the caret (Ctrl+L, the next match). No Replace
+    /// while a Save runs (E24).
     fn search(&mut self, search: Search, replace: Option<String>, again: bool) {
         match replace {
             None => {
                 let found = self.edit(|ed, _| ed.find(&search, again));
                 self.said = found.is_none().then(|| not_found(&search));
             }
+            Some(_) if self.saving() => {}
             Some(text) if search.options.no_ask => {
                 let (n, said) = self.edit(|ed, _| ed.replace_all(&search, &text));
                 self.said = said.or(Some(match n {
@@ -994,158 +1181,184 @@ impl EditView {
                     n => replaced(n),
                 }));
             }
-            Some(text) => self.next_match(search, text, 0, again),
+            Some(text) => self.next_match(search, text, 0, again, None),
         }
     }
 
-    /// The next match asked about, or the end said.
-    fn next_match(&mut self, search: Search, text: String, count: usize, again: bool) {
-        match self.edit(|ed, _| ed.find(&search, again)) {
-            Some(at) => {
+    /// The next match asked about, or the end said. Backward, a match that ends past `bound` —
+    /// where the earliest replacement made starts — would take some of what was written, and
+    /// is passed over.
+    fn next_match(
+        &mut self,
+        search: Search,
+        text: String,
+        count: usize,
+        mut again: bool,
+        bound: Option<u64>,
+    ) {
+        loop {
+            match self.edit(|ed, _| ed.find(&search, again)) {
+                Some(at) if bound.is_some_and(|b| at.end > b) => again = true,
+                Some(at) => {
+                    self.dialogs.up = Up::Replace {
+                        search,
+                        text,
+                        at,
+                        count,
+                        bound,
+                    };
+                    return;
+                }
+                None if count == 0 => return self.said = Some(not_found(&search)),
+                None => return self.said = Some(replaced(count)),
+            }
+        }
+    }
+
+    /// Replace's question, the pass's keys in their order: Y replaces the match and asks at the
+    /// next, N skips it, Esc stops; another letter answers nothing. Keys after the question
+    /// ended are given back (the encoding question's box may be up).
+    fn replace_keys(&mut self, ctx: &egui::Context) {
+        if !matches!(self.dialogs.up, Up::Replace { .. }) {
+            return;
+        }
+        let mut events = take_keys(ctx).into_iter();
+        let mut after_key = false;
+        for e in events.by_ref() {
+            let Up::Replace {
+                search,
+                text,
+                at,
+                count,
+                bound,
+            } = std::mem::take(&mut self.dialogs.up)
+            else {
+                break;
+            };
+            let r = read(&e, &mut after_key);
+            if r.is(Key::Escape, false) {
+                self.said = (count > 0).then(|| replaced(count));
+            } else if r == Read::Letter('Y') && !self.saving() {
+                let said = self.edit(|ed, _| ed.replace_at(at.clone(), &text));
+                if matches!(said, Some(Said::Refused(_) | Said::Asked(_))) {
+                    // Refused, or the encoding question takes over (E37).
+                    self.said = said;
+                } else {
+                    let bound = search.options.backward.then_some(at.start);
+                    if bound.is_some() {
+                        self.edit(|ed, _| ed.place(at.start, false));
+                    }
+                    self.next_match(search, text, count + 1, true, bound);
+                }
+            } else if r == Read::Letter('N') {
+                self.next_match(search, text, count, true, bound);
+            } else {
                 self.dialogs.up = Up::Replace {
                     search,
                     text,
                     at,
                     count,
-                }
+                    bound,
+                };
+                continue;
             }
-            None if count == 0 => self.said = Some(not_found(&search)),
-            None => self.said = Some(replaced(count)),
+            if !matches!(self.dialogs.up, Up::Replace { .. }) {
+                break;
+            }
         }
+        put_keys(ctx, events.collect());
     }
 
-    /// Replace's question: Y replaces the match and asks at the next, N skips it, Esc stops;
-    /// another letter answers nothing.
-    fn replace_keys(&mut self, ctx: &egui::Context) {
-        let Up::Replace {
-            search,
-            text,
-            at,
-            count,
-        } = std::mem::take(&mut self.dialogs.up)
-        else {
-            return;
-        };
-        if take(ctx, Key::Escape, false) {
-            self.said = (count > 0).then(|| replaced(count));
-            return;
+    /// While a Save runs no edit is made (E24): `true`, and the status row says why.
+    fn saving(&mut self) -> bool {
+        if self.dialogs.file.running {
+            self.said = Some(Said::Refused(SAVING.to_string()));
         }
-        for l in letters(ctx) {
-            match l {
-                'Y' => {
-                    let said = self.edit(|ed, _| ed.replace_at(at.clone(), &text));
-                    if matches!(said, Some(Said::Refused(_) | Said::Asked(_))) {
-                        // Refused, or the encoding question takes over (E37).
-                        self.said = said;
-                        return;
-                    }
-                    if search.options.backward {
-                        self.edit(|ed, _| ed.place(at.start, false));
-                    }
-                    return self.next_match(search, text, count + 1, true);
-                }
-                'N' => return self.next_match(search, text, count, true),
-                _ => {}
-            }
-        }
-        self.dialogs.up = Up::Replace {
-            search,
-            text,
-            at,
-            count,
-        };
+        self.dialogs.file.running
     }
 
     // -----------------------------------------------------------------------------------------
     // The menus.
 
-    /// F10's bar: ← → move it, a name's letter, Enter or ↓ drops that menu, Esc or F10 closes.
-    fn bar_keys(&mut self, ctx: &egui::Context) {
-        let Up::Menu { mut at, .. } = self.dialogs.up else {
-            return;
-        };
-        let backend = self.dialogs.backend;
-        if take(ctx, Key::Escape, false) || take(ctx, Key::F10, false) {
-            self.dialogs.up = Up::None;
-            return;
-        }
-        if take(ctx, Key::ArrowLeft, false) {
-            at = (at + MENUS.len() - 1) % MENUS.len();
-        }
-        if take(ctx, Key::ArrowRight, false) {
-            at = (at + 1) % MENUS.len();
-        }
-        let mut open = take(ctx, Key::Enter, false) || take(ctx, Key::ArrowDown, false);
-        for l in letters(ctx) {
-            if let Some(i) = MENUS.iter().position(|m| m.starts_with(l)) {
-                (at, open) = (i, true);
-            }
-        }
-        let item = first_on(at, backend);
-        self.dialogs.up = Up::Menu { at, open, item };
-    }
-
-    /// A menu's items: ↑ ↓ move the keyboard over the items that have a command, ← → to the
-    /// next menu, Enter or an item's letter runs it, Esc goes back to the bar, F10 closes.
+    /// F10's menus, the pass's keys read in their order against the state each one leaves — a
+    /// letter that drops a menu makes the next letter that menu's item:
+    /// - the bar: ← → move it, a name's letter, Enter or ↓ drops that menu, Esc or F10 closes;
+    /// - a menu: ↑ ↓ move the keyboard over the items that have a command, ← → to the next
+    ///   menu, Enter, Space or an item's letter runs it, Esc goes back to the bar, F10 closes.
+    ///
+    /// Keys after an item ran are given back for what it opened (Find's field).
     fn menu_keys(&mut self, ctx: &egui::Context) {
         let Up::Menu {
-            mut at, mut item, ..
+            mut at,
+            mut open,
+            mut item,
         } = self.dialogs.up
         else {
             return;
         };
         let backend = self.dialogs.backend;
-        if take(ctx, Key::F10, false) {
-            self.dialogs.up = Up::None;
-            return;
-        }
-        if take(ctx, Key::Escape, false) {
-            let item = 0;
-            self.dialogs.up = Up::Menu {
-                at,
-                open: false,
-                item,
-            };
-            return;
-        }
-        let mut its = items(at, backend);
-        // The row a click or Tab gave the keyboard.
-        if let Some(i) = (0..its.len()).find(|&i| ctx.memory(|m| m.has_focus(row_id(at, i)))) {
-            item = i;
-        }
-        while take(ctx, Key::ArrowDown, false) {
-            item = next_on(&its, item, 1);
-        }
-        while take(ctx, Key::ArrowUp, false) {
-            item = next_on(&its, item, -1);
-        }
-        let step = |at: usize, by: usize| (at + by) % MENUS.len();
-        let left = take(ctx, Key::ArrowLeft, false);
-        let right = take(ctx, Key::ArrowRight, false);
-        if left || right {
-            at = step(at, if left { MENUS.len() - 1 } else { 1 });
-            item = first_on(at, backend);
-            its = items(at, backend);
-        }
-        // The keyboard is the menu's to place: egui's own arrow moves are not.
-        ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
-        if take(ctx, Key::Enter, false) {
-            return self.choose(at, item);
-        }
-        for l in letters(ctx) {
-            let on = |i: &Item| i.letter == l && i.act != Act::Off;
-            if let Some(i) = its.iter().position(on) {
-                return self.choose(at, i);
+        if open {
+            // The row a click gave the keyboard.
+            let rows = items(at, backend).len();
+            if let Some(i) = (0..rows).find(|&i| ctx.memory(|m| m.has_focus(row_id(at, i)))) {
+                item = i;
             }
         }
-        self.dialogs.up = Up::Menu {
-            at,
-            open: true,
-            item,
-        };
+        // The keyboard is the menus' to place: egui's own arrow moves are not made.
+        ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+        let n = MENUS.len();
+        let mut events = take_keys(ctx).into_iter();
+        let mut after_key = false;
+        while let Some(e) = events.next() {
+            let r = read(&e, &mut after_key);
+            let its = items(at, backend);
+            let on = |i: usize| its.get(i).is_some_and(|it| it.act != Act::Off);
+            let mut chosen = None;
+            if r.is(Key::F10, false) || (r.is(Key::Escape, false) && !open) {
+                self.dialogs.up = Up::None;
+                return;
+            } else if r.is(Key::Escape, false) {
+                (open, item) = (false, 0);
+            } else if r.is(Key::ArrowLeft, false) || r.is(Key::ArrowRight, false) {
+                let by = if r.is(Key::ArrowLeft, false) {
+                    n - 1
+                } else {
+                    1
+                };
+                at = (at + by) % n;
+                item = first_on(at, backend);
+            } else if r.is(Key::ArrowDown, false) && open {
+                item = next_on(&its, item, 1);
+            } else if r.is(Key::ArrowUp, false) && open {
+                item = next_on(&its, item, -1);
+            } else if r.is(Key::Enter, false)
+                || r.is(Key::Space, false)
+                || r.is(Key::ArrowDown, false)
+            {
+                match open {
+                    true if !r.is(Key::ArrowDown, false) => chosen = Some(item).filter(|&i| on(i)),
+                    true => {}
+                    false => (open, item) = (true, first_on(at, backend)),
+                }
+            } else if let Read::Letter(l) = r {
+                if open {
+                    chosen = (0..its.len()).find(|&i| its[i].letter == l && on(i));
+                } else if let Some(i) = MENUS.iter().position(|m| m.starts_with(l)) {
+                    (at, open, item) = (i, true, first_on(i, backend));
+                }
+            }
+            if let Some(i) = chosen {
+                self.choose(at, i);
+                put_keys(ctx, events.collect());
+                return;
+            }
+        }
+        self.dialogs.up = Up::Menu { at, open, item };
     }
 
-    /// Item `i` of menu `menu` chosen: the menus close and it runs.
+    /// Item `i` of menu `menu` chosen: the menus close and it runs. An edit is made here as its
+    /// key makes it — none while a Save runs (E24) — and Copy and Cut are handed back too, for
+    /// the binding to put the text on the clipboard as for their keys.
     fn choose(&mut self, menu: usize, i: usize) {
         self.dialogs.up = Up::None;
         let Some(item) = items(menu, self.dialogs.backend).into_iter().nth(i) else {
@@ -1153,9 +1366,13 @@ impl EditView {
         };
         match item.act {
             Act::Bind(command) => self.commands.push(command),
+            Act::Edit(command) if super::changes(&command) && self.saving() => {}
             Act::Edit(command) => {
                 self.said = None;
                 self.run(&command);
+                if matches!(command, Command::Copy | Command::Cut) {
+                    self.commands.push(command);
+                }
             }
             Act::Find => self.find_field(false),
             Act::Replace => self.find_field(true),
@@ -1350,21 +1567,38 @@ impl EditView {
             ctx.memory_mut(|m| m.request_focus(row));
         } else if !on.is_empty() {
             // A new prompt, or one whose buttons lost the keyboard: Cancel (the last) has it.
+            // In the pass a prompt opens no key moves the keyboard off Cancel — not ← →, not
+            // Tab, which egui applies itself — so Ctrl+R then ← in one read leaves it on Cancel
+            // (E6); Enter there presses Cancel.
+            let new = self.dialogs.shown != Some(b.id);
             let has = on.iter().position(|id| ctx.memory(|m| m.has_focus(*id)));
             let mut i = match has {
-                Some(i) if self.dialogs.shown == Some(b.id) => i,
+                Some(i) if !new => i,
                 _ => on.len() - 1,
             };
-            let left = take(ctx, Key::ArrowLeft, false);
-            let right = take(ctx, Key::ArrowRight, false);
-            if left {
-                i = i.saturating_sub(1);
+            // The box places the keyboard: egui's own arrow move is not made — nor, in its
+            // first pass, Tab's.
+            let arrows = ctx.input(|inp| {
+                inp.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key {
+                            key: Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                })
+            });
+            if !new {
+                if take(ctx, Key::ArrowLeft, false) {
+                    i = i.saturating_sub(1);
+                }
+                if take(ctx, Key::ArrowRight, false) {
+                    i = (i + 1).min(on.len() - 1);
+                }
             }
-            if right {
-                i = (i + 1).min(on.len() - 1);
-            }
-            if left || right {
-                // The box places the keyboard: egui's own arrow move is not made.
+            if new || arrows || has != Some(i) {
                 ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
             }
             if has != Some(i) {
@@ -1424,12 +1658,19 @@ impl EditView {
                     _ => Command::SaveAs,
                 });
                 self.dialogs.pending = Some(exit);
+                // What the copy holds: an edit after it is in no file (`elsewhere`).
+                let pieces = self.ed.buffer().pieces().to_vec();
+                self.dialogs.copied = (choice != Choice::Save).then_some(pieces);
             }
             (Choice::Discard, Up::Close(exit)) => self.dialogs.chosen.push(Chosen::Discard(exit)),
             (Choice::Reload, Up::Conflict { .. }) => self.dialogs.up = Up::Reload,
             (Choice::Overwrite, Up::Conflict { .. }) => self.dialogs.chosen.push(Chosen::Overwrite),
             (Choice::SaveAs, Up::Conflict { .. }) => commands.push(Command::SaveAs),
             (Choice::Reload, Up::Reload) => self.dialogs.chosen.push(Chosen::Reload),
+            (Choice::Type, Up::None) if self.saving() => {
+                // Asked again once the save is done.
+                self.dialogs.shown = None;
+            }
             (Choice::Type, Up::None) => {
                 let said = self.edit(|ed, _| ed.answer(Answer::Type));
                 self.said = said;

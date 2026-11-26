@@ -747,6 +747,33 @@ fn walk(
     }
 }
 
+/// Whether `command` changes the document: what no key makes while a Save runs (E24). A move,
+/// Copy, the modes, the block's markers and everything handed to the binding do not.
+fn changes(command: &Command) -> bool {
+    use crate::edit::arm::BlockOp;
+    match command {
+        Command::Type(_)
+        | Command::NewLine
+        | Command::Tab
+        | Command::Unindent
+        | Command::DeleteRight
+        | Command::DeleteLeft
+        | Command::DeleteLine
+        | Command::DeleteWord
+        | Command::InsertLine
+        | Command::DeleteBlock
+        | Command::Cut
+        | Command::Paste(_)
+        | Command::Undo { .. }
+        | Command::Redo => true,
+        Command::Block(op) => matches!(
+            op,
+            BlockOp::Copy | BlockOp::Move | BlockOp::Delete | BlockOp::Indent | BlockOp::Unindent
+        ),
+        _ => false,
+    }
+}
+
 /// A character of a row: where it starts, what it is, its column and width, and its index in
 /// its line (for its colour).
 struct Ch {
@@ -932,6 +959,11 @@ impl EditView {
         let command = self.keys.press(press);
         if !matches!(command, Command::Nothing | Command::Typing) {
             self.said = command.line(&self.name).map(Said::Warned);
+        }
+        if changes(&command) && self.dialogs.running() {
+            // No edits while a Save runs (E24): moves, Find and the rest still work.
+            self.said = Some(Said::Refused(dialogs::SAVING.to_string()));
+            return Command::Nothing;
         }
         self.run(&command);
         self.open(&command);

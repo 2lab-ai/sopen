@@ -4,7 +4,7 @@
 //! on the status row; one prompt over a Hangul name, the same cells in a terminal.
 
 use super::*;
-use crate::edit::arm::Press;
+use crate::edit::arm::{Armed, Press};
 use crate::edit::buffer::Original;
 use crate::edit::file::{read_local, Session};
 use crate::edit::ops::{Doubt, Editor};
@@ -1095,4 +1095,517 @@ fn dialog_cells_dump_80_by_25() {
     let screen = crate::gui::term::compose(&drv.ctx, &layers, 80, 25);
     println!("-- terminal");
     print!("{}", crate::gui::term::cells_text(&screen, None));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1 (df043a0): each finding's test, failing without its fix. Many put two events
+// in one pass — `Driver::key` and `press_typed` add release and idle passes that hid them.
+
+/// A key pressed, with its physical key, and no release.
+fn down(key: Key, modifiers: Modifiers) -> Event {
+    Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+
+/// A key that types `text` as egui-winit sends it: the key with its physical key, its text.
+fn typing(key: Key, text: &str) -> Vec<Event> {
+    vec![down(key, Modifiers::NONE), Event::Text(text.into())]
+}
+
+fn conflict(overwrite: bool) -> Saved {
+    Saved::Conflict {
+        line: "notes.txt changed since it was read (size 4 → 6)".into(),
+        overwrite,
+        staged: PathBuf::from("/nowhere/notes.txt"),
+        notes: vec![],
+    }
+}
+
+/// MUST 1 (E6): a box takes no key that moves the keyboard in the pass it opens — Ctrl+R then
+/// ← in one read, with unsaved edits, opens the prompt on Cancel, and Enter cancels.
+#[test]
+fn r1_ctrl_r_then_left_in_one_pass_leaves_cancel_focused() {
+    let mut b = Bound(view("abc\n"), vec![]);
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.frame(&mut b, typing(Key::X, "x"), Modifiers::NONE);
+    let ctrl_r = down(Key::R, Modifiers::COMMAND);
+    drv.frame(
+        &mut b,
+        vec![ctrl_r, down(Key::ArrowLeft, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert!(b.0.asking());
+    assert!(focused(&drv, "[ Cancel ]"), "on Cancel, not Discard");
+    drv.frame(
+        &mut b,
+        vec![down(Key::Enter, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert!(!b.0.asking());
+    assert_eq!(b.0.take_chosen(), vec![], "nothing discarded");
+    assert_eq!(doc(&b.0), b"xabc\n");
+}
+
+/// MUST 1: Tab, which egui applies itself as the pass begins, in the pass a prompt opens: on
+/// Cancel too, not wrapped to Save.
+#[test]
+fn r1_ctrl_r_then_tab_in_one_pass_leaves_cancel_focused() {
+    let mut b = Bound(view("abc\n"), vec![]);
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.frame(&mut b, typing(Key::X, "x"), Modifiers::NONE);
+    let ctrl_r = down(Key::R, Modifiers::COMMAND);
+    let tab = down(Key::Tab, Modifiers::NONE);
+    drv.frame(&mut b, vec![ctrl_r, tab], Modifiers::NONE);
+    assert!(focused(&drv, "[ Cancel ]"), "on Cancel");
+    drv.frame(&mut b, vec![], Modifiers::NONE);
+    assert!(focused(&drv, "[ Cancel ]"), "still on Cancel, not Save");
+    drv.frame(
+        &mut b,
+        vec![down(Key::Enter, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert_eq!((b.0.take_commands(), b.0.take_chosen()), (vec![], vec![]));
+}
+
+/// MUST 1: the encoding question opened by a typed character, ← in the same pass: on Cancel.
+#[test]
+fn r1_a_question_and_left_in_one_pass_leaves_cancel_focused() {
+    let guessed = Doubt {
+        guessed: true,
+        undecodable: 0,
+    };
+    let mut b = Bound(
+        view_on("abc\n", "notes.txt", Backend::Window, guessed),
+        vec![],
+    );
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut b, 1);
+    let left = down(Key::ArrowLeft, Modifiers::NONE);
+    drv.frame(
+        &mut b,
+        vec![Event::Text("한".into()), left],
+        Modifiers::NONE,
+    );
+    assert!(b.0.asking());
+    assert!(focused(&drv, "[ Cancel ]"), "on Cancel, not Type");
+    drv.frame(
+        &mut b,
+        vec![down(Key::Enter, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert_eq!(doc(&b.0), b"abc\n", "nothing typed");
+}
+
+/// MUST 1: a box opened inside the dialogs' pass — Replace's Y raising the encoding question —
+/// with ← after it in the same pass: on Cancel.
+#[test]
+fn r1_a_replace_raising_the_question_and_left_leave_cancel_focused() {
+    let guessed = Doubt {
+        guessed: true,
+        undecodable: 0,
+    };
+    let mut v = view_on("a b a\n", "notes.txt", Backend::Window, guessed);
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&ctrl(Key::F));
+    type_in(&mut drv, &mut v, "a");
+    drv.key(&mut v, Key::Tab, Modifiers::NONE);
+    drv.frame(&mut v, vec![Event::Text("한".into())], Modifiers::NONE);
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    assert_eq!(
+        v.editor().shown(),
+        Some(0..1),
+        "Replace asks at the first match"
+    );
+    let mut events = typing(Key::Y, "y");
+    events.push(down(Key::ArrowLeft, Modifiers::NONE));
+    drv.frame(&mut v, events, Modifiers::NONE);
+    assert!(v.editor().question().is_some(), "the encoding question");
+    assert!(focused(&drv, "[ Cancel ]"), "on Cancel, not Type");
+    drv.frame(
+        &mut v,
+        vec![down(Key::Enter, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert_eq!(doc(&v), b"a b a\n", "nothing replaced");
+}
+
+/// MUST 2: the same box opened again before an empty pass opens on Cancel, not on the button
+/// just pressed — Overwrite then a second conflict from the binding's Overwrite.
+#[test]
+fn r1_the_conflict_reopened_by_overwrite_opens_on_cancel() {
+    let mut v = view("abc\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&Press::Text("x".into()));
+    v.landed(&conflict(true));
+    drv.idle(&mut v, 1);
+    for _ in 0..2 {
+        drv.frame(
+            &mut v,
+            vec![down(Key::ArrowLeft, Modifiers::NONE)],
+            Modifiers::NONE,
+        );
+    }
+    assert!(focused(&drv, "[ Overwrite ]"));
+    drv.frame(
+        &mut v,
+        vec![down(Key::Enter, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert_eq!(v.take_chosen(), vec![Chosen::Overwrite]);
+    // The binding's Overwrite finds another change, before the next pass.
+    v.landed(&conflict(true));
+    drv.frame(&mut v, vec![], Modifiers::NONE);
+    assert!(focused(&drv, "[ Cancel ]"), "on Cancel, not Overwrite");
+    drv.frame(
+        &mut v,
+        vec![down(Key::Enter, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert_eq!(v.take_chosen(), vec![], "Enter cancelled");
+}
+
+/// MUST 2: Save from the close prompt, then a `Found` that leaves the editor unsaved reopens the
+/// prompt before an empty pass: on Cancel, not Save.
+#[test]
+fn r1_the_close_prompt_reopened_by_a_found_opens_on_cancel() {
+    reopened_after_save("found");
+}
+
+/// MUST 2: Save from the close prompt fails, and a new exit asks before an empty pass: on
+/// Cancel, not Save.
+#[test]
+fn r1_the_close_prompt_reopened_after_a_failed_save_opens_on_cancel() {
+    reopened_after_save("failed");
+}
+
+fn reopened_after_save(after: &str) {
+    {
+        let mut v = view("abc\n");
+        let mut drv = Driver::new(640.0, 400.0);
+        v.press(&Press::Text("x".into()));
+        assert!(!v.leave(Exit::Close));
+        drv.idle(&mut v, 1);
+        for _ in 0..3 {
+            drv.frame(
+                &mut v,
+                vec![down(Key::Tab, Modifiers::SHIFT)],
+                Modifiers::NONE,
+            );
+        }
+        // (egui gives Shift+Tab's focus at the next pass.)
+        drv.frame(&mut v, vec![], Modifiers::NONE);
+        assert!(focused(&drv, "[ Save ]"), "{after}");
+        drv.frame(
+            &mut v,
+            vec![down(Key::Enter, Modifiers::NONE)],
+            Modifiers::NONE,
+        );
+        assert_eq!(v.take_commands(), vec![Command::Save], "{after}");
+        match after {
+            "found" => v.landed(&Saved::Found { notes: vec![] }),
+            _ => {
+                v.not_saved("cannot write notes.txt".into());
+                assert!(!v.leave(Exit::Close));
+            }
+        }
+        assert!(v.asking(), "{after}: the prompt again");
+        drv.frame(&mut v, vec![], Modifiers::NONE);
+        assert!(focused(&drv, "[ Cancel ]"), "{after}: on Cancel, not Save");
+        drv.frame(
+            &mut v,
+            vec![down(Key::Enter, Modifiers::NONE)],
+            Modifiers::NONE,
+        );
+        assert_eq!(v.take_commands(), vec![], "{after}: Enter cancelled");
+    }
+}
+
+/// Find's fields as they stand: the needle, the options, the field with the keyboard.
+fn find_state(v: &EditView) -> Option<(String, String, Field)> {
+    match &v.dialogs.up {
+        Up::Find(f) => Some((f.needle.clone(), f.options.clone(), f.field)),
+        _ => None,
+    }
+}
+
+/// MUST 3: a status field reads the pass's text before the Enter after it — `o` then Enter in
+/// one pass finds `two`, not `tw`.
+#[test]
+fn r1_find_reads_its_text_before_the_enter_in_the_same_pass() {
+    let mut v = view("one two one\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&ctrl(Key::F));
+    type_in(&mut drv, &mut v, "tw");
+    let mut events = typing(Key::O, "o");
+    events.push(down(Key::Enter, Modifiers::NONE));
+    drv.frame(&mut v, events, Modifiers::NONE);
+    let state = find_state;
+    assert_eq!(
+        state(&v),
+        Some(("two".into(), String::new(), Field::Options))
+    );
+    drv.frame(
+        &mut v,
+        vec![down(Key::Enter, Modifiers::NONE)],
+        Modifiers::NONE,
+    );
+    assert_eq!(v.editor().shown(), Some(4..7));
+}
+
+/// MUST 3: an option letter typed before the Enter in one pass is the needle's, not
+/// `Options:`'s.
+#[test]
+fn r1_a_letter_before_the_enter_is_the_needles() {
+    let mut v = view("one two one\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&ctrl(Key::F));
+    drv.idle(&mut v, 1);
+    let mut events = typing(Key::W, "w");
+    events.push(down(Key::Enter, Modifiers::NONE));
+    drv.frame(&mut v, events, Modifiers::NONE);
+    assert_eq!(
+        find_state(&v),
+        Some(("w".into(), String::new(), Field::Options))
+    );
+}
+
+/// MUST 3: Go to `1`, then `2` and Enter in one pass, goes to line 12.
+#[test]
+fn r1_go_to_reads_its_digit_before_the_enter() {
+    let mut drv = Driver::new(640.0, 400.0);
+    let text: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+    let mut v = view(&text);
+    v.press(&ctrl(Key::G));
+    type_in(&mut drv, &mut v, "1");
+    let mut events = typing(Key::Num2, "2");
+    events.push(down(Key::Enter, Modifiers::NONE));
+    drv.frame(&mut v, events, Modifiers::NONE);
+    assert!(!v.asking());
+    assert_eq!(
+        v.editor().caret(),
+        v.editor().buffer().line_start(11).unwrap()
+    );
+}
+
+/// MUST 3: a terminal's paste or fast typing — Find's needle, Tab, the replacement, Enter,
+/// Enter in one pass — fills the fields in turn and asks at the first match.
+#[test]
+fn r1_one_pass_fills_finds_fields_and_runs_it() {
+    let mut drv = Driver::new(640.0, 400.0);
+    let mut v = view("one two one\n");
+    v.press(&ctrl(Key::F));
+    let mut events = Vec::new();
+    for (key, t) in [(Key::O, "o"), (Key::N, "n"), (Key::E, "e")] {
+        events.extend(typing(key, t));
+    }
+    events.push(down(Key::Tab, Modifiers::NONE));
+    events.extend(typing(Key::Num1, "1"));
+    events.push(down(Key::Enter, Modifiers::NONE));
+    events.push(down(Key::Enter, Modifiers::NONE));
+    drv.frame(&mut v, events, Modifiers::NONE);
+    assert!(matches!(&v.dialogs.up, Up::Replace { text, .. } if text == "1"));
+    assert_eq!(v.editor().shown(), Some(0..3));
+}
+
+/// MUST 4: the menus read the pass's letters against the state each leaves: F10, then F and S
+/// in one pass, is File → Save, not the Search menu.
+#[test]
+fn r1_menu_letters_in_one_pass_follow_each_other() {
+    let mut v = view("abc\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&Press::key(Key::F10, Modifiers::NONE));
+    drv.idle(&mut v, 1);
+    let mut events = typing(Key::F, "f");
+    events.extend(typing(Key::S, "s"));
+    drv.frame(&mut v, events, Modifiers::NONE);
+    assert_eq!(v.take_commands(), vec![Command::Save]);
+    assert!(!v.asking());
+}
+
+/// MUST 5 (E24): while a Save runs no key edits — the status row says why — but moves and Find
+/// still work.
+#[test]
+fn r1_no_edits_while_a_save_runs() {
+    let mut v = view("abc\n");
+    let mut drv = Driver::new(1000.0, 400.0);
+    v.set_file(file(true));
+    v.press(&Press::Text("x".into()));
+    assert_eq!(doc(&v), b"abc\n", "nothing typed while it saves");
+    drv.idle(&mut v, 1);
+    let row = status_row(&drv);
+    assert!(
+        row.contains("saving — editing resumes when the save is done"),
+        "{row}"
+    );
+    v.press(&Press::key(Key::ArrowRight, Modifiers::NONE));
+    assert_eq!(v.editor().caret(), 1, "a move still works");
+    v.press(&ctrl(Key::F));
+    assert!(v.asking(), "Find still opens");
+}
+
+/// MUST 5 (E24): an edit made while the close prompt's Save copy ran (the binding not saying it
+/// runs) is in no file: `elsewhere` asks again instead of leaving.
+#[test]
+fn r1_an_edit_after_the_prompts_save_copy_holds_the_exit() {
+    let mut drv = Driver::new(1000.0, 400.0);
+    let mut v = view("abc\n");
+    v.press(&Press::Text("x".into()));
+    v.set_file(FileState {
+        can_replace: false,
+        ..file(false)
+    });
+    assert!(!v.leave(Exit::Close));
+    drv.idle(&mut v, 1);
+    for _ in 0..3 {
+        drv.key(&mut v, Key::Tab, Modifiers::SHIFT);
+    }
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    assert_eq!(v.take_commands(), vec![Command::SaveCopy]);
+    v.press(&Press::Text("y".into()));
+    v.elsewhere("saved a copy at notes.edited.txt".into());
+    assert_eq!(
+        v.take_chosen(),
+        vec![],
+        "the edit after the copy is in no file"
+    );
+    assert!(v.asking(), "the prompt asks again");
+    drv.idle(&mut v, 1);
+    assert!(focused(&drv, "[ Cancel ]"));
+}
+
+/// SHOULD 6: a backward Replace never takes what a replacement wrote: in `aab`, `ab` → `b`
+/// backward, Y at the last `ab` leaves `ab`, whose `ab` ends inside the replacement.
+#[test]
+fn r1_a_backward_replace_skips_matches_into_its_replacement() {
+    let mut v = view("aab");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.editor_mut().place(3, false);
+    v.press(&ctrl(Key::F));
+    type_in(&mut drv, &mut v, "ab");
+    drv.key(&mut v, Key::Tab, Modifiers::NONE);
+    type_in(&mut drv, &mut v, "b");
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    type_in(&mut drv, &mut v, "b");
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    assert_eq!(v.editor().shown(), Some(1..3));
+    drv.press_typed(&mut v, Key::Y, "y");
+    assert_eq!(doc(&v), b"ab");
+    assert!(!v.asking(), "no match left before the replacement");
+    assert!(
+        status_row(&drv).contains("replaced 1"),
+        "{}",
+        status_row(&drv)
+    );
+}
+
+/// SHOULD 7: the Edit menu's Copy and Cut are handed back too, for the binding's clipboard.
+#[test]
+fn r1_the_menus_copy_and_cut_go_to_the_binding() {
+    let mut v = view("abc\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&Press::key(Key::ArrowRight, Modifiers::SHIFT));
+    for (key, text, command) in [(Key::C, "c", Command::Copy), (Key::T, "t", Command::Cut)] {
+        v.press(&Press::key(Key::F10, Modifiers::NONE));
+        drv.press_typed(&mut v, Key::E, "e");
+        drv.press_typed(&mut v, key, text);
+        assert_eq!(v.take_commands(), vec![command]);
+    }
+    assert_eq!(v.clip.as_ref().map(|c| c.text()), Some("a"));
+    assert_eq!(doc(&v), b"bc\n", "cut");
+}
+
+/// SHOULD 8: a `^K` or `^S` armed when a prompt opens from outside is disarmed: the key after
+/// the prompt's Cancel is typed, not the arming's letter.
+#[test]
+fn r1_a_prompt_from_outside_disarms_the_keys() {
+    let mut v = view("abc\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&Press::Text("x".into()));
+    v.press(&ctrl(Key::K));
+    assert!(!v.leave(Exit::Close));
+    assert_eq!(v.keys.armed(), Armed::None);
+    drv.idle(&mut v, 1);
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    v.press(&Press::Text("y".into()));
+    assert_eq!(doc(&v), b"xyabc\n", "typed, not ^K Y");
+    let mut v = view_on("abc\n", "notes.txt", Backend::Terminal, Doubt::default());
+    v.press(&Press::Text("x".into()));
+    v.press(&ctrl(Key::S));
+    assert_eq!(v.keys.armed(), Armed::Save);
+    v.landed(&conflict(true));
+    drv.idle(&mut v, 1);
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    assert_eq!(v.press(&Press::Text("c".into())), Command::Type("c".into()));
+    assert_eq!(doc(&v), b"xcabc\n", "typed, not ^S C");
+}
+
+/// SHOULD 9 (E10): a menu's letter is its physical key's: in File, the key on S that types `o`
+/// (another layout) is Save.
+#[test]
+fn r1_a_menu_letter_is_the_physical_key() {
+    let mut v = view("abc\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&Press::key(Key::F10, Modifiers::NONE));
+    drv.press_typed(&mut v, Key::F, "f");
+    let s_as_o = Event::Key {
+        key: Key::O,
+        physical_key: Some(Key::S),
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+    drv.frame(
+        &mut v,
+        vec![s_as_o, Event::Text("o".into())],
+        Modifiers::NONE,
+    );
+    assert_eq!(v.take_commands(), vec![Command::Save]);
+}
+
+/// SHOULD 10: Go to 0 is no line, past the end is the last; an empty needle finds nothing and
+/// asks nothing; a replacement holding the needle, forward, ends.
+#[test]
+fn r1_go_to_bounds_an_empty_needle_and_a_replacement_holding_it() {
+    let text: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+    let mut v = view(&text);
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&ctrl(Key::G));
+    type_in(&mut drv, &mut v, "0");
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    assert!(status_row(&drv).contains("0 is not a line number"));
+    assert_eq!(v.editor().caret(), 0);
+    v.press(&ctrl(Key::G));
+    type_in(&mut drv, &mut v, "999");
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    let last = v.editor().buffer().lines() - 1;
+    assert_eq!(
+        v.editor().caret(),
+        v.editor().buffer().line_start(last).unwrap()
+    );
+    // An empty needle.
+    let mut v = view("abc\n");
+    v.press(&ctrl(Key::F));
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    assert!(!v.asking());
+    assert_eq!((v.editor().shown(), v.editor().caret()), (None, 0));
+    // `a` → `aa`, forward, Y at each: two, then the end.
+    let mut v = view("a a\n");
+    v.press(&ctrl(Key::F));
+    type_in(&mut drv, &mut v, "a");
+    drv.key(&mut v, Key::Tab, Modifiers::NONE);
+    type_in(&mut drv, &mut v, "aa");
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    drv.key(&mut v, Key::Enter, Modifiers::NONE);
+    drv.press_typed(&mut v, Key::Y, "y");
+    drv.press_typed(&mut v, Key::Y, "y");
+    assert!(!v.asking(), "it ended");
+    assert_eq!(doc(&v), b"aa aa\n");
+    assert!(status_row(&drv).contains("replaced 2"));
 }
