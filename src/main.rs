@@ -74,6 +74,13 @@ struct Cli {
         conflicts_with_all = ["app", "hex", "browser", "hold_until_eof", "selftest_audio", "raise_window", "fkeys_watchdog"]
     )]
     tui: bool,
+    /// Open in a window on the machine it opens on (this one, or the target's screen); with no
+    /// display here, an error
+    #[arg(
+        long,
+        conflicts_with_all = ["app", "tui", "selftest_audio", "raise_window", "fkeys_watchdog"]
+    )]
+    gui: bool,
     /// Open the http(s):// address in the default browser of the machine it opens on
     // Refused beside the modes that open no address (they would ignore it); with a file SOURCE,
     // a usage error past clap (run_source).
@@ -280,6 +287,7 @@ fn main() -> ExitCode {
                 cli.app.as_deref(),
                 cli.hex,
                 cli.tui,
+                cli.gui,
                 dirs,
                 &mut rec,
             )
@@ -535,6 +543,7 @@ fn run_source(
     app_name: Option<&str>,
     hex: bool,
     tui: bool,
+    gui: bool,
     dirs: &Dirs,
     rec: &mut Record,
 ) -> Result<u8> {
@@ -548,7 +557,7 @@ fn run_source(
             .into());
         }
         return run_url(
-            source, url, flag, here, hold, browser, app_name, hex, dirs, rec,
+            source, url, flag, here, hold, browser, app_name, hex, gui, dirs, rec,
         );
     }
     // The terminal is here whatever the destination: the destination is where the switch opens
@@ -570,7 +579,12 @@ fn run_source(
     let hostname = forward::hostname();
     let host = match chosen {
         Some(host) if !forward::is_here(&host, hostname.as_deref()) => host,
-        _ => return run_open(source, app_name, hex, dirs, rec).map(|()| 0),
+        _ => {
+            if gui {
+                window_here(gui::display_available())?;
+            }
+            return run_open(source, app_name, hex, dirs, rec).map(|()| 0);
+        }
     };
     let there = forward::source_for(&host, source, hostname.as_deref(), |path| {
         LocalFs::new().realpath(path)
@@ -582,7 +596,17 @@ fn run_source(
     rec.action = Some("open");
     rec.target = Some(host.clone());
     sopen::debug!("opening {there} on {host}");
-    let code = forward::run(&host, &there, app_name, hex, false, &dirs.state)?;
+    let flags = forward::Flags {
+        app: app_name,
+        gui: forward_gui(gui, app_name.is_some(), || {
+            auto_gui(hex, gui::Hooks::from_env().ok().as_ref(), || {
+                seen_kind(source)
+            })
+        }),
+        hex,
+        browser: false,
+    };
+    let code = forward::run(&host, &there, flags, &dirs.state)?;
     // HOST refused a write because the file changed (spec §5): a conflict here too (§10).
     rec.conflict = code == EXIT_CONFLICT;
     Ok(code)
@@ -591,7 +615,8 @@ fn run_source(
 /// `sopen URL` (spec §4a): opened in this machine's browser; with a HOST, in HOST's — a
 /// loopback address served from here through a tunnel that lives as long as this sopen, any
 /// other passed to HOST's sopen as it is. `browser` (`--browser`, 09 §7) goes to HOST's sopen on
-/// both routes; here the system browser is the only route there is yet.
+/// both routes; here the system browser is the only route there is yet. `gui` (`--gui`) stays
+/// here, never forwarded with an address (10 §11 row 4): here it asks for a display.
 #[allow(clippy::too_many_arguments)]
 fn run_url(
     source: &str,
@@ -602,6 +627,7 @@ fn run_url(
     browser: bool,
     app_name: Option<&str>,
     hex: bool,
+    gui: bool,
     dirs: &Dirs,
     rec: &mut Record,
 ) -> Result<u8> {
@@ -622,7 +648,12 @@ fn run_url(
     let hostname = forward::hostname();
     let host = match chosen {
         Some(host) if !forward::is_here(&host, hostname.as_deref()) => host,
-        _ => return open_url(&url, hold).map(|()| 0),
+        _ => {
+            if gui {
+                window_here(gui::display_available())?;
+            }
+            return open_url(&url, hold).map(|()| 0);
+        }
     };
     rec.target = Some(host.clone());
     if url.is_loopback() {
@@ -630,7 +661,11 @@ fn run_url(
         forward::tunnel(&host, &url, browser, &dirs.state)
     } else {
         sopen::debug!("opening {} on {host}", url.shown());
-        forward::run(&host, url.as_str(), None, false, browser, &dirs.state)
+        let flags = forward::Flags {
+            browser,
+            ..forward::Flags::default()
+        };
+        forward::run(&host, url.as_str(), flags, &dirs.state)
     }
 }
 
@@ -726,6 +761,74 @@ fn route(kind: Kind) -> Route {
         Kind::Text => Route::Editor,
         Kind::Image | Kind::Video | Kind::Audio => Route::Window,
         Kind::Other => Route::Binary,
+    }
+}
+
+/// `--gui` with the window opening here (10 §11 row 2): with no `display`, §7.1's line
+/// (`gui::term::NO_DISPLAY`, the TUI's status row) and exit 1, before anything is read; with
+/// one, today's window.
+fn window_here(display: bool) -> Result<()> {
+    if !display {
+        bail!("{}", gui::term::NO_DISPLAY);
+    }
+    Ok(())
+}
+
+/// The forward's automatic `--gui` ([`auto_gui`]), which XF turns on (10 §17 XF). Until then a
+/// forward passes `--gui` only when the owner gave it (decided 2026-11-26): an automatic one
+/// would turn HOST's fallbacks without a display — a folder to the editor, a file fetched and
+/// its path printed — into exit 1, against §11 row 6, while before the flip HOST already opens
+/// a window for a window kind when it can.
+const AUTO_GUI: bool = false;
+
+/// Whether a forward passes `--gui` (10 §7.3, T35; X2-gui): the owner gave it, or — once
+/// [`AUTO_GUI`] is on — `auto` says so. Never with `--app` (§11 row 1).
+fn forward_gui(gui: bool, app: bool, auto: impl FnOnce() -> bool) -> bool {
+    !app && (gui || (AUTO_GUI && auto()))
+}
+
+/// XF's automatic `--gui`, behind [`AUTO_GUI`]: for a window run, `--hex` or the kind this
+/// machine sees (`seen`, asked only then) opens in a window — a folder, an image, video or
+/// audio, a binary. Text keeps HOST's editor (§11 row 5: [`route`]'s `Editor`); a kind not seen
+/// goes without it and HOST picks by kind. A run the hooks (`hooks`, this side's: they travel
+/// to HOST) keep without a window — `SOPEN_LIST`, `SOPEN_AUTOSAVE`, `SOPEN_AUTOEXPORT`, a binary
+/// dialog answered `save` or `cancel` — is no window run (2026-11-26), nor is one whose hooks
+/// cannot be read here (HOST says why).
+fn auto_gui(hex: bool, hooks: Option<&gui::Hooks>, seen: impl FnOnce() -> Option<Kind>) -> bool {
+    let Some(hooks) = hooks else { return false };
+    if hooks.list || hooks.list_git || hooks.autosave || hooks.autoexport {
+        return false;
+    }
+    // `--hex` is the hex window whatever the dialog's answer (`gui::binary::open_file`).
+    if hex {
+        return true;
+    }
+    match seen().map(route) {
+        Some(Route::Browser | Route::Window) => true,
+        Some(Route::Binary) => {
+            !matches!(hooks.choice, Some(gui::Choice::Save | gui::Choice::Cancel))
+        }
+        Some(Route::Editor) | None => false,
+    }
+}
+
+/// SOURCE's kind as this machine sees it before forwarding (X2-gui): a local folder or file by its
+/// stat and its first bytes, as a local open reads them; a remote one by its name alone, where
+/// the name decides it (`kind::by_extension`: an image, video or audio — a folder so named needs
+/// a window as well — or text), never over ssh. Anything else is not seen: a remote name that
+/// does not decide, a local special file (its bytes are not read), a read that fails.
+fn seen_kind(source: &str) -> Option<Kind> {
+    match target::parse(source).ok()? {
+        Target::Local(path) => {
+            let mut fs = LocalFs::new();
+            let abs = fs.realpath(path.to_str()?).ok()?;
+            let stat = fs.stat(&abs).ok()?;
+            if !stat.is_dir && !stat.is_file {
+                return None;
+            }
+            kind::detect(&mut fs, &abs, &stat).ok()
+        }
+        Target::Remote(spec) => kind::by_extension(&spec.path),
     }
 }
 
@@ -1701,6 +1804,19 @@ mod tests {
             assert!(Cli::try_parse_from(args.chain(["a"])).is_err(), "{other:?}");
         }
         assert!(!Cli::try_parse_from(["sopen", "a"]).unwrap().tui);
+        // `--gui` (10 §11 row 2): as HOST's sopen is given it, with `--hex` (the hex window) or
+        // a target; never beside `--app` or `--tui`, the rows that open something else.
+        let cli = Cli::try_parse_from(["sopen", "--here", "--gui", "--", "/srv/dir"]).unwrap();
+        assert!(cli.gui && cli.here && !cli.tui);
+        assert_eq!(cli.source.as_deref(), Some("/srv/dir"));
+        let cli = Cli::try_parse_from(["sopen", "--here", "--gui", "--hex", "--", "a"]).unwrap();
+        assert!(cli.gui && cli.hex);
+        assert!(Cli::try_parse_from(["sopen", "--gui", "--target", "box", "a"]).is_ok());
+        for other in [&["--app", "X"][..], &["--tui"]] {
+            let args = ["sopen", "--gui"].into_iter().chain(other.iter().copied());
+            assert!(Cli::try_parse_from(args.chain(["a"])).is_err(), "{other:?}");
+        }
+        assert!(!Cli::try_parse_from(["sopen", "a"]).unwrap().gui);
         // `--browser` (09 §7), as typed and as HOST's half of a tunnel is given it.
         let cli = Cli::try_parse_from(["sopen", "--browser", "http://x/"]).unwrap();
         assert!(cli.browser && !cli.hold_until_eof);
@@ -1858,6 +1974,124 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(folder_run(&shot, true), FolderRun::Browser);
+    }
+
+    /// X2-gui, until XF: a forward passes `--gui` only when the owner gave it ([`AUTO_GUI`] off);
+    /// `--app` never. XF's automatic rule is tested as it stands: the kinds a sender sees
+    /// ([`seen_kind`]: a local SOURCE by its stat and bytes, a remote one by its name only) and
+    /// which of them, in a window run, bring `--gui` ([`auto_gui`]).
+    #[test]
+    fn a_forward_passes_gui_when_given_and_xf_has_the_rule_by_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let at = |name: &str| tmp.path().join(name).to_str().unwrap().to_string();
+        std::fs::create_dir(tmp.path().join("dir")).unwrap();
+        std::fs::write(tmp.path().join("a.png"), b"").unwrap();
+        std::fs::write(tmp.path().join("a.mp3"), b"").unwrap();
+        std::fs::write(tmp.path().join("blob"), [0u8, 1, 2, 0]).unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "text\n").unwrap();
+        std::fs::write(tmp.path().join("plain"), "text by its bytes\n").unwrap();
+
+        // Until XF: the owner's `--gui` alone, never with `--app`.
+        let never = || -> bool { panic!("the automatic rule was asked") };
+        assert!(forward_gui(true, false, never));
+        assert!(!forward_gui(true, true, never));
+        assert!(!forward_gui(false, true, never));
+        // XF turns the automatic one on (`AUTO_GUI`), with its docs: then this line changes.
+        assert!(
+            !forward_gui(false, false, || true),
+            "automatic --gui before XF"
+        );
+
+        let seen = |source: &str| seen_kind(source);
+        assert_eq!(seen(&at("dir")), Some(Kind::Directory));
+        assert_eq!(seen(&at("a.png")), Some(Kind::Image));
+        assert_eq!(seen(&at("a.mp3")), Some(Kind::Audio));
+        assert_eq!(seen(&at("blob")), Some(Kind::Other));
+        assert_eq!(seen(&at("notes.txt")), Some(Kind::Text));
+        assert_eq!(seen(&at("plain")), Some(Kind::Text));
+        assert_eq!(seen(&at("missing")), None);
+        assert_eq!(seen("/dev/null"), None, "a special file is not read");
+        assert_eq!(seen("box:/srv/a.mp4"), Some(Kind::Video));
+        assert_eq!(seen("me@box:rel/a.txt"), Some(Kind::Text));
+        assert_eq!(seen("box:/srv/data"), None);
+        assert_eq!(seen("box:/srv/archive.zip"), None);
+        assert_eq!(seen("box:"), None);
+
+        // XF's rule: the kinds that open in a window, and `--hex`; not text, not a kind unseen.
+        let never = || -> Option<Kind> { panic!("the kind was looked at") };
+        let none = gui::Hooks::default();
+        let window = Some(&none);
+        let passes = |source: &str| auto_gui(false, window, || seen_kind(source));
+        for window in ["dir", "a.png", "a.mp3", "blob"] {
+            assert!(passes(&at(window)), "{window}");
+        }
+        assert!(passes("box:/srv/a.mp4"));
+        for no in [at("notes.txt"), at("plain"), "box:/srv/data".to_string()] {
+            assert!(!passes(&no), "{no}");
+        }
+        assert!(auto_gui(true, window, never));
+
+        // A run the hooks keep without a window gets none (2026-11-26).
+        let image = || Some(Kind::Image);
+        let binary = || Some(Kind::Other);
+        for windowless in [
+            gui::Hooks {
+                list: true,
+                ..Default::default()
+            },
+            gui::Hooks {
+                list_git: true,
+                ..Default::default()
+            },
+            gui::Hooks {
+                autosave: true,
+                ..Default::default()
+            },
+            gui::Hooks {
+                autoexport: true,
+                ..Default::default()
+            },
+        ] {
+            let hooks = Some(&windowless);
+            assert!(!auto_gui(false, hooks, image), "{windowless:?}");
+            assert!(!auto_gui(true, hooks, never), "{windowless:?}");
+        }
+        // The binary dialog: answered without a window by save and cancel, with one by hex;
+        // `--hex` is the hex window whatever the answer; an image has no dialog to answer.
+        let answered = |choice| gui::Hooks {
+            choice: Some(choice),
+            ..Default::default()
+        };
+        for choice in [gui::Choice::Save, gui::Choice::Cancel] {
+            let hooks = answered(choice);
+            assert!(!auto_gui(false, Some(&hooks), binary));
+            assert!(auto_gui(true, Some(&hooks), never));
+            assert!(auto_gui(false, Some(&hooks), image));
+        }
+        assert!(auto_gui(false, Some(&answered(gui::Choice::Hex)), binary));
+        // A screenshot is a window; hooks this side cannot read bring none (HOST says why).
+        let shot = gui::Hooks {
+            screenshot: Some(PathBuf::from("/tmp/shot.png")),
+            ..Default::default()
+        };
+        assert!(auto_gui(false, Some(&shot), image));
+        assert!(!auto_gui(false, None, image));
+        assert!(!auto_gui(true, None, never));
+    }
+
+    /// `--gui` with the window here (10 §11 row 2): with no display, §7.1's line, exit 1 (not a
+    /// usage error); with one, today's window.
+    #[test]
+    fn gui_with_no_display_here_is_its_line_and_exit_1() {
+        window_here(true).unwrap();
+        let e = window_here(false).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "no display here — sopen config target <host>, or --target, opens the window on \
+             another machine"
+        );
+        assert!(!e.chain().any(|c| c.is::<Usage>() || c.is::<Refused>()));
+        assert_eq!(exit(Err(e)), ExitCode::from(EXIT_ERROR));
     }
 
     /// The browser's start names an IPv6 host unbracketed for ssh (`destination`) and bracketed

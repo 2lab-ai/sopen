@@ -83,7 +83,7 @@ pub(crate) const HAND_OFF: &str = "F12 shows it in the window";
 pub(crate) const MODAL_LINE: &str =
     "a dialog the terminal does not draw yet: F12 shows it in the window, Esc closes it";
 /// The status line when there is no display for the window (10 §7.1).
-pub(crate) const NO_DISPLAY: &str =
+pub const NO_DISPLAY: &str =
     "no display here — sopen config target <host>, or --target, opens the window on another machine";
 
 /// The most text sent to the terminal's clipboard (OSC 52): many terminals refuse or cut more.
