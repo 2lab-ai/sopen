@@ -597,6 +597,9 @@ struct Viewer {
     /// (03 §6.3): the viewer was told before its first pass, and so is every view made later —
     /// the hex window an image gives way to among them.
     views: view_set::Views,
+    /// Whether its text view wraps, as last seen on screen: what the switch's state carries of
+    /// it while another view is on screen (10 §7.4).
+    text_wrap: Option<bool>,
 }
 
 /// The directory tree on the side that had the keyboard when F10 was pressed (05; 02 §3.1
@@ -1035,6 +1038,8 @@ impl Browser {
         keep: Option<usize>,
         ctx: Option<&egui::Context>,
     ) {
+        // A listing a given switch state did not ask for: what it was still putting back goes.
+        self.given_overtaken();
         let (tx, rx) = mpsc::channel();
         let (conn, connect, remote) = (
             self.conn.clone(),
@@ -1812,6 +1817,7 @@ impl Browser {
             abs,
             switch: made.switch,
             views,
+            text_wrap: None,
         });
         self.moved_at = None;
     }
@@ -2700,6 +2706,9 @@ impl Window for Browser {
             // No viewer, no view keys (08 §8).
             super::set_view_keys(&ctx, None);
         }
+        // The switch's own pass, before anything of this one: a given state's next step, on
+        // the display the last pass committed; the text view's wrap noted.
+        self.switch_pass(&ctx);
         self.play(&ctx);
         self.git_stop_on_esc(&ctx);
         self.poll(&ctx);
@@ -2715,8 +2724,6 @@ impl Window for Browser {
             self.list_keys(&ctx);
         }
         self.resolve(&ctx);
-        // A given switch state's next step, once the display it builds on is committed.
-        self.given_pass(&ctx);
         self.git_follow(&ctx);
         // The F-key row is the key table's, by the context and the mode (04 §2).
         let in_git = self.git_focused().is_some();

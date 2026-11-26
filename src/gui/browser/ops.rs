@@ -1840,8 +1840,9 @@ impl Ops {
 
     /// The owner's dialog that is open — the select-group, Copy / Move, make-folder or delete
     /// dialog, else the rename field — as the switch carries it (10 §7.4): what it is, its
-    /// field's text, caret and selection (egui's edit state of the field), and its refusal. A
-    /// job's question and its report are the job's, which never crosses (§7.4: no jobs).
+    /// field's text, caret and selection (egui's edit state of the field), its refusal, and the
+    /// entries it acts on. A job's question and its report are the job's, which never crosses
+    /// (§7.4: no jobs).
     pub fn open_dialog(&self, ctx: &egui::Context) -> Option<DialogState> {
         let caret = |id: egui::Id| {
             let range = egui::text_edit::TextEditState::load(ctx, id)?
@@ -1849,7 +1850,7 @@ impl Ops {
                 .char_range()?;
             Some((range.secondary.index.0, range.primary.index.0))
         };
-        let given = |kind, text: &str, id, error: Option<&String>| {
+        let given = |kind, text: &str, id, error: Option<&String>, entries: &[String]| {
             let at = caret(id);
             DialogState {
                 kind,
@@ -1857,6 +1858,7 @@ impl Ops {
                 caret: at.map(|(_, caret)| caret),
                 anchor: at.map(|(anchor, _)| anchor),
                 error: error.cloned(),
+                entries: entries.to_vec(),
             }
         };
         if let Some(d) = &self.group {
@@ -1865,18 +1867,26 @@ impl Ops {
             } else {
                 DialogKind::Unselect
             };
-            return Some(given(kind, &d.pattern, group_id().with("pattern"), None));
+            let id = group_id().with("pattern");
+            return Some(given(kind, &d.pattern, id, None, &[]));
         }
         if let Some(d) = &self.copy {
             let kind = match d.kind {
                 Transfer::Copy => DialogKind::Copy,
                 Transfer::Move => DialogKind::Move,
             };
-            return Some(given(kind, &d.target, copy_field_id(), d.error.as_ref()));
+            let (id, error) = (copy_field_id(), d.error.as_ref());
+            return Some(given(kind, &d.target, id, error, &d.names));
         }
         if let Some(d) = &self.make {
             let id = make_folder_id().with("name");
-            return Some(given(DialogKind::MakeFolder, &d.name, id, d.error.as_ref()));
+            return Some(given(
+                DialogKind::MakeFolder,
+                &d.name,
+                id,
+                d.error.as_ref(),
+                &[],
+            ));
         }
         if let Some(d) = &self.delete {
             let kind = match d.bin {
@@ -1889,15 +1899,12 @@ impl Ops {
                 caret: None,
                 anchor: None,
                 error: None,
+                entries: d.names.clone(),
             });
         }
         let r = self.rename.as_ref()?;
-        Some(given(
-            DialogKind::Rename,
-            &r.text,
-            rename_id(),
-            r.error.as_ref(),
-        ))
+        let (from, error) = (std::slice::from_ref(&r.from), r.error.as_ref());
+        Some(given(DialogKind::Rename, &r.text, rename_id(), error, from))
     }
 
     /// The dialog the browser has just opened, as the key would have, takes what `given` carried

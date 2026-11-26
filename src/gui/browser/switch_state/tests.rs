@@ -8,7 +8,7 @@ use super::*;
 use crate::encoding::Encoding;
 use crate::git::history::fixture::{self, Repo};
 use crate::git::runner::GitRunner;
-use crate::gui::browser::{panel, Connect, GitConnect, Start};
+use crate::gui::browser::{panel, BrowserEvent, Connect, GitConnect, Start};
 use crate::gui::chrome::CELL;
 use crate::gui::testkit::Driver;
 use crate::gui::{cells, term, Window};
@@ -301,7 +301,7 @@ fn the_viewer_crosses_on_its_view() {
     let viewer = state.viewer.clone().expect("the viewer");
     assert_eq!(viewer.view, 2, "{viewer:?}");
     assert!(viewer.place.is_some_and(|p| p > 0), "{viewer:?}");
-    assert_eq!(viewer.wrap, None, "the hex view has no wrap");
+    assert_eq!(viewer.wrap, Some(true), "the text view behind it wraps");
     assert!(
         before.contains("1 Text · 2 Hex · 3 Raw"),
         "{}",
@@ -426,8 +426,8 @@ fn a_sparse_line_reads_and_other_versions_are_refused() {
 /// `<this machine>:/abs`) and come back through the caller's map (`mac:/abs` → `/abs`): the host
 /// moves, the paths stay, out and back is the state again — a Copy target typed as an absolute
 /// place too, its caret and selection on the same characters; a name, or another machine's place
-/// the map leaves alone or cannot place, stays as typed. A map that gives two hosts, or a path
-/// that is not absolute, is refused.
+/// the map leaves alone, stays as typed. A map that gives two hosts, or a path that is not
+/// absolute, is refused.
 #[test]
 fn paths_are_rewritten_out_and_back_by_the_callers_map() {
     let panel = |folder: &str, pin: Option<&str>| PanelState {
@@ -451,6 +451,7 @@ fn paths_are_rewritten_out_and_back_by_the_callers_map() {
             caret: Some(3),
             anchor: Some(0),
             error: Some("a refusal".into()),
+            entries: vec!["a.txt".into()],
         }),
         viewer: Some(ViewerState {
             file: "/w/two/a.txt".into(),
@@ -458,6 +459,7 @@ fn paths_are_rewritten_out_and_back_by_the_callers_map() {
             place: Some(7),
             encoding: None,
             wrap: Some(true),
+            revision: false,
         }),
     };
     let out_map = |source: &str| {
@@ -485,8 +487,11 @@ fn paths_are_rewritten_out_and_back_by_the_callers_map() {
         state.dialog.as_mut().unwrap().text = Some(kept.into());
         let out = state.rewritten(out_map).expect("out");
         assert_eq!(out.dialog, state.dialog, "{kept} out");
-        assert_eq!(out.rewritten(back_map).expect("back"), state, "{kept} back");
     }
+    let mut named = here.clone();
+    named.dialog.as_mut().unwrap().text = Some("sub/dir".into());
+    let out = named.rewritten(out_map).expect("out");
+    assert_eq!(out.rewritten(back_map).expect("back"), named, "a name back");
     let two_hosts = here.rewritten(|source| {
         Ok(match source {
             "/w" => "other:/w".to_string(),
@@ -499,20 +504,24 @@ fn paths_are_rewritten_out_and_back_by_the_callers_map() {
 }
 
 /// A folder of the state that is gone here shows its nearest parent that lists, and the status
-/// row says so; the viewer of a file in it is not opened. The other panel is as given.
+/// row says so; the tree, the dialog and the viewer it had are not opened there. The other panel
+/// is as given.
 #[test]
 fn a_gone_folder_shows_its_nearest_parent() {
     let (_tmp, root) = root();
     let gone = format!("{root}/gone/deeper");
     let state = read(
         &format!(
-            r#"{{"v":1,"panels":[{{"folder":"{gone}","bar":"x.txt"}},{{"folder":"{root}/many","bar":"f03.txt"}}],
+            r#"{{"v":1,"panels":[{{"folder":"{gone}","bar":"x.txt","tree":true}},{{"folder":"{root}/many","bar":"f03.txt"}}],
+               "dialog":{{"kind":"make_folder","text":"made"}},
                "viewer":{{"file":"{gone}/x.txt"}}}}"#
         ),
         "HOST",
     )
     .unwrap();
     let (b, after) = given(&root, None, state);
+    assert!(b.b.ops.open_dialog(&b.drv.ctx).is_none(), "no dialog");
+    assert!(b.b.tree.is_none(), "no tree");
     assert_eq!(b.b.panels[0].dir, root);
     assert_eq!(b.b.panels[1].dir, format!("{root}/many"));
     assert_eq!(
@@ -521,8 +530,11 @@ fn a_gone_folder_shows_its_nearest_parent() {
     );
     assert!(b.b.viewer.is_none());
     let said = b.b.status_line().text;
+    let dialog = format!("make folder was not opened again: the list is on {root} here");
     assert!(
-        said.starts_with(&format!("{gone}: ")) && said.ends_with(&format!("— showing {root}")),
+        said.starts_with(&format!("{gone}: "))
+            && said.contains(&format!("— showing {root} · "))
+            && said.ends_with(&dialog),
         "{said}"
     );
     assert!(after.contains(&said[..40]), "{}", rows(&after));
@@ -537,9 +549,268 @@ fn a_gone_folder_shows_its_nearest_parent() {
 fn a_state_of_another_host_is_refused() {
     let (_tmp, root) = root();
     let mut b = Side::new(&root, None);
-    b.settle();
     let mut state = b.take();
     state.host = Some("elsewhere".into());
     assert!(b.b.give_state(state).is_err());
     assert!(b.b.given.is_none());
+}
+
+// The review's cases (X2-state, 2026-11-26): the line comes over ssh, so it is untrusted.
+
+/// `state` given to a new browser on `root`, not yet drawn.
+fn fresh_given(root: &str, state: SwitchState) -> Side {
+    let mut b = Side::new(root, None);
+    b.b.give_state(state).expect("the state is this machine's");
+    b
+}
+
+/// A line read as HOST sent it.
+fn line(text: &str) -> SwitchState {
+    read(text, "HOST").expect("the line reads")
+}
+
+/// The rename field and a Copy dialog cross on the entries they act on: the same cells.
+#[test]
+fn a_rename_and_a_copy_cross_on_their_entries() {
+    let (_tmp, root) = root();
+    let mut a = Side::new(&root, None);
+    a.settle();
+    a.bar(0, "notes.txt");
+    a.key(Key::F2);
+    a.settle();
+    a.typed("renamed");
+    a.settle();
+    let before = a.cells();
+    let state = a.take();
+    let dialog = state.dialog.clone().expect("the rename field");
+    assert_eq!(dialog.kind, DialogKind::Rename);
+    assert_eq!(dialog.text.as_deref(), Some("renamed.txt"));
+    assert_eq!(dialog.entries, ["notes.txt"]);
+    let (_b, after) = given(&root, None, through_the_line(&state));
+    same_screen(&before, &after);
+
+    let mut a = Side::new(&root, None);
+    a.settle();
+    a.select(0, &["beta", "notes.txt"]);
+    a.key(Key::F5);
+    a.settle();
+    a.typed("sub");
+    a.settle();
+    let before = a.cells();
+    let state = a.take();
+    let dialog = state.dialog.clone().expect("the Copy dialog");
+    assert_eq!(dialog.kind, DialogKind::Copy);
+    assert_eq!(dialog.entries, ["beta", "notes.txt"]);
+    let (_b, after) = given(&root, None, through_the_line(&state));
+    same_screen(&before, &after);
+}
+
+/// A dialog is opened again only on what it acted on: a line that names no entry opens no rename
+/// on whatever the bar is on (here `/`'s first entry); an entry gone here opens none; the bar
+/// moved (↑) during the putting back opens none on the new row. Each says why on the status row.
+#[test]
+fn a_dialog_opens_only_on_its_own_entries() {
+    let b = given(
+        "/",
+        None,
+        line(r#"{"v":1,"panels":[{"folder":"/"},{"folder":"/"}],"dialog":{"kind":"rename","text":"x"}}"#),
+    )
+    .0;
+    assert!(
+        b.b.ops.renaming().is_none(),
+        "no rename on {:?}",
+        b.b.panels[0].current().map(|e| &e.name)
+    );
+    let said = b.b.status_line().text;
+    assert!(said.contains("rename was not opened again"), "{said}");
+
+    let (_tmp, root) = root();
+    let gone = line(&format!(
+        r#"{{"v":1,"panels":[{{"folder":"{root}","bar":"vanished.txt"}},{{"folder":"{root}"}}],
+           "dialog":{{"kind":"rename","text":"x","entries":["vanished.txt"]}}}}"#
+    ));
+    let (b, _) = given(&root, None, gone);
+    assert!(b.b.ops.renaming().is_none());
+    assert!(
+        b.b.status_line().text.contains("vanished.txt"),
+        "{}",
+        b.b.status_line().text
+    );
+
+    let moved = line(&format!(
+        r#"{{"v":1,"panels":[{{"folder":"{root}","bar":"notes.txt"}},{{"folder":"{root}"}}],
+           "dialog":{{"kind":"rename","text":"x","entries":["notes.txt"]}}}}"#
+    ));
+    let mut b = fresh_given(&root, moved);
+    b.drv.until(&mut b.b, 30, |b| {
+        b.given.as_ref().is_some_and(|g| g.step > Step::Lists)
+    });
+    // (`notes.txt` is the last row: the bar moves up.)
+    b.key(Key::ArrowUp);
+    b.settle();
+    assert_ne!(
+        b.b.panels[0].current().map(|e| e.name.as_str()),
+        Some("notes.txt")
+    );
+    assert!(b.b.ops.renaming().is_none(), "no rename on the new row");
+}
+
+/// A Copy target the map cannot place goes as nothing (the receiver's own target) with the
+/// reason as its refusal; the other paths are mapped as ever. A caret past the text is held to
+/// it before it moves (no overflow on `usize::MAX`).
+#[test]
+fn a_target_the_map_cannot_place_is_not_carried_bare() {
+    let state = line(
+        r#"{"v":1,"panels":[{"folder":"/w"},{"folder":"/x"}],
+            "dialog":{"kind":"copy","text":"/elsewhere/t","caret":3,"anchor":0,"entries":["a"]}}"#,
+    );
+    let out = state
+        .rewritten(|source| match source {
+            "/elsewhere/t" => anyhow::bail!("no way there"),
+            _ => Ok(format!("mac:{source}")),
+        })
+        .expect("the folders map");
+    assert_eq!(out.panels[0].folder, "/w");
+    let d = out.dialog.expect("the dialog");
+    assert_eq!((d.text, d.caret, d.anchor), (None, None, None));
+    assert_eq!(
+        d.error.as_deref(),
+        Some("/elsewhere/t: no way there — give the folder again")
+    );
+
+    let mut far = state.clone();
+    far.dialog.as_mut().unwrap().caret = Some(usize::MAX);
+    far.dialog.as_mut().unwrap().anchor = Some(usize::MAX);
+    let out = far.rewritten(|s| Ok(format!("mac:{s}"))).expect("out");
+    let d = out.dialog.expect("the dialog");
+    assert_eq!(d.text.as_deref(), Some("mac:/elsewhere/t"));
+    assert_eq!((d.caret, d.anchor), (Some(16), Some(16)));
+}
+
+/// What arrives is checked before anything is listed: folders, pins and the viewer's file must
+/// be absolute, the host a label ssh cannot read as an option (`-o…`) or as two words — by
+/// `read`, by `rewritten`'s map, and by `give_state` for a state made any other way.
+#[test]
+fn the_line_is_checked_at_the_boundary() {
+    for bad in [
+        r#"{"v":1,"panels":[{"folder":"rel"},{"folder":"/b"}]}"#,
+        r#"{"v":1,"panels":[{"folder":"/a","pin":"repo"},{"folder":"/b"}]}"#,
+        r#"{"v":1,"panels":[{"folder":"/a"},{"folder":"/b"}],"viewer":{"file":"x.txt"}}"#,
+        r#"{"v":1,"host":"-oProxyCommand=x","panels":[{"folder":"/a"},{"folder":"/b"}]}"#,
+        r#"{"v":1,"host":"a b","panels":[{"folder":"/a"},{"folder":"/b"}]}"#,
+        r#"{"v":1,"active":2,"panels":[{"folder":"/a"},{"folder":"/b"}]}"#,
+    ] {
+        assert!(read(bad, "HOST").is_err(), "{bad}");
+    }
+    let state = line(r#"{"v":1,"panels":[{"folder":"/a"},{"folder":"/b"}]}"#);
+    let option = state.rewritten(|s| Ok(format!("-oProxyCommand=x:{s}")));
+    assert!(option.is_err(), "{option:?}");
+    let (_tmp, root) = root();
+    let mut relative = line(&format!(
+        r#"{{"v":1,"panels":[{{"folder":"{root}"}},{{"folder":"{root}"}}]}}"#
+    ));
+    relative.panels[1].folder = "many".into();
+    let mut b = Side::new(&root, None);
+    assert!(b.b.give_state(relative).is_err());
+    assert!(b.b.given.is_none());
+}
+
+/// A state is given once, to a browser that has not been drawn: again, or after a pass, is an
+/// error — never a panic, nothing changed.
+#[test]
+fn a_state_is_given_once_to_a_fresh_browser() {
+    let (_tmp, root) = root();
+    let state = line(&format!(
+        r#"{{"v":1,"panels":[{{"folder":"{root}"}},{{"folder":"{root}/many"}}]}}"#
+    ));
+    let mut b = fresh_given(&root, state.clone());
+    assert!(b.b.give_state(state.clone()).is_err(), "a second time");
+    b.settle();
+    assert!(b.b.give_state(state).is_err(), "after a pass");
+    assert!(b.b.given.is_none());
+}
+
+/// A listing the putting back did not ask for (a file operation's, a git write's re-read) ends
+/// it: nothing of it comes later, and the browser settles.
+#[test]
+fn a_listing_of_its_own_ends_a_restore() {
+    let (_tmp, root) = root();
+    let state = line(&format!(
+        r#"{{"v":1,"panels":[{{"folder":"{root}/many"}},{{"folder":"{root}/alpha"}}],
+           "dialog":{{"kind":"make_folder","text":"later"}}}}"#
+    ));
+    let mut b = fresh_given(&root, state);
+    let event = BrowserEvent::FilesChanged {
+        host: None,
+        dirs: vec![root.clone()],
+    };
+    b.b.event(&b.drv.ctx.clone(), event);
+    b.drv.until(&mut b.b, 5, |b| b.ready());
+    assert!(b.b.given.is_none());
+    assert!(b.b.ops.open_dialog(&b.drv.ctx).is_none(), "no dialog later");
+    assert_eq!(b.b.panels[0].dir, root);
+}
+
+/// Taken while it is still being put back, a state is what was given where it is not back yet.
+#[test]
+fn a_state_taken_while_it_is_put_back_is_the_one_given() {
+    let (_tmp, root) = root();
+    let state = line(&format!(
+        r#"{{"v":1,"mode":"dual","active":1,
+           "panels":[{{"folder":"{root}/many","bar":"f05.txt","selected":["f01.txt"],"top":3}},
+                     {{"folder":"{root}","bar":"notes.txt","tree":true}}],
+           "dialog":{{"kind":"make_folder","text":"half","caret":2,"anchor":2}},
+           "viewer":{{"file":"{root}/notes.txt","view":1,"place":0,"wrap":false}}}}"#
+    ));
+    let b = fresh_given(&root, state.clone());
+    assert_eq!(b.take(), state);
+}
+
+/// The text view's wrap goes with the state while the hex view is on screen: back in the text
+/// view, the receiver's is unwrapped as the sender's. An encoding the file picked (not chosen)
+/// is not carried: the receiver picks it again.
+#[test]
+fn the_hidden_text_views_wrap_crosses_and_a_picked_encoding_does_not() {
+    let (_tmp, root) = root();
+    let mut a = Side::new(&root, None);
+    a.settle();
+    a.bar(0, "long.txt");
+    a.key(Key::Enter);
+    a.settle();
+    a.key(Key::PageDown);
+    a.settle();
+    a.key(Key::W);
+    a.settle();
+    let on_text = a.take().viewer.expect("the viewer");
+    assert_eq!(on_text.view, 1);
+    assert_eq!(on_text.encoding, None, "UTF-8 was picked, not chosen");
+    a.drv.press_typed(&mut a.b, Key::Num2, "2");
+    a.settle();
+    let state = a.take();
+    let viewer = state.viewer.clone().expect("the viewer");
+    assert_eq!((viewer.view, viewer.wrap), (2, Some(false)), "{viewer:?}");
+    assert_eq!(viewer.encoding, None);
+    let (mut b, _) = given(&root, None, through_the_line(&state));
+    for side in [&mut a, &mut b] {
+        side.drv.press_typed(&mut side.b, Key::Num1, "1");
+        side.settle();
+    }
+    same_screen(&a.cells(), &b.cells());
+}
+
+/// A diff or a file at a revision is not carried: the receiver says so, and opens nothing.
+#[test]
+fn a_revision_viewer_is_said_not_carried() {
+    let (_tmp, root) = root();
+    let state = line(&format!(
+        r#"{{"v":1,"panels":[{{"folder":"{root}","bar":"notes.txt"}},{{"folder":"{root}"}}],
+           "viewer":{{"file":"{root}/notes.txt","revision":true}}}}"#
+    ));
+    let (b, _) = given(&root, None, state);
+    assert!(b.b.viewer.is_none());
+    let said = b.b.status_line().text;
+    assert!(
+        said.starts_with(&format!("{root}/notes.txt: a diff or a file at a revision")),
+        "{said}"
+    );
 }

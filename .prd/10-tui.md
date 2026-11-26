@@ -773,3 +773,10 @@ on the title row (`chrome.rs:805-832`) and F8's list of encodings as a cell dial
   cannot see is forwarded without it and HOST picks by kind; HOST's exit 2 for an unknown `--gui`
   makes the sender retry once without it and say on stderr that HOST's sopen is older (X2-gui).
   T35 still guards a HOST past the flip for every window kind the sender sees.
+- **§7.4's "an open dialog with its typed text" vs the git panel's dialogs** (found reviewing
+  X2-state, 2026-11-26). v1 carries the list's dialogs (04 §4–§5: the select-group, Copy / Move,
+  rename, make-folder and delete ones) and nothing of the git panel's: a commit message, a tag's or
+  a branch's name typed in an action's dialog (03 §7), the planner's unsaved plan, is carried by
+  nobody yet — the git panel's screen moves in X4, which adds those fields and bumps `v` (§7.4).
+  Until then a switch with one open drops its text; X2-switch's question before the switch is
+  where to say so.
