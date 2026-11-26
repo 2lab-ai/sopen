@@ -61,5 +61,13 @@ installed on <host>` (exit 127) means it has no sopen, `sopen on <host> ended wi
 N (signal n?)` means it most likely was interrupted there, and exit 2 with `<host>`'s own usage
 line (other than the one for `--gui`) means its sopen is too old for the run, or the run is wrong.
 
+From `sopen --tui` with a target, F12 moves the file browser into a window on `<host>`'s screen
+— sopen there gets `--here --gui` and the terminal's state (folders, bars, selections, an open
+dialog, the viewer) on its input — and closing that window, or F12 there, brings the terminal back
+with the window's state. ssh is told never to ask anything (the terminal is xtools'), so `<host>`
+must be reachable without a question first: run `ssh <host>` once in a shell otherwise. The
+receipt hooks that script a run (`SOPEN_STATE`, `SOPEN_SCREENSHOT`, `SOPEN_AUTOSAVE`, `SOPEN_LIST`,
+…) stay here for this switch. See [In the terminal](tui.md).
+
 A web address with `--target` opens in `<host>`'s browser, a loopback one through a tunnel: see
 [Web addresses](urls.md).

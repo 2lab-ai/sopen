@@ -666,6 +666,57 @@ enum Exit {
     Quit,
 }
 
+/// Whether the switch to another machine may go now ([`Browser::before_switch`], 10 §7.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Before {
+    Go,
+    /// Not yet: a job that writes runs (the status row says `waiting for <it>…`), or the
+    /// question about unsaved edits is up or being carried out. The browser asks for the switch
+    /// again once it may go ([`Browser::switch_due`]).
+    Held,
+}
+
+/// The switch to `to` (another machine) held back (10 §7.4), and where it is.
+struct Switching {
+    to: String,
+    step: SwitchStep,
+}
+
+/// What the question before the switch is about (10 §7.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// Unsaved edits in the viewer: `Save the changes to host:/abs before switching to HOST?`.
+    Unsaved,
+    /// The git panel's open dialog or the planner's plan, which the state does not carry yet
+    /// (Tensions; X4 carries them).
+    Git,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SwitchStep {
+    /// A job that writes runs: what it is.
+    Waiting(String),
+    /// The question is up; what of it has the keyboard (the viewer or the git dialog behind takes
+    /// it in its pass: it is given back after).
+    Asking(Ask, Option<egui::Id>),
+    /// Its Save or Save As was pressed in the viewer (F5, F7, as the owner's keys): the switch
+    /// goes once it lands.
+    Saving,
+    /// What held it is over (the job ended, the Save landed, the viewer left): asked for again
+    /// at the end of this pass, it is decided anew — a job that writes waits, a question asks.
+    Due,
+    /// The answer lets it go with what the question was about (Discard, Switch): asked for
+    /// again at the end of this pass.
+    LetGo(Ask),
+    /// Asked for again after [`SwitchStep::LetGo`]: the next [`Browser::before_switch`] does not
+    /// ask about it again — in this pass only (a switch that went elsewhere leaves nothing
+    /// behind).
+    Cleared(Ask),
+}
+
+/// The title of the question about unsaved edits, as the viewers' close prompts are titled.
+const SWITCH_TITLE: &str = "Unsaved changes";
+
 /// A viewer that is gone, and what it may still be writing.
 struct Closing {
     settle: Box<dyn FnMut(bool) -> Option<Outcome>>,
@@ -712,6 +763,22 @@ impl Leftover {
         }
         self.settle(true);
         self.outcome.clone()
+    }
+}
+
+/// A browser's [`Leftover`], for one the terminal's switch replaced or made (10 §7.3):
+/// [`open_on`] finishes only the one of the browser it built.
+pub(crate) struct Leftovers(Rc<RefCell<Leftover>>);
+
+impl Leftovers {
+    /// What has settled is taken now — a viewer gone with its browser lets go of its file.
+    pub(crate) fn settle(&self) {
+        self.0.borrow_mut().settle(false);
+    }
+
+    /// After the run, as [`open_on`] finishes its own: every write waited for, what it did.
+    pub(crate) fn finish(&self) -> Outcome {
+        self.0.borrow_mut().finish()
     }
 }
 
@@ -839,6 +906,11 @@ pub(crate) struct Browser {
     /// The switch's state this browser was given (10 §7.4), while what it asks for is still
     /// being put back ([`switch_state`]): the browser has not settled until it is.
     given: Option<switch_state::Given>,
+    /// The switch to another machine, held back by a job that writes or a question (10 §7.4).
+    switching: Option<Switching>,
+    /// The switch goes with Discard's answer: the viewer's edits are dropped once it has started
+    /// ([`Browser::discard_for_switch`]).
+    discarding: bool,
 }
 
 impl Drop for Browser {
@@ -987,6 +1059,8 @@ impl Browser {
             trash_check: trash_check(),
             trash_wait: None,
             given: None,
+            switching: None,
+            discarding: false,
         };
         browser.list(None, start.abs, None, None);
         browser
@@ -1006,7 +1080,7 @@ impl Browser {
 
     /// Tests: a stand-in engine.
     #[cfg(test)]
-    fn set_ops_run(&mut self, run: ops::Run) {
+    pub(crate) fn set_ops_run(&mut self, run: ops::Run) {
         self.ops = ops::Ops::new(run);
     }
 
@@ -2588,6 +2662,14 @@ impl Browser {
     /// the last result, else the keys. Over a viewer: an operation's question, else the switch's
     /// line, else the viewer's result, else its keys.
     fn status_line(&self) -> Status {
+        // A switch to another machine waits for a job that writes (10 §7.4).
+        if let Some(Switching {
+            step: SwitchStep::Waiting(what),
+            ..
+        }) = &self.switching
+        {
+            return Status::info(format!("waiting for {what}…"));
+        }
         if let Some(opening) = &self.opening {
             let name = &opening.name;
             if opening.cancel.load(Ordering::Relaxed) {
@@ -2705,10 +2787,336 @@ impl Browser {
     /// a git action runs (§7.4's jobs that write). A viewer already closed that still writes is
     /// waited for after the window ([`open`]), so it loses nothing.
     pub(crate) fn would_lose(&mut self) -> bool {
-        let holds = |v: &mut Viewer| v.embedded.window.hold() != crate::views::Hold::Clean;
-        self.viewer.as_mut().is_some_and(holds)
-            || self.ops.busy()
-            || self.git.panels.iter().any(|p| !p.running.is_empty())
+        self.viewer_hold() == crate::views::Hold::Unsaved || self.writing().is_some()
+    }
+
+    /// What the viewer on screen holds (07 §10); clean without one.
+    fn viewer_hold(&mut self) -> crate::views::Hold {
+        (self.viewer.as_mut()).map_or(crate::views::Hold::Clean, |v| v.embedded.window.hold())
+    }
+
+    /// The job that writes and runs now (10 §7.4), as `waiting for <it>…` names it: the viewer's
+    /// Save, a file operation, a git action — what the window would lose besides unsaved edits
+    /// ([`Browser::would_lose`]).
+    pub(crate) fn writing(&mut self) -> Option<String> {
+        let label = self.label.as_deref();
+        if let Some(v) = self.viewer.as_mut() {
+            if v.embedded.window.hold() == crate::views::Hold::Saving {
+                return Some(format!("the save of {}", show(label, &v.abs)));
+            }
+        }
+        if self.ops.busy() {
+            return Some("the file operation".to_string());
+        }
+        let git = self.git.panels.iter().any(|p| !p.running.is_empty());
+        git.then(|| "the git action".to_string())
+    }
+
+    /// The window's [`Leftover`]: the terminal's switch finishes it for a browser it replaced or
+    /// made.
+    pub(crate) fn leftovers(&self) -> Leftovers {
+        Leftovers(self.leftover.clone())
+    }
+
+    /// The switch to another machine, `to`, asks the browser first (10 §7.4): a job that writes
+    /// makes it wait (`waiting for <it>…` on the status row); unsaved edits in the viewer ask
+    /// `Save the changes to host:/abs before switching to HOST?`; the git panel's open dialog or
+    /// the planner's plan, which the state does not carry, asks whether to switch without it.
+    /// Held, it is asked for again once what held it is over ([`Browser::switch_due`]) and
+    /// decided anew; asked again while held, nothing new happens.
+    pub(crate) fn before_switch(&mut self, to: &str) -> Before {
+        let mut let_go = None;
+        if let Some(s) = self.switching.take() {
+            if s.to == to {
+                match s.step {
+                    SwitchStep::LetGo(ask) | SwitchStep::Cleared(ask) => let_go = Some(ask),
+                    SwitchStep::Due => {}
+                    _ => {
+                        self.switching = Some(s);
+                        return Before::Held;
+                    }
+                }
+            }
+        }
+        let step = if let Some(what) = self.writing() {
+            SwitchStep::Waiting(what)
+        } else if let_go != Some(Ask::Unsaved) && self.viewer_hold() == crate::views::Hold::Unsaved
+        {
+            SwitchStep::Asking(Ask::Unsaved, None)
+        } else if let_go != Some(Ask::Git) && self.git_dropped().is_some() {
+            SwitchStep::Asking(Ask::Git, None)
+        } else {
+            self.discarding = let_go == Some(Ask::Unsaved);
+            return Before::Go;
+        };
+        self.switching = Some(Switching {
+            to: to.to_string(),
+            step,
+        });
+        Before::Held
+    }
+
+    /// What held the switch is over (once): the terminal asks for it again, and
+    /// [`Browser::before_switch`] decides anew — but for what the question's answer let go.
+    pub(crate) fn switch_due(&mut self) -> bool {
+        match self.switching.as_ref().map(|s| s.step.clone()) {
+            Some(SwitchStep::Due) => {
+                self.switching = None;
+                true
+            }
+            Some(SwitchStep::LetGo(ask)) => {
+                if let Some(s) = self.switching.as_mut() {
+                    s.step = SwitchStep::Cleared(ask);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The question before the switch is up: the view keys are a question's (08 §4), so a view
+    /// digit or the hex view's Esc never acts under it.
+    pub(crate) fn switch_asking(&self) -> bool {
+        (self.switching.as_ref()).is_some_and(|s| matches!(s.step, SwitchStep::Asking(..)))
+    }
+
+    /// The switch has started with Discard's answer (once): the viewer drops its edits as its
+    /// own Discard does — the journal it recorded removed — and is left; the state taken just
+    /// before has it, so HOST opens its file as stored.
+    pub(crate) fn discard_for_switch(&mut self, ctx: &egui::Context) {
+        if !std::mem::take(&mut self.discarding) {
+            return;
+        }
+        if let Some(viewer) = self.viewer.as_mut() {
+            viewer.embedded.window.discard();
+        }
+        self.leave(ctx, Exit::List);
+    }
+
+    /// The switch did not start after all: Discard's answer is forgotten.
+    pub(crate) fn switch_not_started(&mut self) {
+        self.discarding = false;
+    }
+
+    /// The switch ended without HOST's state (10 §7.3): the terminal stays and lists again —
+    /// both panels re-read, each bar where it was.
+    pub(crate) fn switch_back(&mut self, ctx: &egui::Context) {
+        for i in 0..2 {
+            let p = &self.panels[i];
+            let (dir, at) = (p.dir.clone(), p.highlight);
+            let name = p.current().map(|e| e.name.clone());
+            self.relist(Some(i), dir, name, Some(at), Some(ctx));
+        }
+    }
+
+    /// A viewer is on screen with no question of its own up and no Save running — its prompt,
+    /// if it asked one, was answered by staying (HOST's half drops the state it took when the
+    /// prompt came up, X2-switch).
+    pub(crate) fn viewer_stays(&mut self) -> bool {
+        self.viewer.as_mut().is_some_and(|v| {
+            let window = &mut v.embedded.window;
+            window.view_state() != crate::view_keys::State::Question
+                && window.hold() != crate::views::Hold::Saving
+        })
+    }
+
+    /// What of the git panels the switch's state does not carry and would drop (10 §7.4,
+    /// Tensions): the planner's plan, or a dialog with what is typed in it.
+    fn git_dropped(&self) -> Option<&'static str> {
+        let panels = &self.git.panels;
+        if panels.iter().any(|p| p.view.planner_model().is_some()) {
+            return Some("The planner's unsaved plan");
+        }
+        panels.iter().any(|p| p.view.dialog_up()).then_some(
+            "The git panel's open dialog, and what is typed in it (a commit message, a tag's or \
+             a branch's name),",
+        )
+    }
+
+    /// A held switch's part of a pass, before anything else of it: the job waited for has ended,
+    /// the Save chosen landed (the viewer clean) or did not (the switch is off, said why), what
+    /// a question asked about is gone.
+    fn switching_pass(&mut self, ctx: &egui::Context) {
+        let Some(s) = self.switching.as_ref() else {
+            return;
+        };
+        let (to, step) = (s.to.clone(), s.step.clone());
+        let next = match step {
+            // Not asked for again in its pass: the switch went elsewhere, or not at all.
+            SwitchStep::Cleared(_) => None,
+            SwitchStep::Due | SwitchStep::LetGo(_) => Some(step),
+            SwitchStep::Waiting(_) => Some(match self.writing() {
+                Some(what) => SwitchStep::Waiting(what),
+                None => SwitchStep::Due,
+            }),
+            SwitchStep::Asking(Ask::Unsaved, keyboard) => Some(match self.viewer_hold() {
+                crate::views::Hold::Unsaved => SwitchStep::Asking(Ask::Unsaved, keyboard),
+                // Saved, saving, or the viewer left, meanwhile: decided anew.
+                _ => SwitchStep::Due,
+            }),
+            SwitchStep::Asking(Ask::Git, keyboard) => Some(match self.git_dropped() {
+                Some(_) => SwitchStep::Asking(Ask::Git, keyboard),
+                None => SwitchStep::Due,
+            }),
+            // The key is still to be played, or played this pass: its Save starts in it.
+            SwitchStep::Saving if !self.script.is_empty() || self.script_gap > 0 => {
+                Some(SwitchStep::Saving)
+            }
+            SwitchStep::Saving => {
+                let question = self.viewer.as_mut().is_some_and(|v| {
+                    v.embedded.window.view_state() == crate::view_keys::State::Question
+                });
+                match self.viewer_hold() {
+                    crate::views::Hold::Saving => Some(SwitchStep::Saving),
+                    crate::views::Hold::Unsaved if question => Some(SwitchStep::Saving),
+                    crate::views::Hold::Unsaved => {
+                        let file = self.viewer.as_ref().map(|v| v.abs.clone());
+                        let file = show(self.label.as_deref(), &file.unwrap_or_default());
+                        self.status = Status::error(format!(
+                            "not switched to {to}: {file} still has unsaved changes"
+                        ));
+                        None
+                    }
+                    crate::views::Hold::Clean => Some(SwitchStep::Due),
+                }
+            }
+        };
+        match next {
+            Some(step) => {
+                if matches!(step, SwitchStep::Waiting(_) | SwitchStep::Saving) {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+                self.switching = Some(Switching { to, step });
+            }
+            None => self.switching = None,
+        }
+    }
+
+    /// While the question before the switch is up, the pass's keys, typed text, pastes, copies
+    /// and cuts are the question's: taken out before anything of the pass sees them, and handed
+    /// to it at the pass's end ([`Browser::switch_question`]).
+    fn switch_keys(&mut self, ctx: &egui::Context) -> Vec<egui::Event> {
+        if !self.switch_asking() {
+            return Vec::new();
+        }
+        ctx.input_mut(|i| {
+            let (taken, kept) = std::mem::take(&mut i.events).into_iter().partition(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key { .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::Ime(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Copy
+                        | egui::Event::Cut
+                )
+            });
+            i.events = kept;
+            taken
+        })
+    }
+
+    /// The question before the switch (10 §7.4), at the pass's end over `area` (the list's or
+    /// the viewer's), while it is up, given the pass's `keys` ([`Browser::switch_keys`]); in
+    /// cells through `ops::dialog`, as the viewers' close prompts are: Tab walks the buttons,
+    /// Enter or Space presses the one with the keyboard, Esc or a click outside is Cancel. Its
+    /// text holds the keyboard first, as the delete dialog's does, given back after the pass of
+    /// what is behind it (a hex grid or a git dialog's field takes it every pass).
+    /// - Unsaved edits: `Save the changes to host:/abs before switching to HOST?` — Save · Save
+    ///   As… · Discard · Cancel (07 §10). Save and Save As… press the viewer's own F5 and F7 (as
+    ///   the owner's keys, [`Browser::play`]) and the switch goes once the viewer is clean;
+    ///   Discard lets it go, the viewer's edits dropped once it has started
+    ///   ([`Browser::discard_for_switch`]); Cancel stays.
+    /// - The git panel's dialog or plan: what is dropped, and Switch · Cancel.
+    fn switch_question(&mut self, ctx: &egui::Context, area: Rect, keys: Vec<egui::Event>) {
+        use ops::dialog::{self, Button, Ink, Inputs, Part};
+        let Some((to, ask, keyboard)) = self.switching.as_ref().and_then(|s| match s.step {
+            SwitchStep::Asking(ask, keyboard) => Some((s.to.clone(), ask, keyboard)),
+            _ => None,
+        }) else {
+            return;
+        };
+        let id = egui::Id::unique("sopen-switch-question");
+        let held = id.with("question");
+        let (title, text, buttons) = match ask {
+            Ask::Unsaved => {
+                let Some(viewer) = self.viewer.as_ref() else {
+                    return;
+                };
+                let file = show(self.label.as_deref(), &viewer.abs);
+                let buttons = vec![
+                    Button::new("Save", id.with("save")),
+                    Button::new("Save As…", id.with("save as")),
+                    Button::new("Discard", id.with("discard")),
+                    Button::new("Cancel", id.with("cancel")),
+                ];
+                let text = format!("Save the changes to {file} before switching to {to}?");
+                (SWITCH_TITLE.to_string(), text, buttons)
+            }
+            Ask::Git => {
+                let what = self.git_dropped().unwrap_or("The git panel's open dialog");
+                let buttons = vec![
+                    Button::new("Switch", id.with("switch")),
+                    Button::new("Cancel", id.with("cancel")),
+                ];
+                let text = format!("{what} is not carried to {to}: switching drops it.");
+                (format!("Switch to {to}"), text, buttons)
+            }
+        };
+        let parts = [
+            Part::Held(text, Ink::Text, held),
+            Part::Blank,
+            Part::Buttons(buttons),
+        ];
+        // The keyboard the pass behind took, given back; then the pass's keys, the question's.
+        ctx.memory_mut(|m| m.request_focus(keyboard.unwrap_or(held)));
+        ctx.input_mut(|i| i.events.extend(keys));
+        let layout = dialog::layout(cells::Grid::over(area), &title, 50, &parts);
+        let shown = dialog::show(ctx, id, &layout, Inputs::default());
+        let played = |key: Key| Play::Key(key, Modifiers::NONE);
+        let keyboard = ctx
+            .memory(|m| m.focused())
+            .filter(|f| *f == held || shown.controls.contains(f))
+            .or(Some(held));
+        let step = if shown.clicked(id.with("save")) {
+            self.script.push_back(played(Key::F5));
+            Some(SwitchStep::Saving)
+        } else if shown.clicked(id.with("save as")) {
+            self.script.push_back(played(Key::F7));
+            Some(SwitchStep::Saving)
+        } else if shown.clicked(id.with("discard")) {
+            Some(SwitchStep::LetGo(Ask::Unsaved))
+        } else if shown.clicked(id.with("switch")) {
+            Some(SwitchStep::LetGo(Ask::Git))
+        } else if shown.clicked(id.with("cancel")) || shown.modal.should_close() {
+            None
+        } else {
+            Some(SwitchStep::Asking(ask, keyboard))
+        };
+        if !matches!(step, Some(SwitchStep::Asking(..))) {
+            // Answered: the keyboard goes back to what is behind (the viewer's F5 is played
+            // next).
+            ctx.memory_mut(|m| {
+                for c in std::iter::once(held).chain(shown.controls.iter().copied()) {
+                    m.surrender_focus(c);
+                }
+            });
+        }
+        // Nothing of the pass's keys is left for the passes after it.
+        ctx.input_mut(|i| {
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::Key { .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::Ime(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Copy
+                        | egui::Event::Cut
+                )
+            })
+        });
+        self.switching = step.map(|step| Switching { to, step });
     }
 }
 
@@ -2724,6 +3132,8 @@ impl Window for Browser {
         // The switch's own pass, before anything of this one: a given state's next step, on
         // the display the last pass committed; the text view's wrap noted.
         self.switch_pass(&ctx);
+        self.switching_pass(&ctx);
+        let switch_keys = self.switch_keys(&ctx);
         self.play(&ctx);
         self.git_stop_on_esc(&ctx);
         self.poll(&ctx);
@@ -2790,6 +3200,8 @@ impl Window for Browser {
         if let Some(changed) = changed {
             self.after_operation(&ctx, changed);
         }
+        // The question before a switch to another machine, over everything (10 §7.4).
+        self.switch_question(&ctx, area, switch_keys);
         let working = !self.listing.is_empty()
             || self.opening.is_some()
             || !self.launches.is_empty()

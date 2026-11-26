@@ -4553,6 +4553,19 @@ impl MediaWindow {
         self.painted = true;
     }
 
+    /// Discard (07 §10): the edits go back to the file as it is and nothing more is written —
+    /// this session's journal, the one it holds, removed as the window goes
+    /// ([`MediaWindow::settle_journal`]); it closes without asking, unless an export runs.
+    fn discard_edits(&mut self) {
+        self.prompt = false;
+        // With an export running the window still waits for it (closing again closes it now):
+        // that rule is unchanged by the edits.
+        self.close_ok = self.job.is_none();
+        self.discard = true;
+        self.timeline = Timeline::new(self.media.rate(), self.media.ticks());
+        self.sel.clear();
+    }
+
     fn close_prompt(&mut self, ctx: &egui::Context) {
         // A file at a revision has nothing to ask about (its Discard removes the journal).
         if self.at_revision {
@@ -4612,13 +4625,7 @@ impl MediaWindow {
                     self.open_save_as(true);
                 }
                 if ui.button("Discard").on_hover_text(&discard_hover).clicked() {
-                    self.prompt = false;
-                    self.close_ok = !exporting;
-                    self.discard = true;
-                    // With an export running the window still waits for it (closing again
-                    // closes it now): that rule is unchanged by the edits.
-                    self.timeline = Timeline::new(self.media.rate(), self.media.ticks());
-                    self.sel.clear();
+                    self.discard_edits();
                     super::request_close(ctx);
                 }
                 if ui.button("Cancel").clicked() {
@@ -5078,6 +5085,10 @@ impl super::Window for MediaWindow {
 
     /// What a switch of views asks or waits for (08 §5): a Save, an Export or a Save As
     /// running is waited for as a Save is (it writes through the views' save session).
+    fn discard(&mut self) {
+        self.discard_edits();
+    }
+
     fn hold(&mut self) -> crate::views::Hold {
         if self.busy() {
             crate::views::Hold::Saving

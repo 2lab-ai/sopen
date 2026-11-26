@@ -716,11 +716,15 @@ impl Browser {
 
     /// After the view's pass: what the view declares to the view keys for the next input.
     pub(super) fn views_after(&mut self, ctx: &egui::Context) {
+        // The question before a switch to another machine (10 §7.4) is a question too: no view
+        // digit and no hex view's Esc acts under it.
+        let switch_asking = self.switch_asking();
         let Some(viewer) = self.viewer.as_mut() else {
             return;
         };
         let views = &mut viewer.views;
-        let state = if views.picker.is_some() || help::is_open(ctx) || views.set.asking() {
+        let asking = views.picker.is_some() || help::is_open(ctx) || views.set.asking();
+        let state = if asking || switch_asking {
             view_keys::State::Question
         } else if ctx.text_edit_focused() {
             view_keys::State::Field

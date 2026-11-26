@@ -3716,12 +3716,7 @@ impl ImageWindow {
                     None => discard,
                 };
                 if discard.clicked() {
-                    self.prompt = false;
-                    // Discard is the one way out that does not keep the journal (07 §3).
-                    if let Err(e) = self.keeper.discard() {
-                        eprintln!("sopen: {e:#}");
-                    }
-                    self.close_ok = true;
+                    self.discard_edits();
                     super::request_close(ctx);
                 }
                 if ui.button("Cancel").clicked() {
@@ -3732,6 +3727,18 @@ impl ImageWindow {
         if modal.should_close() {
             self.prompt = false;
         }
+    }
+}
+
+impl ImageWindow {
+    /// Discard (07 §10): the one way out that does not keep the journal (07 §3) — this
+    /// session's, the one its keeper holds, removed — and the window closes without asking.
+    fn discard_edits(&mut self) {
+        self.prompt = false;
+        if let Err(e) = self.keeper.discard() {
+            eprintln!("sopen: {e:#}");
+        }
+        self.close_ok = true;
     }
 }
 
@@ -3851,6 +3858,10 @@ impl super::Window for ImageWindow {
     }
 
     /// What a switch of views asks or waits for (08 §5): a Save in its queue is one under way.
+    fn discard(&mut self) {
+        self.discard_edits();
+    }
+
     fn hold(&mut self) -> crate::views::Hold {
         if self.job.is_some() || self.queued.is_some() {
             crate::views::Hold::Saving
@@ -5085,6 +5096,12 @@ impl super::Window for Streaming {
         }
     }
 
+    fn discard(&mut self) {
+        if let Some(image) = &mut self.image {
+            image.discard();
+        }
+    }
+
     fn saves_landed(&self) -> u64 {
         self.image.as_ref().map_or(0, |image| image.saves_landed())
     }
@@ -5264,6 +5281,14 @@ impl super::Window for Switching {
             (Some(hex), _) => hex.close_requested(),
             (None, Some(image)) => image.close_requested(),
             (None, None) => true,
+        }
+    }
+
+    fn discard(&mut self) {
+        match (&mut self.hex, &mut self.image) {
+            (Some(hex), _) => hex.discard(),
+            (None, Some(image)) => image.discard(),
+            (None, None) => {}
         }
     }
 
