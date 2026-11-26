@@ -91,6 +91,24 @@ fn each_in_its_place(fx: &Fx, w: f32, h: f32) {
     );
 }
 
+/// A text preview at `side`: rows of cells, every one inside its host's frame (a cell in from
+/// the side, egui's) — the previewed file's, never the list's.
+fn preview_cells_inside(fx: &Fx, side: Rect) {
+    let inside = Rect::from_min_max(side.min + chrome::CELL, side.max - chrome::CELL);
+    let rows = cells_in(fx, side);
+    assert!(!rows.is_empty(), "the preview's rows in cells");
+    for (r, text) in &rows {
+        assert!(
+            inside.expand(0.5).contains_rect(*r),
+            "{text:?} at {r:?} out of {inside:?}"
+        );
+        assert!(
+            !text.contains("Name"),
+            "the list's head in the preview: {text:?}"
+        );
+    }
+}
+
 /// The rows of cells inside `area`, as the column query reads them.
 fn cells_in(fx: &Fx, area: Rect) -> Vec<(Rect, String)> {
     fx.drv.column(area)
@@ -112,10 +130,10 @@ impl Fx {
     }
 }
 
-/// Q1 (TS-8): the list is cells over its whole side, the preview today's egui at the other
-/// side's cells, and nothing either paints leaves its side — at 1000×700, at sizes off the cell
-/// grid, with a hex preview wider than a narrow side, and with the tree (the spike had no check
-/// for it).
+/// Q1 (TS-8): the list is cells over its whole side, the preview at the other side's cells —
+/// a text preview's rows cells inside its host's egui frame (X3-text) — and nothing either paints
+/// leaves its side — at 1000×700, at sizes off the cell grid, with a hex preview wider than a
+/// narrow side, and with the tree (the spike had no check for it).
 #[test]
 fn q1_panes_on_cell_rects_clip_there_and_follow_a_resize() {
     let mut fx = fixture();
@@ -126,9 +144,10 @@ fn q1_panes_on_cell_rects_clip_there_and_follow_a_resize() {
     let list = cells_in(&fx, left);
     assert_eq!(list.len(), 40, "{list:?}");
     assert!(list.iter().all(|(r, _)| r.width() == left.width()));
-    // The preview (egui) at the right side's cells: no cells there.
+    // The preview at the right side's cells: its rows cells inside its host's frame (egui's,
+    // a cell in from the side), none of the list's.
     assert_eq!(panes(&fx), [left, right]);
-    assert!(cells_in(&fx, right).is_empty(), "the preview is egui's");
+    preview_cells_inside(&fx, right);
     let line = fx.drv.find_text("plain notes").expect("the previewed text");
     assert!(right.contains_rect(line), "{line:?} inside {right:?}");
     each_in_its_place(&fx, 1000.0, 700.0);
@@ -140,7 +159,7 @@ fn q1_panes_on_cell_rects_clip_there_and_follow_a_resize() {
     fx.select("main.rs");
     fx.rested();
     assert_eq!(fx.b.active, 1);
-    assert!(cells_in(&fx, left).is_empty(), "the preview on the left");
+    preview_cells_inside(&fx, left);
     assert_eq!(cells_in(&fx, right).len(), 40);
     each_in_its_place(&fx, 1000.0, 700.0);
     // Sizes off the grid: both sides on whole cells, the pane following its side.
@@ -286,10 +305,17 @@ fn q1_the_keyboard_moves_between_the_grid_and_egui_fields_dialogs_and_the_viewer
     // Enter: the text viewer at the central area's cells, no list under it, the title row in
     // cells above it; its keys are its own.
     fx.open("main.rs");
+    let in_grid = cells_in(&fx, g.rect(g.all()));
     assert!(
-        cells_in(&fx, g.rect(g.all())).is_empty(),
-        "no list under a viewer"
+        in_grid.iter().any(|(_, t)| t.contains("Text Viewer")),
+        "the viewer in cells"
     );
+    for name in ["Name", "photo", "zeta", "Listed"] {
+        assert!(
+            !in_grid.iter().any(|(_, t)| t.contains(name)),
+            "no list under a viewer: {name:?} in {in_grid:?}"
+        );
+    }
     let title = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, CELL));
     assert_eq!(cells_in(&fx, title).len(), 1, "the title row in cells");
     assert!(

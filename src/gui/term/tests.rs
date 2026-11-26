@@ -1234,8 +1234,9 @@ fn f12_and_alt_g_ask_for_the_switch_and_a_copy_goes_out_as_osc_52() {
 fn a_pane_the_window_draws_in_egui_is_a_hand_off_box_and_a_click_on_it_switches() {
     let fx = fixture(0);
     let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
-    // The bar on `readme.md` (`..`, three folders, then it): the other side previews it.
-    let mut events: Vec<CEvent> = (0..4).map(|_| plain(KeyCode::Down)).collect();
+    // The bar on the song (`..`, three folders, `readme.md` and the Korean name, then it): the
+    // other side previews it — egui's, where a text preview is cells since X3-text.
+    let mut events: Vec<CEvent> = (0..6).map(|_| plain(KeyCode::Down)).collect();
     events.extend(click(75, 15));
     events.push(ctrl_q());
     tape.0.borrow_mut().events.extend(events);
@@ -2435,12 +2436,13 @@ fn a_status_line_prints_no_control_characters() {
     assert!(vt.copied.is_empty(), "no OSC 52 smuggled in");
 }
 
-/// A hand-off box says what is there: the pane's own title (the preview's path).
+/// A hand-off box says what is there: the pane's own title (the preview's path) — the song's,
+/// a preview egui draws (a text preview is cells since X3-text).
 #[test]
 fn a_hand_off_box_has_the_panes_title() {
     let fx = fixture(0);
     let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
-    let mut events: Vec<CEvent> = (0..4).map(|_| plain(KeyCode::Down)).collect();
+    let mut events: Vec<CEvent> = (0..6).map(|_| plain(KeyCode::Down)).collect();
     events.push(ctrl_q());
     tape.0.borrow_mut().events.extend(events);
     let mut no_switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> { Ok(None) };
@@ -2448,7 +2450,7 @@ fn a_hand_off_box_has_the_panes_title() {
     assert_eq!(b.run(&mut win, &mut no_switch).unwrap(), End::Closed);
     let vt = bytes.vt(100, 30);
     assert!(
-        vt.part(1, 50, 100).contains("readme.md"),
+        vt.part(1, 50, 100).contains("song.mp3"),
         "the box's title:\n{}",
         vt.text()
     );
@@ -2921,9 +2923,9 @@ fn terminal_receipt(fx: &Fx, ctx: egui::Context, cols: u16, rows: u16) -> String
 /// window's of the same screen are the same bytes, the mode button (`[GUI]` in the terminal, none
 /// in a window started directly: 10 §5's one difference) left out of both; read back, its rows
 /// and attribute table are what the window painted, cell by cell, colours and all (a cell of the
-/// window's changed is one difference). Again with the bar on a text file, whose preview egui
-/// draws — in both a hand-off box titled with the file — and with F1's help open, which the end
-/// of a pass paints above the window.
+/// window's changed is one difference). Again with the bar on a song, whose preview egui draws
+/// — in both a hand-off box titled with the file — and with F1's help open, which the end of a
+/// pass paints above the window.
 #[test]
 fn the_cells_receipt_of_both_backends_is_the_same_bytes() {
     let fx = fixture(0);
@@ -2948,11 +2950,12 @@ fn the_cells_receipt_of_both_backends_is_the_same_bytes() {
     let mut changed = painted.clone();
     changed.0[100 * 5 + 3].bg = Color32::from_rgb(1, 2, 3);
     assert_eq!(dump_differences(&dumped, &changed).len(), 1, "the control");
-    // The bar on `readme.md` (`..`, three folders, then it), moved before either receipt: the
-    // receipt's own keys are `SOPEN_KEYS`, which the browser plays.
+    // The bar on the song (`..`, three folders, `readme.md` and the Korean name, then it), whose
+    // preview egui draws (a text preview is cells since X3-text), moved before either receipt:
+    // the receipt's own keys are `SOPEN_KEYS`, which the browser plays.
     let fx = fixture(0);
     let (mut drv, mut win) = window(&fx, 100, 30);
-    for _ in 0..4 {
+    for _ in 0..6 {
         drv.key(&mut win, Key::ArrowDown, Modifiers::NONE);
     }
     drv.until(&mut win, 20, |w| w.ready());
@@ -2961,10 +2964,7 @@ fn the_cells_receipt_of_both_backends_is_the_same_bytes() {
     // The head line, then the screen's rows: the box's top line is the screen's second row.
     let rows: Vec<&str> = terminal.lines().collect();
     assert!(terminal.contains(HAND_OFF), "{terminal}");
-    assert!(
-        rows[2].contains("readme.md"),
-        "the box's title:\n{terminal}"
-    );
+    assert!(rows[2].contains("song.mp3"), "the box's title:\n{terminal}");
     assert_eq!(terminal, in_window, "the same bytes with a hand-off box");
     // F1's help (TS-1's last screen), painted after the window's own pass: the terminal's run on
     // the window's context, where the help is open.
@@ -4116,3 +4116,5 @@ fn ts6_a_box_line_beside_a_wide_glyph_in_a_name_stays_as_written() {
         assert!(shown.starts_with(name), "{name}: {shown:?}");
     }
 }
+
+mod text;
