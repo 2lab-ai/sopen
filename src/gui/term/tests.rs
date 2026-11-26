@@ -40,18 +40,18 @@ use unicode_width::UnicodeWidthStr;
 
 /// A colour as the terminal was told it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ink {
+pub(super) enum Ink {
     Default,
     Rgb(Color32),
     Index(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct VtCell {
+pub(super) struct VtCell {
     /// The grapheme; empty in a wide glyph's second cell.
     symbol: String,
-    fg: Ink,
-    bg: Ink,
+    pub(super) fg: Ink,
+    pub(super) bg: Ink,
 }
 
 impl Default for VtCell {
@@ -69,7 +69,7 @@ impl Default for VtCell {
 /// stack, what OSC 52 copied, and what was printed on the main screen. A sequence it does not
 /// know fails the test: the backend sends nothing else.
 #[derive(Debug, Clone)]
-struct Vt {
+pub(super) struct Vt {
     cols: u16,
     rows: u16,
     cells: Vec<VtCell>,
@@ -77,9 +77,9 @@ struct Vt {
     y: u16,
     fg: Ink,
     bg: Ink,
-    cursor_shown: bool,
-    alt: bool,
-    modes: std::collections::BTreeSet<u16>,
+    pub(super) cursor_shown: bool,
+    pub(super) alt: bool,
+    pub(super) modes: std::collections::BTreeSet<u16>,
     kitty: Vec<u16>,
     copied: Vec<String>,
     main: String,
@@ -92,7 +92,7 @@ struct Vt {
 }
 
 impl Vt {
-    fn new(cols: u16, rows: u16) -> Vt {
+    pub(super) fn new(cols: u16, rows: u16) -> Vt {
         Vt {
             cols,
             rows,
@@ -131,7 +131,7 @@ impl Vt {
         self.cells = vec![VtCell::default(); usize::from(self.cols) * usize::from(self.rows)];
     }
 
-    fn cell(&self, x: u16, y: u16) -> &VtCell {
+    pub(super) fn cell(&self, x: u16, y: u16) -> &VtCell {
         &self.cells[usize::from(y) * usize::from(self.cols) + usize::from(x)]
     }
 
@@ -147,18 +147,18 @@ impl Vt {
             .collect()
     }
 
-    fn row(&self, y: u16) -> String {
+    pub(super) fn row(&self, y: u16) -> String {
         self.part(y, 0, self.cols)
     }
 
-    fn text(&self) -> String {
+    pub(super) fn text(&self) -> String {
         (0..self.rows)
             .map(|y| self.row(y))
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    fn feed(&mut self, bytes: &[u8]) {
+    pub(super) fn feed(&mut self, bytes: &[u8]) {
         let text = std::str::from_utf8(bytes).expect("the backend writes UTF-8");
         let mut rest = text;
         while !rest.is_empty() {
@@ -513,7 +513,7 @@ fn differences_but(
 // A scripted terminal.
 
 #[derive(Default)]
-struct Script {
+pub(super) struct Script {
     size: (u16, u16),
     kitty: bool,
     /// The probe's answer (TS-6): `─` took two cells; and how many times it was asked.
@@ -523,15 +523,15 @@ struct Script {
     hang_up_at_probe: bool,
     /// Raw mode now, and every switch of it.
     raw: bool,
-    raws: Vec<bool>,
+    pub(super) raws: Vec<bool>,
     drops: usize,
     /// Typed into the terminal and not read yet: what `drop_input` drops.
     unread: VecDeque<CEvent>,
     /// The test's events, each given once `gate` says the browser has settled.
-    events: VecDeque<CEvent>,
-    gate: Option<Box<dyn Fn() -> bool>>,
+    pub(super) events: VecDeque<CEvent>,
+    pub(super) gate: Option<Box<dyn Fn() -> bool>>,
     /// The signal that comes once the events are all given.
-    stop: Option<i32>,
+    pub(super) stop: Option<i32>,
     stopped: bool,
     /// The signal comes with the last event (during its pass), not after it.
     stop_with_last: bool,
@@ -542,7 +542,7 @@ struct Script {
 }
 
 #[derive(Clone, Default)]
-struct Tape(Rc<RefCell<Script>>);
+pub(super) struct Tape(pub(super) Rc<RefCell<Script>>);
 
 impl Tty for Tape {
     fn raw(&mut self, on: bool) -> io::Result<()> {
@@ -613,7 +613,7 @@ impl Tty for Tape {
 
 /// The bytes the backend wrote.
 #[derive(Clone, Default)]
-struct Bytes(Rc<RefCell<Vec<u8>>>);
+pub(super) struct Bytes(pub(super) Rc<RefCell<Vec<u8>>>);
 
 impl Write for Bytes {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -626,7 +626,7 @@ impl Write for Bytes {
 }
 
 impl Bytes {
-    fn text(&self) -> String {
+    pub(super) fn text(&self) -> String {
         String::from_utf8(self.0.borrow().clone()).unwrap()
     }
 
@@ -637,7 +637,7 @@ impl Bytes {
     }
 
     /// The screen since the terminal was last entered.
-    fn last_screen(&self, cols: u16, rows: u16) -> Vt {
+    pub(super) fn last_screen(&self, cols: u16, rows: u16) -> Vt {
         let text = self.text();
         let mut vt = Vt::new(cols, rows);
         vt.feed(&text.as_bytes()[text.rfind(ENTER).expect("entered")..]);
@@ -645,11 +645,11 @@ impl Bytes {
     }
 }
 
-fn key(code: KeyCode, modifiers: KeyModifiers) -> CEvent {
+pub(super) fn key(code: KeyCode, modifiers: KeyModifiers) -> CEvent {
     CEvent::Key(KeyEvent::new(code, modifiers))
 }
 
-fn plain(code: KeyCode) -> CEvent {
+pub(super) fn plain(code: KeyCode) -> CEvent {
     key(code, KeyModifiers::NONE)
 }
 
@@ -673,17 +673,17 @@ fn click(column: u16, row: u16) -> [CEvent; 2] {
     ]
 }
 
-fn ctrl_q() -> CEvent {
+pub(super) fn ctrl_q() -> CEvent {
     key(KeyCode::Char('q'), KeyModifiers::CONTROL)
 }
 
 // ---------------------------------------------------------------------------------------------
 // The browser.
 
-struct Fx {
+pub(super) struct Fx {
     _tmp: tempfile::TempDir,
-    root: String,
-    b: Rc<RefCell<Browser>>,
+    pub(super) root: String,
+    pub(super) b: Rc<RefCell<Browser>>,
 }
 
 /// The browser on a folder of three folders (one Korean), and files with a Korean name, an
@@ -693,7 +693,7 @@ fn fixture(more: usize) -> Fx {
 }
 
 /// [`fixture`] with the files `named` besides.
-fn fixture_with(more: usize, named: &[&str]) -> Fx {
+pub(super) fn fixture_with(more: usize, named: &[&str]) -> Fx {
     fixture_free(more, named, None)
 }
 
@@ -806,7 +806,12 @@ fn skin() -> egui::Context {
 
 /// A backend on a scripted `cols` × `rows` terminal (`kitty`: it answers the keyboard query)
 /// whose events wait for `fx`'s browser to settle.
-fn backend(fx: &Fx, cols: u16, rows: u16, kitty: bool) -> (Backend<Tape, Bytes>, Tape, Bytes) {
+pub(super) fn backend(
+    fx: &Fx,
+    cols: u16,
+    rows: u16,
+    kitty: bool,
+) -> (Backend<Tape, Bytes>, Tape, Bytes) {
     let tape = Tape::default();
     {
         let mut s = tape.0.borrow_mut();
@@ -1462,7 +1467,7 @@ fn the_switch_runs_the_browser_in_a_window_and_back_with_its_state() {
             [800.0, 480.0],
             "the window gets the grid's size (T16)"
         );
-        to_window(b, &browser, Ok(Place::Here), |mut switched| {
+        to_window(b, &browser, Ok(Place::Here), no_host, |mut switched| {
             assert!(
                 !typing.0.borrow().raw,
                 "the terminal is left while the window runs"
@@ -1537,7 +1542,7 @@ fn the_help_crosses_the_switch_as_it_is() {
         tape.0.borrow_mut().stop = Some(libc::SIGTERM);
         let browser = fx.b.clone();
         let mut switch = |b: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
-            to_window(b, &browser, Ok(Place::Here), |mut switched| {
+            to_window(b, &browser, Ok(Place::Here), no_host, |mut switched| {
                 let mut drv = Driver::new(800.0, 480.0);
                 drv.as_shell();
                 drv.until(&mut switched, 20, |w| w.ready());
@@ -1571,13 +1576,17 @@ fn the_help_crosses_the_switch_as_it_is() {
     }
 }
 
+/// The switch of a test that never goes to a HOST.
+fn no_host(_: &mut Backend<Tape, Bytes>, host: &str) -> io::Result<Option<String>> {
+    panic!("no switch to {host} in this test")
+}
+
+/// A HOST is the remote switch's (`remote::to_host`, X2-switch), never a window here: its line is
+/// what the terminal says; no display and a window that does not open say why.
 #[test]
 fn a_switch_to_a_host_or_without_a_display_or_a_window_that_does_not_open_says_why() {
     let cases: [(Place, &str); 3] = [
-        (
-            Place::Host("box".into()),
-            "switching to box comes with the remote switch; --here switches on this machine",
-        ),
+        (Place::Host("box".into()), "the remote switch to box"),
         (Place::NoDisplay, NO_DISPLAY),
         (
             Place::Here,
@@ -1595,7 +1604,10 @@ fn a_switch_to_a_host_or_without_a_display_or_a_window_that_does_not_open_says_w
         let browser = fx.b.clone();
         let mut place = Some(place);
         let mut switch = |b: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
-            to_window(b, &browser, Ok(place.take().unwrap()), |_| {
+            let host = |_: &mut Backend<Tape, Bytes>, host: &str| {
+                Ok(Some(format!("the remote switch to {host}")))
+            };
+            to_window(b, &browser, Ok(place.take().unwrap()), host, |_| {
                 Err(crate::gui::NotStarted {
                     reason: "no backend".into(),
                 }
@@ -1633,7 +1645,7 @@ fn the_mode_button_switches_from_the_terminal_and_back_from_the_window() {
     let mut in_window = 0;
     let mut switch = |b: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
         in_window += 1;
-        to_window(b, &browser, Ok(Place::Here), |mut switched| {
+        to_window(b, &browser, Ok(Place::Here), no_host, |mut switched| {
             let mut drv = Driver::new(800.0, 480.0);
             drv.as_shell();
             drv.until(&mut switched, 20, |w| w.ready());
@@ -2185,7 +2197,7 @@ fn the_mode_button_works_over_an_open_dialog_both_ways() {
             text.contains("name abc"),
             "the dialog open when [GUI] switched:\n{text}"
         );
-        to_window(b, &browser, Ok(Place::Here), |mut switched| {
+        to_window(b, &browser, Ok(Place::Here), no_host, |mut switched| {
             let mut drv = Driver::new(800.0, 480.0);
             drv.as_shell();
             drv.until(&mut switched, 20, |w| w.ready());
@@ -2603,7 +2615,7 @@ fn gui_press_then_back(
     let browser = fx.b.clone();
     let typing = tape.clone();
     move |b: &mut Backend<Tape, Bytes>| {
-        let ran = to_window(b, &browser, Ok(Place::Here), |mut switched| {
+        let ran = to_window(b, &browser, Ok(Place::Here), no_host, |mut switched| {
             // The release of the press on [GUI], sent while the window runs.
             let up = mouse(MouseEventKind::Up(MouseButton::Left), 87, 0);
             typing.0.borrow_mut().unread.push_back(up);

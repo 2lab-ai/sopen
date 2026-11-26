@@ -638,11 +638,17 @@ impl Views {
 
     /// Everything the views hold goes with the viewer: the hidden windows (what they may still
     /// write settles after them), a view being made, the view keys.
-    pub(super) fn close(self, closing: &mut Vec<Closing>, workers: &mut Vec<JoinHandle<()>>) {
+    pub(super) fn close(
+        self,
+        closing: &mut Vec<Closing>,
+        workers: &mut Vec<JoinHandle<()>>,
+        file: &str,
+    ) {
         for kept in self.hidden {
             closing.push(Closing {
                 settle: kept.embedded.settle,
                 hold: kept.hold,
+                file: file.to_string(),
             });
         }
         if let Some(mut making) = self.making {
@@ -714,13 +720,30 @@ impl Browser {
         }
     }
 
+    /// The question before a switch to another machine came up between two passes (10 §7.4):
+    /// the view keys are a question's from the next input on, before any pass of it.
+    pub(super) fn views_question(&mut self) {
+        if let Some(viewer) = self.viewer.as_mut() {
+            let mut slot = viewer
+                .views
+                .slot
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            slot.state = view_keys::State::Question;
+        }
+    }
+
     /// After the view's pass: what the view declares to the view keys for the next input.
     pub(super) fn views_after(&mut self, ctx: &egui::Context) {
+        // The question before a switch to another machine (10 §7.4) is a question too: no view
+        // digit and no hex view's Esc acts under it.
+        let switch_asking = self.switch_asking();
         let Some(viewer) = self.viewer.as_mut() else {
             return;
         };
         let views = &mut viewer.views;
-        let state = if views.picker.is_some() || help::is_open(ctx) || views.set.asking() {
+        let asking = views.picker.is_some() || help::is_open(ctx) || views.set.asking();
+        let state = if asking || switch_asking {
             view_keys::State::Question
         } else if ctx.text_edit_focused() {
             view_keys::State::Field
@@ -1065,9 +1088,11 @@ impl Browser {
                         })
                     };
                     if let Some((embedded, hold)) = closed {
+                        let file = super::show(self.label.as_deref(), &viewer.abs);
                         self.leftover.borrow_mut().closing.push(Closing {
                             settle: embedded.settle,
                             hold,
+                            file,
                         });
                     }
                 }

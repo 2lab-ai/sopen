@@ -244,7 +244,6 @@ impl SwitchState {
     /// they must come back on one host, and absolute ([`SwitchState::check`]); a Copy / Move
     /// target typed as an absolute place (it reads as sopen's command line, 04 §5.2) is
     /// rewritten too ([`retarget`]).
-    #[cfg_attr(not(test), allow(dead_code))] // X2-switch's; only tests until then.
     pub(crate) fn rewritten(
         &self,
         map: impl Fn(&str) -> anyhow::Result<String>,
