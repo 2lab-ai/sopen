@@ -7,22 +7,31 @@
 //!
 //! - **Highlighting is the viewer's** (E18): its [`Highlight`], on a worker of the viewer's pool,
 //!   reads a [`LineSource`] over a snapshot of the buffer ([`Snap`]: the original shared, the
-//!   typed bytes copied once) — never the live buffer, never on a frame. Its kept states stand
-//!   every [`STATE_LINES`] lines (E19; EH-3 measures them). An edit drops the states after the
-//!   first changed line's; the rows keep their old colours, laid around what changed, until
-//!   the worker answers for the document as it is now (EH-1). A line over [`LINE_MAX`] stops
-//!   highlighting there, as it does in the viewer: the walk finds it and never parses it; lines
-//!   starting past [`HIGHLIGHT_MAX`] are not offered (EH-2).
-//! - **One row per line** (E16), scrolled sideways to keep the caret in view. A row is laid in
-//!   the file's order, a character per cell — two for a wide one, a tab to the next multiple of
-//!   [`TAB`], a control character its code page 437 glyph: `edit::ops`' column rule, so the cell
-//!   the caret is drawn in is the column ↑ ↓ keep. A long line is walked from checkpoints every
-//!   [`STRIDE`] bytes, so a row deep in it decodes at most a stride before what it shows.
-//! - **The caret** is two scan lines in Insert and the whole cell, its colours swapped, in
-//!   Overwrite (§4's [추정] choice), in both backends; a terminal adds its cursor there.
+//!   typed bytes copied once) — never the live buffer, never on a frame. One ask waits for it at
+//!   most ([`Mailbox`]: a newer one replaces it, keeping the earlier changed line), and an edit
+//!   makes the page asked before it stale at once, so no reply is laid on another document. A
+//!   line is looked at no further than [`LINE_MAX`] past its start, a newer ask stopping a long
+//!   read; the page's first line is found by the buffer's own index. Its kept states stand every
+//!   [`STATE_LINES`] lines (E19; EH-3 measures them). An edit drops the states after the first
+//!   changed line's; the rows keep their old colours, laid around what changed, until the worker
+//!   answers for the document as it is now (EH-1). Highlighting stops where the viewer's does
+//!   (EH-2): at a line over [`LINE_MAX`], which the walk finds and never parses, and past
+//!   [`HIGHLIGHT_MAX`] at the viewer's last index mark below it.
+//! - **One row per line** (E16), scrolled sideways to keep the caret's character, and a preedit
+//!   at it, whole in view — after a resize too. A row is laid in the file's order, a character
+//!   per cell — two for a wide one, a tab to the next multiple of [`TAB`], a control character
+//!   its code page 437 glyph (the viewer's stand-in in an ambiguous-wide terminal), a cell
+//!   taking [`MARKS`] combining marks: `edit::ops`' column rule, so the cell the caret is drawn
+//!   in is the column ↑ ↓ keep. A long line is walked from checkpoints every [`STRIDE`] bytes,
+//!   kept across an edit before the place it changed, so a row or the caret deep in it decodes
+//!   about a stride; a run of marks longer than a stride ends a row.
+//! - **The caret** is two scan lines in Insert and its character's cells, their colours swapped,
+//!   in Overwrite (§4's [추정] choice), in both backends — the window's foot covered there
+//!   ([`EditView::paint`]); a terminal adds its cursor.
 //! - **The input method** (E10, E20): the window's preedit is drawn over the cells at the caret,
-//!   and the IME rectangle set there, while the editor has the keyboard — not while an arming
-//!   waits for a letter, which then matches the physical key (`edit::arm`'s rule).
+//!   and the IME rectangle set there — held to the text's edges while the caret is scrolled
+//!   away — whenever the editor has the keyboard, but not while an arming waits for a letter,
+//!   which then matches the physical key (`edit::arm`'s rule).
 //! - **Keys** go through `edit::arm::Keys` ([`EditView::press`]): edits are made here, the rest
 //!   (Save, leaving, the menus, the switch) handed back to the binding (ED-layout), as are the
 //!   frame's `[↕]` and the `^S` prompt's `[Save]` clicked ([`EditView::take_commands`]).
@@ -31,7 +40,7 @@ use super::cells::{self, Buffer, Cells, Grid, Pen, Position};
 use super::chrome::{self, cga, FKey, Strip};
 use super::text::{self, Highlight, Line, LineSource, Pool, Runs, Slot, HIGHLIGHT_MAX, LINE_MAX};
 use super::Window;
-use crate::edit::arm::{Armed, Backend, Command, Keys, Press};
+use crate::edit::arm::{save_over, Armed, Backend, Command, Keys, Press};
 use crate::edit::buffer::{Buffer as Doc, Original, Piece, Span};
 use crate::edit::ops::{Clip, Editor, Said, Sel, TAB};
 use crate::encoding::{Encoding, Pick};
@@ -41,8 +50,8 @@ use eframe::egui::{self, Color32};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use syntect::parsing::SyntaxReference;
 use unicode_width::UnicodeWidthChar;
 
@@ -61,6 +70,16 @@ pub const STRIDE: u64 = 64 * 1024;
 
 /// Lines whose checkpoints are kept; past it they all go (the next walk makes them again).
 const WALKED_LINES: usize = 64;
+
+/// Bytes past a line's start, beyond [`LINE_MAX`], its end is looked for in: a BOM and an LF unit.
+const LOOK: u64 = 8;
+
+/// The cells of the file's name the `^S` prompt keeps at the least (R1 S10).
+const NAME_MIN: usize = 12;
+
+/// Zero-width characters (combining marks) a cell takes after its glyph, as a terminal keeps a
+/// few; the rest of a run is not drawn (R1 MUST 6).
+const MARKS: usize = 8;
 
 /// The title row's menus (§4): each name's first letter chooses it.
 pub const MENUS: [&str; 6] = ["File", "Edit", "Search", "Block", "Git", "Options"];
@@ -83,6 +102,14 @@ const fn key(n: u8, label: &'static str) -> FKey {
     FKey { n, label }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The bytes this thread's snapshots read, and its rows and carets decoded: the tests'
+    /// measure of the work.
+    static SNAP_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static DECODED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// The cells `c` takes at column `col`: `edit::ops`' rule — a tab to the next multiple of
 /// [`TAB`], a control character its one glyph, else its width (a mark none).
 fn width(c: char, col: u64) -> u64 {
@@ -101,6 +128,12 @@ fn face(c: char) -> char {
     } else {
         chrome::shown_char(c)
     }
+}
+
+/// Whether `c`'s face is a glyph of sopen's own (a C0 control or DEL as its code page 437 glyph,
+/// a C1 control as `·`): an ambiguous-wide terminal is sent the viewer's stand-in for it.
+fn own(c: char) -> bool {
+    (c < ' ' && c != '\t') || c == '\u{7F}' || ('\u{80}'..='\u{9F}').contains(&c)
 }
 
 /// A line's text as the highlighter and the rows both read it: `bytes` from `at` (a line's
@@ -126,7 +159,8 @@ struct Snap {
     spans: Arc<[(u64, Span)]>,
     typed: Arc<[(u64, Arc<[u8]>)]>,
     len: u64,
-    /// The lines offered: those starting before [`HIGHLIGHT_MAX`].
+    /// The document's lines (the viewer's stop past [`HIGHLIGHT_MAX`] is the worker's to find:
+    /// [`BufLines::viewer_stop`]).
     lines: u64,
     enc: Encoding,
     bom: u64,
@@ -137,6 +171,8 @@ impl Snap {
     fn read(&self, range: Range<u64>, out: &mut Vec<u8>) {
         let end = range.end.min(self.len);
         let mut at = range.start;
+        #[cfg(test)]
+        SNAP_READ.with(|n| n.set(n.get() + end.saturating_sub(at)));
         let mut i = self
             .spans
             .partition_point(|(s, _)| *s <= at)
@@ -170,21 +206,24 @@ impl Snap {
         }
     }
 
-    /// Where the LF unit after `at` starts (the end, past the last line) and where the next
-    /// line starts.
-    fn line_end(&self, at: u64) -> (u64, u64) {
-        let mut x = at;
+    /// Where the line from `at` ends, looked for no further than [`LINE_MAX`] (and [`LOOK`])
+    /// past `at`: its LF unit's start and the next line's start — the document's end for the
+    /// last line — or `None` for a longer line, whose end is never looked for (R1 MUST 1).
+    fn line_end(&self, at: u64) -> Option<(u64, u64)> {
+        let limit = (at + LINE_MAX as u64 + LOOK).min(self.len);
+        // A short read first, as most lines are short, then longer ones.
+        let (mut x, mut step) = (at, 256);
         let mut bytes = Vec::new();
-        while x < self.len {
+        while x < limit {
             bytes.clear();
-            self.read(x..(x + CHUNK).min(self.len), &mut bytes);
+            self.read(x..(x + step).min(limit), &mut bytes);
             if let Some(i) = self.enc.find_lf(&bytes, x) {
                 let lf = x + i as u64;
-                return (lf, lf + self.enc.lf().len() as u64);
+                return Some((lf, lf + self.enc.lf().len() as u64));
             }
-            x += bytes.len() as u64;
+            (x, step) = (x + bytes.len() as u64, step * 4);
         }
-        (self.len, self.len)
+        (limit == self.len).then_some((self.len, self.len))
     }
 }
 
@@ -217,8 +256,24 @@ impl Typed {
     }
 }
 
+/// A read stopped for a newer ask, or because the view went: never an error to show.
+#[derive(Debug)]
+struct Superseded;
+
+impl std::fmt::Display for Superseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a newer page was asked for")
+    }
+}
+
+impl std::error::Error for Superseded {}
+
 /// The buffer as the highlighter reads it: lines found from the nearest start known — line 0,
-/// a kept state's line, or the line after the last one read — never through an index.
+/// a kept state's line, the line after the last one read, or the page's first line as the
+/// buffer's own index gives it (12 §7.1) — each looked at no further than [`LINE_MAX`] past
+/// its start. A line longer than that comes cut and ends the read (the walk stops there, as the
+/// viewer's does: [`LineSource::finds_stop`]); so does the viewer's stop past [`HIGHLIGHT_MAX`]
+/// ([`BufLines::viewer_stop`]).
 struct BufLines {
     snap: Snap,
     /// Where the line of kept state `i` (line `i` × [`STATE_LINES`]) starts, as far as a read
@@ -226,6 +281,13 @@ struct BufLines {
     starts: Vec<u64>,
     /// The line after the last one read, and where it starts.
     next: Option<(u64, u64)>,
+    /// The page's first line, and where the buffer's index says it starts.
+    known: Option<(u64, u64)>,
+    /// The text viewer's index marks within [`HIGHLIGHT_MAX`] as far as found, and its stop.
+    marks: Vec<(u64, u64)>,
+    stop: Option<u64>,
+    /// A newer ask came or the view went: a read stops between lines ([`Superseded`]).
+    cancel: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl BufLines {
@@ -234,47 +296,123 @@ impl BufLines {
             snap,
             starts: vec![0],
             next: None,
+            known: None,
+            marks: vec![(0, 0)],
+            stop: None,
+            cancel: None,
         }
     }
 
-    /// The document is `snap` now, changed from line `edit` on: the starts after it go.
-    fn renew(&mut self, snap: Snap, edit: Option<u64>) {
+    /// The document is `snap` now, changed from line `edit` on — the starts and the viewer's
+    /// marks after it go, and its stop is found again — and its page starts as `known` says.
+    fn renew(&mut self, snap: Snap, edit: Option<u64>, known: Option<(u64, u64)>) {
         self.snap = snap;
+        self.known = known;
         if let Some(line) = edit {
             self.starts.truncate((line / STATE_LINES) as usize + 1);
             self.next = self.next.filter(|&(n, _)| n <= line);
+            self.marks.retain(|&(n, _)| n <= line);
+            self.stop = None;
         }
+    }
+
+    fn cancelled(&self) -> Result<()> {
+        match self.cancel.as_ref().is_some_and(|c| c()) {
+            true => Err(anyhow::Error::new(Superseded)),
+            false => Ok(()),
+        }
+    }
+
+    /// Where the text viewer stops highlighting a document past [`HIGHLIGHT_MAX`] (`text.rs`'s
+    /// `share_first`, R1 S5): at the line of its last index mark at or below it — a mark every
+    /// `BLOCK_LINES` lines, or at the first line start a `SPAN` past the last. `None` for a
+    /// shorter document, highlighted whole. One pass over the line starts from the last mark
+    /// kept, a chunk at a time, a newer ask stopping it; a line longer than [`LINE_MAX`] ends it
+    /// there, where highlighting stops anyway.
+    fn viewer_stop(&mut self) -> Result<Option<u64>> {
+        if self.snap.len <= HIGHLIGHT_MAX || self.stop.is_some() {
+            return Ok(self.stop);
+        }
+        let (enc, len) = (self.snap.enc, self.snap.len);
+        let lf = enc.lf().len() as u64;
+        let (mut last, mut last_at) = *self.marks.last().expect("line 0's mark");
+        let (mut line, mut start, mut x) = (last, last_at, last_at);
+        let mut bytes = Vec::new();
+        let stop = 'scan: loop {
+            if x >= len {
+                break last;
+            }
+            self.cancelled()?;
+            let to = (x + CHUNK).min(len);
+            bytes.clear();
+            self.snap.read(x..to, &mut bytes);
+            let mut k = 0;
+            while let Some(i) = enc.find_lf(&bytes[k..], x + k as u64) {
+                if x + (k + i) as u64 - start > LINE_MAX as u64 + LOOK {
+                    break 'scan line;
+                }
+                k += i + lf as usize;
+                (line, start) = (line + 1, x + k as u64);
+                if line - last >= text::BLOCK_LINES || start - last_at >= text::SPAN {
+                    if start > HIGHLIGHT_MAX {
+                        break 'scan last;
+                    }
+                    (last, last_at) = (line, start);
+                    self.marks.push((line, start));
+                }
+            }
+            x = to;
+            if x < len && x - start > LINE_MAX as u64 + LOOK {
+                break line;
+            }
+        };
+        self.stop = Some(stop);
+        Ok(self.stop)
     }
 }
 
 impl LineSource for BufLines {
     fn read_lines(&mut self, first: u64, count: usize) -> Result<Vec<Line>> {
-        let last = first.saturating_add(count as u64).min(self.snap.lines);
+        let stop = self.viewer_stop()?;
+        let last = (first.saturating_add(count as u64).min(self.snap.lines))
+            .min(stop.map_or(u64::MAX, |s| s + 1));
         let mut out = Vec::new();
         if first >= last {
             return Ok(out);
         }
         let i = ((first / STATE_LINES) as usize).min(self.starts.len() - 1);
-        let (mut line, mut at) = (i as u64 * STATE_LINES, self.starts[i]);
-        if let Some((n, x)) = self.next.filter(|&(n, _)| n <= first && n > line) {
-            (line, at) = (n, x);
+        let mut from = (i as u64 * STATE_LINES, self.starts[i]);
+        for known in [self.next, self.known].into_iter().flatten() {
+            if known.0 <= first && known.0 > from.0 {
+                from = known;
+            }
         }
+        let (mut line, mut at) = from;
         let enc = self.snap.enc;
         while line < last {
+            self.cancelled()?;
             if line.is_multiple_of(STATE_LINES) && line / STATE_LINES == self.starts.len() as u64 {
                 self.starts.push(at);
             }
-            let (lf, next) = self.snap.line_end(at);
+            let text_at = if line == 0 { self.snap.bom } else { at };
+            let end = self.snap.line_end(at);
+            let cut = Some(line) == stop
+                || end.is_none_or(|(lf, _)| lf.saturating_sub(text_at) > LINE_MAX as u64);
             if line >= first {
-                let from = if line == 0 { self.snap.bom.min(lf) } else { at };
-                let cut = lf - from > LINE_MAX as u64;
+                let lf = end.map_or(text_at + LINE_MAX as u64, |(lf, _)| lf);
+                let from = text_at.min(lf);
                 let mut bytes = Vec::new();
                 self.snap
                     .read(from..lf.min(from + LINE_MAX as u64), &mut bytes);
-                let text = line_text(enc, from, bytes, cut, next > lf);
+                let ended = end.is_some_and(|(lf, next)| next > lf);
+                let text = line_text(enc, from, bytes, cut, ended);
                 out.push(Line { text, cut });
             }
-            (line, at) = (line + 1, next);
+            match end.filter(|_| !cut) {
+                Some((_, next)) => (line, at) = (line + 1, next),
+                // The read ends with a cut line: nothing after it is looked for.
+                None => return Ok(out),
+            }
         }
         self.next = Some((line, at));
         Ok(out)
@@ -287,15 +425,20 @@ impl LineSource for BufLines {
     fn mark_line(&self, i: usize) -> u64 {
         (i as u64 * STATE_LINES).min(self.snap.lines)
     }
+
+    fn finds_stop(&self) -> bool {
+        true
+    }
 }
 
-/// A page the view wants highlighted, under generation `gen`, of the document `snap`;
-/// `edit`: the first line changed since the last ask.
+/// A page the view wants highlighted, under generation `gen`, of the document `snap`: its
+/// first line `top` and where that starts (the buffer's index), `count` lines; `edit`: the first
+/// line changed since the last ask.
 struct Ask {
     gen: u64,
     snap: Snap,
     edit: Option<u64>,
-    top: u64,
+    top: (u64, u64),
     count: usize,
 }
 
@@ -304,10 +447,41 @@ enum Done {
     Failed(String),
 }
 
+/// The earlier of two changed lines (an ask's `edit`).
+fn earlier(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The newest ask, waiting for the worker: one at most — a newer one replaces it, keeping the
+/// earlier changed line of the two — so a held worker never piles snapshots up (R1 MUST 2).
+#[derive(Default)]
+struct Mailbox {
+    ask: Mutex<Option<Ask>>,
+    ready: Condvar,
+}
+
+impl Mailbox {
+    fn put(&self, mut ask: Ask) {
+        let mut slot = lock(&self.ask);
+        if let Some(old) = slot.take() {
+            ask.edit = earlier(old.edit, ask.edit);
+        }
+        *slot = Some(ask);
+        self.ready.notify_one();
+    }
+}
+
 /// The highlighting worker, from the view's side: dropping it tells it to stop; it is never
 /// joined (a syntect call in progress ends on its own).
 struct Worker {
-    asks: Sender<Ask>,
+    mail: Arc<Mailbox>,
     done: Receiver<Done>,
     latest: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
@@ -317,21 +491,31 @@ struct Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::SeqCst);
+        // Under the lock: the worker sees the stop before it waits, or is woken from it.
+        let _held = lock(&self.mail.ask);
+        self.mail.ready.notify_all();
     }
 }
 
 impl Worker {
-    /// Starts `hl` on a thread of its own when `pool` has a slot: only the newest ask is
-    /// highlighted, the edits of every one before it applied first.
+    /// Starts `hl` on a thread of its own when `pool` has a slot: it takes the newest ask, its
+    /// edits and those of every ask it replaced applied first.
     fn start(mut hl: Highlight, ctx: egui::Context, pool: &Arc<Pool>) -> Option<Worker> {
         let slot: Slot = pool.admit()?;
-        let (asks, rx) = mpsc::channel::<Ask>();
+        let mail = Arc::new(Mailbox::default());
         let (tx, done) = mpsc::channel();
         let latest = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let parsed = hl.parsed();
-        let (l, st) = (latest.clone(), stop.clone());
+        let current = Arc::new(AtomicU64::new(0));
+        let cancel: Arc<dyn Fn() -> bool + Send + Sync> = {
+            let (l, st, c) = (latest.clone(), stop.clone(), current.clone());
+            Arc::new(move || {
+                st.load(Ordering::Relaxed) || l.load(Ordering::Relaxed) != c.load(Ordering::Relaxed)
+            })
+        };
+        let (mailbox, st) = (mail.clone(), stop.clone());
         std::thread::spawn(move || {
             let _slot = slot;
             let wake = ctx.clone();
@@ -341,37 +525,44 @@ impl Worker {
             };
             let work = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut src: Option<BufLines> = None;
-                while let Ok(mut ask) = rx.recv() {
-                    let mut edit = ask.edit;
-                    while let Ok(newer) = rx.try_recv() {
-                        edit = match (edit, newer.edit) {
-                            (Some(a), Some(b)) => Some(a.min(b)),
-                            (a, b) => a.or(b),
-                        };
-                        ask = newer;
-                    }
-                    if st.load(Ordering::Relaxed) {
-                        break;
-                    }
+                loop {
+                    let ask = {
+                        let mut waiting = lock(&mailbox.ask);
+                        loop {
+                            if st.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            if let Some(ask) = waiting.take() {
+                                break ask;
+                            }
+                            waiting =
+                                (mailbox.ready.wait(waiting)).unwrap_or_else(|p| p.into_inner());
+                        }
+                    };
+                    current.store(ask.gen, Ordering::Relaxed);
                     let src = match &mut src {
                         Some(s) => {
-                            s.renew(ask.snap, edit);
+                            s.renew(ask.snap, ask.edit, Some(ask.top));
                             s
                         }
-                        None => src.insert(BufLines::new(ask.snap)),
+                        None => {
+                            let mut s = BufLines::new(ask.snap);
+                            (s.known, s.cancel) = (Some(ask.top), Some(cancel.clone()));
+                            src.insert(s)
+                        }
                     };
-                    if let Some(line) = edit {
+                    if let Some(line) = ask.edit {
                         hl.edited(line, src.mark_before(line));
                     }
                     let gen = ask.gen;
-                    let dropped = || st.load(Ordering::Relaxed) || l.load(Ordering::Relaxed) != gen;
-                    match hl.page(src, ask.top, ask.count, &dropped) {
+                    match hl.page(src, ask.top.0, ask.count, &|| cancel()) {
                         Ok(Some(runs)) => send(Done::Page {
                             gen,
-                            top: ask.top,
+                            top: ask.top.0,
                             runs,
                         }),
                         Ok(None) => {}
+                        Err(e) if e.is::<Superseded>() => {}
                         Err(e) => {
                             send(Done::Failed(format!("{e:#}")));
                             break;
@@ -384,12 +575,18 @@ impl Worker {
             }
         });
         Some(Worker {
-            asks,
+            mail,
             done,
             latest,
             stop,
             parsed,
         })
+    }
+
+    /// Asks waiting for the worker (the tests).
+    #[cfg(test)]
+    fn pending(&self) -> usize {
+        usize::from(lock(&self.mail.ask).is_some())
     }
 }
 
@@ -460,7 +657,8 @@ impl Hl {
 // Walking a line.
 
 /// A long line's checkpoints, per line start: a character start and its column every
-/// [`STRIDE`] bytes walked. Any edit drops them all.
+/// [`STRIDE`] bytes walked. An edit drops those at its place and past it, and the lines that
+/// start there or past it (R1 MUST 8).
 #[derive(Default)]
 struct Checkpoints(HashMap<u64, Vec<(u64, u64)>>);
 
@@ -472,14 +670,26 @@ impl Checkpoints {
         i.checked_sub(1).map_or((ls, 0), |i| v[i])
     }
 
+    /// Where the line at `ls` takes its next checkpoint: a stride past its last.
+    fn due(&self, ls: u64) -> u64 {
+        let last = self.0.get(&ls).and_then(|v| v.last());
+        last.map_or(ls, |l| l.0) + STRIDE
+    }
+
+    /// A checkpoint at `at`, at least a stride past the line's last.
     fn record(&mut self, ls: u64, at: u64, col: u64) {
         if !self.0.contains_key(&ls) && self.0.len() >= WALKED_LINES {
             self.0.clear();
         }
-        let v = self.0.entry(ls).or_default();
-        if at >= v.last().map_or(ls, |l| l.0) + STRIDE {
-            v.push((at, col));
-        }
+        self.0.entry(ls).or_default().push((at, col));
+    }
+
+    /// The document changed from byte `at` on: what was found before it stays.
+    fn edited(&mut self, at: u64) {
+        self.0.retain(|&ls, v| {
+            v.retain(|&(x, _)| x < at);
+            ls < at && !v.is_empty()
+        });
     }
 }
 
@@ -494,11 +704,14 @@ fn walk(
 ) {
     let enc = b.encoding();
     let (mut at, mut col) = from;
+    let mut due = walked.due(ls);
     let mut bytes = Vec::new();
     while at < end {
         let to = (at + CHUNK).min(end);
         bytes.clear();
         b.read(at..to, &mut bytes);
+        #[cfg(test)]
+        DECODED.with(|n| n.set(n.get() + (to - at)));
         let (mut cells, mut used) = enc.decode(&bytes, to == end);
         if used == 0 {
             (cells, used) = enc.decode(&bytes, true);
@@ -511,8 +724,9 @@ fn walk(
             }
             col += w;
             x += u64::from(c.len);
-            if x >= ls + STRIDE {
+            if x >= due {
                 walked.record(ls, x, col);
+                due = x + STRIDE;
             }
         }
         at += used as u64;
@@ -555,8 +769,15 @@ pub struct EditView {
     left: u64,
     rows: u64,
     cols: u64,
-    /// The caret moved or the text changed: the next pass brings the caret into view.
+    /// The caret moved, the text changed or the window did: the next pass brings the caret
+    /// into view.
     follow: bool,
+    /// The wheel's part of a row, kept for its next event (R1 S7).
+    wheel_rest: f32,
+    /// The cells the caret's character takes (Overwrite's block: R1 S9).
+    caret_w: u16,
+    /// The pass is shown in an ambiguous-wide terminal (10 §10).
+    wide: bool,
     /// The document's version: one more at each change.
     version: u64,
     hl: Hl,
@@ -602,6 +823,9 @@ impl EditView {
             rows: 22,
             cols: 49,
             follow: true,
+            wheel_rest: 0.0,
+            caret_w: 1,
+            wide: false,
             version: 0,
             hl: Hl::default(),
             walked: Checkpoints::default(),
@@ -705,7 +929,13 @@ impl EditView {
         let line = b.line_of(at.min(b.len()));
         let delta = b.lines() as i64 - lines as i64;
         self.version += 1;
-        self.walked = Checkpoints::default();
+        self.walked.edited(at);
+        // A page asked of the document before this edit is never laid on it (R1 MUST 3): the
+        // worker drops it, and the view takes no reply asked before now.
+        self.hl.gen += 1;
+        if let Some(worker) = &self.hl.worker {
+            worker.latest.store(self.hl.gen, Ordering::Relaxed);
+        }
         self.hl.edited(line, delta);
     }
 
@@ -721,18 +951,12 @@ impl EditView {
                 s
             })
             .collect();
-        let len = b.len();
-        let lines = if len > HIGHLIGHT_MAX {
-            b.line_of(HIGHLIGHT_MAX - 1) + 1
-        } else {
-            b.lines()
-        };
         Snap {
             original: b.original().clone(),
             spans: spans.into(),
             typed: self.hl.typed.chunks.clone().into(),
-            len,
-            lines,
+            len: b.len(),
+            lines: b.lines(),
             enc: b.encoding(),
             bom: self.ed.bom(),
         }
@@ -767,6 +991,9 @@ impl EditView {
         // An index from the line's start: only a line that has no checkpoint is highlighted.
         let mut i = 0;
         let mut out = Vec::new();
+        // Where the column last moved, and the marks since: a cell takes [`MARKS`] of them, and
+        // a run of them longer than a stride ends the row (R1 MUST 6).
+        let (mut moved, mut marks) = (from.0, 0);
         walk(
             self.ed.buffer(),
             &mut self.walked,
@@ -776,7 +1003,15 @@ impl EditView {
                 if col >= right {
                     return false;
                 }
-                if col + w > left || (w == 0 && col >= left) {
+                if w > 0 {
+                    (moved, marks) = (at, 0);
+                } else if at - moved > STRIDE {
+                    return false;
+                } else {
+                    marks += 1;
+                }
+                let shown = col + w > left || (w == 0 && col >= left);
+                if shown && (w > 0 || marks <= MARKS) {
                     out.push(Ch { at, c, col, w, i });
                 }
                 i += 1;
@@ -786,24 +1021,28 @@ impl EditView {
         out
     }
 
-    /// The caret's line and column.
-    fn caret_place(&mut self) -> (u64, u64) {
+    /// The caret's line and column, and the cells its character takes: two for a wide one,
+    /// else one (a tab's caret is its first cell; at the line's end, one).
+    fn caret_place(&mut self) -> (u64, u64, u64) {
         let caret = self.ed.caret();
         let line = self.ed.buffer().line_of(caret);
         let (ls, end, _) = self.body(line);
         let from = self.walked.before(ls, |at, _| at <= caret);
-        let mut col = from.1;
+        let (mut col, mut cells) = (from.1, 1);
         walk(
             self.ed.buffer(),
             &mut self.walked,
             (ls, end),
             from,
-            |at, _, c, w| {
-                col = c + if at < caret { w } else { 0 };
+            |at, c, x, w| {
+                col = x + if at < caret { w } else { 0 };
+                if at >= caret && c != '\t' {
+                    cells = w.max(1);
+                }
                 at < caret
             },
         );
-        (line, col)
+        (line, col, cells)
     }
 
     /// The place on line `n` at column `goal`: the first character reaching past it, or the
@@ -899,12 +1138,17 @@ impl EditView {
         }
         if let Some(why) = failed {
             self.hl.worker = None;
+            // Plain from now on: no colours of before are laid around the next edits (R1 S1).
+            self.hl.lines.clear();
             self.hl.status = Some(format!("highlighting stopped ({why}); shown plain"));
             return;
         }
         let want = (self.version, self.top, self.rows as usize);
         if self.hl.asked != Some(want) {
             let snap = self.snap();
+            // The page's first line as the buffer's own index finds it (R1 MUST 1).
+            let b = self.ed.buffer();
+            let start = b.line_start(self.top).unwrap_or(b.len());
             let hl = &mut self.hl;
             let worker = hl.worker.as_ref().expect("started");
             hl.gen += 1;
@@ -913,10 +1157,10 @@ impl EditView {
                 gen: hl.gen,
                 snap,
                 edit: hl.edit.take(),
-                top: self.top,
+                top: (self.top, start),
                 count: want.2,
             };
-            let _ = worker.asks.send(ask);
+            worker.mail.put(ask);
             hl.asked = Some(want);
             hl.answered = false;
             // The colours kept: the screen's and a screen either side.
@@ -951,20 +1195,28 @@ impl EditView {
         );
         let text_x = (inner.x + digits + 2).min(inner.right());
         let text = Cells::new(text_x, inner.y, inner.right() - text_x, inner.height);
-        (self.rows, self.cols) = (u64::from(text.height), u64::from(text.width));
+        let laid = (u64::from(text.height), u64::from(text.width));
+        // A window resized brings the caret back into view (R1 MUST 5); the wheel's rows on a
+        // layout that stays are kept.
+        self.follow |= laid != (self.rows, self.cols);
+        (self.rows, self.cols) = laid;
+        self.wide = cells::ambiguous_wide(&ctx);
         self.ed.set_page(self.rows);
         self.mouse(ui, grid, frame, text);
-        let (line, col) = self.caret_place();
+        let (line, col, w) = self.caret_place();
+        self.caret_w = w.min(2) as u16;
         if std::mem::take(&mut self.follow) {
             if line < self.top {
                 self.top = line;
             } else if line >= self.top + self.rows {
                 self.top = line + 1 - self.rows.max(1);
             }
+            // The caret's character whole, and a preedit at it (R1 MUST 4).
+            let need = w.max(cells::width(&self.preedit) as u64);
             if col < self.left {
                 self.left = col;
-            } else if col >= self.left + self.cols {
-                self.left = col + 1 - self.cols.max(1);
+            } else if col + need > self.left + self.cols {
+                self.left = (col + need).saturating_sub(self.cols).min(col);
             }
         }
         self.top = self.top.min(lines.saturating_sub(1));
@@ -988,19 +1240,45 @@ impl EditView {
         let max_top = lines.saturating_sub(self.rows);
         let thumb = (max_top > 0).then(|| self.top.min(max_top) as f32 / max_top as f32);
         cells::scroll_bar(buf, inner.right(), inner.y, inner.height, thumb);
-        let caret = (line >= self.top && line < self.top + self.rows)
-            .then(|| col.checked_sub(self.left).filter(|&c| c < self.cols))
-            .flatten()
-            .map(|c| Position::new(text_x + c as u16, text.y + (line - self.top) as u16))
-            .filter(|_| self.focused);
-        let caret = caret.map(|at| self.composing(&ctx, grid, buf, text, at));
+        if !self.focused || text.width == 0 || text.height == 0 {
+            return None;
+        }
+        // The caret's cell — else its place held to the text's edges, where the input method
+        // still goes (R1 MUST 9).
+        let shown = (self.top..self.top + self.rows).contains(&line)
+            && (self.left..self.left + self.cols).contains(&col);
+        let at = Position::new(
+            text_x + col.saturating_sub(self.left).min(self.cols - 1) as u16,
+            text.y + line.saturating_sub(self.top).min(self.rows - 1) as u16,
+        );
+        let caret = shown.then(|| self.composing(buf, text, at));
+        self.ime(&ctx, grid, text, caret.unwrap_or(at));
         if let Some(at) = caret.filter(|_| self.ed.overwrite() && self.preedit.is_empty()) {
-            // Overwrite: the whole cell, its colours swapped.
-            let cell = &mut buf[(at.x, at.y)];
-            let (fg, bg) = (cell.fg, cell.bg);
-            (cell.fg, cell.bg) = (bg, fg);
+            // Overwrite: the character's cells, both of a wide one, their colours swapped.
+            for x in at.x..(at.x + self.caret_w).min(text.right()) {
+                let cell = &mut buf[(x, at.y)];
+                let (fg, bg) = (cell.fg, cell.bg);
+                (cell.fg, cell.bg) = (bg, fg);
+            }
         }
         caret
+    }
+
+    /// Paints `buf` (`grid`'s) with the caret, as [`cells::paint`] does — in Overwrite with the
+    /// foot it draws covered in the block's colour, so the caret is the swapped cells alone (R1
+    /// S9).
+    pub fn paint(&self, ui: &egui::Ui, grid: &Grid, buf: &Buffer, caret: Option<Position>) {
+        let painter = ui.painter_at(grid.rect(grid.all()));
+        cells::paint(&painter, grid.origin, buf, caret);
+        let Some(at) = caret.filter(|_| self.ed.overwrite() && self.preedit.is_empty()) else {
+            return;
+        };
+        if let ratatui_core::style::Color::Rgb(r, g, b) = buf[(at.x, at.y)].bg {
+            let cells = grid.rect(Cells::new(at.x, at.y, self.caret_w.max(1), 1));
+            let foot =
+                egui::Rect::from_min_max(egui::pos2(cells.left(), cells.bottom() - 2.0), cells.max);
+            painter.rect_filled(foot, 0.0, Color32::from_rgb(r, g, b));
+        }
     }
 
     /// The frame with its title and buttons, double while the editor has the keyboard: `[■]`,
@@ -1065,16 +1343,21 @@ impl EditView {
                 self.hl.colors(n, &all)
             })
             .flatten();
-        let mut last = None;
+        // Each cell's symbol made once: its glyph and the marks after it (R1 MUST 6).
+        let mut cell: Option<(u16, String, Pen)> = None;
+        let put = |buf: &mut Buffer, cell: &mut Option<(u16, String, Pen)>| {
+            if let Some((x, shown, pen)) = cell.take() {
+                cells::put(buf, x, y, &shown, usize::from(text.right() - x), pen);
+            }
+        };
         for ch in chars {
             if ch.w == 0 {
-                if let Some(x) = last {
-                    let cell = &mut buf[(x, y)];
-                    let joined = format!("{}{}", cell.symbol(), ch.c);
-                    cell.set_symbol(&joined);
+                if let Some((_, shown, _)) = cell.as_mut() {
+                    shown.push(ch.c);
                 }
                 continue;
             }
+            put(buf, &mut cell);
             if ch.col + ch.w > right {
                 break;
             }
@@ -1091,26 +1374,20 @@ impl EditView {
             let from = ch.col.max(left);
             let shown = if ch.c == '\t' || ch.col < left {
                 " ".repeat((ch.col + ch.w - from) as usize)
+            } else if self.wide && own(ch.c) {
+                // sopen's own glyph as the viewer sends it there (10 §10, T38; R1 S6).
+                text::own_glyph(face(ch.c), true).to_string()
             } else {
                 face(ch.c).to_string()
             };
-            let x = text.x + (from - left) as u16;
-            let room = usize::from(text.right() - x);
-            cells::put(buf, x, y, &shown, room, pen);
-            last = Some(x);
+            cell = Some((text.x + (from - left) as u16, shown, pen));
         }
+        put(buf, &mut cell);
     }
 
-    /// The input method's preedit over the cells at the caret `at` (E20), and the IME rectangle
-    /// there while no arming waits for a letter (E10): where the caret then stands.
-    fn composing(
-        &mut self,
-        ctx: &egui::Context,
-        grid: &Grid,
-        buf: &mut Buffer,
-        text: Cells,
-        at: Position,
-    ) -> Position {
+    /// The input method's preedit over the cells at the caret `at` (E20): where the caret then
+    /// stands.
+    fn composing(&mut self, buf: &mut Buffer, text: Cells, at: Position) -> Position {
         let p = chrome::PALETTE;
         let mut caret = at;
         if !self.preedit.is_empty() {
@@ -1119,18 +1396,24 @@ impl EditView {
             let w = cells::put(buf, at.x, at.y, &self.preedit, room, pen) as u16;
             caret.x = (at.x + w).min(text.right().saturating_sub(1));
         }
-        if self.keys.armed() == Armed::None {
-            let cursor = grid.rect(Cells::new(caret.x, caret.y, 1, 1));
-            ctx.output_mut(|o| {
-                o.ime = Some(egui::output::IMEOutput {
-                    purpose: egui::IMEPurpose::Normal,
-                    rect: grid.rect(text),
-                    cursor_rect: cursor,
-                    should_interrupt_composition: false,
-                })
-            });
-        }
         caret
+    }
+
+    /// The IME rectangle at `at` of the text `text`, while the editor has the keyboard and no
+    /// arming waits for a letter (E10: the input method on only then).
+    fn ime(&self, ctx: &egui::Context, grid: &Grid, text: Cells, at: Position) {
+        if self.keys.armed() != Armed::None {
+            return;
+        }
+        let cursor = grid.rect(Cells::new(at.x, at.y, 1, 1));
+        ctx.output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                purpose: egui::IMEPurpose::Normal,
+                rect: grid.rect(text),
+                cursor_rect: cursor,
+                should_interrupt_composition: false,
+            })
+        });
     }
 
     /// A click or a drag in the text (the caret, a block), the wheel (scrolling), the frame's
@@ -1142,6 +1425,8 @@ impl EditView {
             for e in &i.events {
                 match e {
                     egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                        // A new composition is brought into view with the caret (R1 MUST 4).
+                        self.follow |= self.preedit != *text;
                         self.preedit.clone_from(text);
                     }
                     egui::Event::Ime(_) => self.preedit.clear(),
@@ -1184,9 +1469,12 @@ impl EditView {
             0.0
         };
         if wheel != 0.0 {
-            let rows = wheel.round() as i64;
+            // What is less than a row is kept for the next event, as the viewer's is (R1 S7).
+            let rows = wheel + self.wheel_rest;
+            let whole = rows.trunc();
+            self.wheel_rest = rows - whole;
             let last = self.ed.buffer().lines().saturating_sub(1);
-            self.top = self.top.saturating_add_signed(rows).min(last);
+            self.top = self.top.saturating_add_signed(whole as i64).min(last);
         }
         let pressed = response.drag_started() || response.clicked();
         if !(pressed || response.dragged()) {
@@ -1224,7 +1512,12 @@ impl EditView {
             }
         };
         if self.keys.armed() == Armed::Save {
-            let prompt = self.keys.mark(&self.name).unwrap_or_default();
+            // The name gives way first, to its last [`NAME_MIN`] cells, so `[Save]` and what
+            // every other key does stay; narrower than the words themselves (84 cells) their end
+            // gives way after it (R1 S10).
+            let fixed = cells::width(&save_over(""));
+            let name_room = room.saturating_sub(fixed).max(NAME_MIN);
+            let prompt = save_over(&cells::fit_left(&self.name, name_room));
             let shown = fit(&prompt, room);
             cells::put(buf, 1, y, &shown, room, Pen::new(p.warn, p.back));
             let at = shown.find("[Save]")?;
@@ -1371,12 +1664,7 @@ impl Window for EditView {
                         self.commands.push(command);
                     }
                 }
-                cells::paint(
-                    &ui.painter_at(grid.rect(grid.all())),
-                    grid.origin,
-                    &buf,
-                    caret,
-                );
+                self.paint(ui, &grid, &buf, caret);
             });
         // The clock turns over at the next minute.
         ui.ctx()

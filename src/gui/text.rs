@@ -142,9 +142,9 @@ use syntect::parsing::{
 };
 
 /// A mark in the line index every this many lines…
-const BLOCK_LINES: u64 = 256;
+pub(super) const BLOCK_LINES: u64 = 256;
 /// …or at the first line start this far past the last mark, whichever comes first.
-const SPAN: u64 = 64 * 1024;
+pub(super) const SPAN: u64 = 64 * 1024;
 /// The longest line highlighting parses, and the most of a line [`TextDoc::read_lines`] gives.
 /// (On screen a line is shown whole: wrapped in rows, or — not wrapped — from any byte of it.)
 pub const LINE_MAX: usize = 4096;
@@ -3331,6 +3331,12 @@ pub(super) trait LineSource {
     fn mark_before(&self, line: u64) -> usize;
     /// The line kept state `i` stands at; past the last, the source's line count.
     fn mark_line(&self, i: usize) -> u64;
+    /// Whether the source finds its stop line as it is read — a line it gives cut at
+    /// [`LINE_MAX`] stops highlighting there (the editor's buffer) — rather than knowing it
+    /// before from an index (the text document, whose walk parses any line as it reads it).
+    fn finds_stop(&self) -> bool {
+        false
+    }
 }
 
 impl LineSource for TextDoc {
@@ -3434,8 +3440,9 @@ impl Highlight {
 
     /// Parses lines `next..to` from `state`, keeping each line's runs in `keep` when given:
     /// [`Walked::Dropped`] when `dropped()` said to stop (checked before every line), and
-    /// [`Walked::Cut`] at a line cut at [`LINE_MAX`], which is never parsed (the text document's
-    /// stop line is known before, from its index; the editor's buffer finds it so, ED-screen).
+    /// [`Walked::Cut`] at a line cut at [`LINE_MAX`] of a source that finds its stop so
+    /// ([`LineSource::finds_stop`], the editor's buffer), which is never parsed; the text
+    /// document's stop line is known before, from its index.
     fn walk<L: LineSource + ?Sized>(
         &self,
         doc: &mut L,
@@ -3455,7 +3462,7 @@ impl Highlight {
                 if dropped() {
                     return Ok(Walked::Dropped);
                 }
-                if line.cut {
+                if line.cut && doc.finds_stop() {
                     return Ok(Walked::Cut(next));
                 }
                 let runs = self.run(state, &line.text);
@@ -6274,7 +6281,7 @@ fn row_chars(
 /// as a terminal that draws a glyph of ambiguous width in two cells (`wide`) is sent it (10 §10,
 /// T38): §10's stand-in, `.` for one it has none for (a letter the printer would lay in two
 /// cells); as it is everywhere else — as the hex view's CP437 column (`hex::column_glyph`).
-fn own_glyph(c: char, wide: bool) -> char {
+pub(super) fn own_glyph(c: char, wide: bool) -> char {
     if !wide || !super::term::ambiguous(c) {
         return c;
     }

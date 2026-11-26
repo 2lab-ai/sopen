@@ -6,7 +6,7 @@ use super::*;
 use crate::edit::ops::Doubt;
 use crate::gui::chrome::PALETTE;
 use crate::gui::testkit::Driver;
-use eframe::egui::{Event, ImeEvent, Key, Modifiers};
+use eframe::egui::{Event, ImeEvent, Key, Modifiers, Pos2};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -369,6 +369,19 @@ fn holding_hook(
     (hook, hold, reached, go)
 }
 
+/// Lets a held worker go after `secs` unless `done` (returned) is sent first: frames that
+/// waited on the parser then fail the test's time bound instead of hanging it.
+fn watchdog(go: &mpsc::Sender<()>, secs: u64) -> mpsc::Sender<()> {
+    let (done, rx) = mpsc::channel::<()>();
+    let go = go.clone();
+    std::thread::spawn(move || {
+        if rx.recv_timeout(Duration::from_secs(secs)).is_err() {
+            let _ = go.send(());
+        }
+    });
+    done
+}
+
 /// EH-1: typing at line 5,128 of a 10,007-line Rust file draws the edited line in its old colours
 /// — the frames go on while the parser is stuck on it — then in the new ones when the worker
 /// answers. An unclosed `/*` at line 1 makes the rest comment, far pages too; closing it brings
@@ -399,7 +412,9 @@ fn eh1_an_edit_keeps_its_old_colours_until_the_worker_answers() {
         .recv_timeout(Duration::from_secs(60))
         .expect("the worker reached the edited line");
     let started = Instant::now();
+    let done = watchdog(&go, 10);
     drv.idle(&mut v, 30);
+    let _ = done.send(());
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "the frames waited for the parser: {:?}",
@@ -559,13 +574,26 @@ fn edits_queued_behind_a_held_worker_reach_it_merged() {
     }
 }
 
-/// E19: the editor's kept states stand every 64 lines — one per 64 lines up to the last.
+/// E19: the editor's kept states stand every 64 lines — one per 64 lines up to the last, at
+/// those lines' starts.
 #[test]
 fn kept_states_stand_every_64_lines() {
-    let mut kept = KeptStates::new(rust(1_000).into_bytes(), "spaced.rs");
+    let text = rust(1_000);
+    let mut kept = KeptStates::new(text.clone().into_bytes(), "spaced.rs");
     kept.fill();
     assert_eq!(STATE_LINES, 64);
     assert_eq!(kept.count(), 999 / 64 + 1);
+    let starts: Vec<u64> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i as u64 + 1))
+        .step_by(64)
+        .collect();
+    assert_eq!(kept.src.starts, starts);
+    assert_eq!(
+        (0..kept.count())
+            .map(|i| kept.src.mark_line(i))
+            .collect::<Vec<_>>(),
+        (0..16).map(|i| i * 64).collect::<Vec<_>>()
+    );
 }
 
 /// The stand-in window that keeps the IME output the last pass put out.
@@ -639,12 +667,16 @@ fn the_text_document_hands_out_a_bulk_reader() {
     let (transport, _control) = fake("/r/big.rs", FakeFile::bytes(bytes.clone()), Link::gate());
     let no_reopen: crate::stream::Reopen = Box::new(|| anyhow::bail!("no second connection"));
     let source = crate::stream::Source::open(transport, no_reopen, Arc::new(|| {})).unwrap();
-    let doc = text::TextDoc::streamed(source);
+    let doc = text::TextDoc::streamed(source.clone());
     let mut reader = doc.bulk_reader().expect("a stream's document has one");
     let mut got = vec![0; bytes.len()];
     let n =
         crate::stream::Bytes::read_at(&mut reader, 0, &mut got, &AtomicBool::new(false)).unwrap();
-    assert_eq!((n, got), (bytes.len(), bytes));
+    assert_eq!((n, &got), (bytes.len(), &bytes));
+    // Fetched as a Bulk reader's blocks, none of them on demand (an Interactive reader's).
+    let fetched = source.stats().fetched;
+    assert!(fetched.bulk >= bytes.len() as u64, "{fetched:?}");
+    assert_eq!(fetched.demand, 0, "{fetched:?}");
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("local.rs");
     std::fs::write(&path, "fn main() {}\n").unwrap();
@@ -693,4 +725,438 @@ fn cells_dump_80_by_25() {
     {
         println!("{}", row(l, 0));
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1 (2906f39): each finding's test, failing without its fix.
+
+/// R1 MUST 1: a line far longer than `LINE_MAX` with no LF is read no further than that past its
+/// start: it comes cut, the read ends with it, and nothing past it is scanned for.
+#[test]
+fn a_long_line_is_read_no_further_than_line_max() {
+    let long = "x".repeat(20 << 20);
+    let mut v = view(&format!("a\n{long}\nb\n"), "long.rs");
+    let mut src = BufLines::new(v.snap());
+    SNAP_READ.with(|n| n.set(0));
+    let lines = src.read_lines(0, 3).unwrap();
+    let read = SNAP_READ.with(std::cell::Cell::get);
+    assert_eq!(lines.len(), 2, "the read ends with the cut line");
+    assert!(!lines[0].cut && lines[1].cut);
+    assert!(read <= 4 * (LINE_MAX as u64 + CHUNK), "{read} bytes read");
+}
+
+/// R1 MUST 1: the page's first line is read from where the buffer's own index says it starts,
+/// nothing before it scanned; and a newer ask stops a read between lines.
+#[test]
+fn a_page_is_read_from_the_index_and_a_newer_ask_stops_a_read() {
+    let mut v = view(&rust(200_000), "many.rs");
+    let start = v.ed.buffer().line_start(150_000).unwrap();
+    let mut src = BufLines::new(v.snap());
+    src.known = Some((150_000, start));
+    SNAP_READ.with(|n| n.set(0));
+    let lines = src.read_lines(150_000, 10).unwrap();
+    let read = SNAP_READ.with(std::cell::Cell::get);
+    assert_eq!(lines[0].text, rust(150_001).lines().last().unwrap());
+    assert!(
+        read <= 10 * 2 * 1024,
+        "{read} bytes read for 10 short lines"
+    );
+    let mut src = BufLines::new(v.snap());
+    src.cancel = Some(Arc::new(|| true));
+    let e = src.read_lines(150_000, 10).expect_err("stopped");
+    assert!(e.is::<Superseded>(), "{e:#}");
+}
+
+/// R1 MUST 2: edits made while the worker is held keep one ask waiting, never a queue of
+/// snapshots; once let go it answers for the newest.
+#[test]
+fn edits_behind_a_held_worker_keep_one_ask() {
+    let mut v = view(&rust(400), "held.rs");
+    let (hook, hold, reached, go) = holding_hook("item 1\"");
+    v.hook = Some(hook);
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.until(&mut v, 30, |v| v.ready());
+    hold.store(true, Ordering::SeqCst);
+    go_to_line(&mut v, 300);
+    v.press(&Press::Text("z".into()));
+    drv.idle(&mut v, 1);
+    reached
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the worker held on line 2");
+    let done = watchdog(&go, 30);
+    for _ in 0..30 {
+        v.press(&Press::Text("z".into()));
+        drv.idle(&mut v, 1);
+    }
+    let waiting = v.hl.worker.as_ref().unwrap().pending();
+    let _ = done.send(());
+    hold.store(false, Ordering::SeqCst);
+    let _ = go.send(());
+    assert!(waiting <= 1, "{waiting} asks waiting");
+    drv.until(&mut v, 30, |v| v.ready());
+}
+
+/// R1 MUST 2: a worker waiting for an ask ends when it is dropped, giving its pool slot back.
+#[test]
+fn a_dropped_worker_gives_its_slot_back() {
+    let pool = Pool::new(1);
+    let syntax = view("fn x() {}\n", "x.rs").syntax.expect("Rust");
+    let hl = Highlight::new(syntax, Color32::WHITE, u64::MAX).unwrap();
+    let worker = Worker::start(hl, egui::Context::default(), &pool).expect("a slot");
+    assert_eq!(pool.live(), 1);
+    std::thread::sleep(Duration::from_millis(50));
+    drop(worker);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pool.live() > 0 {
+        assert!(Instant::now() < deadline, "the worker never ended");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// R1 MUST 3: a reply the worker made for the document before an edit that moved lines (Enter)
+/// is never laid on the document after it: the rows keep their own colours, moved with them.
+#[test]
+fn a_reply_for_an_older_document_is_never_painted() {
+    let text: Vec<String> = (0..300)
+        .map(|i| match i {
+            11 => "// MARKER".to_string(),
+            i if i % 2 == 0 => format!("fn f{i}() {{}}"),
+            i => format!("// note {i}"),
+        })
+        .collect();
+    let mut v = view(&text.join("\n"), "stale.rs");
+    let (hook, hold, reached, go) = holding_hook("MARKER");
+    v.hook = Some(hook);
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.until(&mut v, 30, |v| v.ready());
+    // An ask the worker holds on line 12 (the page is lines 1–20): an edit far below it.
+    hold.store(true, Ordering::SeqCst);
+    go_to_line(&mut v, 250);
+    v.press(&Press::Text("z".into()));
+    v.ed.place(0, false);
+    v.follow = true;
+    drv.idle(&mut v, 1);
+    reached
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the worker held on line 12");
+    // Enter at line 1 before any pass: every line moves one down; then the old page arrives.
+    v.press(&Press::key(Key::Enter, Modifiers::NONE));
+    hold.store(false, Ordering::SeqCst);
+    go.send(()).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    drv.idle(&mut v, 1);
+    let l = screen(&drv);
+    // (Line 2, the text Enter moved off line 1, is plain until the worker answers: R1 S8.)
+    assert!(text_of(&l, 6, 5).starts_with("fn f2() {}"));
+    assert_eq!(
+        glyph_colors(&l, 6, 5)[0],
+        cga::YELLOW,
+        "line 4 is a function's"
+    );
+    let comment = glyph_colors(&l, 6, 4);
+    assert!(
+        comment.iter().all(|&c| c == cga::CYAN),
+        "line 3: {comment:?}"
+    );
+    drv.until(&mut v, 30, |v| v.ready());
+}
+
+/// R1 MUST 4: the caret on a wide glyph at the right edge brings the whole glyph into view, and
+/// so does a wide preedit at the last column.
+#[test]
+fn a_wide_glyph_or_preedit_at_the_right_edge_comes_into_view() {
+    let mut v = view(&format!("{}\n", "가".repeat(60)), "wide.txt");
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut v, 1);
+    for _ in 0..36 {
+        v.press(&Press::key(Key::ArrowRight, Modifiers::NONE));
+    }
+    drv.idle(&mut v, 1);
+    let l = screen(&drv);
+    let caret = l.caret.expect("the caret on screen");
+    let under = &l.seen()[usize::from(caret.y)][usize::from(caret.x)];
+    assert_eq!(under.symbol, "가", "the caret's character under it");
+    let mut v = view(&format!("{}\n", "a".repeat(72)), "edge.txt");
+    v.press(&Press::key(Key::End, Modifiers::NONE));
+    drv.idle(&mut v, 1);
+    let preedit = Event::Ime(ImeEvent::Preedit {
+        text: "하".into(),
+        active_range_chars: None,
+    });
+    drv.frame(&mut v, vec![preedit], Modifiers::NONE);
+    drv.idle(&mut v, 1);
+    let l = screen(&drv);
+    assert!(text_of(&l, 6, 2).contains('하'), "{}", row(&l, 2));
+}
+
+/// R1 MUST 5: a resize brings the caret back into view; the wheel's scrolling on a layout that
+/// did not change stays where it put the text.
+#[test]
+fn a_resize_brings_the_caret_back_into_view() {
+    let mut v = view(&format!("{}\n", "a".repeat(100)), "resize.txt");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.ed.place(60, false);
+    v.follow = true;
+    drv.idle(&mut v, 1);
+    assert_eq!(screen(&drv).caret, Some(Position::new(66, 2)));
+    drv.resize(320.0, 400.0);
+    drv.idle(&mut v, 1);
+    let caret = screen(&drv)
+        .caret
+        .expect("the caret in view after the resize");
+    assert!(caret.x < 39, "{caret:?}");
+    let mut v = view(&rust(200), "wheel.rs");
+    drv.idle(&mut v, 1);
+    drv.wheel(&mut v, Pos2::new(100.0, 100.0), -10.0);
+    drv.idle(&mut v, 2);
+    assert_eq!(v.top, 30, "the wheel's rows stay");
+}
+
+/// R1 MUST 6: a run of combining marks costs a bounded frame: a cell takes a few of them, its
+/// symbol made once, and a row decodes a bounded stretch however long the run.
+#[test]
+fn combining_marks_cost_a_bounded_frame() {
+    let text = format!("a{}\nnext\n", "\u{301}".repeat(300_000));
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut v = view(&text, "marks.txt");
+        let mut drv = Driver::new(640.0, 400.0);
+        drv.idle(&mut v, 1);
+        DECODED.with(|n| n.set(0));
+        drv.idle(&mut v, 1);
+        let decoded = DECODED.with(std::cell::Cell::get);
+        let l = screen(&drv);
+        let first = l.seen()[2][6].symbol.clone();
+        let _ = tx.send((decoded, first, text_of(&l, 6, 3)));
+    });
+    let (decoded, first, next) = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("two frames over 300,000 marks within 30 s");
+    assert!(
+        first.starts_with('a') && first.chars().count() <= 9,
+        "{} chars",
+        first.chars().count()
+    );
+    assert!(decoded <= 4 * STRIDE, "{decoded} bytes decoded in a frame");
+    assert!(next.starts_with("next"));
+}
+
+/// R1 MUST 7: the text viewer's walk is 01751df's: a line its index did not see cut (the file
+/// changed under it) is parsed as read, and the lines after it are coloured.
+#[test]
+fn the_viewers_walk_parses_a_line_its_index_did_not_see_cut() {
+    let tmp = tempfile::tempdir().unwrap();
+    let line = |i: usize| format!("{:<99}\n", format!("fn f{i}() {{}} //"));
+    let body: String = (0..300).map(line).collect();
+    let path = tmp.path().join("changed.rs");
+    std::fs::write(&path, &body).unwrap();
+    let mut doc = text::TextDoc::open(&path).unwrap();
+    // The file changes under its index, its size kept: lines 11 to 60 run together.
+    let mut changed = body.into_bytes();
+    for i in 10..60 {
+        changed[i * 100 + 99] = b' ';
+    }
+    std::fs::write(&path, &changed).unwrap();
+    let syntax = text::syntax_of("changed.rs", &mut doc).unwrap().unwrap();
+    let mut hl = Highlight::new(syntax, Color32::WHITE, u64::MAX).unwrap();
+    let runs = hl.page(&mut doc, 0, 20, &|| false).unwrap().unwrap();
+    assert!(runs[10].len() > 1, "the line read cut is parsed");
+    assert!(
+        runs[11..].iter().all(|r| r.len() > 1),
+        "the lines after it are coloured"
+    );
+}
+
+/// R1 MUST 8: typing at the end of a long line decodes at most a few strides a frame — the
+/// checkpoints before the edit stay.
+#[test]
+fn typing_at_the_end_of_a_long_line_decodes_a_bounded_stretch() {
+    let mut v = view(&format!("{}\nb\n", "a".repeat(1 << 20)), "line.txt");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&Press::key(Key::End, Modifiers::NONE));
+    drv.idle(&mut v, 1);
+    for _ in 0..3 {
+        v.press(&Press::Text("z".into()));
+        DECODED.with(|n| n.set(0));
+        drv.idle(&mut v, 1);
+        let decoded = DECODED.with(std::cell::Cell::get);
+        assert!(decoded <= 4 * STRIDE, "{decoded} bytes decoded for a key");
+    }
+}
+
+/// R1 MUST 9: the input method stays on while the editor has the keyboard with its caret
+/// scrolled out of view, its rectangle inside the text.
+#[test]
+fn the_input_method_is_on_with_the_caret_scrolled_away() {
+    let mut w = Ime(view(&rust(200), "far.rs"), None);
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut w, 1);
+    drv.wheel(&mut w, Pos2::new(100.0, 100.0), -20.0);
+    drv.idle(&mut w, 1);
+    let l = screen(&drv);
+    assert_eq!(l.caret, None, "scrolled away");
+    let ime = w.1.expect("the input method on");
+    let text = l.rect(Cells::new(6, 2, 73, 20));
+    assert!(text.contains_rect(ime.cursor_rect), "{:?}", ime.cursor_rect);
+}
+
+/// R1 S1: a highlighter that fails leaves every row plain — no old colours laid around edits.
+#[test]
+fn a_failed_highlighter_leaves_every_row_plain() {
+    let mut v = view(&rust(100), "boom.rs");
+    let boom = Arc::new(AtomicBool::new(false));
+    let armed = boom.clone();
+    v.hook = Some(Arc::new(move |line: &str| {
+        if armed.load(Ordering::SeqCst) && line.contains("item 1\"") {
+            panic!("a test's parser failing on purpose");
+        }
+    }));
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.until(&mut v, 30, |v| v.ready());
+    boom.store(true, Ordering::SeqCst);
+    go_to_line(&mut v, 50);
+    v.press(&Press::Text("x".into()));
+    v.ed.place(0, false);
+    v.follow = true;
+    drv.until(&mut v, 30, |v| v.hl.worker.is_none());
+    drv.idle(&mut v, 1);
+    let l = screen(&drv);
+    for y in 2..22 {
+        let colors = glyph_colors(&l, 6, y);
+        assert!(
+            colors.iter().all(|&c| c == PALETTE.text),
+            "row {y}: {colors:?}"
+        );
+    }
+}
+
+/// R1 S5: highlighting stops where the viewer's does — at the last of its index marks at or below
+/// 16 MiB (a mark every 256 lines, or at the first line start a span past the last) — not at
+/// the last line starting below 16 MiB.
+#[test]
+fn highlighting_stops_where_the_viewers_does() {
+    // `/*`, then lines of 4,000 `x`: all comment, cheap to parse. Line k starts at
+    // 3 + 4,001 (k − 1).
+    let lines = 4_300u64;
+    let body = format!(
+        "/*\n{}",
+        format!("{}\n", "x".repeat(4000)).repeat(lines as usize)
+    );
+    let start = |k: u64| if k == 0 { 0 } else { 3 + 4001 * (k - 1) };
+    let (mut last, mut k) = (0u64, 0u64);
+    let stop = loop {
+        k += 1;
+        if k - last >= 256 || start(k) - start(last) >= 64 * 1024 {
+            if start(k) > HIGHLIGHT_MAX {
+                break last;
+            }
+            last = k;
+        }
+    };
+    assert!(
+        stop + 5 < (HIGHLIGHT_MAX - 3) / 4001,
+        "the viewer stops short of 16 MiB"
+    );
+    let mut v = view(&body, "after.rs");
+    let mut drv = Driver::new(640.0, 400.0);
+    for (line, comment) in [(stop - 1, true), (stop + 3, false)] {
+        go_to_line(&mut v, line);
+        drv.until(&mut v, 60, |v| v.ready());
+        let (y, x) = place_of(&v, line);
+        let colors = glyph_colors(&screen(&drv), x, y);
+        let want = if comment { cga::CYAN } else { PALETTE.text };
+        assert!(colors.iter().all(|&c| c == want), "line {line}: {colors:?}");
+    }
+}
+
+/// R1 S6: in an ambiguous-wide terminal a control character's glyph is the viewer's stand-in.
+#[test]
+fn control_glyphs_take_the_viewers_stand_in() {
+    // BEL's glyph is `•`, of ambiguous width.
+    assert_eq!(chrome::shown_char('\u{7}'), '•');
+    assert!(crate::gui::term::ambiguous('•'));
+    let mut v = view("\u{7}x\n", "ctl.txt");
+    let mut drv = Driver::new(640.0, 400.0);
+    cells::set_ambiguous_wide(&drv.ctx, true);
+    drv.idle(&mut v, 1);
+    let want = crate::gui::term::narrow("•").unwrap_or(".");
+    assert_eq!(screen(&drv).seen()[2][6].symbol, want);
+}
+
+/// R1 S7: the wheel's part of a row is kept for the next event, as the viewer's is.
+#[test]
+fn the_wheels_part_rows_add_up() {
+    let mut v = view(&rust(200), "wheel.rs");
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut v, 1);
+    let event = Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::Vec2::new(0.0, -6.4),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
+        modifiers: Modifiers::NONE,
+    };
+    drv.move_to(&mut v, Pos2::new(100.0, 100.0));
+    for _ in 0..3 {
+        drv.frame(&mut v, vec![event.clone()], Modifiers::NONE);
+    }
+    assert_eq!(v.top, 1, "0.4 + 0.4 + 0.4 rows");
+}
+
+/// R1 S9: Overwrite's caret on a wide glyph is both its cells in swapped colours, with no
+/// Insert foot drawn over them.
+#[test]
+fn the_overwrite_caret_covers_a_wide_glyph() {
+    let mut v = view("가나\n", "wide.txt");
+    let mut drv = Driver::new(640.0, 400.0);
+    v.press(&Press::key(Key::Insert, Modifiers::NONE));
+    drv.idle(&mut v, 1);
+    let l = screen(&drv);
+    let swapped = (Some(PALETTE.back), Some(PALETTE.text));
+    let seen = l.seen();
+    assert_eq!((seen[2][6].fg, seen[2][6].bg), swapped);
+    assert_eq!((seen[2][7].fg, seen[2][7].bg), swapped);
+    // The foot cells::paint draws at the caret is covered in the block's colour.
+    let cells = l.rect(Cells::new(6, 2, 2, 1));
+    let foot = egui::Rect::from_min_max(egui::pos2(cells.left(), cells.bottom() - 2.0), cells.max);
+    let rects = drv.rects();
+    let last = rects
+        .iter()
+        .rposition(|(r, _, _)| r.intersects(foot))
+        .expect("the foot");
+    assert_eq!(
+        rects[last].1, PALETTE.text,
+        "the last paint over the foot is the block's"
+    );
+    assert!(rects[last].0.contains_rect(foot));
+}
+
+/// R1 S10: the `^S` prompt shortens the file's name, never its tail.
+#[test]
+fn the_save_prompt_shortens_the_name() {
+    let name = format!("{}.rs", "a_very_long_name_".repeat(4));
+    let mut v = view_in("fn main() {}\n", &name, Backend::Terminal);
+    let mut drv = Driver::new(1000.0, 400.0);
+    v.press(&ctrl(Key::S));
+    drv.idle(&mut v, 1);
+    let status = row(&screen(&drv), 23);
+    let status = status.trim();
+    assert!(status.starts_with("Save over …"), "{status}");
+    // At 80 columns the words alone are wider than the row: the name keeps its end, then the
+    // words' end gives way — `[Save]` stays.
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut v, 1);
+    let narrow = row(&screen(&drv), 23);
+    assert!(
+        narrow
+            .trim()
+            .starts_with("Save over …ng_name_.rs? F2 or a click on [Save] saves"),
+        "{narrow}"
+    );
+    assert!(
+        status.ends_with(
+            "name_.rs? F2 or a click on [Save] saves · C saves a copy · any other key cancels"
+        ),
+        "{status}"
+    );
 }
