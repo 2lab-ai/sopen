@@ -1664,3 +1664,33 @@ fn a_signal_while_away_ends_the_run_and_its_ssh() {
     assert!(gone(ssh), "the ssh client ended and reaped");
     kill_recorded(tmp.path(), "sopen-pid");
 }
+
+/// HOST's state past the bound for it (64 MiB): dropped whole, never read cut — the terminal
+/// stays with the state from before, lists again, and says why.
+#[test]
+fn a_state_too_long_is_dropped_and_said() {
+    let fx = fixture_with(0, &[]);
+    dual(&fx);
+    let before = state_of(&fx);
+    let tmp = tempfile::tempdir().unwrap();
+    let body = "printf 'sopen-xtools-state {\"v\":1,\"p\":\"'; \
+                head -c 68157440 /dev/zero | tr '\\000' a; printf '\"}\\n'; exit 0";
+    stand_in(tmp.path(), body);
+    let remote = remote_for(tmp.path(), &tmp.path().join("sopen"), &fx.root);
+    let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+    let ran = Rc::new(Ran::default());
+    let events = vec![
+        (plain(KeyCode::F(12)), None),
+        (ctrl_q(), Some(after(&ran, &fx, &bytes, 1))),
+    ];
+    script(&tape, &fx, events);
+    assert_eq!(run(&mut b, &fx, &remote, &ran), End::Closed);
+    assert_eq!(
+        *ran.said.borrow(),
+        [Some(
+            "box sent its state too long to read (over 64 MiB): the state from before".into()
+        )]
+    );
+    assert_eq!(state_of(&fx), before);
+    assert!(remote.made.borrow().is_empty(), "no browser made for it");
+}

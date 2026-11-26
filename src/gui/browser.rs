@@ -2894,6 +2894,9 @@ impl Browser {
             }
         }
         let step = if let Some(what) = self.writing() {
+            // No answer outlives a wait: once the write ends it is all decided anew (edits made
+            // meanwhile ask).
+            answered = Answered::default();
             SwitchStep::Waiting(what)
         } else if !answered.unsaved && self.viewer_hold() == crate::views::Hold::Unsaved {
             SwitchStep::Asking(Ask::Unsaved, None)

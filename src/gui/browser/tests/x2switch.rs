@@ -173,3 +173,52 @@ fn discard_then_switch_goes_after_both_questions() {
     );
     assert!(g.fx.b.take_discard(), "with Discard's answer");
 }
+
+/// Discard answered, then a write starts before the switch is decided again: it waits, and once
+/// the write has ended it is decided anew from nothing — the edits made meanwhile (still unsaved)
+/// ask again; no answer outlives a wait.
+#[test]
+fn a_wait_after_an_answer_forgets_it() {
+    let mut fx = fixture();
+    std::fs::write(
+        Path::new(&fx.root).join("0.bin"),
+        (0..=255u8).collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    let root = fx.root.clone();
+    fx.b.list(Some(0), root, None, None);
+    fx.settle();
+    fx.select("0.bin");
+    fx.key(Key::Enter);
+    fx.settle();
+    fx.drv.idle(&mut fx.b, 2);
+    fx.key(Key::F8);
+    fx.key(Key::Enter);
+    fx.typed("Z");
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(fx.b.would_lose(), "an unsaved edit");
+    assert_eq!(fx.b.before_switch("box"), Before::Held);
+    fx.drv.idle(&mut fx.b, 2);
+    fx.drv.click_text_on_top(&mut fx.b, "[ Discard ]");
+    fx.drv.idle(&mut fx.b, 1);
+    assert!(fx.b.switch_due(), "Discard lets it go");
+    // A write starts before the switch is decided again.
+    let done = Arc::new(AtomicBool::new(false));
+    let ended = done.clone();
+    fx.b.leftover.borrow_mut().closing.push(Closing {
+        settle: Box::new(move |_| ended.load(Ordering::SeqCst).then(Outcome::default)),
+        hold: None,
+        file: "/elsewhere".to_string(),
+    });
+    assert_eq!(fx.b.before_switch("box"), Before::Held, "it waits");
+    done.store(true, Ordering::SeqCst);
+    fx.drv.idle(&mut fx.b, 2);
+    assert!(fx.b.switch_due());
+    assert_eq!(
+        fx.b.before_switch("box"),
+        Before::Held,
+        "decided anew: the edit asks"
+    );
+    assert!(fx.b.switch_asking());
+    assert!(!fx.b.take_discard());
+}

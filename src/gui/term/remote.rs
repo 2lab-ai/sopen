@@ -232,12 +232,13 @@ pub(crate) fn to_host<T: Tty, O: Write>(
     };
     let mut cue = None;
     let mut kept = false;
+    let mut too_long = false;
     // The browser as it goes — the question answered — under the dimming: one pass, no input.
     b.pass(&mut Shared(shared.clone()), vec![])?;
     b.term.forget();
     draw_away(b, &away)?;
     let status = loop {
-        let mut redraw = take_said(&run.said(), &mut away, &mut cue, &mut kept);
+        let mut redraw = take_said(&run.said(), &mut away, &mut cue, &mut kept, &mut too_long);
         // HOST kept its window (unsaved edits) and let the session go; its script's shell still
         // holds the session open while that window lives, so ssh would never end by itself:
         // this run's client ends (its pid alone), and is reaped below.
@@ -246,7 +247,7 @@ pub(crate) fn to_host<T: Tty, O: Write>(
         }
         match run.ended() {
             Ok(Some(status)) => {
-                take_said(&run.said(), &mut away, &mut cue, &mut kept);
+                take_said(&run.said(), &mut away, &mut cue, &mut kept, &mut too_long);
                 break Ok(status);
             }
             Ok(None) => {}
@@ -280,7 +281,13 @@ pub(crate) fn to_host<T: Tty, O: Write>(
     };
     drop(run);
     let mut said = match &status {
-        Ok(status) => outcome(host, *status, cue.is_some(), kept, away.ending, &away.err),
+        Ok(status) => {
+            let line = outcome(host, *status, cue.is_some(), kept, away.ending, &away.err);
+            match too_long && cue.is_none() {
+                true => Some(too_long_line(host, line, *status)),
+                false => line,
+            }
+        }
         Err(e) => Some(format!("ssh to {host} could not be waited for: {e}")),
     };
     let given = cue.map(|json| give_back(shared, remote, &ways, host, &json, discard));
@@ -324,19 +331,33 @@ struct Away {
     ending: bool,
 }
 
-/// What HOST said, taken: its state's JSON, its kept cue, its last standard-error line —
-/// whether the screen changes.
+/// The line when HOST's state came too long to read (past `forward`'s bound for it, dropped
+/// whole): said first, then `line` — §7.3's for its end — unless that is only that the screen
+/// was not handed back (code 0).
+fn too_long_line(host: &str, line: Option<String>, status: ExitStatus) -> String {
+    let said =
+        format!("{host} sent its state too long to read (over 64 MiB): the state from before");
+    match line.filter(|_| status.code() != Some(0)) {
+        Some(line) => format!("{said} · {line}"),
+        None => said,
+    }
+}
+
+/// What HOST said, taken: its state's JSON, its kept cue, a state too long to read, its last
+/// standard-error line — whether the screen changes.
 fn take_said(
     said: &[SwitchSaid],
     away: &mut Away,
     cue: &mut Option<String>,
     kept: &mut bool,
+    too_long: &mut bool,
 ) -> bool {
     let mut changed = false;
     for s in said {
         match s {
             SwitchSaid::State(json) => *cue = Some(json.clone()),
             SwitchSaid::Kept => *kept = true,
+            SwitchSaid::StateTooLong => *too_long = true,
             SwitchSaid::Err(line) => {
                 away.err = Some(line.clone());
                 changed = true;

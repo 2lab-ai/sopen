@@ -803,6 +803,8 @@ pub(crate) enum SwitchSaid {
     State(String),
     /// `sopen-xtools-kept` ([`crate::gui::switch_host::KEPT_CUE`]).
     Kept,
+    /// A state's cue past [`STATE_LINE_MAX`]: dropped unread.
+    StateTooLong,
     /// A line of its standard error (ssh's own among them), escapes taken out.
     Err(String),
 }
@@ -811,10 +813,9 @@ impl SwitchSaid {
     /// The cue on a line of HOST's output, matched exactly as [`Cue::of`] matches the tunnel's —
     /// only its end taken off (a `\r` too); any other line is none.
     fn cue(line: &str) -> Option<SwitchSaid> {
-        let line = match line.strip_suffix('\n') {
-            Some(line) => line.strip_suffix('\r').unwrap_or(line),
-            None => line,
-        };
+        // Each taken off on its own: the reader may have taken the `\n` already (a CRLF line).
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
         let state = crate::gui::switch_host::STATE_CUE;
         if line == crate::gui::switch_host::KEPT_CUE {
             return Some(SwitchSaid::Kept);
@@ -845,8 +846,8 @@ pub(crate) struct SwitchRun {
     readers: Vec<std::sync::mpsc::Receiver<()>>,
 }
 
-/// The longest line of HOST's standard output read: a state's cue is one JSON line of the state
-/// (10 §7.4), a few KiB; a longer line is cut there (a cue so cut does not read).
+/// The longest line of HOST's standard output read that is not a state's cue; a longer one is
+/// dropped whole.
 const OUT_LINE_MAX: usize = 1 << 20;
 
 /// What HOST said and was not looked at yet — bounded, never a queue of its output: its last
@@ -856,12 +857,24 @@ struct SwitchHeard {
     state: Option<String>,
     kept: bool,
     err: Option<String>,
+    /// A state's cue past [`STATE_LINE_MAX`] came: dropped, said.
+    too_long: bool,
 }
 
-/// Reads `from` to its end a line at a time (`\n`; a line split across reads is one), each line
-/// cut to `max` bytes — what is past it until its end dropped — and given to `line`.
-fn bounded_lines(mut from: impl std::io::Read, max: usize, mut line: impl FnMut(&[u8])) {
+/// The longest line read that is a state's cue (`sopen-xtools-state ` and its JSON): a state can
+/// pass [`OUT_LINE_MAX`] (select-all in a folder of tens of thousands of names).
+const STATE_LINE_MAX: usize = 64 << 20;
+
+/// Reads `from` to its end a line at a time (`\n`; a line split across reads is one), each given
+/// to `line` with whether it passed its bound: `max` of the line so far says how long it may be;
+/// a line past it keeps its first `max` bytes, the rest until its end dropped.
+fn bounded_lines(
+    mut from: impl std::io::Read,
+    max: impl Fn(&[u8]) -> usize,
+    mut line: impl FnMut(&[u8], bool),
+) {
     let mut now = Vec::new();
+    let mut over = false;
     let mut chunk = [0u8; 8192];
     loop {
         let n = match from.read(&mut chunk) {
@@ -872,24 +885,39 @@ fn bounded_lines(mut from: impl std::io::Read, max: usize, mut line: impl FnMut(
         };
         for &b in &chunk[..n] {
             if b == b'\n' {
-                line(&now);
+                line(&now, over);
                 now.clear();
-            } else if now.len() < max {
-                now.push(b);
+                over = false;
+            } else if !over {
+                match now.len() < max(&now) {
+                    true => now.push(b),
+                    false => over = true,
+                }
             }
         }
     }
     if !now.is_empty() {
-        line(&now);
+        line(&now, over);
     }
 }
 
 /// HOST's standard output read for its cues alone ([`SwitchSaid::cue`]); any other line dropped.
+/// A line past its bound is dropped whole, never read cut: [`STATE_LINE_MAX`] for a state's cue
+/// (said: [`SwitchHeard::too_long`]), [`OUT_LINE_MAX`] for any other.
 fn hear_out(from: impl std::io::Read, heard: &std::sync::Mutex<SwitchHeard>) {
-    bounded_lines(from, OUT_LINE_MAX, |line| {
-        let cue = SwitchSaid::cue(&String::from_utf8_lossy(line));
+    let prefix = format!("{} ", crate::gui::switch_host::STATE_CUE);
+    let state = |line: &[u8]| line.starts_with(prefix.as_bytes());
+    let max = |line: &[u8]| match state(line) {
+        true => STATE_LINE_MAX,
+        false => OUT_LINE_MAX,
+    };
+    bounded_lines(from, max, |line, over| {
         let mut heard = heard.lock().unwrap_or_else(|p| p.into_inner());
-        match cue {
+        if over {
+            heard.too_long |= state(line);
+            return;
+        }
+        match SwitchSaid::cue(&String::from_utf8_lossy(line)) {
             Some(SwitchSaid::State(json)) => heard.state = Some(json),
             Some(SwitchSaid::Kept) => heard.kept = true,
             _ => {}
@@ -898,15 +926,19 @@ fn hear_out(from: impl std::io::Read, heard: &std::sync::Mutex<SwitchHeard>) {
 }
 
 /// HOST's standard error read for its last line that is not blank, escapes taken out, cut to
-/// [`ERR_LINE_MAX`]; a cue there is a plain line.
+/// [`ERR_LINE_MAX`] (a status row's line, never parsed); a cue there is a plain line.
 fn hear_err(from: impl std::io::Read, heard: &std::sync::Mutex<SwitchHeard>) {
-    bounded_lines(from, ERR_LINE_MAX, |line| {
-        let plain = without_escapes(line);
-        let plain = String::from_utf8_lossy(&plain).trim_end().to_string();
-        if !plain.trim().is_empty() {
-            heard.lock().unwrap_or_else(|p| p.into_inner()).err = Some(plain);
-        }
-    });
+    bounded_lines(
+        from,
+        |_| ERR_LINE_MAX,
+        |line, _| {
+            let plain = without_escapes(line);
+            let plain = String::from_utf8_lossy(&plain).trim_end().to_string();
+            if !plain.trim().is_empty() {
+                heard.lock().unwrap_or_else(|p| p.into_inner()).err = Some(plain);
+            }
+        },
+    );
 }
 
 /// `hear` on `pipe` on a thread of its own; the receiver gets `()` at the pipe's end.
@@ -978,6 +1010,9 @@ impl SwitchRun {
         said.extend(heard.state.take().map(SwitchSaid::State));
         if std::mem::take(&mut heard.kept) {
             said.push(SwitchSaid::Kept);
+        }
+        if std::mem::take(&mut heard.too_long) {
+            said.push(SwitchSaid::StateTooLong);
         }
         said
     }
@@ -2236,6 +2271,104 @@ mod tests {
         let last = errs.last().expect("its last stderr line");
         assert_eq!(last.len(), ERR_LINE_MAX, "cut");
         assert!(last.chars().all(|c| c == 'b'));
+    }
+
+    /// A reader of `prefix`, then `fill` bytes of `pad`, then `tail` — made as it is read, so a
+    /// 65 MiB line costs the test no 65 MiB input.
+    struct Line {
+        parts: Vec<(Vec<u8>, usize)>,
+    }
+
+    impl Line {
+        fn new(prefix: &[u8], pad: u8, fill: usize, tail: &[u8]) -> Line {
+            Line {
+                parts: vec![(prefix.to_vec(), 1), (vec![pad], fill), (tail.to_vec(), 1)],
+            }
+        }
+    }
+
+    impl std::io::Read for Line {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some((bytes, times)) = self.parts.first_mut() else {
+                return Ok(0);
+            };
+            let mut n = 0;
+            while *times > 0 && n + bytes.len() <= buf.len() {
+                buf[n..n + bytes.len()].copy_from_slice(bytes);
+                n += bytes.len();
+                *times -= 1;
+            }
+            if *times == 0 {
+                self.parts.remove(0);
+            }
+            Ok(n)
+        }
+    }
+
+    /// What HOST's standard output said, read whole.
+    fn heard_out(from: impl std::io::Read) -> SwitchHeard {
+        let heard = std::sync::Mutex::new(SwitchHeard::default());
+        hear_out(from, &heard);
+        heard.into_inner().unwrap()
+    }
+
+    /// X2-switch's fix-check: a cue ended by CRLF is the cue (its `\r` taken off whether or not
+    /// the reader took the `\n`).
+    #[test]
+    fn cues_ended_by_crlf_are_read() {
+        let heard = heard_out(&b"sopen-xtools-kept\r\nsopen-xtools-state {\"v\":1}\r\n"[..]);
+        assert!(heard.kept, "the kept cue");
+        assert_eq!(heard.state.as_deref(), Some("{\"v\":1}"));
+        assert_eq!(
+            SwitchSaid::cue("sopen-xtools-kept\r"),
+            Some(SwitchSaid::Kept),
+            "a line its reader took the `\\n` off"
+        );
+    }
+
+    /// X2-switch's fix-check: a line of HOST's output past its bound is dropped whole, never
+    /// delivered cut — a valid state padded past the bound with junk after it is no state, and is
+    /// said too long; a state line has a bound of its own (a real state past 1 MiB — select-all in
+    /// a folder of tens of thousands — is read), past which it is dropped too.
+    #[test]
+    fn a_line_past_its_bound_is_dropped_whole() {
+        let state = b"sopen-xtools-state {\"v\":1}";
+        let padded = Line::new(state, b' ', STATE_LINE_MAX, b"junk\n");
+        let heard = heard_out(padded);
+        let cut = heard.state.as_ref().map(String::len);
+        assert_eq!(
+            cut, None,
+            "the valid start of a line past its bound is no state"
+        );
+        assert!(heard.too_long, "said too long");
+        // 2 MiB of a real state: read.
+        let big = Line::new(
+            b"sopen-xtools-state {\"v\":1,\"p\":\"",
+            b'a',
+            2 << 20,
+            b"\"}\n",
+        );
+        let heard = heard_out(big);
+        assert_eq!(
+            heard.state.map(|s| s.len()),
+            Some((2 << 20) + 14),
+            "read whole"
+        );
+        assert!(!heard.too_long);
+        // 65 MiB: past the state's bound — dropped, said too long.
+        let huge = Line::new(
+            b"sopen-xtools-state {\"v\":1,\"p\":\"",
+            b'a',
+            65 << 20,
+            b"\"}\n",
+        );
+        let heard = heard_out(huge);
+        assert_eq!(heard.state.map(|s| s.len()), None);
+        assert!(heard.too_long);
+        // Any other line past the small bound: dropped whole, nothing said of it.
+        let other = Line::new(b"sopen-xtools-kept", b' ', OUT_LINE_MAX, b"\n");
+        let heard = heard_out(other);
+        assert!(!heard.kept && !heard.too_long);
     }
 
     #[test]
