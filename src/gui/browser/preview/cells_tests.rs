@@ -513,6 +513,53 @@ fn a_refresh_keeps_the_sides_frame_while_the_file_is_read_again() {
     );
 }
 
+/// A file whose name says cells but whose ready preview is egui's — a missing `.txt`: its lstat
+/// fails and the side shows the info card — keeps its box while it is prepared again after a
+/// refresh: the frame of its last ready preview, not its name's.
+#[test]
+fn a_refresh_keeps_the_frame_of_the_ready_preview_not_the_names() {
+    let tmp = folder(&[]);
+    let mut pane = pane_in(&tmp, "missing.txt", all);
+    let mut drv = Driver::new(SIZE.x, SIZE.y);
+    crate::gui::mark_terminal(&drv.ctx);
+    drv.until(&mut pane, 20, |p| p.ready());
+    drv.idle(&mut pane, 2);
+    assert!(
+        matches!(&pane.host.shown, Some(Shown::Ready(p)) if p.card().is_some()),
+        "the info card"
+    );
+    one_box(&drv, "the card, ready");
+    let path = pane.want.path.clone();
+    pane.host.refresh(&path);
+    drv.idle(&mut pane, 1);
+    assert!(pane.host.busy(), "prepared again");
+    one_box(&drv, "read again");
+}
+
+/// In a window where pages show (this thread's engine the fake), a plain `.xml` — its page not
+/// its default view (09 §5), so it previews as text — is framed in cells while it is read, as
+/// its preview will be; an `.html`, whose page always is, is egui's.
+#[test]
+fn in_a_window_with_pages_a_plain_xml_is_cells_while_it_is_read() {
+    let fake = crate::gui::web::fake::FakeEngine::native();
+    fake.install();
+    for (name, cells) in [("pom.xml", true), ("index.html", false)] {
+        let mut pane = pane_at(&format!("/d/{name}"), all);
+        let _tx = reading(&mut pane, 1 << 10, 4 << 10);
+        let mut drv = Driver::new(SIZE.x, SIZE.y);
+        drv.idle(&mut pane, 2);
+        assert!(
+            pane.host.pages_here(&drv.ctx, name).shown(),
+            "{name}: pages show here"
+        );
+        assert_eq!(
+            layer_at(&drv, grid().all()).is_some(),
+            cells,
+            "{name}: framed in cells"
+        );
+    }
+}
+
 /// The bar moves to another file (the display commits it): its side's frame is decided again —
 /// a text file's cells while it is read after a picture's box, and back.
 #[test]

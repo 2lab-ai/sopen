@@ -608,14 +608,18 @@ impl Host {
 
     /// The frame of a side whose file, named `name`, has no ready preview yet: egui's where
     /// what is made of it is egui's by its name — a picture, a video or a sound by their
-    /// extension, a page file whose page shows here (09 §4) — and cells otherwise. A name that
-    /// does not tell (a picture with no extension, a file over the preview's limit that becomes
-    /// the info card) changes frames once, when its preview is ready.
+    /// extension, a page file whose page is its default view by its name alone (`.html`,
+    /// `.htm`: 09 §5) where pages show (09 §4) — and cells otherwise. Where the name does not
+    /// tell, the side changes frames once, when its preview is ready: a name framed in cells
+    /// whose preview is the info card (its time budget hit; a file missing, unreadable, special
+    /// or a broken link), a link whose target is of another kind than its name, a `.ts` that is
+    /// a video, a styled `.xml` (its page).
     fn frame_by_name(&self, ctx: &egui::Context, name: &str) -> Frame {
         let egui = matches!(
             crate::kind::by_extension(name),
             Some(Kind::Image | Kind::Video | Kind::Audio)
-        ) || (crate::kind::page_file(name) && self.pages_here(ctx, name).shown());
+        ) || (crate::kind::page_default(name, &[])
+            && self.pages_here(ctx, name).shown());
         if egui {
             Frame::Egui
         } else {
