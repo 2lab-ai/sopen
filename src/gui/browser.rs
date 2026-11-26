@@ -2567,7 +2567,7 @@ impl Browser {
             let rect = grid.rect(side);
             match self.shown.as_ref().map(|s| s[i].clone()) {
                 Some(view::Content::Preview(_)) => {
-                    self.preview.ui(ui, rect);
+                    self.preview.ui(ui, &grid, side, &self.ops.covered(&grid));
                     // 09 §4: the engine refused the preview's page — the preview shows the
                     // source now, and page files open as their source in this window.
                     if let Some(why) = self.preview.take_refused() {
