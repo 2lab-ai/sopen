@@ -142,9 +142,9 @@ use syntect::parsing::{
 };
 
 /// A mark in the line index every this many lines…
-const BLOCK_LINES: u64 = 256;
+pub(super) const BLOCK_LINES: u64 = 256;
 /// …or at the first line start this far past the last mark, whichever comes first.
-const SPAN: u64 = 64 * 1024;
+pub(super) const SPAN: u64 = 64 * 1024;
 /// The longest line highlighting parses, and the most of a line [`TextDoc::read_lines`] gives.
 /// (On screen a line is shown whole: wrapped in rows, or — not wrapped — from any byte of it.)
 pub const LINE_MAX: usize = 4096;
@@ -1279,6 +1279,13 @@ impl TextDoc {
         self.marks
             .partition_point(|m| m.line <= line)
             .saturating_sub(1)
+    }
+
+    /// A Bulk reader of a stream's [`Source`] (12 §7.4, E14): the editor's whole read runs on
+    /// the viewer's channel, its blocks at the cache's cold end, so the viewer's own window stays
+    /// cached. `None` for a file read in place.
+    pub fn bulk_reader(&self) -> Option<crate::stream::Reader> {
+        self.source().map(|s| s.reader(ReaderKind::Bulk))
     }
 
     /// The mark after `idx`, or the end of the file.
@@ -2823,7 +2830,10 @@ fn syntax_by_name(name: &str) -> Option<&'static SyntaxReference> {
 /// does not decide, by the first line (`#!/bin/sh`) read through `doc`. `Ok(None)` for plain
 /// text. An error when that line could not be read — it is [`Pending`], or the read failed:
 /// the choice is still open, and the caller asks again (never plain text for good).
-fn syntax_of(name: &str, doc: &mut TextDoc) -> Result<Option<&'static SyntaxReference>> {
+pub(super) fn syntax_of<L: LineSource + ?Sized>(
+    name: &str,
+    doc: &mut L,
+) -> Result<Option<&'static SyntaxReference>> {
     let found = match syntax_by_name(name) {
         Some(found) => found,
         None => {
@@ -2839,7 +2849,7 @@ fn syntax_of(name: &str, doc: &mut TextDoc) -> Result<Option<&'static SyntaxRefe
 }
 
 /// A highlighted line: runs of text and their colour.
-type Runs = Vec<(Color32, String)>;
+pub(super) type Runs = Vec<(Color32, String)>;
 
 /// A character of a word run: what the grammars' identifier, number and keyword patterns are
 /// made of, and never a delimiter (a quote, a bracket, a comment's start).
@@ -3311,13 +3321,54 @@ pub fn shortens(line: &str, yaml: bool) -> bool {
 /// Parser and highlighter state after some line.
 type State = (ParseState, HighlightState);
 
+/// What highlighting reads (12 §8, ED-screen): lines by number, each cut at [`LINE_MAX`] bytes,
+/// and the lines its kept states stand at — the text document's index marks, or the editor's
+/// buffer every 64 lines (E19). Lines it does not offer are plain.
+pub(super) trait LineSource {
+    /// Lines `first..first + count`, fewer at the source's end.
+    fn read_lines(&mut self, first: u64, count: usize) -> Result<Vec<Line>>;
+    /// The kept state at or before `line`.
+    fn mark_before(&self, line: u64) -> usize;
+    /// The line kept state `i` stands at; past the last, the source's line count.
+    fn mark_line(&self, i: usize) -> u64;
+    /// Whether the source finds its stop line as it is read — a line it gives cut at
+    /// [`LINE_MAX`] stops highlighting there (the editor's buffer) — rather than knowing it
+    /// before from an index (the text document, whose walk parses any line as it reads it).
+    fn finds_stop(&self) -> bool {
+        false
+    }
+}
+
+impl LineSource for TextDoc {
+    fn read_lines(&mut self, first: u64, count: usize) -> Result<Vec<Line>> {
+        TextDoc::read_lines(self, first, count)
+    }
+
+    fn mark_before(&self, line: u64) -> usize {
+        TextDoc::mark_before(self, line)
+    }
+
+    fn mark_line(&self, i: usize) -> u64 {
+        self.marks.get(i).map_or(self.lines, |m| m.line)
+    }
+}
+
+/// How a walk over lines ended.
+enum Walked {
+    All,
+    /// `dropped()` said to stop.
+    Dropped,
+    /// It met a line cut at [`LINE_MAX`], this one, and parsed nothing of it.
+    Cut(u64),
+}
+
 /// Called with each line as the parser is handed it, before it is parsed (tests: a parser that
 /// blocks on a line).
 #[cfg(test)]
 pub(crate) type ParseHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Highlighting state at each mark, computed in order from the top of the file — the worker's.
-struct Highlight {
+pub(super) struct Highlight {
     highlighter: Highlighter<'static>,
     /// The syntax the file's name or first line picked.
     syntax: &'static SyntaxReference,
@@ -3344,7 +3395,7 @@ struct Highlight {
 const BATCH: usize = 64;
 
 impl Highlight {
-    fn new(syntax: &'static SyntaxReference, plain: Color32, stop: u64) -> Option<Self> {
+    pub(super) fn new(syntax: &'static SyntaxReference, plain: Color32, stop: u64) -> Option<Self> {
         let highlighter = Highlighter::new(chrome::syntax_theme());
         Some(Self {
             highlighter,
@@ -3387,17 +3438,20 @@ impl Highlight {
             .collect()
     }
 
-    /// Parses lines `next..to` from `state`, keeping each line's runs in `keep` when given.
-    /// `Ok(false)`: `dropped()` said to stop (checked before every line).
-    fn walk(
+    /// Parses lines `next..to` from `state`, keeping each line's runs in `keep` when given:
+    /// [`Walked::Dropped`] when `dropped()` said to stop (checked before every line), and
+    /// [`Walked::Cut`] at a line cut at [`LINE_MAX`] of a source that finds its stop so
+    /// ([`LineSource::finds_stop`], the editor's buffer), which is never parsed; the text
+    /// document's stop line is known before, from its index.
+    fn walk<L: LineSource + ?Sized>(
         &self,
-        doc: &mut TextDoc,
+        doc: &mut L,
         mut next: u64,
         to: u64,
         state: &mut State,
         dropped: &dyn Fn() -> bool,
         mut keep: Option<&mut Vec<Runs>>,
-    ) -> Result<bool> {
+    ) -> Result<Walked> {
         while next < to {
             let want = (to - next).min(BATCH as u64) as usize;
             let lines = doc.read_lines(next, want)?;
@@ -3406,7 +3460,10 @@ impl Highlight {
             }
             for line in &lines {
                 if dropped() {
-                    return Ok(false);
+                    return Ok(Walked::Dropped);
+                }
+                if line.cut && doc.finds_stop() {
+                    return Ok(Walked::Cut(next));
                 }
                 let runs = self.run(state, &line.text);
                 if let Some(keep) = keep.as_deref_mut() {
@@ -3415,22 +3472,27 @@ impl Highlight {
                 next += 1;
             }
         }
-        Ok(true)
+        Ok(Walked::All)
     }
 
     /// The page of `count` lines at `top`, highlighted up to the stop line (plain after it).
     /// `Ok(None)`: dropped for a newer request (or the window went).
-    fn page(
+    pub(super) fn page<L: LineSource + ?Sized>(
         &mut self,
-        doc: &mut TextDoc,
+        doc: &mut L,
         top: u64,
         count: usize,
         dropped: &dyn Fn() -> bool,
     ) -> Result<Option<Vec<Runs>>> {
         let lines = doc.read_lines(top, count)?;
-        let end = (top + lines.len() as u64).min(self.stop);
         let mut runs = Vec::new();
-        if top < end {
+        // Once more after a walk met a cut line: the stop line is that one from then on.
+        'stopped: loop {
+            let end = (top + lines.len() as u64).min(self.stop);
+            runs.clear();
+            if top >= end {
+                break;
+            }
             if self.states.is_empty() {
                 // The first page: the syntaxes it is parsed with (a grammar rewritten for it is
                 // built here, on the worker, never on a frame).
@@ -3444,20 +3506,31 @@ impl Highlight {
             while self.states.len() <= k {
                 let i = self.states.len() - 1;
                 let mut state = self.states[i].clone();
-                let (from, to) = (doc.marks[i].line, doc.next_mark(i).line);
-                if !self.walk(doc, from, to, &mut state, dropped, None)? {
-                    return Ok(None);
+                let (from, to) = (doc.mark_line(i), doc.mark_line(i + 1));
+                match self.walk(doc, from, to, &mut state, dropped, None)? {
+                    Walked::All => self.states.push(state),
+                    Walked::Dropped => return Ok(None),
+                    Walked::Cut(line) => {
+                        self.stop = line;
+                        continue 'stopped;
+                    }
                 }
-                self.states.push(state);
             }
             // From that mark to the page, then the page's own lines.
             let mut state = self.states[k].clone();
-            let from = doc.marks[k].line;
-            if !self.walk(doc, from, top, &mut state, dropped, None)?
-                || !self.walk(doc, top, end, &mut state, dropped, Some(&mut runs))?
-            {
-                return Ok(None);
+            let from = doc.mark_line(k);
+            for (from, to, keep) in [(from, top, false), (top, end, true)] {
+                let keep = keep.then_some(&mut runs);
+                match self.walk(doc, from, to, &mut state, dropped, keep)? {
+                    Walked::All => {}
+                    Walked::Dropped => return Ok(None),
+                    Walked::Cut(line) => {
+                        self.stop = line;
+                        continue 'stopped;
+                    }
+                }
             }
+            break;
         }
         runs.truncate(lines.len());
         let plain = self.plain;
@@ -3467,6 +3540,37 @@ impl Highlight {
                 .map(|l| vec![(plain, l.text.clone())]),
         );
         Ok(Some(runs))
+    }
+
+    /// The source changed from a line at or after its kept state `mark` on (the editor's
+    /// buffer, 12 §8): the states after `mark` go, and are made again as pages ask for them. The
+    /// stop line goes too, wherever it is — the cut line may be shorter now, and the viewer's
+    /// stop past 16 MiB moves with any edit — and the walk finds it again (R2 6). Only a source
+    /// that finds its stop is edited; the text document's never is.
+    pub(super) fn edited(&mut self, mark: usize) {
+        self.states.truncate(mark + 1);
+        self.stop = u64::MAX;
+    }
+
+    /// The line highlighting stops at, as far as the walks found it (`u64::MAX`: none found).
+    pub(super) fn stop(&self) -> u64 {
+        self.stop
+    }
+
+    /// The states kept now (EH-3's measure, the tests).
+    pub(super) fn kept(&self) -> usize {
+        self.states.len()
+    }
+
+    /// Lines parsed so far, counted as the parser is handed them (the tests).
+    pub(super) fn parsed(&self) -> Arc<AtomicU64> {
+        self.parsed.clone()
+    }
+
+    /// Tests: `hook` sees each line before it is parsed.
+    #[cfg(test)]
+    pub(super) fn set_hook(&mut self, hook: ParseHook) {
+        self.hook = Some(hook);
     }
 }
 
@@ -3506,7 +3610,7 @@ impl Pool {
     }
 
     /// A slot, if one is free.
-    fn admit(self: &Arc<Self>) -> Option<Slot> {
+    pub(super) fn admit(self: &Arc<Self>) -> Option<Slot> {
         let mut n = self.live.load(Ordering::Acquire);
         loop {
             if n >= self.cap {
@@ -3525,7 +3629,7 @@ impl Pool {
 
 /// One worker's place in its [`Pool`], given back when dropped (when the worker's thread ends,
 /// however it ends).
-struct Slot(Arc<Pool>);
+pub(super) struct Slot(Arc<Pool>);
 
 impl Drop for Slot {
     fn drop(&mut self) {
@@ -6181,7 +6285,7 @@ fn row_chars(
 /// as a terminal that draws a glyph of ambiguous width in two cells (`wide`) is sent it (10 §10,
 /// T38): §10's stand-in, `.` for one it has none for (a letter the printer would lay in two
 /// cells); as it is everywhere else — as the hex view's CP437 column (`hex::column_glyph`).
-fn own_glyph(c: char, wide: bool) -> char {
+pub(super) fn own_glyph(c: char, wide: bool) -> char {
     if !wide || !super::term::ambiguous(c) {
         return c;
     }
