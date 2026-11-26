@@ -6533,6 +6533,21 @@ impl Window for TextWindow {
         Some((self.doc.encoding(), self.doc.pick()))
     }
 
+    fn wrapped(&self) -> Option<bool> {
+        Some(self.wrap)
+    }
+
+    /// As W leaves it: the same line at the top, from its start — a jump on its way (`at=`) still
+    /// lands, under the new wrap. A deleted file keeps its page as it was read, as W does.
+    fn set_wrapped(&mut self, wrapped: bool) {
+        if self.wrap != wrapped && !self.gone {
+            self.wrap = wrapped;
+            self.top_off = 0;
+            self.left = 0;
+            self.moved = 0;
+        }
+    }
+
     /// F8's choice (08 §7.5): read in it from the next pass — in place, or indexed again when
     /// the LF unit changes (D22: [`TextWindow::choose`]).
     fn set_encoding(&mut self, enc: Encoding) {

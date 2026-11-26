@@ -784,6 +784,18 @@ pub trait Window {
     fn set_encoding(&mut self, enc: crate::encoding::Encoding) {
         let _ = enc;
     }
+
+    /// Whether the text view wraps its lines (W, F2): what the switch's state carries of it (10
+    /// §7.4). `None`: the window has no wrap (the default).
+    fn wrapped(&self) -> Option<bool> {
+        None
+    }
+
+    /// The text view wraps its lines (`true`) or not from the next pass, as W or F2 leaves it —
+    /// the switch's state given (10 §7.4). The default does nothing.
+    fn set_wrapped(&mut self, wrapped: bool) {
+        let _ = wrapped;
+    }
 }
 
 /// The view keys of the file browser's viewer while one is open (08 §8, VM-7): what the view on
