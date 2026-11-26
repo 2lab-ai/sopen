@@ -1620,6 +1620,10 @@ impl Browser {
             // the viewer — or it is an info card (an error), and the file opens as from the
             // list.
             Err(preview::Ended::Ready(_)) if cancelled => self.status = not_opened(&name, false),
+            // Prepared for the other backend (a switch since: 10 T21): opened as here.
+            Err(preview::Ended::Ready(p)) if !self.preview.fits(ctx, &name, &p) => {
+                self.start_open(ctx, abs, name)
+            }
             Err(preview::Ended::Ready(previewed)) => match previewed.show().hand_over() {
                 Ok(viewer) => self.handed_over(ctx, viewer, abs, name),
                 Err(_card) => self.start_open(ctx, abs, name),
@@ -1894,7 +1898,7 @@ impl Browser {
                 let taken = match self.open_at {
                     Some(_) => preview::Taken::Nothing,
                     None if self.open_loading || self.open_enc.is_some() => preview::Taken::Nothing,
-                    None => self.preview.take(&path),
+                    None => self.preview.take(ctx, &path),
                 };
                 match taken {
                     preview::Taken::Viewer(viewer) => {

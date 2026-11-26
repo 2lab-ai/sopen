@@ -1625,8 +1625,8 @@ impl Gate {
     }
 }
 
-/// The local disk posing as a remote whose `read_to` (a fetch: after the first chunk) or
-/// `create_from` (a save's upload) stops at a gate.
+/// The local disk posing as a remote whose `read_to` (a fetch: after the first chunk),
+/// `create_from` (a save's upload) or `read_head` (a sniff) stops at a gate.
 struct Gated {
     fs: LocalFs,
     gate: Gate,
@@ -1644,6 +1644,9 @@ impl RemoteFs for Gated {
         self.fs.realpath(p)
     }
     fn read_head(&mut self, p: &str, max: usize) -> Result<Vec<u8>> {
+        if self.at == "read_head" {
+            self.gate.hold();
+        }
         self.fs.read_head(p, max)
     }
     fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {

@@ -1763,6 +1763,7 @@ fn a_long_random_walk_keeps_the_rules() {
         (revision(named("a.png")), Screen::GUI),
         (undecodable(named("shot.png"), "bad"), Screen::GUI),
         (named("a.png"), Screen::TERMINAL),
+        (paged(named("index.html"), false), Screen::TERMINAL),
     ];
     for (k, (opening, screen)) in openings.into_iter().enumerate() {
         let mut rng = Lcg(0x5eed + k as u64);

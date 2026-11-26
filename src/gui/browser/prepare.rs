@@ -1177,6 +1177,9 @@ pub struct Previewed {
     page: PageSeen,
     /// See [`HandedOver::shared`].
     shared: Shared,
+    /// The answer of [`Pages::here`] it was prepared under: a page file's preview is handed
+    /// over only in a backend whose answer is the same (10 T21).
+    made_under: Pages,
 }
 
 /// What a preview found of a page file (09 §5–§6), for the views of the viewer it becomes.
@@ -1199,6 +1202,11 @@ impl Default for PageSeen {
 }
 
 impl Previewed {
+    /// The answer of [`Pages::here`] it was prepared under.
+    pub fn made_under(&self) -> &Pages {
+        &self.made_under
+    }
+
     /// The info card, when the file is not previewed.
     #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn card(&self) -> Option<&Card> {
@@ -1253,6 +1261,7 @@ impl Previewed {
             kind,
             page: self.page,
             shared: self.shared,
+            made_under: self.made_under,
         }
     }
 }
@@ -1271,6 +1280,7 @@ pub struct Preview {
     kind: Kind,
     page: PageSeen,
     shared: Shared,
+    made_under: Pages,
 }
 
 /// A preview handed over (Enter or F3 on it): the viewer, a viewer again.
@@ -1295,6 +1305,11 @@ pub struct HandedOver {
 }
 
 impl Preview {
+    /// The answer of [`Pages::here`] it was prepared under ([`Previewed::made_under`]).
+    pub fn made_under(&self) -> &Pages {
+        &self.made_under
+    }
+
     /// Tests: a preview around a window of the test's own (the preview host's input isolation,
     /// shown on a window that would react).
     #[cfg(test)]
@@ -1307,6 +1322,7 @@ impl Preview {
             kind: Kind::Other,
             page: PageSeen::default(),
             shared: Shared::default(),
+            made_under: Pages::Source(None),
         }
     }
 
@@ -1421,6 +1437,7 @@ pub fn preview_paged(
             cache,
             page: known.page,
             shared: known.shared,
+            made_under: pages.clone(),
         }),
         Err(e) if crate::remote::is_cancelled(&e) => Err(e),
         Err(e) => {
@@ -1439,6 +1456,7 @@ pub fn preview_paged(
                 cache,
                 page: PageSeen::default(),
                 shared: Shared::default(),
+                made_under: pages.clone(),
             })
         }
     }
@@ -1534,8 +1552,11 @@ fn preview_parts(
     known.kind = Some(kind);
     // 09 §5–§6: a page file whose default view is its page shows it, where the window shows
     // pages; the decision reads an `.xml`'s head on this connection. Where it shows its source
-    // (a terminal, 10 T21) the viewer it becomes still has the page among its views.
-    if kind == Kind::Text && kind::page_file(crate::remote::split_parent(&real).1) {
+    // (a terminal, 10 T21) the viewer it becomes still has the page among its views; a window
+    // that shows the source (§4, `Pages::Source` with its line) has no page view, so nothing more
+    // is read for it.
+    let page_view = !matches!(pages, Pages::Source(Some(_)));
+    if page_view && kind == Kind::Text && kind::page_file(crate::remote::split_parent(&real).1) {
         budget.check(cancel)?;
         known.page.class = page_class_on(fs.as_mut(), &real)?;
     }

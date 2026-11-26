@@ -431,8 +431,9 @@ terminal cannot draw it:
   source (09 §5). No snapshot: the engine runs inside a window (09 §2). In a terminal the opening
   and the preview make the source and nothing of the page (`Pages::here`), and the set opens with
   `Screen::TERMINAL` — on 3 for a page (`Screen::first_slot`); the page view is made when 1 is
-  chosen, a hand-off box. A page a window's preview made, handed over in a terminal, opens on it
-  as it was made.
+  chosen, a hand-off box. A page file's preview is handed over only in the backend it was made
+  for: after a switch it is made again, and a preparation Enter took over is opened again
+  (`preview::Host::fits`), so a hand-over opens as a fresh open there would.
 - **The keys come from 10's translator** (`gui::term_input`): a terminal sends the character `1`,
   which it gives as `1`'s key and its text, no physical key — matched by the logical key, as §8
   matches it — and every press followed at once by its release (`term_input::RELEASES`, which the

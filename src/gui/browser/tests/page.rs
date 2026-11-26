@@ -761,9 +761,12 @@ fn wv_d_a_remote_preview_is_made_again_in_the_next_window() {
     assert_eq!(connects(), 1, "on the preview session");
 }
 
-/// Review MF1 (b), the reviewer's RED: preview, its window goes, Enter in the terminal, the next
-/// window — the viewer's page is made (its connection went back to the preview session, so it
-/// connects on its own, 06 §13) and comes ready; never stuck with no view and no line.
+/// Review MF1 (b), the reviewer's RED, under 10 T21 (VM-8): preview, its window goes, Enter in
+/// the terminal, the next window. The terminal makes the preview again as it makes one — the
+/// source, on the preview session its page's server gave back (06 §13) — so Enter there opens on
+/// 3 with nothing of the page made; `1` there makes the page (its hand-off box), its server
+/// connecting on its own, and the next window makes its view, which comes ready; never stuck with
+/// no view and no line.
 #[test]
 fn wv_d_a_preview_handed_over_in_the_terminal_is_made_in_the_next_window() {
     let (connect, connects) = counted();
@@ -773,8 +776,7 @@ fn wv_d_a_preview_handed_over_in_the_terminal_is_made_in_the_next_window() {
     loaded(&mut fx, &fake, 0, "index.html");
     crate::gui::web::teardown(&fx.drv.ctx);
     // The old server gives its connection back on its own thread: the scenario is the one
-    // where the preview session has it back before Enter (Enter first keeps it with the viewer,
-    // the other right answer: one session).
+    // where the preview session has it back before the terminal's preview is made.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !fx.b.preview.session_back() {
         assert!(
@@ -785,9 +787,26 @@ fn wv_d_a_preview_handed_over_in_the_terminal_is_made_in_the_next_window() {
     }
     let mut t = terminal();
     t.idle(&mut fx.b, 3);
+    t.until(&mut fx.b, 20, |b| b.ready());
     t.key(&mut fx.b, Key::Enter, Modifiers::NONE);
-    t.idle(&mut fx.b, 2);
-    assert!(fx.b.viewer.is_some(), "handed over in the terminal");
+    t.until(&mut fx.b, 20, |b| b.ready());
+    let views = &fx
+        .b
+        .viewer
+        .as_ref()
+        .expect("handed over in the terminal")
+        .views;
+    assert_eq!(
+        views.set.on_screen(),
+        Some(crate::views::View::Text),
+        "on 3"
+    );
+    assert!(!views.set.is_made(crate::views::View::Page), "no page made");
+    // One: the terminal's preview read its source through the window's one preview session,
+    // which the viewer keeps with that stream.
+    assert_eq!(connects(), 1, "the preview session only");
+    t.press_typed(&mut fx.b, Key::Num1, "1");
+    t.until(&mut fx.b, 20, |b| b.ready());
     let mut window = Driver::new(1000.0, 700.0);
     assert!(
         passes_until(&mut window, &mut fx, |_| fake.views() == 2),
@@ -807,9 +826,9 @@ fn wv_d_a_preview_handed_over_in_the_terminal_is_made_in_the_next_window() {
         fake.request(1, &fake.host(1).url("index.html"), None),
     );
     assert_eq!(head.map(|h| h.code()), Some(200));
-    // The preview session and the viewer's own: the page a window's preview made is handed
-    // over as it is, so the terminal makes no source view, and no connection, beside it.
-    assert_eq!(connects(), 2, "the viewer's own session");
+    // Two: the preview session the viewer kept with its source's stream, and the page's server's
+    // own connection.
+    assert_eq!(connects(), 2, "the viewer's own session for its page");
 }
 
 /// Review MF1, the dual-window run: a remote viewer's page, its window gone, a terminal's pass,

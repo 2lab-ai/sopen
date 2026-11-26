@@ -215,10 +215,12 @@ pub(super) struct PageOpen {
     /// Where the page goes among its views: the preparation's one decision, from the file
     /// opened (its resolved name and head), never the name the list shows.
     pub class: PageClass,
-    /// The window shows pages (else D30's source, 09 §4): with a class other than `Plain`, the
-    /// page is one of its views.
+    /// The opening made the page (`Pages::Page`), so the set opens on it. Else the source: in a
+    /// terminal with the page still one of its views (10 T21: `Screen::TERMINAL`), in a window
+    /// without it (D30's source, 09 §4).
     pub shown: bool,
-    /// The folder the browser was opened on (§3.1's root).
+    /// The folder the browser was opened on (§3.1's root); `None` where nothing of the page was
+    /// made — the page view finds it then as the browser does ([`Browser::start_making`]).
     pub opened_on: Option<String>,
 }
 
@@ -274,10 +276,10 @@ pub(super) fn open_paged(
     opening.read_only = means.in_place;
     opening.undecodable = opened.undecodable.clone();
     let terminal = crate::gui::in_terminal(ctx);
-    // The screen the opening made its first view for: the page where it was made (a window's,
-    // or a window's preview handed over in a terminal); in a terminal, which draws none, the
-    // source with the window's slots (10 T21: `Pages::here` made nothing of the page); else
-    // the source alone (09 §4).
+    // The screen the opening made its first view for — the backend's own, since a preview is
+    // handed over only in the backend it was made for (`preview::Host::fits`): the page where a
+    // window made it; in a terminal, which draws none, the source with the window's slots (10
+    // T21: `Pages::here` made nothing of the page); else the source alone (09 §4).
     let screen = match (page.class, page.shown, terminal) {
         (PageClass::Plain, ..) | (_, false, false) => Screen::NO_ENGINE,
         (_, true, _) => Screen::GUI,

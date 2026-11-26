@@ -196,8 +196,8 @@ fn tp5_a_remote_page_in_the_terminal_makes_no_page_server() {
     assert!(!set.is_made(View::Page), "no page made");
     assert!(set.hidden().is_empty(), "nothing hidden");
     assert_eq!(connects(), 1, "the source's stream only");
-    digit(&mut fx, 1);
-    fx.settle();
+    let mut input = TermInput::new(cfg!(target_os = "macos"));
+    term_key(&mut fx, &mut input, KeyCode::Char('1'));
     assert_eq!(on(&fx), Some(View::Page), "`1`: the page's hand-off");
     assert_eq!(fake.views(), 0, "no engine asked in a terminal");
     assert_eq!(
@@ -207,11 +207,105 @@ fn tp5_a_remote_page_in_the_terminal_makes_no_page_server() {
     );
 }
 
-/// `n` pressed as the keyboard sends it, settled.
-fn digit(fx: &mut Fx, n: u8) {
-    let key = [Key::Num0, Key::Num1, Key::Num2, Key::Num3][usize::from(n)];
-    fx.drv.press_typed(&mut fx.b, key, &n.to_string());
+/// The page's preview in the window: made, its page loaded (view `n` of the fake).
+fn window_preview(fx: &mut Fx, fake: &FakeEngine, n: usize) {
+    fx.drv.until(&mut fx.b, 20, |_| fake.views() > n);
+    let events = fake.events(n);
+    events.send(WebEvent::Loading);
+    events.send(WebEvent::Finished);
+    fx.settle();
+}
+
+/// A page previewed in the terminal (its source), then F12: the window's passes make its
+/// preview again as the window makes it — the page — so Enter there hands over what a fresh
+/// open would make: `1 Page`, on screen (one view, the preview's).
+#[test]
+fn a_terminals_page_preview_is_made_again_in_the_window() {
+    let (mut fx, fake) = pages(true);
+    fx.b.mode = view::Mode::Preview;
     fx.drv.idle(&mut fx.b, 2);
+    fx.select("index.html");
+    fx.settle();
+    assert_eq!(fake.views(), 0, "the terminal's preview: the source");
+    let mut w = Driver::new(1000.0, 700.0);
+    w.idle(&mut fx.b, 3);
+    w.until(&mut fx.b, 20, |_| fake.views() == 1);
+    let events = fake.events(0);
+    events.send(WebEvent::Loading);
+    events.send(WebEvent::Finished);
+    w.until(&mut fx.b, 20, |b| b.ready());
+    w.key(&mut fx.b, Key::Enter, Modifiers::NONE);
+    w.until(&mut fx.b, 20, |b| b.ready());
+    assert_eq!(strip(&fx), "1 Page · 2 Hex · 3 Text");
+    assert_eq!(on(&fx), Some(View::Page), "the page, 1");
+    assert_eq!(fake.views(), 1, "the preview's view, handed over");
+}
+
+/// The reverse: a page previewed in the window (its page), then the terminal: its passes make
+/// the preview again as the terminal does — the source — so Enter there opens on 3, nothing of
+/// the page made.
+#[test]
+fn a_windows_page_preview_is_made_again_in_the_terminal() {
+    let (mut fx, fake) = pages(false);
+    fx.b.mode = view::Mode::Preview;
+    fx.drv.idle(&mut fx.b, 2);
+    fx.select("index.html");
+    window_preview(&mut fx, &fake, 0);
+    let mut t = Driver::new(1000.0, 700.0);
+    crate::gui::mark_terminal(&t.ctx);
+    t.idle(&mut fx.b, 3);
+    t.until(&mut fx.b, 20, |b| b.ready());
+    t.key(&mut fx.b, Key::Enter, Modifiers::NONE);
+    t.until(&mut fx.b, 20, |b| b.ready());
+    assert_eq!(strip(&fx), "1 Page · 2 Hex · 3 Text");
+    assert_eq!(on(&fx), Some(View::Text), "on its source, 3");
+    let set = &fx.b.viewer.as_ref().unwrap().views.set;
+    assert!(!set.is_made(View::Page), "no page made");
+}
+
+/// Enter while the terminal's preview of a page is still being prepared (held at the styled
+/// XML's head read, its page decision) takes the preparation over as the opening (02 §4.4); a
+/// switch before it ends leaves it the terminal's: the window opens the file again as it opens
+/// one — on its page (10 T21).
+#[test]
+fn a_preparation_taken_over_then_switched_opens_as_the_window_does() {
+    let gate = Gate::default();
+    let (mut fx, fake) = pages_on(true, None, gated(&gate, "read_head"));
+    fx.b.mode = view::Mode::Preview;
+    fx.drv.idle(&mut fx.b, 2);
+    fx.select("styled.xml");
+    gate.reached_running(&mut fx);
+    fx.key(Key::Enter);
+    assert!(fx.b.viewer.is_none(), "taken over, still being prepared");
+    let mut w = Driver::new(1000.0, 700.0);
+    w.idle(&mut fx.b, 2);
+    gate.release();
+    w.until(&mut fx.b, 20, |_| fake.views() == 1);
+    let events = fake.events(0);
+    events.send(WebEvent::Loading);
+    events.send(WebEvent::Finished);
+    w.until(&mut fx.b, 20, |b| b.ready());
+    assert_eq!(strip(&fx), "1 Page · 2 Hex · 3 Text");
+    assert_eq!(on(&fx), Some(View::Page), "the window's open: its page");
+}
+
+/// A remote page previewed in the terminal reads its source on the window's one preview
+/// session, no page server made; Enter hands that stream over, so the viewer is on the same one
+/// connection.
+#[test]
+fn a_remote_page_previewed_in_the_terminal_holds_one_connection() {
+    let (connect, connects) = counted();
+    let (mut fx, fake) = pages_on(true, Some("box"), connect);
+    fx.b.mode = view::Mode::Preview;
+    fx.drv.idle(&mut fx.b, 2);
+    fx.select("index.html");
+    fx.settle();
+    assert_eq!(connects(), 1, "the preview session");
+    fx.key(Key::Enter);
+    fx.settle();
+    assert_eq!(on(&fx), Some(View::Text), "on its source, 3");
+    assert_eq!(fake.views(), 0);
+    assert_eq!(connects(), 1, "the preview's stream, handed over");
 }
 
 /// TK-3 through the translator: in the terminal `1` → view 1 (the page's hand-off); Alt+9 (the

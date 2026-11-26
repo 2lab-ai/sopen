@@ -658,9 +658,9 @@ terminal: §4's no-display rule.
 **The page view in a terminal** (WV-D, VM-8) is a hand-off box (10 §11) — its frame and rows are
 cells; no engine is asked in a terminal — until 10's X6 draws its one-row hand-off (`the page is
 drawn in the window — F12`). In a terminal the opening and the preview make the source and nothing
-of the page (`Pages::here`: no server, no connection for it), so the viewer opens on 3 (a page a
-window's preview made, handed over there, opens on it as made); `1` makes the page view, its server
-connecting on its own, and F12's window makes the view there; a window that goes takes its view
+of the page (`Pages::here`: no server, no connection for it), so the viewer opens on 3; a page
+file's preview made before a switch is made again, so a hand-over opens as a fresh open does in
+either backend; `1` makes the page view, its server connecting on its own, and F12's window makes the view there; a window that goes takes its view
 down and the next one makes it again (a remote page on the connection its server gave back, else
 connected again).
 
