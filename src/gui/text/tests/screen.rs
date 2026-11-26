@@ -529,6 +529,55 @@ fn a_row_full_before_a_tab_ends_there() {
     assert_eq!(rows_of(&win)[..2], ["y".repeat(cols), "z end".to_string()]);
 }
 
+/// A space with a mark on it is no row-end space: at a full row's end it starts the next row,
+/// its mark with it — never swallowed as a space the row broke at is.
+#[test]
+fn a_space_with_a_mark_is_not_swallowed_at_a_rows_end() {
+    let cols = columns(600.0, 400.0);
+    let tmp = tempfile::tempdir().unwrap();
+    let body = format!("{} \u{301}z end\n", "y".repeat(cols));
+    let mut win = viewer(tmp.path(), "mark.txt", &body);
+    let mut drv = Driver::new(600.0, 400.0);
+    drv.until(&mut win, 5, |w| w.ready());
+    assert_eq!(
+        rows_of(&win)[..2],
+        ["y".repeat(cols), " \u{301}z end".to_string()]
+    );
+}
+
+/// In an ambiguous-wide terminal the status row's own words get their stand-ins — the cut's
+/// `…` — but a message's own text (a path with `·` and `…` in it) is the file system's, as it
+/// is: content (T38).
+#[test]
+fn a_status_message_keeps_its_own_text_in_a_wide_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut win = viewer(tmp.path(), "s.txt", "one\ntwo\n");
+    let mut drv = Driver::new(640.0, 160.0);
+    crate::gui::cells::set_ambiguous_wide(&drv.ctx, true);
+    drv.until(&mut win, 5, |w| w.ready());
+    win.status = Status::error("cannot read /srv/a·b…c.txt");
+    drv.idle(&mut win, 1);
+    let row = |drv: &Driver| -> String {
+        let layers = cells::layers(&drv.ctx);
+        let hit = cells::find(&layers, "lines 1");
+        let hit = hit.first().expect("the status row");
+        cells::row_text(&layers[hit.layer].buf, hit.cells.y).0
+    };
+    assert!(
+        row(&drv).contains("cannot read /srv/a·b…c.txt"),
+        "{:?}",
+        row(&drv)
+    );
+    // Cut: the `…` the cut adds is sopen's.
+    win.status = Status::error(format!("cannot read /srv/a·b…c.txt {}", "z".repeat(80)));
+    drv.idle(&mut win, 1);
+    let cut = row(&drv);
+    assert!(
+        cut.contains("/srv/a·b…c.txt zz") && cut.trim_end().ends_with("z~"),
+        "{cut:?}"
+    );
+}
+
 /// A right-to-left run with digits in it, as UAX #9 lays it in a left-to-right row: the run is
 /// reversed whole, its digits kept in their order as a unit — and digits after a Latin letter
 /// are that word's (`L`).

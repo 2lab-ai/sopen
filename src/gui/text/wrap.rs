@@ -176,7 +176,9 @@ impl Kind {
             return Kind::Other;
         };
         match c {
-            ' ' | '\t' => Kind::Space,
+            // (A space with a mark on it is a visible glyph: part of a word.)
+            ' ' | '\t' if cluster.len() == 1 => Kind::Space,
+            ' ' | '\t' => Kind::Other,
             '、' | '。' | '〃' | '々' | '〆' | '〉' | '》' | '」' | '』' | '】' | '〕' | '〗'
             | '〙' | '〛' | '〞' | '〟' | '〻' | 'ゝ' | 'ゞ' | '゛' | '゜' | 'ー' | 'ヽ' | 'ヾ'
             | '・' | '！' | '）' | '，' | '．' | '：' | '；' | '？' | '］' | '｝' | '｠' | '｡'

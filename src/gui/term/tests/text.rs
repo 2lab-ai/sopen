@@ -91,8 +91,11 @@ fn ts4_the_text_viewer_shows_the_windows_cells_in_the_terminal() {
 /// stay whole. A terminal that draws `─` in one cell gets the glyphs.
 #[test]
 fn ts6_the_text_viewers_control_glyphs_have_their_stand_ins() {
-    let fx = fixture_with(0, &["a-ctrl.txt"]);
-    let path = std::path::Path::new(&fx.root).join("a-ctrl.txt");
+    // A name longer than the bar's room for the title, so the title is cut wherever the
+    // host keeps its temporary folders.
+    let name = format!("a-ctrl-{}.txt", "x".repeat(80));
+    let fx = fixture_with(0, &[name.as_str()]);
+    let path = std::path::Path::new(&fx.root).join(&name);
     std::fs::write(path, "a\u{7}b\u{18}c\u{85}d ♥• end\n").unwrap();
     let (mut drv, mut win) = window(&fx, 100, 30);
     for _ in 0..4 {

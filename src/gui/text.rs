@@ -5705,7 +5705,12 @@ impl TextWindow {
         let color = if status.error { p.error } else { p.text };
         let room = usize::from(end.saturating_sub(x));
         let shown = cells::fit_start(&text, room);
-        let laid = own_text(&shown, wide);
+        // The message is its own (a path in it is the file system's, T38), but the `…` a cut
+        // adds is sopen's.
+        let laid = match shown.strip_suffix('…') {
+            Some(head) if shown != text => format!("{head}{}", own_text("…", wide)),
+            _ => shown.clone(),
+        };
         cells::put(buf, x, y, &laid, room, Pen::new(color, p.back));
         if shown != text {
             let row = grid.rect(Cells::new(x, y, room as u16, 1));
