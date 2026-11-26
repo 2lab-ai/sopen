@@ -118,19 +118,22 @@ impl Pages {
     /// How a file named `name` opens in `ctx`'s window, asked on its frame (the engine is the
     /// windows' thread's): a page file as its page where pages show here (09 §4), else as its
     /// source with the line saying why — `failed`, a view the engine refused before, says it
-    /// for the rest of the window. Any other name opens as before 09, no engine asked.
+    /// for the rest of the window. Any other name opens as before 09, no engine asked. In a
+    /// terminal, which draws no page (10 T21), a page file opens as its source with no line and
+    /// nothing of the page is made; its page is still one of its views (the class the
+    /// preparation finds), made when it is chosen.
     pub fn here(
         ctx: &egui::Context,
         name: &str,
         opened_on: Option<String>,
         failed: Option<&crate::gui::web::Unavailable>,
     ) -> Pages {
-        if !kind::page_file(name) {
+        if !kind::page_file(name) || crate::gui::in_terminal(ctx) {
             return Pages::Source(None);
         }
         let here = match failed {
             Some(why) => Err(why.clone()),
-            None => page::pages_here(ctx),
+            None => page::pages_here(),
         };
         match here {
             Ok(()) => Pages::Page { opened_on },
@@ -1174,6 +1177,9 @@ pub struct Previewed {
     page: PageSeen,
     /// See [`HandedOver::shared`].
     shared: Shared,
+    /// The answer of [`Pages::here`] it was prepared under: a page file's preview is handed
+    /// over only in a backend whose answer is the same (10 T21).
+    made_under: Pages,
 }
 
 /// What a preview found of a page file (09 §5–§6), for the views of the viewer it becomes.
@@ -1196,6 +1202,11 @@ impl Default for PageSeen {
 }
 
 impl Previewed {
+    /// The answer of [`Pages::here`] it was prepared under.
+    pub fn made_under(&self) -> &Pages {
+        &self.made_under
+    }
+
     /// The info card, when the file is not previewed.
     #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
     pub fn card(&self) -> Option<&Card> {
@@ -1250,6 +1261,7 @@ impl Previewed {
             kind,
             page: self.page,
             shared: self.shared,
+            made_under: self.made_under,
         }
     }
 }
@@ -1268,6 +1280,7 @@ pub struct Preview {
     kind: Kind,
     page: PageSeen,
     shared: Shared,
+    made_under: Pages,
 }
 
 /// A preview handed over (Enter or F3 on it): the viewer, a viewer again.
@@ -1292,6 +1305,11 @@ pub struct HandedOver {
 }
 
 impl Preview {
+    /// The answer of [`Pages::here`] it was prepared under ([`Previewed::made_under`]).
+    pub fn made_under(&self) -> &Pages {
+        &self.made_under
+    }
+
     /// Tests: a preview around a window of the test's own (the preview host's input isolation,
     /// shown on a window that would react).
     #[cfg(test)]
@@ -1304,6 +1322,7 @@ impl Preview {
             kind: Kind::Other,
             page: PageSeen::default(),
             shared: Shared::default(),
+            made_under: Pages::Source(None),
         }
     }
 
@@ -1418,6 +1437,7 @@ pub fn preview_paged(
             cache,
             page: known.page,
             shared: known.shared,
+            made_under: pages.clone(),
         }),
         Err(e) if crate::remote::is_cancelled(&e) => Err(e),
         Err(e) => {
@@ -1436,6 +1456,7 @@ pub fn preview_paged(
                 cache,
                 page: PageSeen::default(),
                 shared: Shared::default(),
+                made_under: pages.clone(),
             })
         }
     }
@@ -1530,11 +1551,17 @@ fn preview_parts(
     let (kind, sniff) = kind::detect_sniffed(fs.as_mut(), &real, &stat)?;
     known.kind = Some(kind);
     // 09 §5–§6: a page file whose default view is its page shows it, where the window shows
-    // pages; the decision reads an `.xml`'s head on this connection.
-    if let (Kind::Text, Pages::Page { opened_on }) = (kind, pages) {
-        known.page.shown = true;
+    // pages; the decision reads an `.xml`'s head on this connection. Where it shows its source
+    // (a terminal, 10 T21) the viewer it becomes still has the page among its views — a page
+    // file by the name the list shows, as `Pages::here` asks; a window that shows the source
+    // (§4, `Pages::Source` with its line) has no page view, so nothing more is read for it.
+    let page_view = !matches!(pages, Pages::Source(Some(_)));
+    if page_view && kind == Kind::Text && kind::page_file(&known.name) {
         budget.check(cancel)?;
         known.page.class = page_class_on(fs.as_mut(), &real)?;
+    }
+    if let (Kind::Text, Pages::Page { opened_on }) = (kind, pages) {
+        known.page.shown = true;
         // A remote page lends the window's preview session; without it, its source.
         let lent = session.filter(|_| label.is_some());
         if known.page.class == PageClass::PageFirst && (label.is_none() || lent.is_some()) {

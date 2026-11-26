@@ -22,8 +22,8 @@
 //!   Hangul composition there, 10 §4), else it is hidden.
 //! - **Hand-off boxes** (T17, 10 §11): cells no layer covers are a pane the window draws in egui
 //!   (the preview's frame, a viewer not yet in cells, the tree, the git panel) — in the terminal a
-//!   frame saying `F12 shows it in the window`; a click on it is the switch. The hex view is
-//!   cells (X3-hex), so it is drawn here as in the window.
+//!   frame saying `F12 shows it in the window`; a click on it is the switch. The text viewer
+//!   (X3-text) and the hex view (X3-hex) are cells, so they are drawn here as in the window.
 //! - **Colours** are sent as RGB when `COLORTERM` says `truecolor` or `24bit`, else through
 //!   [`cells::index256`]; never the 16 indexes a theme repaints (T15).
 //! - **Ambiguous width** (10 §10, TS-6): the first time the terminal is taken, `─` is written at
@@ -83,7 +83,7 @@ pub(crate) const HAND_OFF: &str = "F12 shows it in the window";
 pub(crate) const MODAL_LINE: &str =
     "a dialog the terminal does not draw yet: F12 shows it in the window, Esc closes it";
 /// The status line when there is no display for the window (10 §7.1).
-pub(crate) const NO_DISPLAY: &str =
+pub const NO_DISPLAY: &str =
     "no display here — sopen config target <host>, or --target, opens the window on another machine";
 
 /// The most text sent to the terminal's clipboard (OSC 52): many terminals refuse or cut more.

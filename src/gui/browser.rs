@@ -39,6 +39,7 @@ pub(crate) use ops::shown_wrapped;
 mod panel;
 mod prepare;
 mod preview;
+pub(crate) mod switch_state;
 mod tree;
 pub(crate) mod view;
 mod view_set;
@@ -596,6 +597,9 @@ struct Viewer {
     /// (03 §6.3): the viewer was told before its first pass, and so is every view made later —
     /// the hex window an image gives way to among them.
     views: view_set::Views,
+    /// Whether its text view wraps, as last seen on screen: what the switch's state carries of
+    /// it while another view is on screen (10 §7.4).
+    text_wrap: Option<bool>,
 }
 
 /// The directory tree on the side that had the keyboard when F10 was pressed (05; 02 §3.1
@@ -832,6 +836,9 @@ pub(crate) struct Browser {
     /// own), and the check running for the delete dialog that is open.
     trash_check: TrashCheck,
     trash_wait: Option<TrashWait>,
+    /// The switch's state this browser was given (10 §7.4), while what it asks for is still
+    /// being put back ([`switch_state`]): the browser has not settled until it is.
+    given: Option<switch_state::Given>,
 }
 
 impl Drop for Browser {
@@ -979,6 +986,7 @@ impl Browser {
             git,
             trash_check: trash_check(),
             trash_wait: None,
+            given: None,
         };
         browser.list(None, start.abs, None, None);
         browser
@@ -1030,6 +1038,8 @@ impl Browser {
         keep: Option<usize>,
         ctx: Option<&egui::Context>,
     ) {
+        // A listing a given switch state did not ask for: what it was still putting back goes.
+        self.given_overtaken();
         let (tx, rx) = mpsc::channel();
         let (conn, connect, remote) = (
             self.conn.clone(),
@@ -1498,6 +1508,8 @@ impl Browser {
         let panels = panel.map_or(vec![0, 1], |p| vec![p]);
         let (entries, free) = match result {
             Ok(listed) => listed,
+            // A given state's folder that does not list here: its nearest parent that does.
+            Err(e) if self.given_unlisted(ctx, panel, &dir, &e) => return,
             Err(e) => {
                 for i in panels {
                     self.list_errors[i] = Some(format!("{e:#}"));
@@ -1528,6 +1540,7 @@ impl Browser {
                 // The entry is gone (moved away, renamed elsewhere): the bar stays on its row.
                 panel.highlight = row.min(panel.entries.len().saturating_sub(1));
             }
+            self.given_listed(i, &dir);
         }
         // A listing is not a bar move: what it changes commits at once (02 §3.1). A folder whose
         // detection failed (an answer it could not read, a lost channel) is asked again on this
@@ -1620,6 +1633,10 @@ impl Browser {
             // the viewer — or it is an info card (an error), and the file opens as from the
             // list.
             Err(preview::Ended::Ready(_)) if cancelled => self.status = not_opened(&name, false),
+            // Prepared for the other backend (a switch since: 10 T21): opened as here.
+            Err(preview::Ended::Ready(p)) if !self.preview.fits(ctx, &name, &p) => {
+                self.start_open(ctx, abs, name)
+            }
             Err(preview::Ended::Ready(previewed)) => match previewed.show().hand_over() {
                 Ok(viewer) => self.handed_over(ctx, viewer, abs, name),
                 Err(_card) => self.start_open(ctx, abs, name),
@@ -1804,6 +1821,7 @@ impl Browser {
             abs,
             switch: made.switch,
             views,
+            text_wrap: None,
         });
         self.moved_at = None;
     }
@@ -1894,7 +1912,7 @@ impl Browser {
                 let taken = match self.open_at {
                     Some(_) => preview::Taken::Nothing,
                     None if self.open_loading || self.open_enc.is_some() => preview::Taken::Nothing,
-                    None => self.preview.take(&path),
+                    None => self.preview.take(ctx, &path),
                 };
                 match taken {
                     preview::Taken::Viewer(viewer) => {
@@ -2656,11 +2674,13 @@ impl Browser {
         Status::info(LIST_HINT)
     }
 
-    /// Nothing is on its way: no listing, no opening, the display committed and its preview
-    /// on screen, the viewer ready, no file operation running unasked (one waiting at its
-    /// name-in-the-way question has settled: only an answer moves it).
+    /// Nothing is on its way: no switch state still being put back, no listing, no opening, the
+    /// display committed and its preview on screen, the viewer ready, no file operation running
+    /// unasked (one waiting at its name-in-the-way question has settled: only an answer moves
+    /// it).
     fn settled(&self) -> bool {
         self.painted
+            && self.given.is_none()
             && self.listing.is_empty()
             && self.opening.is_none()
             && !self.uncommitted
@@ -2690,6 +2710,9 @@ impl Window for Browser {
             // No viewer, no view keys (08 §8).
             super::set_view_keys(&ctx, None);
         }
+        // The switch's own pass, before anything of this one: a given state's next step, on
+        // the display the last pass committed; the text view's wrap noted.
+        self.switch_pass(&ctx);
         self.play(&ctx);
         self.git_stop_on_esc(&ctx);
         self.poll(&ctx);

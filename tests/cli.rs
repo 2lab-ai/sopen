@@ -1451,7 +1451,9 @@ fn media_autoexport_writes_a_sibling() {
 // cannot see). The target's stand-in sopen prints `FAKE_SOPEN_SAY` (its lines), if set — with
 // `FAKE_SOPEN_PACE=<seconds>`, one at a time, that long after each — and with
 // `FAKE_SOPEN_HOLD=1` then reads its input to the end, as HOST's half of a tunnel holds, before
-// it exits — so it plays a HOST sopen of any version, cues included (09 §7).
+// it exits — so it plays a HOST sopen of any version, cues included (09 §7). With
+// `FAKE_SOPEN_UNKNOWN=<flag>` it is a sopen that does not know that flag: given it, it prints
+// clap's usage error for it on its stderr and exits 2 before anything else, as clap does.
 
 /// A target name no test machine has.
 const HOST: &str = "sopen-test-target";
@@ -1572,7 +1574,13 @@ impl FakeSsh {
         executable(
             &sopen,
             &format!(
-                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{dir}/sopen-argv'\n\
+                "#!/bin/sh\n\
+                 if [ -n \"${{FAKE_SOPEN_UNKNOWN:-}}\" ]; then for a in \"$@\"; do \
+                 if [ \"$a\" = \"$FAKE_SOPEN_UNKNOWN\" ]; then printf \"error: unexpected argument \
+                 '%s' found\\n\\n  tip: a similar argument exists: '--tui'\\n\\nUsage: sopen --here \
+                 --tui [SOURCE]\\n\\nFor more information, try '--help'.\\n\" \"$a\" >&2; exit 2; fi; \
+                 done; fi\n\
+                 for a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{dir}/sopen-argv'\n\
                  if [ -n \"${{FAKE_SOPEN_SIGNAL:-}}\" ]; then kill -\"$FAKE_SOPEN_SIGNAL\" $$; fi\n\
                  if [ -n \"${{FAKE_SOPEN_PACE:-}}\" ]; then printf '%s\\n' \"$FAKE_SOPEN_SAY\" | \
                  while IFS= read -r l; do printf '%s\\n' \"$l\"; '{sleep}' \"$FAKE_SOPEN_PACE\"; done\n\
@@ -1786,6 +1794,351 @@ fn target_runs_sopen_there_over_ssh_and_keeps_its_exit_code() {
     assert!(ssh.argv().is_none());
     let log = std::fs::read_to_string(tmp.path().join("state/usage.jsonl")).unwrap();
     assert!(!log.contains(HOST), "{log}");
+}
+
+/// `--gui` on a forward (10 §7.3, T35; X2-gui), until XF: passed only when the owner gave it
+/// (decided 2026-11-26) — whatever the kind, a hook keeping the run without a window included —
+/// never with `--app` (a usage error) nor for an address (§11 rows 1 and 4). Without it a run is
+/// today's, HOST picking by kind; the kinds a sender sees are `seen_kind`'s, tested in the
+/// binary, for XF's automatic `--gui`.
+#[test]
+fn a_target_run_passes_gui_only_when_given() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let bin = ssh.sopen.to_str().unwrap();
+    let short = sopen::forward::short_hostname().expect("this machine has a host name");
+    std::fs::create_dir(tmp.path().join("dir")).unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "text\n").unwrap();
+    std::fs::write(tmp.path().join("blob"), [0u8, 1, 2, 0]).unwrap();
+    std::fs::write(tmp.path().join("a.mp3"), b"").unwrap();
+    let path = |name: &str| tmp.path().join(name).to_str().unwrap().to_string();
+    let there = |name: &str| {
+        let real = std::fs::canonicalize(tmp.path().join(name)).unwrap();
+        format!("{short}:{}", real.display())
+    };
+    let ran = |args: &[&str], hook: (&str, &str)| -> Vec<String> {
+        ssh.forget();
+        let args: Vec<&str> = ["--target", HOST]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        let out = sopen(
+            tmp.path(),
+            &args,
+            &[("PATH", &ssh.path), ("SOPEN_TARGET_BIN", bin), hook],
+        );
+        assert!(
+            out.status.success(),
+            "{args:?} {hook:?}: {}",
+            text(&out.stderr)
+        );
+        ssh.sopen_argv().expect("sopen ran on the target")
+    };
+    let plain = ("SOPEN_EDITOR_WAIT", "3");
+    let with = |gui: bool, source: &str| -> Vec<String> {
+        let mut want = vec!["--here".to_string()];
+        if gui {
+            want.push("--gui".to_string());
+        }
+        want.extend(["--".to_string(), source.to_string()]);
+        want
+    };
+    let image = format!("{HOST}:/srv/img.png");
+    // No kind brings it: a folder, an image, an mp3, a binary, text, a name that decides nothing.
+    for (source, as_there) in [
+        (path("dir"), there("dir")),
+        (path("a.mp3"), there("a.mp3")),
+        (path("blob"), there("blob")),
+        (path("notes.txt"), there("notes.txt")),
+        (image.clone(), "/srv/img.png".to_string()),
+        (format!("{HOST}:/srv/data"), "/srv/data".to_string()),
+    ] {
+        assert_eq!(ran(&[&source], plain), with(false, &as_there), "{source}");
+        assert_eq!(
+            ran(&["--gui", &source], plain),
+            with(true, &as_there),
+            "{source}"
+        );
+    }
+    // Nor `--hex`, nor a hook — the owner's `--gui` goes with any of them.
+    assert_eq!(
+        ran(&["--hex", &image], plain),
+        ["--here", "--hex", "--", "/srv/img.png"]
+    );
+    assert_eq!(
+        ran(&["--gui", "--hex", &image], plain),
+        ["--here", "--gui", "--hex", "--", "/srv/img.png"]
+    );
+    for hook in [
+        ("SOPEN_LIST", "1"),
+        ("SOPEN_AUTOSAVE", "1"),
+        ("SOPEN_SCREENSHOT", "/tmp/shot.png"),
+    ] {
+        assert_eq!(
+            ran(&[&image], hook),
+            with(false, "/srv/img.png"),
+            "{hook:?}"
+        );
+        assert_eq!(
+            ran(&["--gui", &image], hook),
+            with(true, "/srv/img.png"),
+            "{hook:?}"
+        );
+    }
+    // `--app` never; with `--gui` it is a usage error.
+    assert_eq!(
+        ran(&["--app", "X", &path("blob")], plain),
+        ["--here", "--app", "X", "--", &there("blob")]
+    );
+    ssh.forget();
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, "--gui", "--app", "X", &path("blob")],
+        &[("PATH", &ssh.path), ("SOPEN_TARGET_BIN", bin)],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(ssh.argv().is_none(), "ssh ran");
+    // An address never: the owner's `--gui` stays here.
+    let (browser, _) = stand_in_browser(tmp.path());
+    let url = "https://example.com/a";
+    ssh.forget();
+    let out = sopen(
+        tmp.path(),
+        &["--gui", "--target", HOST, "--browser", url],
+        &[
+            ("PATH", &ssh.path),
+            ("SOPEN_TARGET_BIN", bin),
+            ("SOPEN_BROWSER", browser.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        ssh.sopen_argv().unwrap(),
+        ["--here", "--browser", "--", url]
+    );
+}
+
+/// The line sopen says when the target's sopen does not know `--gui` (X2-gui).
+fn older_line() -> String {
+    format!("sopen: sopen on {HOST} is older and does not know --gui; running it there again without it")
+}
+
+/// A target whose sopen predates `--gui` (X2-gui): clap there refuses it (exit 2, its line) before
+/// anything runs, so the same run goes once more without it, and one line says why; HOST's exit
+/// code is then the run's.
+#[test]
+fn an_older_sopen_on_the_target_gets_the_run_again_without_gui() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let dir = tmp.path().join("dir");
+    std::fs::create_dir(&dir).unwrap();
+    let out = sopen(
+        tmp.path(),
+        &[
+            "--target",
+            HOST,
+            "--gui",
+            "--hex",
+            &format!("{HOST}:/srv/a.bin"),
+        ],
+        &[
+            ("PATH", &ssh.path),
+            ("SOPEN_TARGET_BIN", ssh.sopen.to_str().unwrap()),
+            ("FAKE_SOPEN_UNKNOWN", "--gui"),
+            ("FAKE_SOPEN_EXIT", "3"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    let calls = ssh_calls(&ssh);
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    // The first run asked for the window, the second is the same run without that one word.
+    assert!(calls[0].contains(&q("--gui")), "{:#?}", calls[0]);
+    let without: Vec<String> = calls[0]
+        .iter()
+        .filter(|w| *w != &q("--gui"))
+        .cloned()
+        .collect();
+    assert_eq!(calls[1], without);
+    assert_eq!(
+        ssh.sopen_argv().unwrap(),
+        ["--here", "--hex", "--", "/srv/a.bin"]
+    );
+    // HOST's own lines pass as they came; then sopen's one line.
+    let err = text(&out.stderr);
+    assert!(
+        err.starts_with("error: unexpected argument '--gui' found\n"),
+        "{err}"
+    );
+    assert_eq!(err.lines().last(), Some(older_line().as_str()), "{err}");
+    assert_eq!(err.matches(&older_line()).count(), 1, "{err}");
+    let log = usage_lines(tmp.path());
+    assert_eq!(log.len(), 1, "one run in the log");
+    assert_eq!(log[0]["conflict"], true);
+
+    // A folder there: the same, with exit 0.
+    ssh.forget();
+    let _ = std::fs::remove_file(ssh.dir.join("calls"));
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, "--gui", dir.to_str().unwrap()],
+        &[
+            ("PATH", &ssh.path),
+            ("SOPEN_TARGET_BIN", ssh.sopen.to_str().unwrap()),
+            ("FAKE_SOPEN_UNKNOWN", "--gui"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(ssh_calls(&ssh).len(), 2);
+    let short = sopen::forward::short_hostname().expect("this machine has a host name");
+    let real = std::fs::canonicalize(&dir).unwrap();
+    assert_eq!(
+        ssh.sopen_argv().unwrap(),
+        ["--here", "--", &format!("{short}:{}", real.display())]
+    );
+    assert!(text(&out.stderr).ends_with(&format!("{}\n", older_line())));
+}
+
+/// Any other exit 2 from the target is its answer as it is, never retried: clap's line for
+/// another flag (a sopen older still, without `--here`), or a usage error without that line.
+#[test]
+fn another_usage_error_on_the_target_is_not_retried() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let source = format!("{HOST}:/srv/a.png");
+    for (env, line) in [
+        (
+            ("FAKE_SOPEN_UNKNOWN", "--here"),
+            Some("error: unexpected argument '--here' found"),
+        ),
+        (("FAKE_SOPEN_EXIT", "2"), None),
+    ] {
+        let _ = std::fs::remove_file(ssh.dir.join("calls"));
+        let out = sopen(
+            tmp.path(),
+            &["--target", HOST, "--gui", &source],
+            &[
+                ("PATH", &ssh.path),
+                ("SOPEN_TARGET_BIN", ssh.sopen.to_str().unwrap()),
+                env,
+            ],
+        );
+        assert_eq!(out.status.code(), Some(2), "{env:?}: {}", text(&out.stderr));
+        let calls = ssh_calls(&ssh);
+        assert_eq!(calls.len(), 1, "{env:?}: {calls:#?}");
+        assert!(calls[0].contains(&q("--gui")), "{:#?}", calls[0]);
+        let err = text(&out.stderr);
+        assert!(!err.contains("is older"), "{env:?}: {err}");
+        if let Some(line) = line {
+            assert!(err.starts_with(&format!("{line}\n")), "{err}");
+        }
+    }
+}
+
+/// The run is made again only on evidence that HOST's sopen refused `--gui` before it did
+/// anything (X2-gui, 2026-11-26): exit 2, clap's line the first HOST wrote on its stderr (blank
+/// lines and colours aside), nothing on its stdout. A sopen that does something first and says so
+/// — a line on its stdout, or another line on its stderr before clap's — then exits 2 with that
+/// line is HOST's answer as it is: run once, its side effect once.
+#[test]
+fn a_target_that_did_something_before_the_line_is_not_run_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let ran = tmp.path().join("ran");
+    let wrapper = tmp.path().join("wrapper-sopen");
+    let clap = "error: unexpected argument '--gui' found";
+    for (said, retried) in [
+        (
+            format!("printf 'wrote it\\n'; printf \"\\n{clap}\\n\" >&2"),
+            false,
+        ),
+        (format!("printf \"fetching a.png\\n{clap}\\n\" >&2"), false),
+        (
+            format!("printf \"\\n\\n{clap}\\n\\nUsage: sopen\\n\" >&2"),
+            true,
+        ),
+    ] {
+        let _ = std::fs::remove_file(&ran);
+        let _ = std::fs::remove_file(ssh.dir.join("calls"));
+        // On the second run (no `--gui`) it opens as a newer sopen would: exit 0.
+        executable(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nprintf 'x\\n' >> '{ran}'\n\
+                 for a in \"$@\"; do if [ \"$a\" = --gui ]; then {said}; exit 2; fi; done\nexit 0\n",
+                ran = ran.display()
+            ),
+        );
+        let out = sopen(
+            tmp.path(),
+            &["--target", HOST, "--gui", &format!("{HOST}:/srv/dir")],
+            &[
+                ("PATH", &ssh.path),
+                ("SOPEN_TARGET_BIN", wrapper.to_str().unwrap()),
+            ],
+        );
+        let err = text(&out.stderr);
+        let runs = std::fs::read_to_string(&ran).unwrap().lines().count();
+        let calls = ssh_calls(&ssh).len();
+        if retried {
+            assert_eq!(out.status.code(), Some(0), "{said}: {err}");
+            assert_eq!((calls, runs), (2, 2), "{said}: {err}");
+            assert!(err.ends_with(&format!("{}\n", older_line())), "{err}");
+        } else {
+            assert_eq!(out.status.code(), Some(2), "{said}: {err}");
+            assert_eq!((calls, runs), (1, 1), "{said}: {err}");
+            assert!(!err.contains("is older"), "{said}: {err}");
+            assert!(err.contains(clap), "{said}: {err}");
+        }
+    }
+}
+
+/// HOST's sopen given `--gui` with no display there says §7.1's line; this side passes it on as
+/// it came, through the stream it watches, and leaves with HOST's exit 1 — no retry.
+#[test]
+fn hosts_no_display_line_passes_as_it_came() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ssh = FakeSsh::new(tmp.path());
+    let line =
+        "sopen: no display here — sopen config target <host>, or --target, opens the window \
+                on another machine";
+    let wrapper = tmp.path().join("no-display-sopen");
+    executable(
+        &wrapper,
+        &format!("#!/bin/sh\nprintf '%s\\n' '{line}' >&2\nexit 1\n"),
+    );
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, "--gui", &format!("{HOST}:/srv/dir")],
+        &[
+            ("PATH", &ssh.path),
+            ("SOPEN_TARGET_BIN", wrapper.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr), format!("{line}\n"));
+    assert_eq!(ssh_calls(&ssh).len(), 1);
+}
+
+/// `--gui` asks for the window where SOURCE opens; here, with no display, that is §7.1's line and
+/// exit 1 (10 §11 row 2) before anything is read.
+#[cfg(target_os = "linux")]
+#[test]
+fn gui_with_no_display_here_is_its_line_and_exit_1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("dir");
+    std::fs::create_dir(&dir).unwrap();
+    let mut cmd = sopen_command(tmp.path());
+    cmd.args(["--gui", "--here"])
+        .arg(&dir)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stderr),
+        "sopen: no display here — sopen config target <host>, or --target, opens the window on \
+         another machine\n"
+    );
 }
 
 #[test]

@@ -3,6 +3,7 @@
 //! and pages through real key events.
 
 use super::*;
+use crate::gui::cells;
 use crate::gui::chrome;
 use crate::gui::testkit::Driver;
 use eframe::egui::{Key, Modifiers, Pos2};
@@ -2874,38 +2875,94 @@ fn a_long_line_is_laid_out_as_far_as_the_window_shows() {
 // ---------------------------------------------------------------------------------------------
 // Word wrap (owner, message 13): on by default, the whole of every line, read a chunk at a time.
 
-/// Where the rows of text start across the window: the left edge of the text drawn that starts
-/// with `prefix` (the line numbers sit to the left of it).
+/// Where the rows of text start across the window: the left edge of the cells that show `prefix`
+/// (the line numbers sit to the left of it), its topmost place.
 fn text_x(drv: &Driver, prefix: &str) -> f32 {
-    drv.texts()
+    let layers = cells::layers(&drv.ctx);
+    let hit = cells::find(&layers, prefix)
         .into_iter()
-        .find(|(_, _, t)| t.starts_with(prefix))
-        .map(|(r, _, _)| r.left())
-        .unwrap_or_else(|| panic!("no text starts with {prefix:?}"))
+        .min_by_key(|h| h.cells.y)
+        .unwrap_or_else(|| panic!("no cells show {prefix:?}"));
+    layers[hit.layer].rect(hit.cells).left()
 }
 
-/// The rows of text drawn at column `x`, top to bottom — whether or not they fit their clip.
-fn rows_at(drv: &Driver, x: f32) -> Vec<String> {
-    let mut rows: Vec<(f32, String)> = drv
-        .texts()
-        .into_iter()
-        .filter(|(r, _, _)| (r.left() - x).abs() < 0.5)
-        .map(|(r, _, t)| (r.top(), t))
-        .collect();
-    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
-    rows.into_iter().map(|(_, t)| t).collect()
-}
-
-/// Every row drawn at column `x` lies inside the rect it is clipped to: no glyph is cut at the
-/// window's edge.
-fn assert_rows_inside(drv: &Driver, x: f32) {
-    for (bounds, clip, text) in drv.texts() {
-        if (bounds.left() - x).abs() < 0.5 {
-            assert!(
-                clip.expand(0.5).contains_rect(bounds),
-                "{text:?} runs out of the window: {bounds:?} in {clip:?}"
-            );
+/// The frame's rows in cells: the layer that holds the scroll bar, its column, and the rows
+/// from its `↑` to its `↓` (the rows' cells).
+fn frame_rows(drv: &Driver) -> (std::sync::Arc<cells::Layer>, u16, std::ops::Range<u16>) {
+    let p = chrome::PALETTE;
+    let bar = |s: &cells::Seen| (s.fg, s.bg) == (Some(p.track), Some(p.track_back));
+    for l in cells::layers(&drv.ctx) {
+        let seen = l.seen();
+        let a = l.buf.area;
+        for (dy, row) in seen.iter().enumerate() {
+            let Some(dx) = row.iter().position(|s| s.symbol == "↑" && bar(s)) else {
+                continue;
+            };
+            let down = (dy..seen.len()).find(|&y| seen[y][dx].symbol == "↓");
+            let down = down.expect("the bar's ↓");
+            let (x, top) = (a.x + dx as u16, a.y + dy as u16);
+            return (l.clone(), x, top..a.y + down as u16 + 1);
         }
+    }
+    panic!("no scroll bar in cells");
+}
+
+/// The rows of text in cells from column `x` (points) to the scroll bar, top to bottom: what
+/// each row's cells show from there, its blanks at the end left out (a cell cannot tell a space
+/// from no character), rows that show nothing left out.
+fn rows_at(drv: &Driver, x: f32) -> Vec<String> {
+    let (l, bar, rows) = frame_rows(drv);
+    let a = l.buf.area;
+    let from = ((x - l.origin.x) / chrome::CELL.x).round() as u16;
+    let seen = l.seen();
+    rows.filter_map(|y| {
+        let row = &seen[usize::from(y - a.y)];
+        let text: String = (from..bar)
+            .map(|x| row[usize::from(x - a.x)].symbol.as_str())
+            .collect();
+        let text = text.trim_end().to_string();
+        (!text.is_empty()).then_some(text)
+    })
+    .collect()
+}
+
+/// No row's cells run over the frame: the scroll bar's column is the bar's all the way down
+/// (the rows end before it), whatever is shown from column `x`.
+fn assert_rows_inside(drv: &Driver, x: f32) {
+    let (l, bar, rows) = frame_rows(drv);
+    let p = chrome::PALETTE;
+    let a = l.buf.area;
+    let seen = l.seen();
+    for y in rows {
+        let s = &seen[usize::from(y - a.y)][usize::from(bar - a.x)];
+        assert!(
+            cells::frame_cell(&s.symbol, s.fg, s.bg) || s.bg == Some(p.thumb),
+            "row {y} runs over the bar at {x}: {s:?}"
+        );
+    }
+}
+
+/// The page's rows as wrapping cut them — a row's last space too, which its cells cannot tell
+/// from no character — once the cells from column `x` are seen to show them, top to bottom.
+fn page_rows(drv: &Driver, win: &TextWindow, x: f32) -> Vec<String> {
+    let rows = rows_of(win);
+    let shown: Vec<String> = (rows.iter())
+        .map(|r| r.trim_end().to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
+    assert_eq!(rows_at(drv, x), shown, "the cells show the page's rows");
+    rows
+}
+
+/// Every row of the page on screen fits its room in cells, as the cell painter lays it.
+fn assert_rows_fit(win: &TextWindow) {
+    for row in &win.page.as_ref().expect("a page").rows {
+        let text = row.cut.text();
+        assert!(
+            cells::width(&text) <= win.room.max(1),
+            "{text:?} is wider than {} cells",
+            win.room
+        );
     }
 }
 
@@ -2924,7 +2981,7 @@ fn lines_wrap_by_default() {
     let mut drv = Driver::new(600.0, 400.0);
     drv.until(&mut win, 5, |w| w.ready());
     let x = text_x(&drv, "0000 0001");
-    let rows = rows_at(&drv, x);
+    let rows = page_rows(&drv, &win, x);
     assert!(rows.len() >= 3, "wrapped: {rows:?}");
     let shown: String = rows.iter().take_while(|r| *r != "next").cloned().collect();
     assert!(
@@ -2980,7 +3037,7 @@ fn a_line_over_line_max_is_shown_whole_across_rows() {
     drv.until(&mut win, 5, |w| w.ready());
     let x = text_x(&drv, "0000 0001");
     drv.key(&mut win, Key::End, Modifiers::NONE);
-    let rows = rows_at(&drv, x);
+    let rows = page_rows(&drv, &win, x);
     assert!(
         rows.last().is_some_and(|r| r.ends_with("THE END")),
         "the end of the line: {rows:?}"
@@ -3086,9 +3143,9 @@ fn a_character_across_a_read_edge_is_never_split_in_a_wrapped_line() {
     assert!(rows.iter().all(|r| !r.contains('\u{FFFD}')), "{rows:?}");
 }
 
-/// With the system fonts a window gets (Hangul, emoji: wider than a cell), rows are broken by
-/// the measured width of their glyphs: every row inside the window, no glyph cut at its edge,
-/// and the rows are the line.
+/// With the system fonts a window gets (Hangul, emoji: drawn wider than a cell), rows are
+/// broken by the cells their glyphs take — two each — not by how wide a font draws them: every
+/// row inside the window, no glyph cut at its edge, and the rows are the line.
 #[test]
 fn hangul_and_emoji_wrap_inside_the_window_with_system_fonts() {
     use egui_system_font_provider::SystemFontProvider;
@@ -3167,7 +3224,7 @@ fn rows_break_after_a_space_when_the_word_fits() {
     let mut drv = Driver::new(600.0, 400.0);
     drv.until(&mut win, 5, |w| w.ready());
     let x = text_x(&drv, "lorem ipsum");
-    let rows = rows_at(&drv, x);
+    let rows = page_rows(&drv, &win, x);
     let line_rows: Vec<String> = rows
         .iter()
         .take_while(|r| !r.starts_with('z'))
@@ -3270,11 +3327,11 @@ fn highlighting_runs_on_across_wrapped_rows_and_never_cuts_a_line() {
     drv.key(&mut win, Key::End, crate::gui::testkit::command(false));
     drv.until(&mut win, 10, |w| w.ready());
     assert!(
-        rows_at(&drv, x)
+        page_rows(&drv, &win, x)
             .concat()
             .contains("xxx THE END */ let y = 1;fn after() {}"),
         "the long line whole after highlighting: {:?}",
-        rows_at(&drv, x)
+        rows_of(&win)
     );
     assert_eq!(drv.colors_of("fn after() {}"), Some(vec![plain]));
 }
@@ -3466,7 +3523,7 @@ fn a_deleted_file_keeps_its_wrapped_page_through_a_resize_and_w() {
     let mut drv = Driver::new(600.0, 400.0);
     drv.until(&mut win, 5, |w| w.ready());
     let x = text_x(&drv, "0000 0001");
-    let rows = rows_at(&drv, x);
+    let rows = page_rows(&drv, &win, x);
     std::fs::remove_file(tmp.path().join("gone.txt")).unwrap();
     later(&clock, 2.0);
     drv.idle(&mut win, 3);
@@ -3477,7 +3534,11 @@ fn a_deleted_file_keeps_its_wrapped_page_through_a_resize_and_w() {
     drv.key(&mut win, Key::W, Modifiers::NONE);
     drv.key(&mut win, Key::PageDown, Modifiers::NONE);
     assert_eq!(win.doc.page_reads(), reads, "nothing read");
-    assert_eq!(rows_at(&drv, x), rows, "the page as it was");
+    assert_eq!(rows_of(&win), rows, "the page as it was");
+    // Narrower now: each row shows what of it fits.
+    for (shown, row) in rows_at(&drv, x).iter().zip(&rows) {
+        assert!(row.starts_with(shown.as_str()), "{shown:?} of {row:?}");
+    }
 }
 
 /// Narrowed while inside a long line, the top goes back to the start of the row it is in at the
@@ -3634,40 +3695,18 @@ fn several_tabs_on_a_row_each_go_to_their_stop() {
 // cluster's glyphs all carry its first character — rows are measured by laying them out, broken
 // only between grapheme clusters, with a bounded number of layouts.
 
-/// The installed fonts a window gets (eframe's system font provider), found for every character
-/// in `need` — laid out once by a probe window first — or why not (the test then skips).
-fn system_fonts(drv: &mut Driver, dir: &Path, need: &str) -> bool {
-    use egui_system_font_provider::SystemFontProvider;
-    drv.ctx
-        .add_font_provider(Arc::new(SystemFontProvider::new()));
-    let mut probe = viewer(dir, "probe.txt", &format!("{need}\n"));
-    drv.idle(&mut probe, 3);
-    let f = chrome::font();
-    let missing: String = need
-        .chars()
-        .filter(|&c| c != ' ' && !drv.ctx.fonts_mut(|fonts| fonts.has_glyph(&f, c)))
-        .collect();
-    if !missing.is_empty() {
-        eprintln!("SKIPPED: no installed font for {missing:?}");
-    }
-    missing.is_empty()
-}
-
 /// Every row of the file as wrapping cuts it at the window's width, from the top (through a memo
 /// of its own), and the row starts found going back up from the last row.
 fn all_rows(drv: &Driver, win: &mut TextWindow) -> (Vec<wrap::Row>, Vec<wrap::Pos>) {
-    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
-    let font = chrome::font();
-    let cell = drv.ctx.fonts_mut(|f| f.glyph_width(&font, '0'));
+    let _ = drv;
     let room = win.room;
     let mut memo = wrap::Memo::default();
     memo.reset(room);
     let mut w = wrap::Wrapper {
         doc: &mut win.doc,
         memo: &mut memo,
-        m: wrap::Measure::new(&drv.ctx, font, plain),
         width: room,
-        read: wrap::read_cap(room, cell),
+        read: wrap::read_cap(room),
     };
     let (mut rows, mut p) = (Vec::new(), wrap::Pos::default());
     loop {
@@ -3698,23 +3737,21 @@ fn rejoined(rows: &[wrap::Row], line: u64) -> String {
 }
 
 /// A long line of `unit` (words shorter than a row) at 480 points: the first page and a page
-/// down take a bounded number of layouts; every row is inside the window, starts between
-/// grapheme clusters and ends after a space (a word that fits is never split); the rows put
-/// together are the line; going back up from the end finds the same rows.
+/// down cut a bounded number of rows; every row fits its cells, starts between grapheme
+/// clusters and ends after a space (a word that fits is never split); the rows put together are
+/// the line; going back up from the end finds the same rows. No font is asked: rows are measured
+/// in cells (unicode-width), as the cell painter lays them.
 fn shaped_line_wraps_at_clusters(name: &str, unit: &str) {
     use unicode_segmentation::UnicodeSegmentation;
     let tmp = tempfile::tempdir().unwrap();
     let mut drv = Driver::new(480.0, 300.0);
-    if !system_fonts(&mut drv, tmp.path(), unit) {
-        return;
-    }
     // Past a restart point (16 KiB).
     let line = unit.repeat(20 * 1024 / unit.len() + 1);
     let mut win = viewer(tmp.path(), name, &format!("{line}\nnext\n"));
     let before = wrap::laid();
     drv.until(&mut win, 120, |w| w.ready());
     let rows = win.page.as_ref().unwrap().rows.len();
-    let cols = (win.room / chrome::CELL.x) as usize;
+    let cols = win.room;
     let laid = |since: (usize, usize)| {
         let now = wrap::laid();
         (now.0 - since.0, now.1 - since.1)
@@ -3722,24 +3759,18 @@ fn shaped_line_wraps_at_clusters(name: &str, unit: &str) {
     let (layouts, chars) = laid(before);
     assert!(
         layouts <= 8 * rows + 16 && chars <= 8 * rows * (2 * cols + 16),
-        "{name}: {layouts} layouts of {chars} characters for a page of {rows} rows"
+        "{name}: {layouts} rows cut, {chars} characters, for a page of {rows} rows"
     );
-    let x = drv
-        .texts()
-        .into_iter()
-        .filter(|(_, _, t)| !t.is_empty() && line.starts_with(t.as_str()))
-        .map(|(r, _, _)| r.left())
-        .next()
-        .expect("the first row");
-    assert_rows_inside(&drv, x);
+    assert_rows_fit(&win);
     let before = wrap::laid();
     drv.key(&mut win, Key::PageDown, Modifiers::NONE);
     let (layouts, _) = laid(before);
     assert!(
         layouts <= 8 * rows + 16,
-        "{name}: {layouts} layouts for PgDn"
+        "{name}: {layouts} rows cut for PgDn"
     );
-    assert_rows_inside(&drv, x);
+    assert_rows_fit(&win);
+    assert_rows_inside(&drv, 0.0);
 
     let (all, back) = all_rows(&drv, &mut win);
     let starts: std::collections::HashSet<usize> = line
@@ -3747,8 +3778,6 @@ fn shaped_line_wraps_at_clusters(name: &str, unit: &str) {
         .map(|(i, _)| i)
         .chain([line.len()])
         .collect();
-    let font = chrome::font();
-    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
     let of_line: Vec<&wrap::Row> = all.iter().filter(|r| r.line == Some(0)).collect();
     for (k, row) in of_line.iter().enumerate() {
         assert!(
@@ -3756,14 +3785,10 @@ fn shaped_line_wraps_at_clusters(name: &str, unit: &str) {
             "{name}: row {k} starts inside a cluster: {:?}",
             row.cut.text()
         );
-        let wide = drv
-            .ctx
-            .fonts_mut(|f| f.layout_no_wrap(row.cut.text(), font.clone(), plain))
-            .size()
-            .x;
+        let wide = cells::width(&row.cut.text());
         assert!(
-            wide <= win.room + 0.5,
-            "{name}: row {k} is {wide} wide in {}",
+            wide <= win.room,
+            "{name}: row {k} is {wide} cells in {}",
             win.room
         );
         // A restart point (16 KiB) moves on to the next word start too.
@@ -3880,9 +3905,6 @@ fn a_restart_point_inside_a_cluster_moves_past_it() {
     use unicode_segmentation::UnicodeSegmentation;
     let tmp = tempfile::tempdir().unwrap();
     let mut drv = Driver::new(480.0, 300.0);
-    if !system_fonts(&mut drv, tmp.path(), "कि") {
-        return;
-    }
     let restart = wrap::RESTART as usize;
     // "क" ends where the restart point is; "ि" starts there.
     let mut line = "a".repeat(restart - 3);
@@ -3917,58 +3939,31 @@ fn a_restart_point_inside_a_cluster_moves_past_it() {
 // ---------------------------------------------------------------------------------------------
 // Review round 3: rows that start right to left, and Chinese / Japanese without spaces.
 
-/// Where each glyph of the painted row holding `needle` sits, left to right: (character, x).
-fn painted(drv: &Driver, needle: &str) -> Vec<(char, f32)> {
-    let (_, galley) = drv
-        .galleys()
+/// What the cells of the row showing `needle` read, left to right.
+fn row_in_cells(drv: &Driver, needle: &str) -> String {
+    let layers = cells::layers(&drv.ctx);
+    let hit = cells::find(&layers, needle)
         .into_iter()
-        .find(|(_, g)| g.text().contains(needle))
-        .unwrap_or_else(|| panic!("no row holds {needle:?}"));
-    let mut glyphs: Vec<(char, f32)> = galley
-        .rows
-        .iter()
-        .flat_map(|r| r.glyphs.iter())
-        // Only glyphs with an advance: egui also lists a zero-width one per character it shaped
-        // into a glyph run (in logical order, at the run's end).
-        .filter(|g| g.advance_width > 0.0)
-        .map(|g| (g.chr, g.pos.x))
-        .collect();
-    glyphs.sort_by(|a, b| a.1.total_cmp(&b.1));
-    glyphs
-}
-
-/// The x of each letter of `word` as painted (the first glyph found for each, in reading order).
-fn word_xs(glyphs: &[(char, f32)], word: &str) -> Vec<f32> {
-    // The painted order left to right, as a string: the word must read left to right in it.
-    let order: String = glyphs.iter().map(|g| g.0).collect();
-    let at = order
-        .find(word)
-        .unwrap_or_else(|| panic!("{word:?} does not read left to right in {order:?}"));
-    let start = order[..at].chars().count();
-    glyphs[start..start + word.chars().count()]
-        .iter()
-        .map(|g| g.1)
-        .collect()
+        .next()
+        .unwrap_or_else(|| panic!("no row of cells holds {needle:?}"));
+    cells::row_text(&layers[hit.layer].buf, hit.cells.y).0
 }
 
 /// A row whose first strong character is right to left (a line starting in Hebrew, and a wrapped
-/// row starting mid-line with a Hebrew word) still paints its English words left to right, and
-/// each Hebrew word right to left; the row is as wide as it was measured.
+/// row starting mid-line with a Hebrew word) still lays its English words left to right in its
+/// cells, and each Hebrew word right to left — a run of them reversed into the cells' order, as
+/// it reads; the row takes the cells it was measured in.
 #[test]
 fn a_row_starting_right_to_left_keeps_english_left_to_right() {
     let cols = columns(600.0, 400.0);
     let tmp = tempfile::tempdir().unwrap();
     let mut drv = Driver::new(600.0, 400.0);
-    if !system_fonts(&mut drv, tmp.path(), "שלום") {
-        return;
-    }
     // Row 1 starts with Hebrew; the wrapped line has a row starting with "כהן".
     let filler = "x".repeat(cols - 2);
     let body = format!("שלום text here and more\n{filler} כהן\", \"email\": \"u0\"\n");
     let mut win = viewer(tmp.path(), "rtl.txt", &body);
     drv.until(&mut win, 5, |w| w.ready());
-    let x = text_x(&drv, "xxxx");
-    let rows = rows_at(&drv, x);
+    let rows = rows_of(&win);
     assert!(
         rows.iter().any(|r| r.starts_with("כהן")),
         "a wrapped row starts with Hebrew: {rows:?}"
@@ -3977,30 +3972,27 @@ fn a_row_starting_right_to_left_keeps_english_left_to_right() {
         ("text here", ["text", "here"], "שלום"),
         ("email", ["email", "u0"], "כהן"),
     ] {
-        let glyphs = painted(&drv, needle);
+        let order = row_in_cells(&drv, needle);
         for word in english {
-            let xs = word_xs(&glyphs, word);
-            assert!(xs.windows(2).all(|w| w[0] < w[1]), "{word:?} at {xs:?}");
+            assert!(order.contains(word), "{word:?} left to right in {order:?}");
         }
         // The Hebrew word reads right to left: its last letter leftmost.
         let reversed: String = hebrew.chars().rev().collect();
-        word_xs(&glyphs, &reversed);
-        // As wide as the row was measured (laid out as one run).
-        let (_, galley) = drv
-            .galleys()
-            .into_iter()
-            .find(|(_, g)| g.text().contains(needle))
-            .unwrap();
-        let font = chrome::font();
-        let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
-        let measured = drv
-            .ctx
-            .fonts_mut(|f| f.layout_no_wrap(galley.text().to_string(), font.clone(), plain))
-            .size()
-            .x;
-        assert_eq!(galley.size().x, measured, "{needle:?}");
+        assert!(
+            order.contains(&reversed),
+            "{hebrew:?} reversed in {order:?}"
+        );
+        // The row's cells are its characters in the cells' order, nothing else.
+        let row = rows.iter().find(|r| r.contains(needle)).unwrap();
+        let chars: Vec<(char, Color32)> = row.chars().map(|c| (c, Color32::WHITE)).collect();
+        let visual: String = in_cell_order(&chars).into_iter().map(|(g, _)| g).collect();
+        assert!(
+            order.contains(visual.trim_end()),
+            "{order:?} shows {row:?} as {visual:?}"
+        );
     }
-    assert_rows_inside(&drv, x);
+    assert_rows_fit(&win);
+    assert_rows_inside(&drv, 0.0);
 }
 
 /// A Chinese or Japanese paragraph with only a few spaces: a row breaks between any two
@@ -4010,9 +4002,6 @@ fn a_row_starting_right_to_left_keeps_english_left_to_right() {
 fn cjk_rows_fill_the_width(name: &str, unit: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let mut drv = Driver::new(480.0, 300.0);
-    if !system_fonts(&mut drv, tmp.path(), unit) {
-        return;
-    }
     let line = unit.repeat(30);
     let mut win = viewer(tmp.path(), name, &format!("{line}\n"));
     drv.until(&mut win, 10, |w| w.ready());
@@ -4031,14 +4020,8 @@ fn cjk_rows_fill_the_width(name: &str, unit: &str) {
         })
         .collect();
     assert_eq!(forward, back, "{name}: the same rows going back up");
-    let font = chrome::font();
-    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
-    let wide = |t: &str| {
-        drv.ctx
-            .fonts_mut(|f| f.layout_no_wrap(t.to_string(), font.clone(), plain))
-            .size()
-            .x
-    };
+    // Measured in cells, as the cell painter lays them (an ideograph two).
+    let wide = cells::width;
     let closing = "。、，．」』）！？：；";
     let latin_words: std::collections::HashSet<&str> = unit
         .split(|c: char| !c.is_ascii_alphabetic())
@@ -4109,77 +4092,65 @@ fn a_chinese_paragraph_fills_its_rows() {
     );
 }
 
-/// Sections of a painted row never split a grapheme cluster: a combining mark, a ZWJ or a
-/// variation selector after a right-to-left letter — mid-row or at the row's end — goes in its
-/// base's section (egui would shape it alone, detached from its base).
+/// A row's cells never split a grapheme cluster: a combining mark, a ZWJ or a variation
+/// selector after a right-to-left letter — mid-row or at the row's end — stays with its base in
+/// one glyph (its cell), and the clusters are the row's, each once, a right-to-left run reversed.
 #[test]
-fn directed_sections_never_split_a_cluster() {
+fn cell_order_never_splits_a_cluster() {
     use unicode_segmentation::UnicodeSegmentation;
-    let font = chrome::font();
-    for s in [
-        "\u{05D0}\u{0301} x",
-        "x \u{05D0}\u{0301}",
-        "\u{0628}\u{0301} x",
-        "x \u{0628}\u{0301}",
-        "\u{05D0}\u{0591}\u{05D1} text",
-        "x \u{0628}\u{200D}",
-        "\u{05D0}\u{FE0F} y",
+    for (s, laid) in [
+        ("\u{05D0}\u{0301} x", vec!["\u{05D0}\u{0301}", " ", "x"]),
+        ("x \u{05D0}\u{0301}", vec!["x", " ", "\u{05D0}\u{0301}"]),
+        ("\u{0628}\u{0301} x", vec!["\u{0628}\u{0301}", " ", "x"]),
+        ("x \u{0628}\u{0301}", vec!["x", " ", "\u{0628}\u{0301}"]),
+        (
+            "\u{05D0}\u{0591}\u{05D1} text",
+            vec!["\u{05D1}", "\u{05D0}\u{0591}", " ", "t", "e", "x", "t"],
+        ),
+        ("x \u{0628}\u{200D}", vec!["x", " ", "\u{0628}\u{200D}"]),
+        ("\u{05D0}\u{FE0F} y", vec!["\u{05D0}\u{FE0F}", " ", "y"]),
+        // A word: its letters reversed, the space between two words with them.
+        (
+            "\u{05E9}\u{05DC}\u{05D5}\u{05DD} \u{05E2}\u{05D5}\u{05DC}\u{05DD} ok",
+            vec![
+                "\u{05DD}", "\u{05DC}", "\u{05D5}", "\u{05E2}", " ", "\u{05DD}", "\u{05D5}",
+                "\u{05DC}", "\u{05E9}", " ", "o", "k",
+            ],
+        ),
     ] {
-        let job = directed_job(s.chars().map(|c| (c, Color32::WHITE)).collect(), &font);
-        assert_eq!(job.text, s);
-        let starts: std::collections::HashSet<usize> = s
-            .grapheme_indices(true)
-            .map(|(i, _)| i)
-            .chain([s.len()])
-            .collect();
-        let ranges: Vec<(usize, usize)> = job
-            .sections
-            .iter()
-            .map(|sec| (sec.byte_range.start.0, sec.byte_range.end.0))
-            .collect();
-        for &(from, to) in &ranges {
-            assert!(
-                starts.contains(&from) && starts.contains(&to),
-                "{s:?}: a section boundary inside a cluster: {ranges:?}"
-            );
-        }
+        let chars: Vec<(char, Color32)> = s.chars().map(|c| (c, Color32::WHITE)).collect();
+        let order: Vec<String> = in_cell_order(&chars).into_iter().map(|(g, _)| g).collect();
+        assert_eq!(order, laid, "{s:?}");
+        let mut clusters: Vec<&str> = s.graphemes(true).collect();
+        let mut got: Vec<&str> = order.iter().map(String::as_str).collect();
+        clusters.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, clusters, "{s:?}: each cluster once");
     }
 }
 
-/// On screen such a mark sits over its base — mid-row and at the row's end — and the row is as
-/// wide as it was measured.
+/// In the row's cells such a mark is in its base's cell — mid-row and at the row's end — and
+/// the row takes the cells it was measured in, a colour per cluster (its base's).
 #[test]
 fn a_mark_after_a_right_to_left_letter_stays_on_its_base() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut drv = Driver::new(600.0, 400.0);
-    if !system_fonts(&mut drv, tmp.path(), "\u{0628}") {
-        return;
-    }
-    let font = chrome::font();
-    let plain = chrome::Palette::of(&drv.ctx.global_style().visuals).text;
+    let p = chrome::PALETTE;
     for s in ["\u{0628}\u{0301} x", "x \u{0628}\u{0301}"] {
-        let job = directed_job(s.chars().map(|c| (c, plain)).collect(), &font);
-        let galley = drv.ctx.fonts_mut(|f| f.layout_job(job));
-        let measured = drv
-            .ctx
-            .fonts_mut(|f| f.layout_no_wrap(s.to_string(), font.clone(), plain));
-        assert_eq!(galley.size().x, measured.size().x, "{s:?}");
-        let glyphs = &galley.rows[0].glyphs;
-        let base = glyphs
-            .iter()
-            .position(|g| g.chr == '\u{0628}' && g.advance_width > 0.0)
-            .expect("the base");
-        let (left, right) = (glyphs[base].pos.x, glyphs[base].max_x());
-        for (i, g) in glyphs.iter().enumerate() {
-            if i != base && (g.chr == '\u{0628}' || g.chr == '\u{0301}') {
-                assert!(
-                    g.pos.x >= left - 1.5 && g.max_x() <= right + 0.5,
-                    "{s:?}: the mark at {}..{} is off its base at {left}..{right}",
-                    g.pos.x,
-                    g.max_x()
-                );
-            }
-        }
+        let chars: Vec<(char, Color32)> = s
+            .chars()
+            .map(|c| (c, if c == '\u{0301}' { p.dim } else { p.text }))
+            .collect();
+        let mut buf = cells::Buffer::empty(cells::Cells::new(0, 0, 10, 1));
+        assert!(!lay_row(&mut buf, 0, 0, 10, &chars), "{s:?} fits");
+        let (text, at) = cells::row_text(&buf, 0);
+        assert!(text.starts_with(s), "{text:?}");
+        let base = text.chars().position(|c| c == '\u{0628}').unwrap();
+        assert_eq!(at[base], at[base + 1], "{s:?}: the mark in its base's cell");
+        assert_eq!(buf[(at[base], 0)].symbol(), "\u{0628}\u{0301}");
+        assert_eq!(
+            buf[(at[base], 0)].fg,
+            ratatui_core::style::Color::Rgb(170, 170, 170)
+        );
+        assert_eq!(cells::width(s), 3, "{s:?}: three cells");
     }
 }
 
@@ -4923,13 +4894,20 @@ fn where_no_character_start_is_proven_the_row_shows_marks() {
         );
         assert_eq!(row.cut.dim, row.cut.shown.len());
     }
+    // (`░` is a frame's glyph to the test kit's runs: the marks' cells are read directly.)
     let marks = rest[0].cut.text();
-    let dim = drv.colors_of(&marks).unwrap();
-    assert_ne!(dim[0], plain[0], "marks are dim");
+    let layers = cells::layers(&drv.ctx);
+    let hit = cells::find(&layers, &marks)
+        .into_iter()
+        .next()
+        .expect("the marks' cells");
+    let dim = cells::colors(&layers[hit.layer], hit.cells);
+    assert_eq!(dim, [chrome::PALETTE.dim], "marks are dim");
+    assert_ne!(dim[0], plain[0]);
     assert!(
         drv.texts()
             .iter()
-            .any(|(_, _, t)| t.contains("CP949: no character boundary known here")),
+            .any(|(_, _, t)| t.contains("CP949: no character boundary")),
         "{:?}",
         drv.texts()
     );
@@ -5029,8 +5007,7 @@ fn end_on_an_odd_length_utf16_line_lands_on_a_character_start() {
     let mut w = wrap::Wrapper {
         doc: &mut doc,
         memo: &mut memo,
-        m: wrap::Measure::new(&drv.ctx, FontId::monospace(14.0), egui::Color32::WHITE),
-        width: 1000.0,
+        width: 125,
         read: 8,
     };
     let span = w.line(0).unwrap();
@@ -5250,3 +5227,5 @@ fn a_rebuild_overtaken_by_a_change_comes_back_to_its_place_by_byte() {
 }
 
 pub(super) mod cp949;
+
+mod screen;

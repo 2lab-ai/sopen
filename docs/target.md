@@ -7,6 +7,7 @@ sopen --target <host> <host>:/tmp/a.html      # a file on <host> itself opens th
 sopen --target <host> ./notes.txt             # a local file: <host> fetches it from this machine
 sopen config target <host>                    # from now on `sopen SOURCE` opens on <host>
 sopen --here myserver:/tmp/a.html             # …but this one here
+sopen --gui --target <host> <host>:/srv/app   # in a window on <host>, never its fallback without one
 sopen config                                  # where the config file is, the target (and fkeys, if set)
 sopen config target --unset                   # back to this machine
 sopen config fkeys system                     # macOS: sopen never touches what the top row sends
@@ -38,6 +39,17 @@ alias. It needs sopen installed; sopen there gets `--here`, so it never sends th
 A local file (or a `localhost:` one) is fetched by `<host>` from this machine by its short host
 name, so that name must work for `ssh` on `<host>`.
 
+`--gui` asks for the window: with a target, sopen there gets it too (never with `--app` or for an
+address), and with no desktop session there its sopen says `no display here — …` and
+exits 1 instead of today's fallbacks. Without `--gui` a forwarded run is as before: `<host>` picks
+by what it finds. (When the terminal becomes xtools' default, sopen will add `--gui` itself for
+what opens in a window.) A `<host>` whose sopen is older than `--gui` refuses it (its own usage
+error, before it does anything); sopen then runs the same thing there once more without it, and
+says `sopen on <host> is older and does not know --gui; running it there again without it`.
+`--gui` without a target opens here as before, and on a machine without a display (Linux without
+`DISPLAY` or `WAYLAND_DISPLAY`) it exits 1 with `no display here — sopen config target <host>, or
+--target, opens the window on another machine`.
+
 The window opens on `<host>`'s desktop session (on Linux sopen finds it through
 `systemctl --user`). On macOS an app started over ssh cannot take focus: the xtools window
 floats above the other windows until you click, type or scroll in it (or it gets focus), but the editor
@@ -45,8 +57,9 @@ floats above the other windows until you click, type or scroll in it (or it gets
 there; a sopen stopped without a terminal leaves the window on `<host>` open.
 
 The exit code is `<host>`'s; `could not reach <host>` means ssh did not get there, `sopen is not
-installed on <host>` (exit 127) means it has no sopen, and `sopen on <host> ended with status
-N (signal n?)` means it most likely was interrupted there.
+installed on <host>` (exit 127) means it has no sopen, `sopen on <host> ended with status
+N (signal n?)` means it most likely was interrupted there, and exit 2 with `<host>`'s own usage
+line (other than the one for `--gui`) means its sopen is too old for the run, or the run is wrong.
 
 A web address with `--target` opens in `<host>`'s browser, a loopback one through a tunnel: see
 [Web addresses](urls.md).

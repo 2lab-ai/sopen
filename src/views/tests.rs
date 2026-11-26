@@ -4,10 +4,7 @@ use std::time::{Duration, SystemTime};
 use View::{Audio, Hex, Image, Page, Raw, Text, Video};
 
 const NONE: Option<View> = None;
-const PAGES: Screen = Screen {
-    pictures: true,
-    pages: true,
-};
+const PAGES: Screen = Screen::GUI;
 const CLEAN: Now = Now::CLEAN;
 const UNSAVED: Now = Now {
     hold: Hold::Unsaved,
@@ -372,24 +369,24 @@ fn rows() -> Vec<Row> {
     ));
     let ts = of_kind(kind::refine_after_fetch("clip.ts", Kind::Video, None), 9);
     out.push(row(".ts that is not media", ts, gui, [h, h, t], Hex, None));
-    // §9: a terminal that draws no pictures.
+    // 10 T21 (TP-5): the terminal keeps every slot; an image and a video open on 1, a page
+    // file on its source, 3 (its view 1 the page's hand-off), plain XML and RSS on 1.
     let term = Screen::TERMINAL;
-    let np = Some(Why::NoPictures);
     out.push(row(
         "png, terminal",
         named("a.png"),
         term,
         [i, h, NONE],
-        Hex,
-        np.clone(),
+        Image,
+        None,
     ));
     out.push(row(
         "mp4, terminal",
         named("a.mp4"),
         term,
         [v, h, NONE],
-        Hex,
-        np,
+        Video,
+        None,
     ));
     out.push(row(
         "mp3, terminal",
@@ -399,8 +396,22 @@ fn rows() -> Vec<Row> {
         Audio,
         None,
     ));
-    let html = paged(named("index.html"), false);
-    out.push(row("html, terminal", html, term, [t, h, r], Text, None));
+    for (what, opening) in [
+        ("html, terminal", paged(named("index.html"), false)),
+        ("htm, terminal", paged(named("index.htm"), false)),
+        ("styled xml, terminal", paged(named("feed.xml"), true)),
+    ] {
+        out.push(row(what, opening, term, [p, h, t], Text, None));
+    }
+    let plain = paged(named("feed.xml"), false);
+    out.push(row(
+        "plain xml, terminal",
+        plain,
+        term,
+        [t, h, p],
+        Text,
+        None,
+    ));
     let e = empty(named("e.png"));
     out.push(row(
         "empty png, terminal",
@@ -430,6 +441,25 @@ fn every_row_of_section_3_locally_and_through_a_stream() {
             assert_eq!(set.reach(), reach, "{what}");
             assert_eq!(set.opening(), &opening, "{what}");
         }
+    }
+}
+
+/// 10 T21: the same keys mean the same views in both backends — every row's slots in the
+/// terminal are the window's, and so is D10; only where a page file opens differs: on its
+/// source, 3, where the window opens its page, 1.
+#[test]
+fn t21_the_terminal_keeps_the_windows_slots_and_opens_a_page_on_its_source() {
+    for row in rows().into_iter().filter(|r| r.screen == Screen::GUI) {
+        let what = row.what;
+        let window = ViewSet::open(row.opening.clone(), Screen::GUI).unwrap();
+        let term = ViewSet::open(row.opening.clone(), Screen::TERMINAL).unwrap();
+        assert_eq!(term.slots(), window.slots(), "{what}");
+        assert_eq!(term.unshown(), window.unshown(), "{what}");
+        let opens = match window.on_screen() {
+            Some(Page) => term.slot(Slot::Three),
+            on => on,
+        };
+        assert_eq!(term.on_screen(), opens, "{what}");
     }
 }
 
@@ -521,7 +551,6 @@ fn the_reasons_say_the_file_is_shown_as_bytes() {
         "unknown image format; the file is shown as bytes"
     );
     assert!(Why::Empty.to_string().contains("0 bytes"));
-    assert!(Why::NoPictures.to_string().contains("no pictures"));
 }
 
 // ---- §5: a switch ----
@@ -1734,6 +1763,7 @@ fn a_long_random_walk_keeps_the_rules() {
         (revision(named("a.png")), Screen::GUI),
         (undecodable(named("shot.png"), "bad"), Screen::GUI),
         (named("a.png"), Screen::TERMINAL),
+        (paged(named("index.html"), false), Screen::TERMINAL),
     ];
     for (k, (opening, screen)) in openings.into_iter().enumerate() {
         let mut rng = Lcg(0x5eed + k as u64);

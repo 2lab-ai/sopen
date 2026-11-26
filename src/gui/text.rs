@@ -20,14 +20,22 @@
 //!
 //! The place on screen is a byte offset (06 §7.2): where the top line starts in the file, with
 //! its line number where the index reaches it, and the byte of it the top row starts at.
-//! Lines wrap by default ([`wrap`]): every line is shown whole, in rows broken by the measured
-//! width of their glyphs, and a page reads only its rows' bytes — a line of hundreds of megabytes
+//! Lines wrap by default ([`wrap`]): every line is shown whole, in rows broken by the cells their
+//! glyphs take, and a page reads only its rows' bytes — a line of hundreds of megabytes
 //! too, from wherever the page is in it. W or F2 switch to one row per line, where the place
 //! within a line is a byte of it: → and ←, Home, End and the wheel sideways move it, and a row
 //! is read under the same bound as a wrapped one, so a line of any length can be scrolled to
 //! any byte. Cmd/Ctrl+G opens Go to in the status row: a line number, or `0x…` for a byte
 //! offset. The scroll bar is clicked or dragged: by lines when the lines are all known and not
-//! wrapped, else by bytes.
+//! wrapped, else by bytes; its ↑ and ↓ step a row.
+//!
+//! The screen is cells (10 §4–§6, X3-text): the bar, the frame with the gutter and the rows,
+//! the notes and the status row with Go to's field (`ops::dialog`'s) are written into one buffer
+//! on the viewer's grid and painted a glyph per cell, so the terminal shows the viewer as the
+//! window does. A row's widths are unicode-width's (Hangul, CJK and an emoji two cells, a
+//! letter and its marks one: [`wrap`]); its colours are the highlighter's, a cell each; a run
+//! of right-to-left letters is reversed into the cells' order (each letter its own glyph — an
+//! Arabic one in its isolated form, as in a terminal). No egui text layout is on this path.
 //!
 //! Highlighting carries state from the top of the file: the state at each mark is computed
 //! once, in order, and a page is highlighted from the mark before it. It runs on a worker of
@@ -111,11 +119,14 @@
 
 mod wrap;
 
+use super::browser::ops::dialog;
+use super::cells::{self, Buffer, Cells, Grid, Pen, Position};
+use super::chrome::CELL;
 use super::{chrome, Embedded, Outcome, Status, Window};
 use crate::encoding::{Around, Encoding, Pick};
 use crate::stream::{Bytes, ReadError, ReaderKind, Source};
 use anyhow::{Context as _, Result};
-use eframe::egui::{self, text::LayoutJob, Color32, FontId, Key, Modifiers, Pos2, Rect};
+use eframe::egui::{self, Color32, Key, Modifiers};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -3724,9 +3735,9 @@ struct Page {
     left: u64,
     /// The top line's length (the status row).
     top_len: u64,
-    /// The width its rows were laid out for, the rows, whether they reach the end of the
-    /// file, and each line's colours by character once highlighted.
-    width: f32,
+    /// The width in cells its rows were laid out for, the rows, whether they reach the end of
+    /// the file, and each line's colours by character once highlighted.
+    width: usize,
     rows: Vec<wrap::Row>,
     at_end: bool,
     colors: Vec<Vec<Color32>>,
@@ -3747,7 +3758,7 @@ impl Page {
             top_off: 0,
             left: 0,
             top_len: 0,
-            width: 0.0,
+            width: 0,
             rows: Vec::new(),
             at_end: false,
             colors: Vec::new(),
@@ -3860,11 +3871,12 @@ struct TextWindow {
     shoot_loading: bool,
     /// Wrapped: what wrapping found so far (for this index and width).
     memo: wrap::Memo,
-    /// The width rows are laid out in (the last pass's).
-    room: f32,
-    /// A plain row was laid out wider than its room (the fonts changed since it was wrapped): the
-    /// page was wrapped again, once.
-    rewrapped: bool,
+    /// The cells rows are laid out in (the last pass's).
+    room: usize,
+    /// The pass is a terminal's that draws a glyph of ambiguous width in two cells (10 §10,
+    /// [`cells::ambiguous_wide`]): sopen's own glyphs in the rows and its own words around them
+    /// get their stand-ins where they are laid ([`own_glyph`], [`own_text`]).
+    wide: bool,
     wheel_rest: f32,
     /// Not wrapped: the part of a byte the wheel sideways has moved by and not yet moved.
     wheel_across: f32,
@@ -4111,8 +4123,8 @@ impl TextWindow {
             drag: None,
             shoot_loading: false,
             memo: wrap::Memo::default(),
-            room: 0.0,
-            rewrapped: false,
+            room: 0,
+            wide: false,
             wheel_rest: 0.0,
             wheel_across: 0.0,
             page: None,
@@ -4976,7 +4988,7 @@ impl TextWindow {
     }
 
     /// The page at `top`, read once and highlighted as soon as the states reach it.
-    fn ensure_page(&mut self, ctx: &egui::Context, plain: Color32, font: &FontId) {
+    fn ensure_page(&mut self, ctx: &egui::Context) {
         let (top, count) = (self.top, self.visible as usize);
         let moving = self.jump.is_some() || self.moved != 0 || self.resnap;
         let same = !self.stale_page
@@ -5036,7 +5048,7 @@ impl TextWindow {
             return;
         }
         if !same {
-            let mut page = match self.read_page(ctx, plain, font, count) {
+            let mut page = match self.read_page(count) {
                 Ok(page) => page,
                 Err(e) if is_pending(&e) => {
                     // On its way (06 §7.2): the page on screen stays, and where the keys asked
@@ -5062,7 +5074,7 @@ impl TextWindow {
                 Err(e) if is_stale(&e) => {
                     // Changed after the check, during the read: read again from the path.
                     self.waiting = true;
-                    return self.ensure_page(ctx, plain, font);
+                    return self.ensure_page(ctx);
                 }
                 Err(e) => {
                     self.status = Status::error(format!("{e:#}"));
@@ -5123,14 +5135,8 @@ impl TextWindow {
     /// The page of `rows` rows from the top — wrapped, or one row to a line — after the jump
     /// and the moves the keys asked for, and the top it ends up at: never past the last page
     /// (the file's last row at the bottom).
-    fn read_page(
-        &mut self,
-        ctx: &egui::Context,
-        plain: Color32,
-        font: &FontId,
-        rows: usize,
-    ) -> Result<Page> {
-        use wrap::{Measure, Pos, Wrapper};
+    fn read_page(&mut self, rows: usize) -> Result<Page> {
+        use wrap::{Pos, Wrapper};
         // (CP949: the checkpoints this page asks for are kept while it is on screen.)
         self.doc.phases.page += 1;
         let total = self.doc.total();
@@ -5161,17 +5167,16 @@ impl TextWindow {
             Some(Jump::Line(line, _)) if line >= lines && passing => return waits(),
             _ => {}
         }
-        let cell = ctx.fonts_mut(|f| f.glyph_width(font, '0'));
-        let columns = (self.room / cell.max(1.0)).floor().max(1.0) as u64;
+        // The cells a row has (one at least: a row of a window narrower than a glyph holds one).
+        let columns = self.room.max(1);
         let wrap = self.wrap;
         // A place inside a line is a multiple of the unit (08 §7.3 rule 4).
         let mut left = self.doc.encoding().align_down(self.left);
         let mut w = Wrapper {
             doc: &mut self.doc,
             memo: &mut self.memo,
-            m: Measure::new(ctx, font.clone(), plain),
-            width: self.room,
-            read: wrap::read_cap(self.room, cell),
+            width: columns,
+            read: wrap::read_cap(columns),
         };
         let mut pos = Pos {
             at: self.top,
@@ -5227,7 +5232,7 @@ impl TextWindow {
                     } else {
                         // The line's last characters at the right edge, when they are not
                         // there already.
-                        let end = w.end_left(span, columns as usize)?;
+                        let end = w.end_left(span, columns)?;
                         (end > left).then(|| {
                             left = end;
                             pos
@@ -5238,7 +5243,7 @@ impl TextWindow {
                         None => {
                             // Already at the line's end: the end of the file.
                             self.jump_to(Jump::FileEnd);
-                            return self.read_page(ctx, plain, font, rows);
+                            return self.read_page(rows);
                         }
                     }
                 }
@@ -5389,8 +5394,10 @@ impl TextWindow {
         }
     }
 
-    fn bar(&self, ui: &mut egui::Ui) {
-        let p = chrome::Palette::of(ui.visuals());
+    /// The bar's stats (06 §7.2, 08 §7.5): how many lines and bytes — how far the lines are known
+    /// while a stream's may grow — and the syntax; then the encoding apart (D34: `UTF-16LE
+    /// (BOM)`, `UTF-8 (guessed)`), the stats ending ` ·` before it.
+    fn stats(&self) -> (String, Option<String>) {
         let syntax = self
             .syntax
             .map_or("plain text", |s| s.name.as_str())
@@ -5411,39 +5418,72 @@ impl TextWindow {
                 syntax,
             ]
         };
-        // Laid out from the right: its encoding beside its syntax (08 §7.5, D34: `UTF-16LE
-        // (BOM)`, `UTF-8 (guessed)`) whole, then the rest of the stats, cut at their end where
-        // the window is too narrow for them (06 §7.2's `lines known to …` is the longest), then
-        // the title in the room left, cut from the left as a path is: a long path never hides
-        // the stats, and nothing hides the encoding.
         let mut stats = parts.join(" · ");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let Some(encoding) = self.doc.encoding_label() {
-                // One cell after it, a space of the grid (a trailing space in the rest's text
-                // would take no width): with the rest's ` ·` they read as one line.
-                let gap = ui.spacing().item_spacing.x;
-                ui.spacing_mut().item_spacing.x = chrome::CELL.x;
-                let label = egui::RichText::new(encoding).color(p.dim);
-                ui.add(egui::Label::new(label).extend());
-                ui.spacing_mut().item_spacing.x = gap;
-                stats.push_str(" ·");
-            }
-            super::one_line(ui, &stats, p.dim);
-            if ui.available_width() < 2.0 * chrome::CELL.x {
-                // No room for even `…`.
+        let encoding = self.doc.encoding_label();
+        if encoding.is_some() {
+            stats.push_str(" ·");
+        }
+        (stats, encoding)
+    }
+
+    /// The bar in row `y` of `buf` (`grid`'s), a blank cell at either end, laid from the right:
+    /// the encoding whole (08 §7.5, VM-3: nothing cuts it), a cell, the stats — cut at their end
+    /// where the bar is too narrow for them (06 §7.2's `lines known to …` is the longest) — then
+    /// two cells and the title in the room left, cut from the left as a path is (the whole on
+    /// hover): a long path never hides the stats, and nothing hides the encoding.
+    fn bar_cells(&self, ui: &mut egui::Ui, grid: &Grid, buf: &mut Buffer, y: u16) {
+        let p = chrome::PALETTE;
+        let cols = grid.cols;
+        let (x0, end) = (1, cols.saturating_sub(1));
+        let dim = Pen::new(p.dim, p.back);
+        let (stats, encoding) = self.stats();
+        let mut right = end;
+        if let Some(encoding) = encoding {
+            // The blank cells at the bar's ends give way before the encoding is cut: flush right
+            // when it fills the bar but a cell, from the first cell when it fills it all. (A bar
+            // narrower than the encoding shows its start: there is no room to keep.)
+            let w = cells::width(&encoding) as u16;
+            let (at, stop) = if w <= end.saturating_sub(x0) {
+                (end - w, end)
+            } else {
+                (cols.saturating_sub(w), cols)
+            };
+            cells::put(buf, at, y, &encoding, usize::from(stop - at), dim);
+            if at <= x0 {
                 return;
             }
-            ui.separator();
-            let font = egui::TextStyle::Body.resolve(ui.style());
-            let room = ui.available_width();
-            let title = chrome::fit_left(ui.ctx(), &self.title, &font, room);
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                let label = ui.add(egui::Label::new(egui::RichText::new(&title).color(p.text)));
-                if title != self.title {
-                    label.on_hover_text(&self.title);
-                }
-            });
-        });
+            right = at - 1;
+        }
+        if right <= x0 {
+            return;
+        }
+        let shown = own_text(
+            &cells::fit_start(&stats, usize::from(right - x0)),
+            self.wide,
+        );
+        let at = right - cells::width(&shown) as u16;
+        cells::put(buf, at, y, &shown, usize::from(right - at), dim);
+        let room = usize::from(at - x0).saturating_sub(2);
+        if room < 2 {
+            // No room for even `…` and a letter.
+            return;
+        }
+        let title = cells::fit_left(&self.title, room);
+        // (The path is the file's own, but the `…` a cut adds.)
+        let shown = match title.strip_prefix('…') {
+            Some(rest) if title != self.title => format!("{}{rest}", own_text("…", self.wide)),
+            _ => title.clone(),
+        };
+        cells::put(buf, x0, y, &shown, room, Pen::new(p.text, p.back));
+        if title != self.title {
+            let row = grid.rect(Cells::new(x0, y, room as u16, 1));
+            ui.interact(
+                row,
+                ui.scope_id().with("sopen-text-title"),
+                egui::Sense::hover(),
+            )
+            .on_hover_text(&self.title);
+        }
     }
 
     /// `loading…`, and after [`SLOW_AFTER`] of waiting that the remote is slow.
@@ -5492,7 +5532,8 @@ impl TextWindow {
         }
     }
 
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
+    /// What the status row says: where the page on screen is, and the window's status.
+    fn status_line(&self) -> (String, Status) {
         let lines = self.doc.line_count();
         // A stream describes the page on screen — never where the keys asked to go — and says
         // `of N` only once N is the file's (06 §7.2).
@@ -5563,42 +5604,124 @@ impl TextWindow {
                 },
             },
         };
-        let mut go = None;
-        ui.horizontal(|ui| {
-            let place = !shown.is_empty();
-            if place {
-                ui.monospace(shown);
+        (shown, status)
+    }
+
+    /// Go to's field (Cmd/Ctrl+G, 06 §7.2, as the hex window's) on the status row `y` of `grid`,
+    /// while it is open: `ops::dialog`'s cell field, after the place and `Go to`. Its engine takes
+    /// this pass's typing here, before the page is read: Enter goes there in this pass; Enter, Esc
+    /// or a click elsewhere closes it (Esc takes egui's focus as the pass begins). Where it stands.
+    fn goto_field(&mut self, ui: &mut egui::Ui, grid: &Grid, y: u16) -> Option<Cells> {
+        let ctx = ui.ctx().clone();
+        let at = goto_cells(grid.cols, y, &self.status_line().0)?;
+        let text = self.goto.as_mut()?;
+        let had = ctx.memory(|m| m.has_focus(goto_id()) || m.had_focus_last_frame(goto_id()));
+        dialog::field(ui, grid, at, goto_id(), text, |e| e);
+        let has = ctx.memory(|m| m.has_focus(goto_id()));
+        if had && !has {
+            let go = ctx
+                .input(|i| i.key_pressed(Key::Enter))
+                .then(|| text.clone());
+            self.goto = None;
+            if let Some(text) = go {
+                self.go(&text);
             }
-            if let Some(text) = self.goto.as_mut() {
-                // Go to (Cmd/Ctrl+G), as the hex window's: Enter goes there, Esc leaves.
-                if place {
-                    ui.separator();
-                }
-                ui.label("Go to");
-                let field = ui.add(
-                    chrome::field(text)
-                        .id(goto_id())
-                        .hint_text("line, or 0x… offset")
-                        .desired_width(150.0),
-                );
-                if field.lost_focus() {
-                    if ui.input(|i| i.key_pressed(Key::Enter)) {
-                        go = Some(text.clone());
-                    }
-                    self.goto = None;
-                }
-                return;
-            }
-            if !status.text.is_empty() {
-                if place {
-                    ui.separator();
-                }
-                status.show(ui);
-            }
-        });
-        if let Some(text) = go {
-            self.go(&text);
+            return None;
         }
+        Some(at)
+    }
+
+    /// The status row in row `y` of `buf` (`grid`'s), from its second cell, as the page on
+    /// screen is now: where the page is, then — a `│` apart — Go to's field at `field` with
+    /// `Go to` before it (the place cut to end before them: where the field stands was settled
+    /// before the page was read), or the status in its colour, cut with "…" to the row (the
+    /// whole on hover). The field's caret's cell, while it has the keyboard.
+    fn status_cells(
+        &self,
+        ui: &mut egui::Ui,
+        grid: &Grid,
+        buf: &mut Buffer,
+        y: u16,
+        field: Option<Cells>,
+    ) -> Option<Position> {
+        let p = chrome::PALETTE;
+        let (x0, end) = (1, grid.cols.saturating_sub(1));
+        if end <= x0 {
+            return None;
+        }
+        let (place, status) = self.status_line();
+        let pen = Pen::new(p.text, p.back);
+        let wide = self.wide;
+        let mut x = x0;
+        let put = |buf: &mut Buffer, x: &mut u16, text: &str, end: u16| {
+            let room = usize::from(end.saturating_sub(*x));
+            let shown = own_text(&cells::fit_start(text, room), wide);
+            *x += cells::put(buf, *x, y, &shown, room, pen) as u16;
+        };
+        // Before the field: its `Go to`, and the place's ` │ ` before that.
+        let place_end = match field {
+            Some(at) => at.x.saturating_sub((cells::width(GOTO) + 1 + 3) as u16),
+            None => end,
+        };
+        if !place.is_empty() {
+            put(buf, &mut x, &place, place_end);
+        }
+        let apart = |buf: &mut Buffer, x: &mut u16| {
+            if *x > x0 {
+                put(buf, x, " │ ", end);
+            }
+        };
+        if let Some(at) = field {
+            apart(buf, &mut x);
+            let label = at.x.saturating_sub(cells::width(GOTO) as u16 + 1).max(x);
+            cells::put(
+                buf,
+                label,
+                y,
+                GOTO,
+                usize::from(at.x.saturating_sub(label)),
+                pen,
+            );
+            let ctx = ui.ctx();
+            let text = self.goto.as_deref().unwrap_or_default();
+            let focused = ctx.memory(|m| m.has_focus(goto_id()));
+            let caret = dialog::field_cells(ctx, buf, at, goto_id(), text, focused);
+            if text.is_empty() {
+                let room = usize::from(at.width).saturating_sub(1);
+                let hint = own_text(&cells::fit_start(GOTO_HINT, room), wide);
+                let black = chrome::cga::BLACK;
+                cells::put(buf, at.x + 1, y, &hint, room, Pen::new(p.dim, black));
+            }
+            return caret;
+        }
+        if status.text.is_empty() {
+            return None;
+        }
+        apart(buf, &mut x);
+        // A line break or a tab is a blank: the row is one line.
+        let text: String = (status.text.chars())
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let color = if status.error { p.error } else { p.text };
+        let room = usize::from(end.saturating_sub(x));
+        let shown = cells::fit_start(&text, room);
+        // The message is its own (a path in it is the file system's, T38), but the `…` a cut
+        // adds is sopen's.
+        let laid = match shown.strip_suffix('…') {
+            Some(head) if shown != text => format!("{head}{}", own_text("…", wide)),
+            _ => shown.clone(),
+        };
+        cells::put(buf, x, y, &laid, room, Pen::new(color, p.back));
+        if shown != text {
+            let row = grid.rect(Cells::new(x, y, room as u16, 1));
+            ui.interact(
+                row,
+                ui.scope_id().with("sopen-text-status"),
+                egui::Sense::hover(),
+            )
+            .on_hover_text(&status.text);
+        }
+        None
     }
 
     /// Where the scroll bar's thumb is (0 at the top, 1 at the end; `None`: nothing to scroll).
@@ -5650,7 +5773,46 @@ impl TextWindow {
         self.jump_to(jump);
     }
 
-    fn body(&mut self, ui: &mut egui::Ui) {
+    /// The scroll bar at `bar` of `grid` (a column: ↑, the track, ↓): ↑ and ↓ a row (not
+    /// wrapped: a line), as the DOS bar steps; a click on the track is a jump there, and the
+    /// thumb dragged is one where it is let go (06 §7.2) — while it is dragged only the thumb
+    /// moves: a place it passes is not read.
+    fn scroll_bar_input(&mut self, ui: &mut egui::Ui, grid: &Grid, bar: Cells) {
+        if bar.height < 3 {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        let id = ui.scope_id().with("sopen-text-scroll");
+        let one = |y: u16| grid.rect(Cells::new(bar.x, y, 1, 1));
+        let up = ui.interact(one(bar.y), id.with("up"), egui::Sense::click());
+        let down = ui.interact(one(bar.bottom() - 1), id.with("down"), egui::Sense::click());
+        let track = grid.rect(Cells::new(bar.x, bar.y + 1, 1, bar.height - 2));
+        let response = ui.interact(track, id, egui::Sense::click_and_drag());
+        let step = i64::from(down.clicked()) - i64::from(up.clicked());
+        if step != 0 {
+            self.moved += step;
+            ctx.request_repaint();
+        }
+        let room = (track.height() - CELL.y).max(1.0);
+        let at = response
+            .interact_pointer_pos()
+            .map(|pos| ((pos.y - track.top() - CELL.y / 2.0) / room).clamp(0.0, 1.0));
+        if response.dragged() {
+            self.drag = at.or(self.drag);
+        }
+        if response.clicked() || response.drag_stopped() {
+            if let Some(at) = at.or(self.drag) {
+                self.scroll_to(at);
+            }
+            self.drag = None;
+            ctx.request_repaint();
+        }
+    }
+
+    /// The frame at `frame` of `grid` and what is in it, into `buf`: the rows, each a line's
+    /// number (or byte offset) in the gutter and its characters a glyph per cell, in their
+    /// colours; the scroll bar on the right border; a preview's last row.
+    fn body(&mut self, ui: &mut egui::Ui, grid: &Grid, buf: &mut Buffer, frame: Cells) {
         let ctx = ui.ctx().clone();
         // A re-read that landed is swapped in before anything reads or is measured (the
         // highlighter below starts on the new index).
@@ -5672,30 +5834,26 @@ impl TextWindow {
                 source.retry();
             }
         }
-        let outer = ui.max_rect();
-        let p = chrome::Palette::of(ui.visuals());
+        let p = chrome::PALETTE;
+        let dim = Pen::new(p.dim, p.back);
+        let wide = self.wide;
         // The window: its frame, titled as PC Shell's (single-lined in a preview: it does not
-        // have the keyboard), the lines inside it.
-        let framed = chrome::frame(&ui.painter_at(outer), outer, TITLE, !self.preview);
-        let font = chrome::mono(ui);
-        let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-        // Rows touch, a cell apart, as on a text screen.
-        let row_h = text_h.ceil();
+        // have the keyboard), the rows inside it.
+        let inner = cells::frame(buf, frame, TITLE, !self.preview);
         // A preview that shows only the start of its file says so on its last row (02 §4.3).
         // (A stream's pass stops at the preview's budget; a local file's was stopped there.)
         let short = self.doc.cut_short()
             || (self.doc.is_stream()
                 && !self.doc.whole()
                 && self.preview_index.is_some_and(|b| self.doc.size() >= b));
-        let note = (self.preview && short && framed.height() >= 2.0 * row_h)
+        let note = (self.preview && short && inner.height >= 2)
             .then(|| format!("preview of the first {}", amount(self.doc.size())));
-        let rect = match note {
-            Some(_) => Rect::from_min_max(
-                framed.min,
-                Pos2::new(framed.right(), framed.bottom() - row_h),
-            ),
-            None => framed,
-        };
+        let rows = Cells::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height - u16::from(note.is_some()),
+        );
         if !self.preview && self.doc.cut_short() && !self.waiting && self.reindex.is_none() {
             // Handed over: the index goes on from where the preview's pass stopped.
             self.start_resume(&ctx);
@@ -5703,14 +5861,16 @@ impl TextWindow {
         self.grow_index(&ctx);
         self.pick_syntax();
         let lines = self.doc.line_count();
-        self.visible = ((rect.height() / row_h).floor() as u64).max(1);
-        let digits = self.digits(lines);
-        let gutter = cw * (digits as f32 + 1.0);
-        let text_x = rect.left() + gutter + cw;
-        self.room = (rect.right() - text_x).max(0.0);
+        self.visible = u64::from(rows.height).max(1);
+        // The gutter: a blank cell, the numbers right-aligned in `digits` cells, a blank; then
+        // the rows' text, in the cells up to the right border.
+        let digits = self.digits(lines) as u16;
+        let gutter_end = rows.x.saturating_add(digits + 1).min(rows.right());
+        let text_x = gutter_end.saturating_add(1).min(rows.right());
+        self.room = usize::from(rows.right() - text_x);
         // Scrolling waits for a re-read, as the keys do; a preview takes no wheel.
         if !self.preview
-            && ui.rect_contains_pointer(outer)
+            && ui.rect_contains_pointer(grid.rect(frame))
             && !self.waiting
             && self.reindex.is_none()
             && !self.stream_frozen()
@@ -5722,12 +5882,12 @@ impl TextWindow {
                         rows -= match unit {
                             egui::MouseWheelUnit::Line => delta.y * 3.0,
                             egui::MouseWheelUnit::Page => delta.y * self.visible as f32,
-                            egui::MouseWheelUnit::Point => delta.y / row_h,
+                            egui::MouseWheelUnit::Point => delta.y / CELL.y,
                         };
                         across -= match unit {
                             egui::MouseWheelUnit::Line => delta.x * 3.0,
                             egui::MouseWheelUnit::Page => delta.x * 16.0,
-                            egui::MouseWheelUnit::Point => delta.x / cw,
+                            egui::MouseWheelUnit::Point => delta.x / CELL.x,
                         };
                     }
                 }
@@ -5795,7 +5955,7 @@ impl TextWindow {
         // A checkpoint read that ended is in before the page is read (08 §7.4); one the page
         // asked for starts after it.
         self.poll_phases();
-        self.ensure_page(&ctx, p.text, &font);
+        self.ensure_page(&ctx);
         self.start_phases(&ctx);
         if self.live && !self.preview && !self.frozen() && self.at_end() {
             // At the end of a local file: looked at again each second with no input (one stat),
@@ -5804,150 +5964,68 @@ impl TextWindow {
             #[cfg(test)]
             FOLLOWS.with(|n| n.set(n.get() + 1));
         }
-        let painter = ui.painter_at(rect);
-        // The scroll bar on the right border, beside the lines.
-        let bar = Rect::from_min_max(
-            Pos2::new(rect.right(), rect.top()),
-            Pos2::new(rect.right() + chrome::CELL.x, rect.bottom()),
-        );
-        let track = chrome::scroll_bar(&ui.painter_at(outer), bar, self.thumb());
-        if !self.preview && !self.waiting && self.reindex.is_none() && !self.stream_frozen() {
-            // A click on it, or its thumb let go, is a jump (06 §7.2). While the thumb is
-            // dragged only the thumb moves: a place it passes is not read.
-            let id = ui.scope_id().with("sopen-text-scroll");
-            let response = ui.interact(bar, id, egui::Sense::click_and_drag());
-            let room = (track.height() - chrome::CELL.y).max(1.0);
-            let at = response
-                .interact_pointer_pos()
-                .map(|pos| ((pos.y - track.top() - chrome::CELL.y / 2.0) / room).clamp(0.0, 1.0));
-            if response.dragged() {
-                self.drag = at.or(self.drag);
+        // The scroll bar on the right border, beside the rows: a click or a drag first, then
+        // the thumb where it is now.
+        if frame.width >= 2 && rows.height > 0 {
+            let bar = Cells::new(inner.right(), rows.y, 1, rows.height);
+            if !self.preview && !self.waiting && self.reindex.is_none() && !self.stream_frozen() {
+                self.scroll_bar_input(ui, grid, bar);
             }
-            if response.clicked() || response.drag_stopped() {
-                if let Some(at) = at.or(self.drag) {
-                    self.scroll_to(at);
-                }
-                self.drag = None;
-                ctx.request_repaint();
-            }
+            cells::scroll_bar(buf, bar.x, bar.y, bar.height, self.thumb());
         }
-        let text_painter =
-            ui.painter_at(Rect::from_min_max(Pos2::new(text_x, rect.top()), rect.max));
         // The gutter: a line's number where the index reaches it; past that its byte offset
         // (06 §7.2), with `…` before it when it is not known to be a line's start.
-        let number = |k: usize, row: &wrap::Row| {
+        let number = |buf: &mut Buffer, y: u16, row: &wrap::Row| {
             let label = match row.line {
                 Some(line) => (line + 1).to_string(),
-                None if row.loose => format!("…0x{:X}", row.at),
+                None if row.loose => format!("{}0x{:X}", own_text("…", wide), row.at),
                 None => format!("0x{:X}", row.at),
             };
-            painter.text(
-                Pos2::new(rect.left() + gutter, rect.top() + k as f32 * row_h),
-                egui::Align2::RIGHT_TOP,
-                label,
-                font.clone(),
-                p.dim,
-            );
+            let room = usize::from(gutter_end - rows.x);
+            let w = cells::width(&label).min(room) as u16;
+            cells::put(buf, gutter_end - w, y, &label, w.into(), dim);
         };
-        let mut overflow = false;
-        match &self.page {
-            Some(page) if page.wrapped => {
-                for (k, row) in page.rows.iter().enumerate() {
-                    // The number on a line's first row only.
-                    if row.start == 0 {
-                        number(k, row);
+        let end = rows.right();
+        if let Some(page) = &self.page {
+            for (k, row) in page.rows.iter().take(usize::from(rows.height)).enumerate() {
+                let y = rows.y + k as u16;
+                // Wrapped, the number on a line's first row only.
+                if !page.wrapped || row.start == 0 {
+                    number(buf, y, row);
+                }
+                let colors = row.first_char.zip(row.line).and_then(|(first, n)| {
+                    let line = page.colors.get(n.checked_sub(page.top_line?)? as usize)?;
+                    Some((first, line.as_slice()))
+                });
+                // As much of the row as its cells can show, never all a row not wrapped was read
+                // for (up to 16 bytes a column): its characters a few times the cells, more only
+                // while they all fit and the row goes on.
+                let mut most = 2 * usize::from(end - text_x) + 16;
+                loop {
+                    let chars = row_chars(row, colors, p.text, p.dim, most, wide);
+                    let all = chars.len() < most;
+                    if lay_row(buf, text_x, y, end, &chars) || all {
+                        break;
                     }
-                    let colors = row.first_char.zip(row.line).and_then(|(first, n)| {
-                        let line = page.colors.get(n.checked_sub(page.top_line?)? as usize)?;
-                        Some((first, line.as_slice()))
-                    });
-                    // As it was measured (one section).
-                    let measured = || {
-                        ctx.fonts_mut(|f| f.layout_no_wrap(row.cut.text(), font.clone(), p.text))
-                    };
-                    let rtl = row
-                        .cut
-                        .shown
-                        .iter()
-                        .any(|&(c, _)| direction(c) == Some(true));
-                    // Placeholder marks and C1 controls' `·` are dim (08 §7.4, D32).
-                    let marked = row.cut.dim > 0 || !row.cut.dots.is_empty();
-                    let plain = || {
-                        if rtl || marked {
-                            let job = directed_job(row_chars(row, None, p.text, p.dim), &font);
-                            ctx.fonts_mut(|f| f.layout_job(job))
-                        } else {
-                            measured()
-                        }
-                    };
-                    let mut galley = match colors {
-                        Some(colors) => {
-                            let job =
-                                directed_job(row_chars(row, Some(colors), p.text, p.dim), &font);
-                            ctx.fonts_mut(|f| f.layout_job(job))
-                        }
-                        None => plain(),
-                    };
-                    // Sections are shaped apart and can come out a hair wider than the row was
-                    // measured: plain then, and at worst as measured (never cut at the edge).
-                    if galley.size().x > page.width + 0.5 && colors.is_some() {
-                        galley = plain();
-                    }
-                    if galley.size().x > page.width + 0.5 && (rtl || marked) {
-                        galley = measured();
-                    }
-                    overflow |= galley.size().x > page.width + 0.5;
-                    text_painter.galley(
-                        Pos2::new(text_x, rect.top() + k as f32 * row_h),
-                        galley,
-                        p.text,
-                    );
+                    most *= 2;
                 }
             }
-            Some(page) => {
-                // Only the columns that fit are laid out: a row is read wider than it shows.
-                let columns = ((rect.right() - text_x) / cw).floor().max(0.0) as usize;
-                for (k, row) in page.rows.iter().enumerate() {
-                    number(k, row);
-                    let colors = row.first_char.zip(row.line).and_then(|(first, n)| {
-                        let line = page.colors.get(n.checked_sub(page.top_line?)? as usize)?;
-                        Some((first, line.as_slice()))
-                    });
-                    let mut shown = row_chars(row, colors, p.text, p.dim);
-                    shown.truncate(columns);
-                    let galley = ctx.fonts_mut(|f| f.layout_job(directed_job(shown, &font)));
-                    text_painter.galley(
-                        Pos2::new(text_x, rect.top() + k as f32 * row_h),
-                        galley,
-                        p.text,
-                    );
-                }
-                if self.doc.passing() {
-                    // The rows below the last line indexed so far (a line that runs past
-                    // what is indexed): their starts are not known yet. They fill in as the
-                    // index pass reaches them (06 §7.2).
-                    for k in page.rows.len()..self.visible as usize {
-                        text_painter.text(
-                            Pos2::new(text_x, rect.top() + k as f32 * row_h),
-                            egui::Align2::LEFT_TOP,
-                            LOADING,
-                            font.clone(),
-                            p.dim,
-                        );
-                    }
+            if !page.wrapped && self.doc.passing() {
+                // The rows below the last line indexed so far (a line that runs past
+                // what is indexed): their starts are not known yet. They fill in as the
+                // index pass reaches them (06 §7.2).
+                for k in page.rows.len()..usize::from(rows.height) {
+                    let room = usize::from(end - text_x);
+                    let loading = own_text(LOADING, wide);
+                    cells::put(buf, text_x, rows.y + k as u16, &loading, room, dim);
                 }
             }
-            None => {}
         }
-        if self.pending && self.page.as_ref().is_none_or(Page::is_empty) {
+        if self.pending && self.page.as_ref().is_none_or(Page::is_empty) && rows.height > 0 {
             // Nothing to show yet (a stream's first block is on its way): one dim row.
-            painter.text(
-                Pos2::new(rect.left() + cw, rect.top()),
-                egui::Align2::LEFT_TOP,
-                LOADING,
-                font.clone(),
-                p.dim,
-            );
+            let x = (rows.x + 1).min(end);
+            let loading = own_text(LOADING, wide);
+            cells::put(buf, x, rows.y, &loading, usize::from(end - x), dim);
         }
         if self.pending {
             // How long this read has been on its way; a pass when the status row says more.
@@ -5977,37 +6055,112 @@ impl TextWindow {
             }
         }
         if let Some(note) = &note {
-            ui.painter_at(framed).text(
-                Pos2::new(rect.left(), rect.bottom()),
-                egui::Align2::LEFT_TOP,
-                note,
-                font.clone(),
-                p.dim,
+            let shown = cells::fit_start(note, usize::from(inner.width));
+            cells::put(
+                buf,
+                inner.x,
+                inner.bottom() - 1,
+                &shown,
+                inner.width.into(),
+                dim,
             );
-        }
-        if overflow && !self.rewrapped && !self.frozen() {
-            // A plain row wider than it was wrapped for: the fonts changed since (a fallback
-            // font came in). Wrapped again from scratch, once.
-            self.rewrapped = true;
-            self.memo.reset(self.room);
-            self.resnap = true;
-            ctx.request_repaint();
         }
         self.painted = true;
     }
 }
 
-/// A wrapped row's characters as painted (a tab as its spaces), each in its colour: by
+/// The label before Go to's field, and what its field says while empty.
+const GOTO: &str = "Go to";
+const GOTO_HINT: &str = "line, or 0x… offset";
+
+/// The cells Go to's field takes in a status row `cols` wide at row `y`: after `place`, a `│`
+/// apart (as [`TextWindow::status_cells`] writes them), `Go to` and a blank — where the row is
+/// too narrow for all of them, at its end; `None` where no cell of it fits.
+fn goto_cells(cols: u16, y: u16, place: &str) -> Option<Cells> {
+    let end = cols.saturating_sub(1);
+    let label = cells::width(GOTO) as u16 + 1;
+    // As wide as the hint and a cell, less on a narrower row; the place before it is cut.
+    let w = (cells::width(GOTO_HINT) as u16 + 2).min(end.saturating_sub(1 + label));
+    if w == 0 {
+        return None;
+    }
+    let apart = if place.is_empty() { 0 } else { 3 };
+    let after = (cells::width(place) as u16).saturating_add(1 + apart + label);
+    Some(Cells::new(after.min(end - w), y, w, 1))
+}
+
+/// Where the viewer's parts stand on its grid (10 §6): the bar on its first row, the status row
+/// on its last, the notes — what must be read whole (where earlier copies' unsaved edits went),
+/// wrapped by cells — above that, and the frame between. A preview is its frame alone (02 §4.2).
+struct Laid {
+    bar: Option<u16>,
+    status: Option<u16>,
+    notes: Vec<(u16, String)>,
+    frame: Cells,
+}
+
+impl Laid {
+    fn on(grid: &Grid, preview: bool, notices: &[String]) -> Laid {
+        let all = grid.all();
+        if preview {
+            return Laid {
+                bar: None,
+                status: None,
+                notes: vec![],
+                frame: all,
+            };
+        }
+        let rows = grid.rows;
+        let bar = (rows >= 1).then_some(0);
+        let status = (rows >= 2).then(|| rows - 1);
+        // As many rows of notes as leave the frame three (its border and a row) — one at least
+        // on a grid of four rows: they are what must be read. Rows that do not fit are never
+        // dropped unsaid: the last row shown has the start of its own and how many are not.
+        let room = usize::from(grid.cols.saturating_sub(2));
+        let mut wrapped: Vec<String> = (notices.iter())
+            .flat_map(|n| dialog::wrap(n, room))
+            .collect();
+        let most = usize::from(rows.saturating_sub(5)).max(usize::from(rows >= 4));
+        let shown = wrapped.len().min(most);
+        if shown > 0 && shown < wrapped.len() {
+            let more = format!(" {} more", wrapped.len() - shown);
+            let head = cells::fit_start(&wrapped[shown - 1], room.saturating_sub(more.len() + 1));
+            let head = head.trim_end_matches('…').trim_end();
+            wrapped[shown - 1] = format!("{head}…{more}");
+        }
+        let first = rows.saturating_sub(1 + shown as u16);
+        let notes = (wrapped.into_iter().take(shown).enumerate())
+            .map(|(k, text)| (first + k as u16, text))
+            .collect();
+        let top = u16::from(bar.is_some());
+        Laid {
+            bar,
+            status,
+            notes,
+            frame: Cells::new(0, top, grid.cols, first.saturating_sub(top)),
+        }
+    }
+}
+
+/// A row's first `most` characters as painted (a tab as its spaces), each in its colour: by
 /// `colors`, the line's colour per character with the row's first at index `first`, else plain;
-/// its placeholder marks and C1 controls' `·` `dim` (08 §7.4, D32).
+/// its placeholder marks and C1 controls' `·` `dim` (08 §7.4, D32). In an ambiguous-wide
+/// terminal (`wide`) a control character's glyph — sopen's own — is its stand-in
+/// ([`own_glyph`]); the same glyph written in the file stays as it is.
 fn row_chars(
     row: &wrap::Row,
     colors: Option<(usize, &[Color32])>,
     plain: Color32,
     dim: Color32,
+    most: usize,
+    wide: bool,
 ) -> Vec<(char, Color32)> {
-    let mut out = Vec::with_capacity(row.cut.shown.len());
+    let mut out = Vec::with_capacity(row.cut.shown.len().min(most));
     for (i, &(c, n)) in row.cut.shown.iter().enumerate() {
+        if out.len() >= most {
+            out.truncate(most);
+            break;
+        }
         let color = if i < row.cut.dim || row.cut.dots.binary_search(&i).is_ok() {
             dim
         } else {
@@ -6015,9 +6168,36 @@ fn row_chars(
                 .and_then(|(first, colors)| colors.get(first + i).copied())
                 .unwrap_or(plain)
         };
+        let c = match row.cut.own.binary_search(&i) {
+            Ok(_) => own_glyph(c, wide),
+            Err(_) => c,
+        };
         out.extend(std::iter::repeat_n((c, color), usize::from(n)));
     }
     out
+}
+
+/// A glyph of sopen's own table (a control character's code page 437 glyph, a C1 control's `·`)
+/// as a terminal that draws a glyph of ambiguous width in two cells (`wide`) is sent it (10 §10,
+/// T38): §10's stand-in, `.` for one it has none for (a letter the printer would lay in two
+/// cells); as it is everywhere else — as the hex view's CP437 column (`hex::column_glyph`).
+fn own_glyph(c: char, wide: bool) -> char {
+    if !wide || !super::term::ambiguous(c) {
+        return c;
+    }
+    let stand_in = super::term::narrow(c.encode_utf8(&mut [0u8; 4]));
+    stand_in.and_then(|s| s.chars().next()).unwrap_or('.')
+}
+
+/// Words of sopen's own on the viewer's rows (the stats' and the status row's ` · `, a cut's
+/// `…`, `loading…`) as an ambiguous-wide terminal (`wide`) is sent them: their `·` `.` and `…`
+/// `~` (10 §10), so the words keep their cells; as they are everywhere else.
+fn own_text(text: &str, wide: bool) -> String {
+    if wide {
+        text.replace('·', ".").replace('…', "~")
+    } else {
+        text.to_string()
+    }
 }
 
 /// Whether `c` is written right to left (`Some(true)`: Hebrew, Arabic and the other
@@ -6037,120 +6217,252 @@ fn direction(c: char) -> Option<bool> {
     }
 }
 
-/// A row as painted, laid out left to right: a section per run of one colour and one direction.
-/// egui shapes a section in the direction of its first strong character, so a row starting with a
-/// right-to-left word (Hebrew is in the VGA font, shaped in one run with the English after it)
-/// came out reversed whole, its English too. Here each run of right-to-left letters — with the
-/// spaces and marks between them — is a section of its own (shaped right to left, as it reads),
-/// and everything else is shaped left to right; the runs stay in their order, as in a
-/// left-to-right paragraph. Sections never split a grapheme cluster (a cluster takes its base's
-/// direction and colour). The text is the row's own: only how egui shapes it changes.
-fn directed_job(chars: Vec<(char, Color32)>, font: &FontId) -> LayoutJob {
+/// What a character is to the order of a row's cells (UAX #9's bidi classes, as far as a row in a
+/// left-to-right paragraph with no embeddings needs them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bidi {
+    /// A left-to-right letter or digit.
+    L,
+    /// A right-to-left letter (Hebrew; Arabic, AL, laid as R).
+    R,
+    /// A digit (EN; Arabic-Indic, AN, laid as EN).
+    En,
+    /// `,` `.` `:` `/` (CS) and `+` `-` (ES): a number's own between two digits.
+    Sep,
+    /// `#` `$` `%` `°` … (ET): a number's own next to its digits.
+    Et,
+    /// Anything else: spaces, punctuation, symbols, marks.
+    N,
+}
+
+impl Bidi {
+    fn of(c: char) -> Bidi {
+        match c {
+            '0'..='9' | '\u{0660}'..='\u{0669}' | '\u{06F0}'..='\u{06F9}' => Bidi::En,
+            ',' | '.' | ':' | '/' | '+' | '-' => Bidi::Sep,
+            '#' | '$' | '%' | '°' | '±' | '¢' | '£' | '¤' | '¥' | '€' | '‰' | '′' | '″' => {
+                Bidi::Et
+            }
+            c => match direction(c) {
+                Some(true) => Bidi::R,
+                Some(false) => Bidi::L,
+                None => Bidi::N,
+            },
+        }
+    }
+}
+
+/// A row's characters (as [`row_chars`] gives them) as its cells show them, left to right: by
+/// grapheme cluster — a mark, a ZWJ or a variation selector with its base, in its base's colour —
+/// ordered as UAX #9 orders a left-to-right row with no embeddings (W4, W5, W7, N1, N2, I1, I2,
+/// L2): a right-to-left run — its letters, the digits among them and the spaces and marks
+/// between — reversed into the cells' order, as it reads, its numbers kept in their own order
+/// as units (`שלום 123 עולם` shows `םלוע 123 םולש`); everything else in its own order. Each
+/// cluster is a glyph of its own (10 §4): an Arabic letter in its isolated form, as a terminal
+/// shows it. The text is the row's own: only its order changes.
+fn in_cell_order(chars: &[(char, Color32)]) -> Vec<(String, Color32)> {
     use unicode_segmentation::UnicodeSegmentation;
     let text: String = chars.iter().map(|&(c, _)| c).collect();
-    // By grapheme cluster, each with its base's direction and colour: a mark, a ZWJ or a
-    // variation selector goes where its base goes, never into a section of its own (egui would
-    // shape it apart from its base).
-    let mut clusters: Vec<(&str, Option<bool>, Color32)> = Vec::new();
+    let mut clusters: Vec<(&str, Color32)> = Vec::new();
+    let mut class: Vec<Bidi> = Vec::new();
     let mut at = 0;
     for g in text.graphemes(true) {
         let (base, color) = chars[at];
-        clusters.push((g, direction(base), color));
+        clusters.push((g, color));
+        class.push(Bidi::of(base));
         at += g.chars().count();
     }
-    // A neutral cluster goes right to left only between two right-to-left letters.
-    let mut next_rtl = vec![false; clusters.len()];
-    let mut next = None;
-    for i in (0..clusters.len()).rev() {
-        next_rtl[i] = next == Some(true);
-        if clusters[i].1.is_some() {
-            next = clusters[i].1;
+    let n = class.len();
+    // W4: one separator between two digits is the number's; W5: a number's signs next to it.
+    for i in 1..n.saturating_sub(1) {
+        if class[i] == Bidi::Sep && class[i - 1] == Bidi::En && class[i + 1] == Bidi::En {
+            class[i] = Bidi::En;
         }
     }
-    let mut job = LayoutJob::default();
-    // A section of its own for each run, also next to one in the same colour: `append` would
-    // join them, and egui would shape them as one again.
-    let push = |job: &mut LayoutJob, run: &str, color: Color32| {
-        use egui::text::ByteIndex;
-        let start = job.text.len();
-        job.text.push_str(run);
-        job.sections.push(egui::text::LayoutSection {
-            leading_space: 0.0,
-            byte_range: ByteIndex(start)..ByteIndex(job.text.len()),
-            format: egui::TextFormat::simple(font.clone(), color),
-        });
-    };
-    let (mut run, mut key) = (String::new(), None);
-    let mut prev = None;
-    for (i, &(g, class, color)) in clusters.iter().enumerate() {
-        let rtl = class.unwrap_or(prev == Some(true) && next_rtl[i]);
-        if class.is_some() {
-            prev = class;
+    for i in 0..n {
+        if class[i] != Bidi::Et {
+            continue;
         }
-        if let Some((was, _)) = key.filter(|&k| k != (color, rtl)) {
-            push(&mut job, &run, was);
-            run.clear();
+        let end = i + class[i..].iter().take_while(|&&c| c == Bidi::Et).count();
+        let by_digit = (i > 0 && class[i - 1] == Bidi::En) || class.get(end) == Some(&Bidi::En);
+        if by_digit {
+            class[i..end].fill(Bidi::En);
         }
-        key = Some((color, rtl));
-        run.push_str(g);
     }
-    if let Some((color, _)) = key {
-        push(&mut job, &run, color);
+    // W6, W7: what is left of them is neutral; digits after a left-to-right letter (or at the
+    // row's start) are that word's.
+    let mut strong = Bidi::L;
+    for c in &mut class {
+        match *c {
+            Bidi::Sep | Bidi::Et => *c = Bidi::N,
+            Bidi::En if strong == Bidi::L => *c = Bidi::L,
+            Bidi::L | Bidi::R => strong = *c,
+            _ => {}
+        }
     }
-    job
+    // N1, N2: neutrals take the direction on both sides of them (digits count as right to left
+    // there), else the row's, left to right; I1, I2: the levels.
+    let rtl = |c: Bidi| matches!(c, Bidi::R | Bidi::En);
+    let mut level = vec![0u8; n];
+    let mut i = 0;
+    while i < n {
+        if class[i] != Bidi::N {
+            level[i] = match class[i] {
+                Bidi::R => 1,
+                Bidi::En => 2,
+                _ => 0,
+            };
+            i += 1;
+            continue;
+        }
+        let end = i + class[i..].iter().take_while(|&&c| c == Bidi::N).count();
+        let before = i.checked_sub(1).is_some_and(|k| rtl(class[k]));
+        let after = class.get(end).is_some_and(|&c| rtl(c));
+        level[i..end].fill(u8::from(before && after));
+        i = end;
+    }
+    // L2: from the highest level down to 1, each run at that level or above reversed.
+    let mut order: Vec<usize> = (0..n).collect();
+    for floor in (1..=2u8).rev() {
+        let mut i = 0;
+        while i < n {
+            if level[order[i]] < floor {
+                i += 1;
+                continue;
+            }
+            let end = i + order[i..]
+                .iter()
+                .take_while(|&&k| level[k] >= floor)
+                .count();
+            order[i..end].reverse();
+            i = end;
+        }
+    }
+    (order.into_iter())
+        .map(|k| (clusters[k].0.to_string(), clusters[k].1))
+        .collect()
+}
+
+/// `chars` (a row as painted, each in its colour) into row `y` of `buf` from cell `x` up to cell
+/// `end`: first as much of it as fits there, in its own order — a glyph that does not fit ends
+/// it, never cut in half (a row not wrapped is read wider than it shows) — then in the order its
+/// cells show it ([`in_cell_order`]), a glyph per cluster, as many cells as it takes. Whether a
+/// glyph did not fit: else more of the row could still show.
+fn lay_row(buf: &mut Buffer, x: u16, y: u16, end: u16, chars: &[(char, Color32)]) -> bool {
+    use unicode_segmentation::UnicodeSegmentation;
+    let room = usize::from(end.saturating_sub(x));
+    let text: String = chars.iter().map(|&(c, _)| c).collect();
+    let (mut used, mut fits, mut full) = (0, 0, false);
+    for g in text.graphemes(true) {
+        let w = cells::width(g);
+        if used + w > room {
+            full = true;
+            break;
+        }
+        used += w;
+        fits += g.chars().count();
+    }
+    let back = chrome::PALETTE.back;
+    let mut at = x;
+    for (g, color) in in_cell_order(&chars[..fits]) {
+        // (A cluster no cell shows — a lone mark, a zero-width space — takes none.)
+        at += cells::put(buf, at, y, &g, cells::width(&g), Pen::new(color, back)) as u16;
+    }
+    full
+}
+
+/// The cells of `grid` a dialog of cells over the viewer covers — F8's list of encodings, the
+/// key help — with its shadow: blanked in the viewer's own buffer first, so a wide glyph half
+/// under a dialog's edge goes, as a terminal erases it (cells.rs: one buffer over another). A
+/// list is shown before the viewer in the pass (`picker_ui`): it is the top modal layer of the
+/// last pass that has painted in this one — one closed since has not.
+fn covered(ctx: &egui::Context, grid: &Grid) -> Vec<Cells> {
+    let mut out = super::help::covered(ctx, grid);
+    let modal = ctx.memory(|m| m.top_modal_layer());
+    let painted = |l: &egui::LayerId| ctx.graphics(|g| g.get(*l).is_some_and(|p| !p.is_empty()));
+    let rect = (modal.filter(painted)).and_then(|l| ctx.memory(|m| m.area_rect(l.id)));
+    if let Some(rect) = rect {
+        let at = |v: f32, o: f32, cell: f32, n: u16| ((v - o) / cell).clamp(0.0, f32::from(n));
+        let (x0, y0) = (
+            at(rect.min.x, grid.origin.x, CELL.x, grid.cols).floor(),
+            at(rect.min.y, grid.origin.y, CELL.y, grid.rows).floor(),
+        );
+        let (x1, y1) = (
+            at(rect.max.x, grid.origin.x, CELL.x, grid.cols).ceil(),
+            at(rect.max.y, grid.origin.y, CELL.y, grid.rows).ceil(),
+        );
+        let frame = Cells::new(x0 as u16, y0 as u16, (x1 - x0) as u16, (y1 - y0) as u16);
+        if frame.width > 0 && frame.height > 0 {
+            out.push(frame);
+            out.extend(dialog::shadow_of(frame).map(|r| r.intersection(grid.all())));
+        }
+    }
+    out
 }
 
 impl Window for TextWindow {
+    /// The viewer on its area's cell grid (10 §4–§6): the bar, the frame with its rows, the
+    /// notes and the status row — a preview its frame and rows alone (02 §4.2) — written into one
+    /// buffer, a glyph per cell, and painted once Go to's field has had its say.
     fn ui(&mut self, ui: &mut egui::Ui) {
-        if self.preview {
-            // Only the lines, in the frame: no bars, no notes, no keys (02 §4.2).
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ui, |ui| self.body(ui));
-            return;
-        }
-        // Whether this pass's input may retry a failed stream is settled here, from how the
-        // pass began: one that began with a reload under way, or whose input starts one
-        // (`keys`), retries nothing — whenever in the pass that reload ends. One gesture is
-        // one attempt.
-        let reloading = self.reloading;
-        self.input = !reloading
-            && ui.ctx().input(|i| {
-                i.events.iter().any(|e| {
-                    matches!(
-                        e,
-                        egui::Event::Key { pressed: true, .. }
-                            | egui::Event::PointerButton { pressed: true, .. }
-                            | egui::Event::MouseWheel { .. }
-                    )
-                })
-            });
-        // Cmd/Ctrl+G opens the Go to field in the status row (06 §7.2), which then has the
-        // typing: no key of the window acts from there.
         let ctx = ui.ctx().clone();
-        let open = super::command_key(&ctx, Key::G, false);
-        if open {
-            self.goto = Some(String::new());
-            ctx.memory_mut(|m| m.request_focus(goto_id()));
+        if !self.preview {
+            // Whether this pass's input may retry a failed stream is settled here, from how
+            // the pass began: one that began with a reload under way, or whose input starts one
+            // (`keys`), retries nothing — whenever in the pass that reload ends. One gesture is
+            // one attempt.
+            let reloading = self.reloading;
+            self.input = !reloading
+                && ctx.input(|i| {
+                    i.events.iter().any(|e| {
+                        matches!(
+                            e,
+                            egui::Event::Key { pressed: true, .. }
+                                | egui::Event::PointerButton { pressed: true, .. }
+                                | egui::Event::MouseWheel { .. }
+                        )
+                    })
+                });
+            // Cmd/Ctrl+G opens the Go to field in the status row (06 §7.2), which then has the
+            // typing: no key of the window acts from there.
+            let open = super::command_key(&ctx, Key::G, false);
+            if open {
+                self.goto = Some(String::new());
+                ctx.memory_mut(|m| m.request_focus(goto_id()));
+            }
+            let typing = self.goto.is_some() && (open || ctx.memory(|m| m.has_focus(goto_id())));
+            self.keys(&ctx, typing);
         }
-        let typing = self.goto.is_some() && (open || ctx.memory(|m| m.has_focus(goto_id())));
-        self.keys(&ctx, typing);
-        chrome::bar_panel(egui::Panel::top("sopen-text-bar")).show(ui, |ui| self.bar(ui));
-        chrome::bar_panel(egui::Panel::bottom("sopen-text-status"))
-            .show(ui, |ui| self.status_bar(ui));
-        if !self.notices.is_empty() {
-            let error = ui.visuals().error_fg_color;
-            let lines: Vec<(String, Color32)> =
-                self.notices.iter().map(|n| (n.clone(), error)).collect();
-            egui::Panel::bottom("sopen-text-notes").show(ui, |ui| {
-                ui.add_space(2.0);
-                super::disclosures(ui, &lines);
-                ui.add_space(2.0);
-            });
+        let p = chrome::PALETTE;
+        self.wide = cells::ambiguous_wide(&ctx);
+        let grid = Grid::over(ui.max_rect());
+        let laid = Laid::on(&grid, self.preview, &self.notices);
+        let mut buf = Buffer::empty(grid.all());
+        let body = Pen::new(p.text, p.back);
+        cells::fill(&mut buf, grid.all(), body);
+        let field = (laid.status)
+            .filter(|_| self.goto.is_some())
+            .and_then(|y| self.goto_field(ui, &grid, y));
+        self.body(ui, &grid, &mut buf, laid.frame);
+        if let Some(y) = laid.bar {
+            self.bar_cells(ui, &grid, &mut buf, y);
         }
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ui, |ui| self.body(ui));
+        let room = usize::from(grid.cols.saturating_sub(2));
+        for (y, note) in &laid.notes {
+            cells::put(&mut buf, 1, *y, note, room, Pen::new(p.error, p.back));
+        }
+        let mut caret =
+            (laid.status).and_then(|y| self.status_cells(ui, &grid, &mut buf, y, field));
+        for under in covered(&ctx, &grid) {
+            cells::fill(&mut buf, under, body);
+            caret = caret.filter(|c| !under.contains(*c));
+        }
+        cells::paint(
+            &ui.painter_at(grid.rect(grid.all())),
+            grid.origin,
+            &buf,
+            caret,
+        );
     }
 
     fn ready(&self) -> bool {
@@ -6219,6 +6531,21 @@ impl Window for TextWindow {
 
     fn encoding(&self) -> Option<(Encoding, Option<crate::encoding::Pick>)> {
         Some((self.doc.encoding(), self.doc.pick()))
+    }
+
+    fn wrapped(&self) -> Option<bool> {
+        Some(self.wrap)
+    }
+
+    /// As W leaves it: the same line at the top, from its start — a jump on its way (`at=`) still
+    /// lands, under the new wrap. A deleted file keeps its page as it was read, as W does.
+    fn set_wrapped(&mut self, wrapped: bool) {
+        if self.wrap != wrapped && !self.gone {
+            self.wrap = wrapped;
+            self.top_off = 0;
+            self.left = 0;
+            self.moved = 0;
+        }
     }
 
     /// F8's choice (08 §7.5): read in it from the next pass — in place, or indexed again when

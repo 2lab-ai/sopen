@@ -18,6 +18,7 @@ mod s5;
 mod s6;
 mod vm7;
 mod vm7b;
+mod vm8;
 mod x1a;
 mod x1b;
 
@@ -629,17 +630,24 @@ fn the_sides_and_the_viewer_stand_on_the_cell_grid() {
         sides,
         "a list and a preview, 496 and 504 points"
     );
-    // The viewer: the whole grid — its own bar on top and status bar below inside it (a cell
-    // and 4 points each), its frame between them.
+    // The viewer: the whole grid, in cells (X3-text) — its own bar on the first row and its
+    // status row on the last, its frame between them.
     fx.key(Key::Enter);
     fx.settle();
     assert!(fx.b.viewer.is_some(), "the viewer");
-    let (all, bar) = (grid_columns(0, 125), Vec2::new(0.0, chrome::CELL.y + 4.0));
-    assert_eq!(
-        panes(&fx),
-        [Rect::from_min_max(all.min + bar, all.max - bar)],
-        "the viewer at all the cells"
-    );
+    let all = grid_columns(0, 125);
+    let layers = cells::layers(&fx.drv.ctx);
+    let viewer = cells::find(&layers, "Text Viewer");
+    let viewer = &layers[viewer.first().expect("the viewer in cells").layer];
+    let a = viewer.buf.area;
+    assert_eq!(viewer.rect(a), all, "the viewer at all the cells");
+    let corners = [
+        (a.left(), a.top() + 1, "╔"),
+        (a.right() - 1, a.bottom() - 2, "╝"),
+    ];
+    for (x, y, corner) in corners {
+        assert_eq!(viewer.buf[(x, y)].symbol(), corner, "its frame's ({x},{y})");
+    }
     fx.key(Key::Escape);
     fx.settle();
     assert!(fx.b.viewer.is_none());
@@ -1357,12 +1365,13 @@ fn w8b_esc_in_the_pass_an_image_gives_way_leaves_it() {
     assert_eq!(fx.current(), "huge.png");
 }
 
-/// Some text on screen holds `part` (a line of the window's rows, wrapped or not).
+/// Some text on screen holds `part` (a line of the window's rows, wrapped or not): a text egui
+/// drew, or a row of cells — across its runs, so a highlighted line's colours do not split it
+/// (the text viewer is cells, X3-text).
 fn shows(fx: &Fx, part: &str) -> bool {
-    fx.drv
-        .texts()
-        .iter()
-        .any(|(_, _, text)| text.contains(part))
+    let texts = fx.drv.texts();
+    texts.iter().any(|(_, _, text)| text.contains(part))
+        || !cells::find(&cells::layers(&fx.drv.ctx), part).is_empty()
 }
 
 /// 06 §7.3, §12 V15 (W8b): the memory line of a remote image too large to decode without asking
@@ -1624,8 +1633,8 @@ impl Gate {
     }
 }
 
-/// The local disk posing as a remote whose `read_to` (a fetch: after the first chunk) or
-/// `create_from` (a save's upload) stops at a gate.
+/// The local disk posing as a remote whose `read_to` (a fetch: after the first chunk),
+/// `create_from` (a save's upload) or `read_head` (a sniff) stops at a gate.
 struct Gated {
     fs: LocalFs,
     gate: Gate,
@@ -1643,6 +1652,9 @@ impl RemoteFs for Gated {
         self.fs.realpath(p)
     }
     fn read_head(&mut self, p: &str, max: usize) -> Result<Vec<u8>> {
+        if self.at == "read_head" {
+            self.gate.hold();
+        }
         self.fs.read_head(p, max)
     }
     fn list_dir(&mut self, p: &str) -> Result<Vec<String>> {

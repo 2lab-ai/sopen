@@ -1,7 +1,8 @@
 //! The viewer's views in today's windows (`.prd/08-viewer.md` §8, VM-7): the egui binding of the
 //! view set ([`crate::views`]) and the view keys ([`crate::view_keys`]).
 //!
-//! The viewer opens on its file's view 1 (or Hex, D10) as before; 1, 2 and 3 — taken before the
+//! The viewer opens on its file's view 1 (or Hex, D10) as before — in a terminal a page file on
+//! its source, 3, nothing of its page made (10 T21, VM-8); 1, 2 and 3 — taken before the
 //! viewer's pass by the shell's input hook (`gui::route_view_keys`), or F9 then one of them, or a
 //! click on the title row's strip — choose a view by §3's table. A view is made the first time it
 //! is chosen, on a worker, by the same preparation the opening ran ([`prepare::prepare_view`]);
@@ -214,10 +215,12 @@ pub(super) struct PageOpen {
     /// Where the page goes among its views: the preparation's one decision, from the file
     /// opened (its resolved name and head), never the name the list shows.
     pub class: PageClass,
-    /// The window shows pages (else D30's source, 09 §4): with a class other than `Plain`, the
-    /// page is one of its views.
+    /// The opening made the page (`Pages::Page`), so the set opens on it. Else the source: in a
+    /// terminal, for a page file by the name the list shows, with the page still one of its
+    /// views (10 T21: `Screen::TERMINAL`); otherwise without it (D30's source, 09 §4).
     pub shown: bool,
-    /// The folder the browser was opened on (§3.1's root).
+    /// The folder the browser was opened on (§3.1's root); `None` where nothing of the page was
+    /// made — the page view finds it then as the browser does ([`Browser::start_making`]).
     pub opened_on: Option<String>,
 }
 
@@ -272,14 +275,22 @@ pub(super) fn open_paged(
     opening.page = page.class;
     opening.read_only = means.in_place;
     opening.undecodable = opened.undecodable.clone();
-    let screen = if page.shown && page.class != PageClass::Plain {
-        Screen::GUI
-    } else {
-        Screen::NO_ENGINE
+    let terminal = crate::gui::in_terminal(ctx);
+    // The screen the opening made its first view for — the backend's own, since a preview is
+    // handed over only in the backend it was made for (`preview::Host::fits`): the page where a
+    // window made it; in a terminal, which draws none, the source with the window's slots (10
+    // T21: `Pages::here` made nothing of the page) where a window would show the page — a page
+    // file by the name the list shows (09 §5), not a link to one under another name; else the
+    // source alone (09 §4).
+    let screen = match (page.class, page.shown, terminal) {
+        (PageClass::Plain, ..) => Screen::NO_ENGINE,
+        (_, true, _) => Screen::GUI,
+        (_, false, true) if crate::kind::page_file(&means.name) => Screen::TERMINAL,
+        (_, false, _) => Screen::NO_ENGINE,
     };
     let set = ViewSet::open(opening, screen).expect("a file has views");
     // A terminal's input sends its releases made (`term_input::RELEASES`), a window's its own.
-    let releases = !crate::gui::in_terminal(ctx) || crate::gui::term_input::RELEASES;
+    let releases = !terminal || crate::gui::term_input::RELEASES;
     let down = ctx.input(|i| i.keys_down.iter().copied().collect::<Vec<_>>());
     let slot = Arc::new(Mutex::new(ViewKeySlot {
         state: view_keys::State::Free,
@@ -1115,7 +1126,13 @@ impl Browser {
             View::Text | View::Raw => notice.or_else(|| views.source_line.take()),
             _ => notice,
         };
-        let opened_on = views.opened_on.clone();
+        // A page file opened with nothing of its page made (a terminal, 10 T21) was handed no
+        // folder: its root is found from the one the browser was opened on, when that is on the
+        // file's host, as the browser finds it for an opening.
+        let opened_on = views
+            .opened_on
+            .clone()
+            .or_else(|| (views.means.label == self.label).then(|| self.opened_on.clone()));
         let means = &views.means;
         let (connect, label, path, in_place) = (
             means.connect.clone(),

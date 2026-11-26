@@ -21,7 +21,7 @@ What the machine that shows the file needs, then what the remote needs. Install:
   remote. The file browser, the image and media windows, the binary-file dialog and the hex window
   need a desktop session (X11 or Wayland); without one a folder opens in the editor and a binary,
   image or media file is fetched and its path printed — or, with `--tui`, the file browser runs in
-  the terminal.
+  the terminal; with `--gui`, which asks for the window, sopen says so and exits 1.
 
 ## What the remote needs
 
