@@ -2141,8 +2141,9 @@ enum Press {
     OfferSaveAs,
     /// The live question about a temp (07 §3.1): Remove it (`true`) or Keep it.
     Left(bool),
-    /// A recovery row's button.
-    Row(usize, RowAction),
+    /// A recovery row's button, the row by its identity ([`row_key`]), never its place: the row
+    /// that moves up when the one above goes never takes that one's controls or keyboard.
+    Row(u64, RowAction),
 }
 
 /// A control of the rows below the grid: its label, what it does, whether it does it now.
@@ -2152,19 +2153,93 @@ struct Control {
     on: bool,
 }
 
-/// One row of cells below the grid ([`HexWindow::below`]).
+/// One row of cells below the grid ([`HexWindow::below`]), laid out for its width: what it
+/// draws is all of what acts there, and what acts is a Tab stop ([`HexWindow::below_controls`]).
 enum Below {
     /// A text, wrapped already, in its pen.
     Text(String, Pen),
-    /// Buttons, a `│` before the one at the index (a recovery row's own, after its question's
-    /// answers).
-    Buttons(Vec<Control>, Option<usize>),
-    /// The read-only window's: `[ Keep edits… ]`, the path field, `[ Write the list there ]`.
-    Keep,
+    /// Buttons at their first cells, and a `│` at its cell (between a question's answers and a
+    /// recovery row's own buttons, on one row of cells).
+    Buttons(Vec<(u16, Control)>, Option<u16>),
+    /// The read-only window's: `[ Keep edits… ]` and its path field, `field` cells wide, then
+    /// `[ Write the list there ]` — on this row (`write`), or alone on the next
+    /// ([`Below::KeepWrite`]) where this one has no room for it.
+    Keep {
+        field: u16,
+        write: bool,
+    },
+    KeepWrite,
 }
 
 fn below_id(press: Press) -> egui::Id {
     egui::Id::unique("sopen-hex-below").with(press)
+}
+
+/// A button's cells: `[ label ]`.
+fn button_cells(label: &str) -> u16 {
+    cells::width(label) as u16 + 4
+}
+
+/// `controls` on rows `cols` cells wide, from cell 1, two blanks apart — a `│` with a blank
+/// either side before the one at `rule` — and a button that does not fit after another on the
+/// next row (a rule at a row's start is left out). One wider than the row stands alone, cut.
+fn placed(controls: Vec<Control>, rule: Option<usize>, cols: u16) -> Vec<Below> {
+    let (mut out, mut row, mut bar, mut x) = (vec![], vec![], None, 1u16);
+    for (k, c) in controls.into_iter().enumerate() {
+        let w = button_cells(c.label);
+        let ruled = Some(k) == rule;
+        let need = w + if ruled { 3 } else { 0 };
+        if !row.is_empty() && x.saturating_add(need) > cols {
+            out.push(Below::Buttons(std::mem::take(&mut row), bar.take()));
+            x = 1;
+        }
+        if ruled && !row.is_empty() {
+            bar = Some(x);
+            x += 3;
+        }
+        row.push((x, c));
+        x = x.saturating_add(w + 2);
+    }
+    if !row.is_empty() {
+        out.push(Below::Buttons(row, bar));
+    }
+    out
+}
+
+/// A recovery row's identity: its journal's folder, its temp's path, its undo file's or its
+/// note's line — what its controls are keyed on ([`Press::Row`]).
+fn row_key(row: &Row) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match row {
+        Row::Edits { orphan, .. } | Row::Kept { orphan, .. } => {
+            ("journal", orphan.dir()).hash(&mut h)
+        }
+        Row::Undo { line, .. } => ("undo", line).hash(&mut h),
+        Row::Temp { path, .. } => ("temp", path).hash(&mut h),
+        Row::Note(line) => ("note", line).hash(&mut h),
+    }
+    h.finish()
+}
+
+/// The recovery rows as their controls see them: each one's identity and whether it asks about
+/// a temp. A press that changes it gives the keyboard back to the grid.
+fn rows_seen(rows: &[Row]) -> Vec<(u64, bool)> {
+    let asks = |row: &Row| match row {
+        Row::Edits { temp, .. } | Row::Kept { temp, .. } => temp.is_some(),
+        _ => false,
+    };
+    rows.iter().map(|r| (row_key(r), asks(r))).collect()
+}
+
+/// Whether a row below the grid holds `[ Write the list there ]`: the keep row where it has room,
+/// or the row of its own after it. `None`: not the keep row's.
+fn row_write(row: &Below) -> Option<bool> {
+    match row {
+        Below::Keep { write, .. } => Some(*write),
+        Below::KeepWrite => Some(true),
+        _ => None,
+    }
 }
 
 /// A journal's question about a temp, and a temp's row: Remove it, Keep it.
@@ -3076,7 +3151,11 @@ impl HexWindow {
     /// Writes the next generation — now, waiting for it (focus loss, close, a Save's start), or
     /// in the background. The journal is made by the first one.
     fn write_generation(&mut self, wait: bool) {
+        // Nothing to write (an edit undone before the tick, restored bytes still landing): what
+        // was due is dropped, or the tick would ask for a repaint every pass and the prompt never
+        // settle. The next change of the document is due again.
         if !self.wants_generation() {
+            self.schedule.taking();
             return;
         }
         // One at a time: a generation on its way is waited for before the next.
@@ -3561,7 +3640,8 @@ impl HexWindow {
     /// §5.1) — a line each, a journal's question about a temp under it, its buttons (buttons,
     /// not letter keys: a letter types a byte), the question's answers first. Cells have no
     /// hover: why a row's buttons are off is a dim row under them.
-    fn below(&self, room: usize) -> Vec<Below> {
+    fn below(&self, cols: u16) -> Vec<Below> {
+        let room = usize::from(cols.saturating_sub(2).max(1));
         let p = chrome::PALETTE;
         let (error, dim) = (Pen::new(p.error, p.back), Pen::new(p.dim, p.back));
         let mut out = vec![];
@@ -3580,40 +3660,50 @@ impl HexWindow {
             text(&mut out, line, error);
         }
         if self.read_only.is_some() && self.retained.is_none() {
-            out.push(Below::Keep);
+            // `[ Keep edits… ]`, the field, `[ Write the list there ]` on one row where the
+            // field keeps its fewest cells; else the last on the next row.
+            let at = 1 + button_cells("Keep edits…") + 2;
+            let after = 2 + button_cells("Write the list there") + 1;
+            let write = cols >= at + KEEP_FEWEST + after;
+            let field = if write {
+                cols - at - after
+            } else {
+                cols.saturating_sub(at + 1).max(1)
+            };
+            out.push(Below::Keep { field, write });
+            if !write {
+                out.push(Below::KeepWrite);
+            }
         }
         let free = self.job.is_none() && !self.dialog_up();
         let control = |label: &'static str, press: Press, on: bool| Control { label, press, on };
         if let Some(why) = &self.offer {
             text(&mut out, &format!("not saved: {why}"), error);
-            out.push(Below::Buttons(
-                vec![
-                    control("Write in place…", Press::InPlace, free),
-                    control("Save As…", Press::OfferSaveAs, free),
-                ],
-                None,
-            ));
+            let all = vec![
+                control("Write in place…", Press::InPlace, free),
+                control("Save As…", Press::OfferSaveAs, free),
+            ];
+            out.extend(placed(all, None, cols));
         }
         if let Some(left) = &self.left {
             text(&mut out, &left.line, error);
             let free = free && self.answering.is_none();
-            out.push(Below::Buttons(
-                vec![
-                    control("Remove it", Press::Left(true), free),
-                    control("Keep it", Press::Left(false), free),
-                ],
-                None,
-            ));
+            let all = vec![
+                control("Remove it", Press::Left(true), free),
+                control("Keep it", Press::Left(false), free),
+            ];
+            out.extend(placed(all, None, cols));
         }
         let busy = self.job.is_some() || self.removing.is_some();
-        for (i, row) in self.rows.iter().enumerate() {
+        for row in &self.rows {
+            let key = row_key(row);
             let (line, temp, buttons) = recovery_row(row);
             text(&mut out, line, error);
             let mut all = vec![];
             if let Some(temp) = temp {
                 text(&mut out, &temp.line, error);
                 for (label, action) in ASK {
-                    all.push(control(label, Press::Row(i, action), !busy));
+                    all.push(control(label, Press::Row(key, action), !busy));
                 }
             }
             let waits = |action| {
@@ -3622,12 +3712,12 @@ impl HexWindow {
             for &(label, action) in buttons {
                 all.push(control(
                     label,
-                    Press::Row(i, action),
+                    Press::Row(key, action),
                     !busy && !waits(action),
                 ));
             }
             let rule = temp.is_some().then_some(ASK.len());
-            out.push(Below::Buttons(all, rule));
+            out.extend(placed(all, rule, cols));
             if temp.is_some() && buttons.iter().any(|&(_, a)| waits(a)) {
                 let why = "Restore and Discard wait: first answer the question about the \
                            interrupted save's file";
@@ -3644,21 +3734,23 @@ impl HexWindow {
         out
     }
 
-    /// The controls of the rows below the grid that act now, in the order Tab walks them: each
+    /// The controls of the rows below the grid, `cols` cells wide, that act now, in the order
+    /// Tab walks them — exactly those [`HexWindow::below_ui`] draws and lets act there: each
     /// button that is on, and the keep row's path field between its two buttons.
-    fn below_controls(&self) -> Vec<egui::Id> {
+    fn below_controls(&self, cols: u16) -> Vec<egui::Id> {
         let mut out = vec![];
-        for row in self.below(usize::MAX) {
+        for row in &self.below(cols) {
             match row {
                 Below::Text(..) => {}
                 Below::Buttons(all, _) => {
-                    out.extend(all.iter().filter(|c| c.on).map(|c| below_id(c.press)));
+                    let on = all.iter().filter(|(_, c)| c.on);
+                    out.extend(on.map(|(_, c)| below_id(c.press)));
                 }
-                Below::Keep => out.extend([
-                    below_id(Press::KeepEdits),
-                    keep_id(),
-                    below_id(Press::WriteList),
-                ]),
+                Below::Keep { .. } => out.extend([below_id(Press::KeepEdits), keep_id()]),
+                Below::KeepWrite => {}
+            }
+            if matches!(row_write(row), Some(true)) {
+                out.push(below_id(Press::WriteList));
             }
         }
         out
@@ -3677,10 +3769,12 @@ impl HexWindow {
         cells::fill(&mut buf, grid.all(), Pen::new(p.text, p.back));
         let cols = grid.cols;
         let (mut pressed, mut caret) = (None, None);
+        // A button at cell `x` of row `y`, cut at the row's end (one wider than the row stands
+        // alone there, [`placed`]): drawn, and acting at the cells it shows.
         let mut button = |ui: &mut egui::Ui, buf: &mut Buffer, x: u16, y: u16, c: &Control| {
-            let w = cells::width(c.label) as u16 + 4;
-            if x + w > cols {
-                return None;
+            let w = button_cells(c.label).min(cols.saturating_sub(x));
+            if w == 0 {
+                return;
             }
             let id = below_id(c.press);
             let sense = if c.on { Sense::click() } else { Sense::hover() };
@@ -3696,7 +3790,16 @@ impl HexWindow {
                 Pen::new(p.dialog_text, p.dialog_back)
             };
             cells::put(buf, x, y, &format!("[ {} ]", c.label), w.into(), pen);
-            Some(x + w + 2)
+        };
+        let keep = Control {
+            label: "Keep edits…",
+            press: Press::KeepEdits,
+            on: true,
+        };
+        let write = Control {
+            label: "Write the list there",
+            press: Press::WriteList,
+            on: true,
         };
         for (y, row) in (0u16..).zip(rows) {
             match row {
@@ -3705,43 +3808,28 @@ impl HexWindow {
                     cells::put(&mut buf, 1, y, text, room, *pen);
                 }
                 Below::Buttons(all, rule) => {
-                    let mut x = 1;
-                    for (k, c) in all.iter().enumerate() {
-                        if Some(k) == *rule {
-                            cells::put(&mut buf, x, y, "│", 1, Pen::new(p.text, p.back));
-                            x += 3;
-                        }
-                        match button(ui, &mut buf, x, y, c) {
-                            Some(next) => x = next,
-                            None => break,
-                        }
+                    if let Some(x) = rule {
+                        cells::put(&mut buf, *x, y, "│", 1, Pen::new(p.text, p.back));
+                    }
+                    for (x, c) in all {
+                        button(ui, &mut buf, *x, y, c);
                     }
                 }
-                Below::Keep => {
-                    let keep = Control {
-                        label: "Keep edits…",
-                        press: Press::KeepEdits,
-                        on: true,
-                    };
-                    let write = Control {
-                        label: "Write the list there",
-                        press: Press::WriteList,
-                        on: true,
-                    };
-                    let Some(at) = button(ui, &mut buf, 1, y, &keep) else {
-                        continue;
-                    };
-                    let after = cells::width(write.label) as u16 + 4 + 2;
-                    let w = cols.saturating_sub(at + after + 1).max(KEEP_FEWEST);
-                    let field = Cells::new(at, y, w.min(cols.saturating_sub(at)), 1);
+                Below::Keep { field, write: here } => {
+                    button(ui, &mut buf, 1, y, &keep);
+                    let at = 1 + button_cells(keep.label) + 2;
+                    let field = Cells::new(at, y, (*field).min(cols.saturating_sub(at)), 1);
                     dialog::field(ui, &grid, field, keep_id(), &mut self.keep_to, |e| e);
                     let focused = ctx.memory(|m| m.has_focus(keep_id()));
                     let id = keep_id();
                     let shown =
                         dialog::field_cells(&ctx, &mut buf, field, id, &self.keep_to, focused);
                     caret = caret.or(shown);
-                    button(ui, &mut buf, field.right() + 2, y, &write);
+                    if *here {
+                        button(ui, &mut buf, field.right() + 2, y, &write);
+                    }
                 }
+                Below::KeepWrite => button(ui, &mut buf, 1, y, &write),
             }
         }
         self.blank_under(&ctx, &grid, &mut buf);
@@ -3775,7 +3863,19 @@ impl HexWindow {
             }
             Press::OfferSaveAs => self.open_save_as(false),
             Press::Left(remove) => self.answer_left(ctx, remove),
-            Press::Row(i, action) => self.row_action(i, action),
+            Press::Row(key, action) => {
+                let Some(i) = self.rows.iter().position(|r| row_key(r) == key) else {
+                    return;
+                };
+                let before = rows_seen(&self.rows);
+                self.row_action(i, action);
+                // The rows changed under the control that had the keyboard (a row went, a
+                // question was answered): the keyboard goes back to the grid, never to a
+                // control that comes into that place.
+                if rows_seen(&self.rows) != before {
+                    ctx.memory_mut(|m| m.request_focus(grid_id()));
+                }
+            }
         }
     }
 
@@ -3833,6 +3933,20 @@ impl HexWindow {
             return false;
         };
         ctx.memory_mut(|m| m.set_focus_lock_filter(controls[i], lock));
+        // A key's auto-repeat never presses a control: only a press of its own does.
+        ctx.input_mut(|input| {
+            input.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::Key {
+                        key: Key::Enter | Key::Space,
+                        pressed: true,
+                        repeat: true,
+                        ..
+                    }
+                )
+            })
+        });
         if take(false) {
             match controls.get(i + 1) {
                 Some(next) => focus(*next),
@@ -5185,7 +5299,8 @@ impl super::Window for HexWindow {
         self.area = Rect::from_min_max(whole.min, egui::pos2(whole.right(), above_keys));
         // The rows below the grid's controls, Tab's way into them; one with the keyboard (the
         // read-only window's path field among them) keeps this frame's keys.
-        let controls = self.below_controls();
+        let cols = (ui.available_width() / chrome::CELL.x).floor() as u16;
+        let controls = self.below_controls(cols);
         self.keys(&ctx, goto_owns, &controls);
         // A question the keys opened or answered: the rest of the window's cells under it.
         self.under = self.questions_cover();
@@ -5203,8 +5318,7 @@ impl super::Window for HexWindow {
             .exact_size(chrome::CELL.y)
             .show(ui, |ui| self.status_bar(ui));
         // The rows below the grid, whole rows of cells.
-        let cols = (ui.available_width() / chrome::CELL.x).floor() as usize;
-        let rows = self.below(cols.saturating_sub(2).max(1));
+        let rows = self.below(cols);
         if !rows.is_empty() {
             let pressed = egui::Panel::bottom("disclosures")
                 .frame(egui::Frame::NONE)
@@ -5224,7 +5338,7 @@ impl super::Window for HexWindow {
                 // A field or a row's control that has the keyboard (a click into the path field
                 // this frame) keeps it: the grid does not take it back.
                 let focused = ctx.memory(|m| m.focused());
-                let row_owns = focused.is_some_and(|f| self.below_controls().contains(&f));
+                let row_owns = focused.is_some_and(|f| self.below_controls(cols).contains(&f));
                 self.grid(ui, goto_owns || row_owns)
             });
         self.poll_job(&ctx);
@@ -5250,7 +5364,7 @@ impl super::Window for HexWindow {
             ctx.request_repaint();
         }
         let focused = ctx.memory(|m| m.focused());
-        self.row_focus = focused.is_some_and(|f| self.below_controls().contains(&f));
+        self.row_focus = focused.is_some_and(|f| self.below_controls(cols).contains(&f));
     }
 
     /// Over a stream (06 §11): once the state's patches are in and the screen's bytes have

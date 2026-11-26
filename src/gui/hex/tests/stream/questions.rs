@@ -141,13 +141,13 @@ fn the_close_prompts_save_and_save_as_by_keyboard() {
     tab(&mut ed, false);
     tab(&mut ed, false);
     ed.key(Key::Enter, Modifiers::NONE);
-    assert!(ed.win.save_as.is_some(), "the modal");
+    assert!(
+        ed.win.save_as.as_ref().is_some_and(|(m, ..)| !m.busy()),
+        "the modal, and the Enter that pressed Save As… saves nothing"
+    );
     ed.frames(2);
     assert!(in_cells(&ed.drv, " Save As "), "in cells");
-    assert!(
-        entries(&out).is_empty(),
-        "the Enter that pressed Save As… saved too"
-    );
+    assert!(entries(&out).is_empty(), "nothing written");
     assert!(
         in_cells(
             &ed.drv,
@@ -550,4 +550,175 @@ fn closing_keeps_the_edits_at_once_and_a_generations_end_repaints() {
     assert!(ed.win.writing.is_some(), "an edit no pass saw");
     ed.drv.until(&mut ed.win, 20, |w| w.ready());
     assert_eq!(ed.win.schedule.status(), Keep::Kept);
+}
+
+/// Two journals of earlier sessions (two kills, then a reopen): two rows.
+fn two_kept_journals() -> Ed {
+    let mut ed = ed(&body());
+    ed.typed("AB");
+    ed.kept();
+    ed.reopen();
+    ed.win.place(0x10, Pane::Hex);
+    ed.typed("CD");
+    ed.kept();
+    ed.reopen();
+    assert_eq!(ed.rows().len(), 2, "{:?}", ed.rows());
+    assert_eq!(ed.journals().len(), 2, "{:?}", ed.journals());
+    ed
+}
+
+/// A key pressed (`down`) or let go in a pass of its own, nothing else in it.
+fn key_event(ed: &mut Ed, key: Key, down: bool) {
+    let event = Event::Key {
+        key,
+        physical_key: None,
+        pressed: down,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+    ed.drv.frame(&mut ed.win, vec![event], Modifiers::NONE);
+}
+
+/// R1 (review round 1): a row's controls are keyed on the row, not its place. Discard on the
+/// first of two rows by keyboard (Tab from the ASCII column to its `[ Discard ]`, Space), then
+/// Space again: the second row's journal is still there — the row that moved up did not take
+/// the first one's keyboard, which went back to the grid.
+#[test]
+fn r1_a_second_press_after_a_discard_never_discards_the_next_row() {
+    let mut ed = two_kept_journals();
+    ed.win.place(0, Pane::Ascii);
+    for _ in 0..3 {
+        tab(&mut ed, false);
+    }
+    ed.key(Key::Space, Modifiers::NONE);
+    ed.frames(1);
+    assert_eq!(ed.rows().len(), 1, "the first Space discarded a row");
+    assert_eq!(ed.journals().len(), 1);
+    ed.key(Key::Space, Modifiers::NONE);
+    ed.frames(1);
+    assert_eq!(
+        ed.journals().len(),
+        1,
+        "the second Space discarded the next row"
+    );
+    assert_eq!(ed.rows().len(), 1);
+    assert_eq!(ed.drv.ctx.memory(|m| m.focused()), Some(grid_id()));
+}
+
+/// R1: a key's auto-repeat never presses a row's button. Space goes down while the grid has the
+/// keyboard and stays down; Tab to the first row's `[ Discard ]`; the repeat that comes next is
+/// not a press — both journals stay.
+#[test]
+fn r1_a_key_repeat_never_presses_a_rows_button() {
+    let mut ed = two_kept_journals();
+    ed.win.place(0, Pane::Ascii);
+    key_event(&mut ed, Key::Space, true);
+    for _ in 0..3 {
+        tab(&mut ed, false);
+    }
+    assert_eq!(
+        pens_of(&ed.drv, "[ Discard ]"),
+        Some(focused_pen()),
+        "the first row's Discard has the keyboard"
+    );
+    // Space still down: this press is its auto-repeat (egui marks it so).
+    key_event(&mut ed, Key::Space, true);
+    ed.frames(1);
+    key_event(&mut ed, Key::Space, false);
+    assert_eq!(ed.journals().len(), 2, "the repeat discarded a journal");
+    assert_eq!(ed.rows().len(), 2);
+}
+
+/// R1: on a narrow window (400 points, 50 cells) a row's buttons that do not fit wrap onto the
+/// next row of cells; every button that acts is drawn, and Tab walks only what is drawn: through
+/// the temp question's answers to `[ Later ]` (Restore and Discard wait), and Enter on it acts.
+#[test]
+fn r1_buttons_that_do_not_fit_wrap_and_tab_reaches_them() {
+    let mut ed = ed(&body());
+    ed.typed("AB");
+    kill_at(&mut ed, patch::Step::Copy(1));
+    ed.reopen();
+    ed.drv.resize(400.0, 560.0);
+    ed.frames(3);
+    for button in [
+        "[ Remove it ]",
+        "[ Keep it ]",
+        "[ Restore ]",
+        "[ Later ]",
+        "[ Discard ]",
+    ] {
+        assert!(in_cells(&ed.drv, button), "{button} is drawn");
+    }
+    ed.win.place(0, Pane::Ascii);
+    for button in ["[ Remove it ]", "[ Keep it ]", "[ Later ]"] {
+        tab(&mut ed, false);
+        assert_eq!(pens_of(&ed.drv, button), Some(focused_pen()), "{button}");
+    }
+    ed.key(Key::Enter, Modifiers::NONE);
+    ed.frames(1);
+    assert!(
+        ed.rows().is_empty(),
+        "Later put the row away: {:?}",
+        ed.rows()
+    );
+}
+
+/// R1: an edit undone before the journal's tick leaves nothing to write: the generation due then
+/// is dropped — the window stops asking for repaints, and under the prompt (raised as in the pass
+/// of the undo) it settles.
+#[test]
+fn r1_nothing_to_write_is_not_due_for_ever() {
+    let mut ed = ed(&body());
+    ed.typed("AB");
+    ed.key(Key::Z, command(false));
+    ed.key(Key::Z, command(false));
+    assert_eq!(ed.win.doc.changed_count(), 0, "undone");
+    assert!(ed.win.schedule.due().is_some(), "a generation was due");
+    ed.win.prompt = true;
+    std::thread::sleep(Duration::from_millis(300));
+    // What a tick asks of a context of its own (one that has asked for nothing yet).
+    let ticked = |ed: &mut Ed| -> Vec<Duration> {
+        let woken = egui::Context::default();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        woken.set_request_repaint_callback(move |info| seen.lock().unwrap().push(info.delay));
+        ed.win.tick_journal(&woken);
+        let asked = asked.lock().unwrap().clone();
+        asked
+    };
+    ticked(&mut ed);
+    assert_eq!(ticked(&mut ed), [], "a repaint asked for nothing, again");
+    assert_eq!(ticked(&mut ed), [], "and again");
+    assert!(ed.win.schedule.due().is_none(), "still due");
+    assert!(ed.win.ready(), "the prompt never settles");
+}
+
+/// R1: Discard pressed while the prompt's own journal write is still held (the generation that
+/// raising the prompt started, at its gate): the write is let go, the window goes, and no journal
+/// is left — the one that write made is removed with the window, as Discard says.
+#[test]
+fn r1_discard_before_the_prompts_write_lands_leaves_no_journal() {
+    let mut ed = ed(&body());
+    let gate = Arc::new(AtomicBool::new(true));
+    // Let go if the test fails first: the window's end waits for the write.
+    let _open = Opens(gate.clone());
+    ed.win.generation_gate = Some(gate.clone());
+    ed.typed("AB");
+    assert!(!ed.win.close_requested());
+    assert!(ed.win.writing.is_some(), "the prompt's write, held");
+    ed.frames(2);
+    ed.drv.click_text(&mut ed.win, "[ Discard ]");
+    assert!(ed.win.discard && ed.win.close_ok, "Discard");
+    assert!(ed.journals().is_empty(), "nothing written yet");
+    gate.store(false, Ordering::SeqCst);
+    let win = std::mem::replace(
+        &mut ed.win,
+        window_on(ed.tmp.path(), &ed.remote, Side::Local, None, &ed.moved).1,
+    );
+    drop(win);
+    assert!(
+        ed.journals().is_empty(),
+        "a journal left: {:?}",
+        ed.journals()
+    );
 }
