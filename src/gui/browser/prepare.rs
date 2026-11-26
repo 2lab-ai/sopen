@@ -118,19 +118,22 @@ impl Pages {
     /// How a file named `name` opens in `ctx`'s window, asked on its frame (the engine is the
     /// windows' thread's): a page file as its page where pages show here (09 §4), else as its
     /// source with the line saying why — `failed`, a view the engine refused before, says it
-    /// for the rest of the window. Any other name opens as before 09, no engine asked.
+    /// for the rest of the window. Any other name opens as before 09, no engine asked. In a
+    /// terminal, which draws no page (10 T21), a page file opens as its source with no line and
+    /// nothing of the page is made; its page is still one of its views (the class the
+    /// preparation finds), made when it is chosen.
     pub fn here(
         ctx: &egui::Context,
         name: &str,
         opened_on: Option<String>,
         failed: Option<&crate::gui::web::Unavailable>,
     ) -> Pages {
-        if !kind::page_file(name) {
+        if !kind::page_file(name) || crate::gui::in_terminal(ctx) {
             return Pages::Source(None);
         }
         let here = match failed {
             Some(why) => Err(why.clone()),
-            None => page::pages_here(ctx),
+            None => page::pages_here(),
         };
         match here {
             Ok(()) => Pages::Page { opened_on },
@@ -1530,11 +1533,14 @@ fn preview_parts(
     let (kind, sniff) = kind::detect_sniffed(fs.as_mut(), &real, &stat)?;
     known.kind = Some(kind);
     // 09 §5–§6: a page file whose default view is its page shows it, where the window shows
-    // pages; the decision reads an `.xml`'s head on this connection.
-    if let (Kind::Text, Pages::Page { opened_on }) = (kind, pages) {
-        known.page.shown = true;
+    // pages; the decision reads an `.xml`'s head on this connection. Where it shows its source
+    // (a terminal, 10 T21) the viewer it becomes still has the page among its views.
+    if kind == Kind::Text && kind::page_file(crate::remote::split_parent(&real).1) {
         budget.check(cancel)?;
         known.page.class = page_class_on(fs.as_mut(), &real)?;
+    }
+    if let (Kind::Text, Pages::Page { opened_on }) = (kind, pages) {
+        known.page.shown = true;
         // A remote page lends the window's preview session; without it, its source.
         let lent = session.filter(|_| label.is_some());
         if known.page.class == PageClass::PageFirst && (label.is_none() || lent.is_some()) {

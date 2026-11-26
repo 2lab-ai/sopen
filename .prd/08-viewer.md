@@ -8,8 +8,8 @@ tags: [sopen, spec, xtools, viewer, encoding]
 
 Status: planned (2026-11-24). §2–§7 are the contract: the model of which views a file has, which key
 means what, what a switch keeps, and how text is decoded over byte ranges; its units (§13) are ready
-to build. §8 binds the model to today's egui windows and is **provisional** until XR-T decides the
-screen; §9 says what a terminal binding needs from the model.
+to build. §8 binds the model to the window (VM-7), §9 to the terminal (VM-8, 10 T21): one screen of
+cells in both, the window's input its own.
 
 The target is item 4 of [`xtools/ssot.md`](xtools/ssot.md) (owner message 20), shaped by its item 2
 (message 23): xtools becomes a terminal UI first, with a GUI that is the same screen, built as XR-T's
@@ -75,8 +75,9 @@ inferred, not read in code or measured. What it amends in 01, 04, 06, 07, the RE
 | a folder, fifo, socket, device, dangling link, a name that is not UTF-8 | not opened, as today (`browser.rs:1780-1783, 1824-1831`) | — | — |
 
 - **none**: the key does nothing and the strip shows no 3 (D7).
-- **HTML, HTM and XML follow 09** (D40); until 09's page view lands, all of them are 1 Text, 2 Hex,
-  3 Raw (D30).
+- **HTML, HTM and XML follow 09** (D40); where file pages show their source (09 §4: no engine here,
+  or one that does not contain a file view), all of them are 1 Text, 2 Hex, 3 Raw (D30); a
+  terminal keeps 09's slots (§9).
 - **Raw is the Text view with highlighting off** (D8): one document, index, encoding and place. JSON's
   "raw text" in message 20 is Raw.
 - The image's memory line (06 §7.3) is view 1's first state and is **Free** (§4): 2 is its Hex view, with
@@ -389,7 +390,11 @@ and 4 with step 3's slot empty; VM-4 filled step 3 (`src/encoding/cp949.rs`).
   reruns the whole-file pass with progress, and Esc keeps the old encoding. Into CP949: §7.4's lazy
   checkpoints. **View 3 of a local binary** uses the local pass, with progress and Esc (D23).
 
-## 8. Today's screen: the egui binding (provisional, after XR-T)
+## 8. The window's binding (VM-7)
+
+Its screen half is cells, the terminal's too (§9): the strip on the title row and F8's list as a cell
+dialog (10 §12, #128). Its input half — the key with its physical key, then its typed text — is the
+window's.
 
 - **The strip** (D6), in the title row before the clock (`browser.rs:2793`, `chrome.rs:713-761`):
   `1 Image · 2 Hex`, the view on screen highlighted (a binary's `1·2 Hex` together), warn-coloured while
@@ -414,21 +419,33 @@ and 4 with step 3's slot empty; VM-4 filled step 3 (`src/encoding/cp949.rs`).
   frames decode, and empty media, give way to Hex as a remote image does today (`image.rs:4592-4633`).
 - Receipt hooks: `SOPEN_STATE` `view=N` and `enc=NAME` (VM-2); `SOPEN_KEYS` `typed:1` (§12).
 
-## 9. What a terminal binding needs from the model
+## 9. The terminal's binding (VM-8, 10 T21)
 
-All `[추정]` (terminal convention, *trace* §7), each a receipt to take before a key is fixed:
-- A terminal sends the character `1` — no key event, no physical key. A view key is then the character
-  1, 2 or 3 with no modifier; an AZERTY owner needs Shift, as for any 1.
-- Cmd never reaches a terminal program; in the legacy encoding Ctrl+3 is ESC (it would leave the viewer)
-  and Ctrl+1 can arrive as a plain `1` (it would switch the view). 04 §6.1's Cmd/Ctrl+digit aliases are
-  no route there without the kitty keyboard protocol or modifyOtherKeys. Alt+digit is none either
-  (Option composes `¡` on macOS; Meta sends ESC, then the digit).
-- **F9-then-digit is the route**: an F-key is an escape sequence in every terminal (message 19's open
-  question of a Mac's top row aside). The binding maps its input to VM-6's keys (a digit, F9, Esc, Enter,
-  any other) and reports its own fields and questions; the strip is a cell row, the encoding a bar field.
-- Image, Video and Page exist only where the screen can draw them (ssot item 2); elsewhere view 1 says
-  why and the file opens on Hex, or on Text for HTML/HTM/XML (ssot's readings). The image's `1`
-  collision exists only where an image is drawn.
+The terminal backend (10) keeps §3's slots, so a key means the same view in both backends and the
+state's `view` means the same after F12 (10 §8); only the view a file opens on differs, where a
+terminal cannot draw it:
+- **An image and a video open on 1**, as in the window: a terminal picture, half blocks at worst
+  (10 §8) — the window's hand-off box until 10's X6 draws it. D10 is as in the window.
+- **HTML, HTM and styled XML open on their source, 3**, view 1 the page's hand-off (`the page is
+  drawn in the window — F12`; the hand-off box until X6); **plain XML and RSS on 1**, already their
+  source (09 §5). No snapshot: the engine runs inside a window (09 §2). In a terminal the opening
+  and the preview make the source and nothing of the page (`Pages::here`), and the set opens with
+  `Screen::TERMINAL` — on 3 for a page (`Screen::first_slot`); the page view is made when 1 is
+  chosen, a hand-off box. A page a window's preview made, handed over in a terminal, opens on it
+  as it was made.
+- **The keys come from 10's translator** (`gui::term_input`): a terminal sends the character `1`,
+  which it gives as `1`'s key and its text, no physical key — matched by the logical key, as §8
+  matches it — and every press followed at once by its release (`term_input::RELEASES`, which the
+  view keys are given). An AZERTY owner needs Shift, as for any 1.
+- Cmd never reaches a terminal program; in the legacy encoding Ctrl+3 is ESC (it would leave the
+  viewer) and Ctrl+1 can arrive as a plain `1` (it would switch the view). 04 §6.1's Cmd/Ctrl+digit
+  aliases are no route there without the kitty keyboard protocol (10 §9). Alt+digit is no view key
+  either (Option composes `¡` on macOS; Meta sends ESC, then the digit), except as the TUI's F-key
+  aliases (10 T7): Alt+9 is F9.
+- **F9-then-digit is the route** that always works: an F-key is an escape sequence in every
+  terminal (message 19's open question of a Mac's top row aside), and Alt+9 is F9.
+- TK-3 (10 §14) as built (`src/gui/browser/tests/vm8.rs`): `1` → view 1, Alt+9 or F9 then a digit
+  → that view, and `1` in an editing hex view is typed, a nibble.
 
 ## 10. Decisions
 
@@ -568,7 +585,8 @@ index cap; an encoding is set by `enc=` or the document's own call until VM-7 br
   (`browser.rs:2167-2180`): a test built on either passes while the real keyboard types and switches at
   once in an editing hex view (*trace* §2.3 item 1). The egui binding adds `Driver::press` (the key with
   its physical key, then its typed text, in one frame, as egui-winit 0.37 does) for every digit and
-  letter, and the `SOPEN_KEYS` step `typed:1`. A terminal binding's tests send the character alone.
+  letter, and the `SOPEN_KEYS` step `typed:1`. The terminal binding's tests send what the translator
+makes of the terminal's character: its key with no physical key, its text and its release, in one pass.
 - **The gate** is the loop's: `just check` with `SOPEN_REQUIRE_FFMPEG=1 SOPEN_REQUIRE_SFTP_SERVER=1` and
   the Linux gate's two clippy runs; a unit that changes a screen brings a screenshot someone looked at.
 

@@ -18,6 +18,7 @@ mod s5;
 mod s6;
 mod vm7;
 mod vm7b;
+mod vm8;
 mod x1a;
 mod x1b;
 

@@ -113,13 +113,10 @@ impl PreviewSession {
     }
 }
 
-/// Why file pages show their source in `ctx`'s window, if they do (09 §4): no engine on this
-/// thread, or one that does not contain a file view with scripts off. In a terminal no engine
-/// is asked (it runs only inside a window): there the page is a hand-off box.
-pub(crate) fn pages_here(ctx: &egui::Context) -> Result<(), Unavailable> {
-    if crate::gui::in_terminal(ctx) {
-        return Ok(());
-    }
+/// Why file pages show their source in this thread's windows, if they do (09 §4): no engine on
+/// this thread, or one that does not contain a file view with scripts off. A terminal never asks
+/// (`Pages::here`: there a page file opens as its source, 10 T21).
+pub(crate) fn pages_here() -> Result<(), Unavailable> {
     match super::engine()?.uncontained(false) {
         Some(channel) => Err(Unavailable::NotContained(channel)),
         None => Ok(()),

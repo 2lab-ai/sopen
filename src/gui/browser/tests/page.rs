@@ -681,7 +681,8 @@ fn wv_d_a_remote_page_preview_gives_the_preview_session_back() {
 
 /// 09 §8, 10 §11: in a terminal no view is made and no engine asked — the page's cells are the
 /// terminal's hand-off box, its frame and rows cells — and the window the switch opens makes
-/// it; a window that went took its view down, and the next one makes another.
+/// it; a window that went took its view down, and the next one makes another. The page opens on
+/// its source there (10 T21, VM-8): `1` shows the page.
 #[test]
 fn wv_d_in_a_terminal_the_page_is_a_hand_off_box() {
     let (mut fx, fake) = dual(None);
@@ -692,6 +693,7 @@ fn wv_d_in_a_terminal_the_page_is_a_hand_off_box() {
     assert!(fx.b.viewer.is_some());
     assert_eq!(fake.views(), 0, "no view in a terminal");
     assert_eq!(strip(&fx), "1 Page · 2 Hex · 3 Text");
+    digit(&mut fx, 1);
     let layers = crate::gui::cells::layers(&fx.drv.ctx);
     let screen = crate::gui::term::compose(&fx.drv.ctx, &layers, 125, 43);
     assert!(
@@ -805,6 +807,8 @@ fn wv_d_a_preview_handed_over_in_the_terminal_is_made_in_the_next_window() {
         fake.request(1, &fake.host(1).url("index.html"), None),
     );
     assert_eq!(head.map(|h| h.code()), Some(200));
+    // The preview session and the viewer's own: the page a window's preview made is handed
+    // over as it is, so the terminal makes no source view, and no connection, beside it.
     assert_eq!(connects(), 2, "the viewer's own session");
 }
 
