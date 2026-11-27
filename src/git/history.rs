@@ -1173,7 +1173,8 @@ pub(crate) mod fixture {
             self.run_in(&self.top, args)
         }
 
-        /// `git <args>` in `dir`; its stdout.
+        /// `git <args>` in `dir`; its stdout. Started through [`crate::testutil::run_fresh`]: a
+        /// stand-in a test has just written in `git`'s place can be busy for a moment on Linux.
         pub fn run_in(&self, dir: &Path, args: &[&str]) -> String {
             let at = self.clock.fetch_add(60, Ordering::SeqCst);
             let date = format!("{at} +0000");
@@ -1185,7 +1186,7 @@ pub(crate) mod fixture {
             c.envs(env(&self.home()))
                 .env("GIT_AUTHOR_DATE", &date)
                 .env("GIT_COMMITTER_DATE", &date);
-            let out = c.output().unwrap();
+            let out = crate::testutil::run_fresh(&mut c);
             assert!(
                 out.status.success(),
                 "git {args:?}: {}",
@@ -1352,6 +1353,35 @@ pub(crate) mod fixture {
         assert!(child.wait().unwrap().success(), "fast-import");
         repo.run(&["reset", "-q", "--hard", "main"]);
         repo
+    }
+
+    /// The real thing (Linux only: macOS starts a script that is still open for writing): a
+    /// stand-in in `git`'s place whose write descriptor is still open — as a child another test
+    /// thread forked holds it until its exec — is busy; the fixture's command runs once the
+    /// descriptor is closed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stand_in_git_still_open_for_writing_runs_once_it_is_closed() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let Some(git) = git() else {
+            return;
+        };
+        let mut repo = Repo::new(&git);
+        let wrapper = repo.tmp.path().join("git-wrapper");
+        let mut file = std::fs::File::create(&wrapper).unwrap();
+        write!(file, "#!/bin/sh\nexec '{}' \"$@\"\n", git.display()).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = Command::new(&wrapper).output().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ExecutableFileBusy, "{err}");
+        repo.git = wrapper;
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(file);
+        });
+        let top = repo.run(&["rev-parse", "--show-toplevel"]);
+        closer.join().unwrap();
+        assert_eq!(top.trim(), repo.top());
     }
 }
 
