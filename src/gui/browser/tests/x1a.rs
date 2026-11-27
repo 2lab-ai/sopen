@@ -391,9 +391,11 @@ fn q1_the_keyboard_moves_between_the_grid_and_egui_fields_dialogs_and_the_viewer
     );
 }
 
-/// Q1 (TS-8): Tab and clicks move the keyboard between the cell list and the git panel (egui at
-/// the right side's cells), and back. The negative controls: Down in the list leaves the git
-/// panel's bar, and a click a cell left of the git panel's side is the list's.
+/// Q1 (TS-8): Tab and clicks move the keyboard between the cell list and the git panel (cells
+/// over the right side, X4-graph), and back. The negative controls: Down in the list leaves the
+/// git panel's bar, and a click a cell left of the git panel's side is the list's. The cells a
+/// git panel's dialog covers are blank in the list too (`Browser::git_covered`), and wide
+/// (Cmd/Ctrl+Shift+G) the panel's cells are the whole grid.
 #[test]
 fn q1_tab_and_clicks_move_the_keyboard_between_the_cell_list_and_the_git_panel() {
     let Some(git) = crate::git::history::fixture::git() else {
@@ -401,9 +403,16 @@ fn q1_tab_and_clicks_move_the_keyboard_between_the_cell_list_and_the_git_panel()
     };
     let mut g = super::s2::Gx::new(super::s2::small(&git));
     g.wait_for_the_panel();
-    let [left, right] = sides(&grid(1000.0, 700.0));
+    let gr = grid(1000.0, 700.0);
+    let [left, right] = sides(&gr);
     assert_eq!(panes(&g.fx), [left, right], "the list and the git panel");
-    assert!(cells_in(&g.fx, right).is_empty(), "the git panel is egui's");
+    let panel = cells_in(&g.fx, right);
+    assert_eq!(
+        panel.len(),
+        usize::from(gr.rows),
+        "the git panel's cells: {panel:?}"
+    );
+    assert!(panel.iter().all(|(at, _)| at.width() == right.width()));
     assert_eq!(cells_in(&g.fx, left).len(), 40, "the list in cells");
     each_in_its_place(&g.fx, 1000.0, 700.0);
     let list_bar = g.fx.current();
@@ -445,6 +454,28 @@ fn q1_tab_and_clicks_move_the_keyboard_between_the_cell_list_and_the_git_panel()
     g.settle();
     assert!(g.b().git_focused().is_none(), "a click on the cell list");
     assert_eq!(g.fx.current(), "..");
+    // A git panel's dialog over the list: the list's cells under it blank (X4-graph).
+    let covered = cells::Cells::new(1, 2, 6, 2);
+    let blank = |g: &super::s2::Gx| {
+        (cells_in(&g.fx, gr.rect(covered)).iter()).all(|(_, t)| t.trim().is_empty())
+    };
+    assert!(!blank(&g), "the control: the list's rows there");
+    g.panel_mut().view.test_covers = vec![covered];
+    g.idle(2);
+    assert!(blank(&g), "{:?}", cells_in(&g.fx, gr.rect(covered)));
+    g.panel_mut().view.test_covers.clear();
+    // Wide: the panel's one layer of cells over all of the grid.
+    g.tab_into_git();
+    g.with(Key::G, Modifiers::COMMAND | Modifiers::SHIFT);
+    g.settle();
+    let whole = |g: &super::s2::Gx| {
+        (cells::layers(&g.fx.drv.ctx).iter())
+            .any(|l| l.buf.area == gr.all() && l.origin == gr.origin)
+    };
+    assert!(whole(&g), "wide: the grid's cells");
+    g.with(Key::G, Modifiers::COMMAND | Modifiers::SHIFT);
+    g.settle();
+    assert!(!whole(&g), "the control: a side again");
 }
 
 /// The topmost rectangle the last pass filled under `p`: the colour a cell's background is

@@ -9,6 +9,7 @@
 //! (03 §4.1). The [`Dialog`] edits a copy; Enter applies it, Esc leaves them as they were.
 
 use crate::git::model::{RefKind, RefLabel, StashRow};
+use crate::gui::cells::{Cells, Grid};
 use crate::gui::chrome;
 use eframe::egui::{self, Key, Modifiers};
 use std::collections::BTreeSet;
@@ -269,8 +270,16 @@ impl Dialog {
         self.filters.branches = BranchChoice::Only(chosen);
     }
 
-    /// One pass: Esc and Enter are taken before its widgets see them.
-    pub fn ui(&mut self, ctx: &egui::Context) -> Option<DialogEnd> {
+    /// The cells of `grid` (the panels') the dialog covers, its box and its shadow, for the panel
+    /// and the other side to blank (10 §17, X4-graph's seam): none while egui draws it, until
+    /// X4-menu.
+    pub fn covers(&self, _grid: &Grid) -> Vec<Cells> {
+        Vec::new()
+    }
+
+    /// One pass on `grid` (the panels', where it stands once it is in cells): Esc and Enter are
+    /// taken before its widgets see them.
+    pub fn ui(&mut self, ctx: &egui::Context, _grid: Grid) -> Option<DialogEnd> {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             return Some(DialogEnd::Cancel);
         }

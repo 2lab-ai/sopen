@@ -19,6 +19,7 @@ use crate::git::model::{
 };
 use crate::git::rebase::EditId;
 use crate::gui::browser::keys::{self, Mods};
+use crate::gui::cells::{Cells, Grid};
 use crate::gui::chrome;
 use eframe::egui::{self, Key};
 
@@ -562,11 +563,11 @@ impl Menu {
         }
     }
 
-    /// One pass: its keys are taken before anything else sees them. The panel draws
-    /// [`HistoryMenu`], which holds this menu and draws it with a commit's history row (S4-C);
-    /// S3-B's tests draw it alone.
+    /// One pass on `grid` (the panels', where it stands once it is in cells): its keys are taken
+    /// before anything else sees them. The panel draws [`HistoryMenu`], which holds this menu and
+    /// draws it with a commit's history row (S4-C); S3-B's tests draw it alone.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn ui(&mut self, ctx: &egui::Context) -> Option<MenuEnd> {
+    pub fn ui(&mut self, ctx: &egui::Context, _grid: Grid) -> Option<MenuEnd> {
         let take = |key: Key| ctx.input_mut(|i| keys::take(i, key, Mods::None));
         if take(Key::Escape) || take(Key::F10) {
             return Some(MenuEnd::Cancel);
@@ -813,10 +814,16 @@ impl HistoryMenu {
         None
     }
 
-    /// One pass, as S3-B's [`Menu::ui`]: ↑ ↓ PgUp PgDn Home End move the bar over all its lines,
-    /// Enter or a click chooses, Esc or F10 closes; its keys are taken before anything else sees
-    /// them.
-    pub fn ui(&mut self, ctx: &egui::Context) -> Option<HistoryMenuEnd> {
+    /// The cells of `grid` (the panels') the menu covers, its box and its shadow, for the panel and
+    /// the other side to blank (10 §17, X4-graph's seam): none while egui draws it, until X4-menu.
+    pub fn covers(&self, _grid: &Grid) -> Vec<Cells> {
+        Vec::new()
+    }
+
+    /// One pass on `grid` (the panels', where it stands once it is in cells), as S3-B's
+    /// [`Menu::ui`]: ↑ ↓ PgUp PgDn Home End move the bar over all its lines, Enter or a click
+    /// chooses, Esc or F10 closes; its keys are taken before anything else sees them.
+    pub fn ui(&mut self, ctx: &egui::Context, _grid: Grid) -> Option<HistoryMenuEnd> {
         let take = |key: Key| ctx.input_mut(|i| keys::take(i, key, Mods::None));
         if take(Key::Escape) || take(Key::F10) {
             return Some(HistoryMenuEnd::Menu(MenuEnd::Cancel));

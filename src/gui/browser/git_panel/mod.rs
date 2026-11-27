@@ -47,6 +47,27 @@ mod tests;
 mod tests_s3;
 #[cfg(test)]
 mod tests_s4;
+// X4's units' own tests (10 §17, X4's rule for shared files): a file each.
+#[cfg(test)]
+mod tests_x4_dialogs;
+#[cfg(test)]
+mod tests_x4_dialogs2;
+#[cfg(test)]
+mod tests_x4_find;
+#[cfg(test)]
+mod tests_x4_graph;
+#[cfg(test)]
+mod tests_x4_lists;
+#[cfg(test)]
+mod tests_x4_menu;
+#[cfg(test)]
+mod tests_x4_pane;
+#[cfg(test)]
+mod tests_x4_planner;
+#[cfg(test)]
+mod tests_x4_planner2;
+#[cfg(test)]
+mod tests_x4_quick;
 
 pub use details::{Details, FileGroup, FileRow, Group, Summary};
 pub use dialogs::Prefill;
@@ -65,10 +86,11 @@ use crate::git::graph::{Graph, Row};
 use crate::git::model::{BackupRef, CommitRow, ObjectType, Oid, RefKind, RefLabel, StatusEntry};
 use crate::git::rebase::{self, Base, Edit, EditId, Model};
 use crate::git::runner::LogEntry;
+use crate::gui::cells::{self, Buffer, Cells, Grid, Pen};
 use crate::gui::chrome::{self, FKey};
 use crate::gui::DialogId;
-use crate::gui::Status;
-use eframe::egui::{self, Key, Rect};
+use crate::gui::{help, Status};
+use eframe::egui::{self, Key};
 use std::collections::{HashMap, HashSet};
 
 /// A row of the graph by what it draws: the bar across a reload, the marks and the details pane
@@ -246,6 +268,10 @@ pub struct Label {
     pub kind: LabelKind,
     /// The ref's name is not valid UTF-8 (shown with U+FFFD; the read model's `RefLabel::lossy`).
     pub lossy: bool,
+    /// Where in `text` the `↔` stands that joins a local branch to the remotes having it (a byte
+    /// offset): the panel's own glyph, which an ambiguous-wide terminal gets as §10's stand-in,
+    /// never a `↔` of a name (T38).
+    pub joined: Option<usize>,
 }
 
 /// The kinds of label, in the order a row draws them (03 §4.4).
@@ -440,6 +466,10 @@ pub struct GitView {
     /// The split this window keeps for this repository (03 §7.8.1 `split`): while kept, the
     /// banner's Continue is `Edit::ContinueSplit`'s.
     split: Option<rebase::Split>,
+    /// Cells a test says an open dialog covers ([`GitView::covered`]): every dialog answers none
+    /// while egui draws it, so the blanking is proved through these until their units land.
+    #[cfg(test)]
+    pub test_covers: Vec<Cells>,
 }
 
 impl RowKey {
@@ -518,6 +548,8 @@ impl GitView {
             confirmed_edit: None,
             stop: None,
             split: None,
+            #[cfg(test)]
+            test_covers: Vec::new(),
         }
     }
 
@@ -839,7 +871,7 @@ impl GitView {
             return Status::info(PLANNER_HINT);
         }
         if self.find.is_some() {
-            return Status::info(FIND_HINT);
+            return Status::info(find::FIND_HINT);
         }
         // The banner's keys (03 §8.5: "then its keys"), while it shows: an edit stop's Amend and
         // Split first, as its buttons read (S4).
@@ -1288,6 +1320,44 @@ impl GitView {
     /// author, question and run): it has the keyboard (its own Enter and Esc), and Esc is its.
     pub fn dialog_up(&self) -> bool {
         self.other_dialog_up() || self.planner.as_ref().is_some_and(|p| p.dialog_up())
+    }
+
+    /// The cells of `grid` (the panels') the panel's open dialogs cover, their boxes and shadows,
+    /// each as its own file says ([`menu::HistoryMenu::covers`], …: nothing while egui draws it):
+    /// the panel blanks them, and the other side's list, preview or tree
+    /// (`Browser::git_covered`), before they are painted (10 §17, X4-graph).
+    pub fn covered(&self, grid: &Grid) -> Vec<Cells> {
+        let mut out = Vec::new();
+        if let Some(d) = &self.filters_dialog {
+            out.extend(d.covers(grid));
+        }
+        if let Some(d) = &self.search_dialog {
+            out.extend(d.covers(grid));
+        }
+        if let Some(m) = &self.menu {
+            out.extend(m.covers(grid));
+        }
+        if let Some(d) = &self.dialog {
+            out.extend(d.covers(grid));
+        }
+        if let Some(d) = &self.quick {
+            out.extend(d.covers(grid));
+        }
+        if let Some(r) = &self.result {
+            out.extend(r.covers(grid));
+        }
+        if let Some(what) = &self.stop_question {
+            out.extend(stop_covers(grid, what));
+        }
+        if let Some(log) = &self.log {
+            out.extend(log.covers(grid));
+        }
+        if let Some(p) = &self.planner {
+            out.extend(p.covers(grid));
+        }
+        #[cfg(test)]
+        out.extend(self.test_covers.iter().copied());
+        out
     }
 
     /// A dialog is up that is not the planner's own: the pane then takes no key.
@@ -2052,14 +2122,14 @@ impl GitView {
         Some(asked)
     }
 
-    /// S3's modals for one pass (each takes its keys before anything else sees them): the menu,
-    /// the action dialog, the result, "Stop git?"; the clipboard's text.
-    fn modals(&mut self, ctx: &egui::Context) -> Vec<GitAction> {
+    /// S3's modals for one pass on `grid` (the panels'; each takes its keys before anything else
+    /// sees them): the menu, the action dialog, the result, "Stop git?"; the clipboard's text.
+    fn modals(&mut self, ctx: &egui::Context, grid: Grid) -> Vec<GitAction> {
         if let Some(text) = self.to_copy.take() {
             ctx.copy_text(text);
         }
         if let Some(menu) = &mut self.menu {
-            return match menu.ui(ctx) {
+            return match menu.ui(ctx, grid) {
                 Some(menu::HistoryMenuEnd::Menu(menu::MenuEnd::Chose { id, target })) => {
                     self.menu = None;
                     self.act(id, target)
@@ -2076,7 +2146,7 @@ impl GitView {
             };
         }
         if let Some(quick) = &mut self.quick {
-            return match quick.ui(ctx, planner::PLAN) {
+            return match quick.ui(ctx, grid, planner::PLAN) {
                 Some(planner::QuickEnd::Run(edit)) => {
                     // The plan the dialog showed for exactly this edit is what runs.
                     let shown = match quick.planned() {
@@ -2095,7 +2165,7 @@ impl GitView {
             };
         }
         if let Some(dialog) = &mut self.dialog {
-            return match dialog.ui(ctx, dialogs::PLAN) {
+            return match dialog.ui(ctx, grid, dialogs::PLAN) {
                 Some(dialogs::DialogEnd::Run {
                     action,
                     dont_ask_again,
@@ -2122,13 +2192,13 @@ impl GitView {
             };
         }
         if let Some(result) = &mut self.result {
-            if result.ui(ctx) {
+            if result.ui(ctx, grid) {
                 self.result = None;
             }
             return Vec::new();
         }
         if let Some(what) = self.stop_question.clone() {
-            return match stop_question(ctx, &what) {
+            return match stop_question(ctx, grid, &what) {
                 Some(true) => {
                     self.stop_question = None;
                     vec![GitAction::StopWrite]
@@ -2495,9 +2565,9 @@ impl GitView {
     }
 }
 
-/// "Stop git?" (03 §3.4) over the write `what`: `Some(true)` on Enter or Yes, `Some(false)` on
-/// Esc, No or a click outside.
-fn stop_question(ctx: &egui::Context, what: &str) -> Option<bool> {
+/// "Stop git?" (03 §3.4) over the write `what`, on `grid` (the panels', where it stands once it
+/// is in cells): `Some(true)` on Enter or Yes, `Some(false)` on Esc, No or a click outside.
+fn stop_question(ctx: &egui::Context, _grid: Grid, what: &str) -> Option<bool> {
     if ctx.input_mut(|i| keys::take(i, Key::Escape, Mods::None)) {
         return Some(false);
     }
@@ -2519,6 +2589,13 @@ fn stop_question(ctx: &egui::Context, what: &str) -> Option<bool> {
         });
     });
     answer.or_else(|| response.should_close().then_some(false))
+}
+
+/// The cells of `grid` (the panels') "Stop git?" over `what` covers, its box and its shadow, for
+/// the panel and the other side to blank (10 §17, X4-graph's seam): none while egui draws it,
+/// until X4-dialogs2 moves [`stop_question`].
+fn stop_covers(_grid: &Grid, _what: &str) -> Vec<Cells> {
+    Vec::new()
 }
 
 /// The key table's rows the panel reads: the landed slices' (S2's own among them since S2-F);
@@ -2572,9 +2649,6 @@ fn menu_hint(history: &menu::HistoryMenu) -> String {
         n => format!("Menu of {of}: {n} items · ↑ ↓ choose · Enter runs · Esc closes"),
     }
 }
-
-/// What the status row says while Find is open.
-const FIND_HINT: &str = "Enter next · Shift+Enter previous · Esc closes Find";
 
 /// The git panel's keys this frame, through the key table's git context (04 §3: exact
 /// modifiers) — the dialog context while Find's field has the typing, nothing while a dialog is
@@ -2633,278 +2707,283 @@ pub fn keys(ctx: &egui::Context, view: &mut GitView) -> Vec<GitAction> {
     asked
 }
 
-/// The git panel in `rect`: its frame titled with the top level, the find row or the column
-/// heads, the visible rows with their lanes, nodes and labels, the bar, the details pane below
-/// them when it is open (the graph keeping at least 8 rows), the scroll bars, the paging line;
-/// and the dialogs. A click puts the bar on a row, a double click is Enter there and the wheel
-/// scrolls, as in the list.
-pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut GitView, active: bool) -> Vec<GitAction> {
+/// Where a pass lays the panel's parts, in cells of the panels' grid (03 §4.2, §6.1): inside the
+/// frame, the banner's rows at the top, the heads' row (or Find's field), the body — the graph's
+/// rows, then the rule and the details pane when it is open, or the log, the Backups list or the
+/// planner over the heads' row and the body — the rule above the foot, and the foot. A function
+/// of the frame's inside and of what is open only (10 §4): no font is measured.
+struct Layout {
+    banner: Cells,
+    head: Cells,
+    /// The graph's rows (or a history search's).
+    rows: Cells,
+    /// The rule between the graph and the pane, and the pane's rows.
+    pane: Option<(u16, Cells)>,
+    /// The log's, the Backups list's or the planner's cells: the heads' row and the body.
+    listing: Cells,
+    rule: u16,
+    foot: u16,
+}
+
+impl Layout {
+    /// The parts inside `inner` with `banner` rows of the banner, the pane open (`pane`) or not:
+    /// `None` where the frame has no room for the heads' row, the rule and the foot.
+    fn of(inner: Cells, banner: usize, pane: bool) -> Option<Layout> {
+        let banner = u16::try_from(banner).unwrap_or(u16::MAX).min(inner.height);
+        if inner.width == 0 || inner.height < banner.saturating_add(3) {
+            return None;
+        }
+        let row = |y: u16, height: u16| Cells::new(inner.x, y, inner.width, height);
+        let head_y = inner.y + banner;
+        let foot = inner.bottom() - 1;
+        let rule = foot - 1;
+        let body = row(head_y + 1, rule - (head_y + 1));
+        let total = body.height;
+        // The pane below the graph, the graph keeping at least 8 rows (03 §6.1), a rule between.
+        let (rows, pane) = if pane && total > 10 {
+            let graph = (total / 2).max(8).min(total - 2);
+            let pane_y = body.y + graph + 1;
+            (
+                row(body.y, graph),
+                Some((body.y + graph, row(pane_y, rule - pane_y))),
+            )
+        } else {
+            (body, None)
+        };
+        Some(Layout {
+            banner: row(inner.y, banner),
+            head: row(head_y, 1),
+            rows,
+            pane,
+            listing: row(head_y, rule - head_y),
+            rule,
+            foot,
+        })
+    }
+}
+
+/// `c` and the border cell right of it on each of its rows, where a part egui draws puts its
+/// scroll bar.
+fn with_border(c: Cells) -> Cells {
+    Cells::new(c.x, c.y, c.width.saturating_add(1), c.height)
+}
+
+/// Cells `r` of `buf` given to what egui draws there: no glyph and no colour, so the window
+/// paints nothing over it and `term::compose` makes a hand-off box of them (10 §17, X4-graph).
+fn leave_to_egui(buf: &mut Buffer, r: Cells) {
+    let r = r.intersection(buf.area);
+    for y in r.top()..r.bottom() {
+        for x in r.left()..r.right() {
+            buf[(x, y)].reset();
+        }
+    }
+}
+
+/// The git panel at cells `side` of `grid` (the panels' grid, between the title and status
+/// rows), in cells (10 §4, X4-graph): its frame titled with the top level, the find row or the
+/// column heads, the visible rows with their lanes, nodes and labels, the bar, the details pane
+/// below them when it is open (the graph keeping at least 8 rows), the scroll bars, the rule and
+/// the paging line; and the dialogs, on `grid`. Each part draws at its cells ([`Layout`]); one
+/// egui still draws ([`details::PAINTS_CELLS`] and the other parts' answers false) has its cells
+/// left to `term::compose` — a hand-off box inside the frame in a terminal — and a dialog egui
+/// draws is a hand-off box where it stands. The cells `under` a dialog of the list's, those under
+/// the panel's own dialogs ([`GitView::covered`]) and under the key help are blanked first. A
+/// click puts the bar on a row, a double click is Enter there, a right click opens the row's
+/// menu, the wheel scrolls and a click on the paging line reads more, all by cells.
+pub fn draw(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    side: Cells,
+    view: &mut GitView,
+    active: bool,
+    under: &[Cells],
+) -> Vec<GitAction> {
     let mut asked = Vec::new();
     let ctx = ui.ctx().clone();
+    let p = chrome::PALETTE;
+    let look = chrome::git::LOOK;
     let title = if view.filters.is_default() {
         view.title.clone()
     } else {
         format!("{} [filtered]", view.title)
     };
+    let rect = grid.rect(side);
     let painter = ui.painter_at(rect);
-    let inner = chrome::panel_frame(&painter, rect, &title, active);
-    let font = chrome::mono(ui);
-    let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-    let row_h = text_h.ceil();
-    // The banner's rows at the panel's top while git has an operation in progress (03 §8.5).
-    let banner_h = view
-        .banner
-        .as_ref()
-        .map_or(0.0, |b| row_h * b.rows() as f32);
-    let banner = Rect::from_min_size(inner.min, egui::vec2(inner.width(), banner_h));
-    let head = Rect::from_min_size(
-        egui::pos2(inner.left(), inner.top() + banner_h),
-        egui::vec2(inner.width(), row_h),
-    );
+    // The side's body under its cells, and under a part egui still draws.
+    painter.rect_filled(rect, 0.0, p.back);
+    let mut buf = Buffer::empty(side);
+    let inner = cells::frame(&mut buf, side, &title, active);
     // The log, the Backups list or the planner in the body, in place of the graph (03 §3.7,
     // §8.2, §7.8.2).
     let listing = view.log.is_some() || view.backups.is_some() || view.planner.is_some();
-    let foot_y = inner.bottom() - row_h;
-    let rule_y = (foot_y - row_h).max(head.bottom());
-    let body = Rect::from_min_max(
-        egui::pos2(inner.left(), head.bottom()),
-        egui::pos2(inner.right(), rule_y),
-    );
-    let total = (body.height() / row_h).floor().max(0.0) as usize;
-    let half = chrome::CELL / 2.0;
-    // The pane below the graph, the graph keeping at least 8 rows (03 §6.1), a rule between.
-    let (list_area, pane_area) = match view.pane.is_some() && !listing {
-        true if total > 10 => {
-            let graph_rows = (total / 2).max(8).min(total - 2);
-            let list = Rect::from_min_size(
-                body.min,
-                egui::vec2(body.width(), row_h * graph_rows as f32),
-            );
-            let pane = Rect::from_min_max(egui::pos2(body.left(), list.bottom() + row_h), body.max);
-            chrome::rule(
-                &painter,
-                inner.left() - half.x,
-                inner.right() + half.x,
-                list.bottom() + half.y,
-                active,
-            );
-            (list, Some(pane))
-        }
-        _ => (body, None),
-    };
+    let banner_rows = view.banner.as_ref().map_or(0, |b| b.rows());
+    let layout = Layout::of(inner, banner_rows, view.pane.is_some() && !listing);
     let pane_keyboard = view.pane.as_ref().is_some_and(|p| p.keyboard);
     let list_active = active && !pane_keyboard && !view.dialog_up();
-    // Find's field over the graph, in the heads' row; its text changed, the bar jumps.
     let dialog = view.dialog_up();
-    // The banner; at an edit stop with Amend and Split before its steps (03 §8.5, S4).
-    let ended = match (&view.banner, &view.stop) {
-        (Some(b), Some(stop)) => in_progress::draw_stop(ui, banner, b, stop),
-        (Some(b), None) => in_progress::draw(ui, banner, b).map(in_progress::StopEnd::Banner),
-        (None, _) => None,
-    };
-    match ended.filter(|_| !dialog) {
-        Some(in_progress::StopEnd::Banner(pressed)) => {
-            view.said = None;
-            asked.extend(view.pressed(pressed));
+    // The cells egui draws (the parts not in cells yet), and Find's caret.
+    let mut eguis: Vec<Cells> = Vec::new();
+    let mut caret = None;
+    view.geometry = None;
+    if let Some(at) = &layout {
+        // The banner; at an edit stop with Amend and Split before its steps (03 §8.5, S4).
+        let ended = match (&view.banner, &view.stop) {
+            (Some(b), Some(stop)) => in_progress::draw_stop(ui, grid, at.banner, &mut buf, b, stop),
+            (Some(b), None) => in_progress::draw(ui, grid, at.banner, &mut buf, b)
+                .map(in_progress::StopEnd::Banner),
+            (None, _) => None,
+        };
+        if view.banner.is_some() && !in_progress::PAINTS_CELLS {
+            eguis.push(at.banner);
         }
-        Some(in_progress::StopEnd::Stop(pressed)) => {
-            view.said = None;
-            asked.extend(view.stop_pressed(pressed));
+        match ended.filter(|_| !dialog) {
+            Some(in_progress::StopEnd::Banner(pressed)) => {
+                view.said = None;
+                asked.extend(view.pressed(pressed));
+            }
+            Some(in_progress::StopEnd::Stop(pressed)) => {
+                view.said = None;
+                asked.extend(view.stop_pressed(pressed));
+            }
+            None => {}
         }
-        None => {}
-    }
-    let list_rect = Rect::from_min_max(head.min, egui::pos2(inner.right(), rule_y));
-    if view.planner.is_some() {
-        // The planner over the body (03 §7.8.2): its keys first while it has the keyboard and
-        // no other dialog is up, then the pane, then its own dialog.
+        if view.planner.is_some() {
+            // The planner over the body (03 §7.8.2): its keys first while it has the keyboard and
+            // no other dialog is up, then the pane, then its own dialog.
+            let pane_active = active && !view.other_dialog_up();
+            let end = view.planner.as_mut().and_then(|p| {
+                planner::draw(
+                    ui,
+                    grid,
+                    at.listing,
+                    &mut buf,
+                    p,
+                    pane_active,
+                    &planner::SEAMS,
+                )
+            });
+            if !planner::PAINTS_CELLS {
+                eguis.push(with_border(at.listing));
+            }
+            asked.extend(view.planner_end(end));
+        } else if let Some(log) = &mut view.log {
+            log_view::draw(ui, grid, at.listing, &mut buf, log, active && !dialog);
+            if !log_view::PAINTS_CELLS {
+                eguis.push(with_border(at.listing));
+            }
+        } else if let Some(list) = &mut view.backups {
+            let end = backups::draw(ui, grid, at.listing, &mut buf, list, active && !dialog);
+            if !backups::PAINTS_CELLS {
+                eguis.push(with_border(at.listing));
+            }
+            let end = end.filter(|_| !dialog);
+            asked.extend(view.backups_end(end));
+        } else {
+            asked.extend(graph_ui(
+                ui,
+                grid,
+                &mut buf,
+                at,
+                view,
+                list_active,
+                dialog,
+                &mut eguis,
+                &mut caret,
+            ));
+            if let (Some((rule, pane_cells)), Some(pane)) = (at.pane, view.pane.as_mut()) {
+                cells::rule(&mut buf, side, rule, active);
+                let subject = pane.subject.clone();
+                let viewed = &view.viewed;
+                let seen = |f: &FileRow| viewed.contains(&(subject.clone(), f.path.clone()));
+                let pane_active = active && pane.keyboard && !dialog;
+                let clicked =
+                    details::draw(ui, grid, pane_cells, &mut buf, pane, &seen, pane_active);
+                if !details::PAINTS_CELLS {
+                    eguis.push(with_border(pane_cells));
+                }
+                if let Some((line, twice)) = clicked {
+                    pane.keyboard = true;
+                    pane.scroll.to(line);
+                    if twice {
+                        asked.extend(view.run_pane(Command::Details));
+                    }
+                }
+            }
+            asked.extend(view.ask_more());
+        }
+        // The paging line: the rule across the frame, then what the stream says (Find's `k of n`
+        // while it is open) and the branch's ahead / behind at the right when it fits.
+        cells::rule(&mut buf, side, at.rule, active);
+        let (n, noun, paging) = match &view.search {
+            Some(s) => (s.rows.len(), "found", &s.paging),
+            None => (view.commits, "commits", &view.paging),
+        };
+        let (mut foot, error) = graph_view::paging_text(paging, n, noun);
+        if let Some(find) = view.find.as_ref().filter(|f| !f.text.is_empty()) {
+            foot = find.foot(view.graph_scroll.bar);
+        }
+        let colour = if error { look.error } else { look.foot };
+        let room = usize::from(inner.width);
+        let shown = cells::fit_start(&foot, room);
+        let used = cells::put(
+            &mut buf,
+            inner.x,
+            at.foot,
+            &shown,
+            room,
+            Pen::new(colour, p.back),
+        );
+        if let Some(t) = &view.tracking {
+            let right = graph_view::tracking_text(t, cells::ambiguous_wide(&ctx));
+            if used + 2 + cells::width(&right) <= room {
+                let pen = Pen::new(look.foot, p.back);
+                cells::put_right(&mut buf, inner.right(), at.foot, &right, pen);
+            }
+        }
+        // A click on the paging line reads more (Enter on it, 03 §4.5).
+        let foot_cells = Cells::new(inner.x, at.foot, inner.width, 1);
+        let foot_click = ui.interact(
+            grid.rect(foot_cells),
+            ui.scope_id().with("sopen-git-foot"),
+            egui::Sense::click(),
+        );
+        if foot_click.clicked() && view.search.is_none() && !dialog {
+            let more = matches!(view.paging, Paging::More(_) | Paging::Error(_));
+            if more && (!view.more_asked || matches!(view.paging, Paging::Error(_))) {
+                view.more_asked = true;
+                asked.push(GitAction::MoreRows);
+            }
+        }
+    } else if view.planner.is_some() {
+        // No room for the parts: the planner still takes its own keys (in its draw), at no cells.
+        let none = Cells::new(inner.x, inner.y, 0, 0);
         let pane_active = active && !view.other_dialog_up();
         let end = view
             .planner
             .as_mut()
-            .and_then(|p| planner::draw(ui, list_rect, p, pane_active, &planner::SEAMS));
-        view.geometry = None;
+            .and_then(|p| planner::draw(ui, grid, none, &mut buf, p, pane_active, &planner::SEAMS));
         asked.extend(view.planner_end(end));
-    } else if let Some(log) = &mut view.log {
-        log_view::draw(ui, list_rect, log, active && !dialog);
-        view.geometry = None;
-    } else if let Some(list) = &mut view.backups {
-        let end = backups::draw(ui, list_rect, list, active && !dialog);
-        view.geometry = None;
-        let end = end.filter(|_| !dialog);
-        asked.extend(view.backups_end(end));
-    } else {
-        let heads = match &mut view.find {
-            Some(find) if view.search.is_none() => {
-                find::field(ui, head, find, cw, !dialog);
-                None
-            }
-            _ => Some(head),
-        };
-        if view.find.is_some() && view.refresh_find() {
-            if let Some(at) = view.find.as_ref().and_then(find::Find::first) {
-                asked.extend(view.move_bar(at));
-            }
-        }
-        let no_marks = HashSet::new();
-        let drawn = match &mut view.search {
-            Some(results) => graph_view::draw(
-                ui,
-                heads,
-                list_area,
-                &mut results.scroll,
-                &graph_view::List {
-                    rows: &results.rows,
-                    graph: None,
-                    labels: &view.labels,
-                    marks: &no_marks,
-                    uncommitted: view.uncommitted,
-                    label_cursor: 0,
-                    active: list_active,
-                    salt: "sopen-git-results",
-                },
-            ),
-            None => graph_view::draw(
-                ui,
-                heads,
-                list_area,
-                &mut view.graph_scroll,
-                &graph_view::List {
-                    rows: &view.rows,
-                    graph: Some(&view.graph),
-                    labels: &view.labels,
-                    marks: &view.marks,
-                    uncommitted: view.uncommitted,
-                    label_cursor: view.label_cursor,
-                    active: list_active,
-                    salt: "sopen-git-rows",
-                },
-            ),
-        };
-        view.geometry = drawn.geometry;
-        // A right click on a row of the graph: the bar on it, then its menu (03 §9.2).
-        let right = ui.input(|i| {
-            i.pointer
-                .secondary_clicked()
-                .then(|| i.pointer.interact_pos())
-                .flatten()
-        });
-        if let (Some(pos), Some(g)) = (right.filter(|_| !dialog), view.geometry()) {
-            if list_area.contains(pos) && view.search.is_none() && g.row_h > 0.0 {
-                let row = g.first + ((pos.y - g.rows_top) / g.row_h).floor().max(0.0) as usize;
-                if row < view.rows.len() {
-                    // The keyboard back to the graph first, as a left click gives it, so the
-                    // menu is the clicked row's, never the pane's file (PR #90 review).
-                    if let Some(pane) = &mut view.pane {
-                        pane.keyboard = false;
-                    }
-                    asked.extend(view.move_bar(row));
-                    view.open_menu();
-                }
-            }
-        }
-        if let Some((at, twice)) = drawn.clicked.filter(|_| !dialog) {
-            if let Some(pane) = &mut view.pane {
-                pane.keyboard = false;
-            }
-            match &mut view.search {
-                Some(results) => {
-                    results.scroll.to(at);
-                    asked.extend(view.follow());
-                }
-                None => asked.extend(view.move_bar(at)),
-            }
-            if twice {
-                let details = match view.search.is_some() {
-                    true => view.run_results(Command::Details),
-                    false => view.details_of_bar(),
-                };
-                asked.extend(details);
-            }
-        }
-        if let (Some(area), Some(pane)) = (pane_area, view.pane.as_mut()) {
-            let subject = pane.subject.clone();
-            let viewed = &view.viewed;
-            let seen = |f: &FileRow| viewed.contains(&(subject.clone(), f.path.clone()));
-            let pane_active = active && pane.keyboard && !dialog;
-            if let Some((line, twice)) = details::draw(ui, area, pane, &seen, pane_active) {
-                pane.keyboard = true;
-                pane.scroll.to(line);
-                if twice {
-                    asked.extend(view.run_pane(Command::Details));
-                }
-            }
-        }
-        asked.extend(view.ask_more());
     }
-    // The paging line: the line across the window, then what the stream says (Find's `k of n`
-    // while it is open) and the branch's ahead / behind at the right when it fits.
-    chrome::rule(
-        &painter,
-        inner.left() - half.x,
-        inner.right() + half.x,
-        rule_y + half.y,
-        active,
-    );
-    let (n, noun, paging) = match &view.search {
-        Some(s) => (s.rows.len(), "found", &s.paging),
-        None => (view.commits, "commits", &view.paging),
-    };
-    let (mut foot, error) = graph_view::paging_text(paging, n, noun);
-    if let Some(find) = view.find.as_ref().filter(|f| !f.text.is_empty()) {
-        foot = find.foot(view.graph_scroll.bar);
+    for r in eguis {
+        leave_to_egui(&mut buf, r);
     }
-    let foot_rect = Rect::from_min_size(
-        egui::pos2(inner.left(), foot_y),
-        egui::vec2(inner.width(), row_h),
-    );
-    let foot_painter = ui.painter_at(foot_rect);
-    let colour = if error {
-        chrome::git::LOOK.error
-    } else {
-        chrome::git::LOOK.foot
-    };
-    let used = foot_painter
-        .text(
-            foot_rect.left_top(),
-            egui::Align2::LEFT_TOP,
-            &foot,
-            font.clone(),
-            colour,
-        )
-        .width();
-    if let Some(t) = &view.tracking {
-        let right = graph_view::tracking_text(t);
-        let w = ctx.fonts_mut(|f| {
-            f.layout_no_wrap(right.clone(), font.clone(), colour)
-                .size()
-                .x
-        });
-        if used + cw * 2.0 + w <= foot_rect.width() {
-            foot_painter.text(
-                foot_rect.right_top(),
-                egui::Align2::RIGHT_TOP,
-                right,
-                font.clone(),
-                chrome::git::LOOK.foot,
-            );
-        }
+    // A dialog — the list's, the panel's own — or the key help over the panel: the cells under it
+    // blank first (cells.rs, one buffer over another), so a wide glyph half under its edge goes
+    // as a terminal erases it.
+    let body = Pen::new(p.text, p.back);
+    let own = view.covered(grid);
+    for r in under
+        .iter()
+        .chain(&own)
+        .copied()
+        .chain(help::covered(&ctx, grid))
+    {
+        cells::fill(&mut buf, r, body);
     }
-    // A click on the paging line reads more (Enter on it, 03 §4.5).
-    let foot_click = ui.interact(
-        foot_rect,
-        ui.scope_id().with("sopen-git-foot"),
-        egui::Sense::click(),
-    );
-    if foot_click.clicked() && view.search.is_none() && !dialog {
-        let more = matches!(view.paging, Paging::More(_) | Paging::Error(_));
-        if more && (!view.more_asked || matches!(view.paging, Paging::Error(_))) {
-            view.more_asked = true;
-            asked.push(GitAction::MoreRows);
-        }
-    }
-    // The dialogs, over everything.
+    cells::paint(&painter, grid.origin, &buf, caret);
+    // The dialogs, over everything, on the panels' grid.
     if let Some(dialog) = &mut view.filters_dialog {
-        match dialog.ui(&ctx) {
+        match dialog.ui(&ctx, *grid) {
             Some(filters::DialogEnd::Apply(f)) => {
                 view.filters_dialog = None;
                 if f != view.filters {
@@ -2918,7 +2997,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut GitView, active: bool) -> 
         }
     }
     if let Some(dialog) = &mut view.search_dialog {
-        match dialog.ui(&ctx) {
+        match dialog.ui(&ctx, *grid) {
             Some(find::SearchEnd::Run(query)) => {
                 view.search_dialog = None;
                 view.find = None;
@@ -2929,7 +3008,121 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut GitView, active: bool) -> 
             None => {}
         }
     }
-    asked.extend(view.modals(&ctx));
+    asked.extend(view.modals(&ctx, *grid));
+    asked
+}
+
+/// The graph's part of a pass ([`draw`]): Find's field in the heads' row (its text changed, the
+/// bar jumps before the rows are drawn) or the column heads, the graph's rows — a history
+/// search's flat list instead while one is shown — and what their clicks ask; the cells egui
+/// draws (Find's field until X4-find) go in `eguis`, Find's caret in `caret`.
+#[allow(clippy::too_many_arguments)]
+fn graph_ui(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    buf: &mut Buffer,
+    at: &Layout,
+    view: &mut GitView,
+    list_active: bool,
+    dialog: bool,
+    eguis: &mut Vec<Cells>,
+    caret: &mut Option<cells::Position>,
+) -> Vec<GitAction> {
+    let mut asked = Vec::new();
+    let heads = match &mut view.find {
+        Some(find) if view.search.is_none() => {
+            *caret = find::field(ui, grid, at.head, buf, find, !dialog);
+            if !find::PAINTS_CELLS {
+                eguis.push(at.head);
+            }
+            None
+        }
+        _ => Some(at.head),
+    };
+    if view.find.is_some() && view.refresh_find() {
+        if let Some(to) = view.find.as_ref().and_then(find::Find::first) {
+            asked.extend(view.move_bar(to));
+        }
+    }
+    let no_marks = HashSet::new();
+    let drawn = match &mut view.search {
+        Some(results) => graph_view::draw(
+            ui,
+            grid,
+            buf,
+            heads,
+            at.rows,
+            &mut results.scroll,
+            &graph_view::List {
+                rows: &results.rows,
+                graph: None,
+                labels: &view.labels,
+                marks: &no_marks,
+                uncommitted: view.uncommitted,
+                label_cursor: 0,
+                active: list_active,
+                salt: "sopen-git-results",
+            },
+        ),
+        None => graph_view::draw(
+            ui,
+            grid,
+            buf,
+            heads,
+            at.rows,
+            &mut view.graph_scroll,
+            &graph_view::List {
+                rows: &view.rows,
+                graph: Some(&view.graph),
+                labels: &view.labels,
+                marks: &view.marks,
+                uncommitted: view.uncommitted,
+                label_cursor: view.label_cursor,
+                active: list_active,
+                salt: "sopen-git-rows",
+            },
+        ),
+    };
+    view.geometry = drawn.geometry;
+    // A right click on a row of the graph (the translator's `Secondary` in a terminal): the bar
+    // on it, then its menu (03 §9.2).
+    let right = ui.input(|i| {
+        i.pointer
+            .secondary_clicked()
+            .then(|| i.pointer.interact_pos())
+            .flatten()
+    });
+    if let (Some(pos), Some(g)) = (right.filter(|_| !dialog), view.geometry()) {
+        let row = g.row_at(pos).filter(|&r| r < view.rows.len());
+        if let (Some(row), true) = (row, view.search.is_none()) {
+            // The keyboard back to the graph first, as a left click gives it, so the menu is the
+            // clicked row's, never the pane's file (PR #90 review).
+            if let Some(pane) = &mut view.pane {
+                pane.keyboard = false;
+            }
+            asked.extend(view.move_bar(row));
+            view.open_menu();
+        }
+    }
+    if let Some((to, twice)) = drawn.clicked.filter(|_| !dialog) {
+        if let Some(pane) = &mut view.pane {
+            pane.keyboard = false;
+        }
+        match &mut view.search {
+            Some(results) => {
+                results.scroll.to(to);
+                asked.extend(view.follow());
+            }
+            None => asked.extend(view.move_bar(to)),
+        }
+        if twice {
+            let details = match view.search.is_some() {
+                true => view.run_results(Command::Details),
+                false => view.details_of_bar(),
+            };
+            asked.extend(details);
+        }
+    }
     asked
 }
 

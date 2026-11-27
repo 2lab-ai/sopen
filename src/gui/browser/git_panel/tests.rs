@@ -4,22 +4,24 @@
 //! (§6.1, G-T1's view part), the keys (§9) and the look (`chrome::git`).
 
 use super::*;
-use crate::git::graph::{End, RowStream};
+use crate::git::graph::RowStream;
 use crate::git::model::{CommitRow, ObjectType, Oid, RefKind, RefLabel, StashRow};
 use crate::gui::chrome::git::{self as look, LOOK};
 use crate::gui::chrome::PALETTE;
 use crate::gui::testkit::Driver;
 use crate::gui::Window;
-use eframe::egui::{Color32, Event, Key, Modifiers, Pos2};
+use eframe::egui::{Color32, Event, Key, Modifiers, Rect};
 
 /// The git panel filling the window's cell grid, as the browser draws it over both sides (10 §4),
 /// with what its keys and clicks asked for.
-struct Host {
-    view: GitView,
-    active: bool,
-    actions: Vec<GitAction>,
+pub(super) struct Host {
+    pub(super) view: GitView,
+    pub(super) active: bool,
+    pub(super) actions: Vec<GitAction>,
     /// Where the last pass drew the panel.
-    rect: Rect,
+    pub(super) rect: Rect,
+    /// Cells a dialog of the list's covers, as the browser hands them to the panel.
+    pub(super) under: Vec<crate::gui::cells::Cells>,
 }
 
 impl Window for Host {
@@ -33,8 +35,14 @@ impl Window for Host {
                 let grid = crate::gui::cells::Grid::over(ui.max_rect());
                 let rect = grid.rect(grid.all());
                 self.rect = rect;
-                self.actions
-                    .extend(draw(ui, rect, &mut self.view, self.active));
+                self.actions.extend(draw(
+                    ui,
+                    &grid,
+                    grid.all(),
+                    &mut self.view,
+                    self.active,
+                    &self.under,
+                ));
             });
     }
 
@@ -43,14 +51,14 @@ impl Window for Host {
     }
 }
 
-struct Fx {
-    drv: Driver,
-    host: Host,
+pub(super) struct Fx {
+    pub(super) drv: Driver,
+    pub(super) host: Host,
 }
 
 impl Fx {
     /// `view` drawn once in a `w`×`h` window.
-    fn new(w: f32, h: f32, view: GitView) -> Self {
+    pub(super) fn new(w: f32, h: f32, view: GitView) -> Self {
         let mut fx = Fx {
             drv: Driver::new(w, h),
             host: Host {
@@ -58,32 +66,33 @@ impl Fx {
                 active: true,
                 actions: Vec::new(),
                 rect: Rect::NOTHING,
+                under: Vec::new(),
             },
         };
         fx.idle();
         fx
     }
 
-    fn idle(&mut self) {
+    pub(super) fn idle(&mut self) {
         self.drv.idle(&mut self.host, 1);
     }
 
     /// What has been asked for since the last call.
-    fn take(&mut self) -> Vec<GitAction> {
+    pub(super) fn take(&mut self) -> Vec<GitAction> {
         std::mem::take(&mut self.host.actions)
     }
 
-    fn key(&mut self, key: Key, mods: Modifiers) -> Vec<GitAction> {
+    pub(super) fn key(&mut self, key: Key, mods: Modifiers) -> Vec<GitAction> {
         self.drv.key(&mut self.host, key, mods);
         self.take()
     }
 
-    fn press(&mut self, key: Key) -> Vec<GitAction> {
+    pub(super) fn press(&mut self, key: Key) -> Vec<GitAction> {
         self.key(key, Modifiers::NONE)
     }
 
     /// `text` typed as one event (an input method's commit, a paste of keys).
-    fn typed(&mut self, text: &str) -> Vec<GitAction> {
+    pub(super) fn typed(&mut self, text: &str) -> Vec<GitAction> {
         self.drv.frame(
             &mut self.host,
             vec![Event::Text(text.into())],
@@ -94,7 +103,7 @@ impl Fx {
     }
 
     /// `text` typed a character a pass, as the keyboard does.
-    fn type_slowly(&mut self, text: &str) -> Vec<GitAction> {
+    pub(super) fn type_slowly(&mut self, text: &str) -> Vec<GitAction> {
         let mut asked = Vec::new();
         for c in text.chars() {
             asked.extend(self.typed(&c.to_string()));
@@ -102,21 +111,21 @@ impl Fx {
         asked
     }
 
-    fn view(&self) -> &GitView {
+    pub(super) fn view(&self) -> &GitView {
         &self.host.view
     }
 
-    fn view_mut(&mut self) -> &mut GitView {
+    pub(super) fn view_mut(&mut self) -> &mut GitView {
         &mut self.host.view
     }
 
     /// The key of the row under the bar.
-    fn bar(&self) -> RowKey {
+    pub(super) fn bar(&self) -> RowKey {
         RowKey::of(self.view().bar_row().expect("a row under the bar"))
     }
 
     /// Every text the last pass drew whole and where, top to bottom, left to right.
-    fn texts(&self) -> Vec<(Rect, String)> {
+    pub(super) fn texts(&self) -> Vec<(Rect, String)> {
         let mut all = self.drv.texts_starting_with("");
         all.sort_by(|a, b| {
             a.0.top()
@@ -127,12 +136,12 @@ impl Fx {
     }
 
     /// Whether the last pass drew exactly `text` whole somewhere.
-    fn shows(&self, text: &str) -> bool {
+    pub(super) fn shows(&self, text: &str) -> bool {
         self.drv.find_text(text).is_some()
     }
 
     /// Every text drawn on the row (same top) where `text` is drawn, left to right.
-    fn row_of(&self, text: &str) -> Vec<String> {
+    pub(super) fn row_of(&self, text: &str) -> Vec<String> {
         let y = self
             .drv
             .find_text(text)
@@ -147,7 +156,7 @@ impl Fx {
     }
 
     /// The subjects drawn, top to bottom (each row's subject is a text of its own).
-    fn drawn_subjects(&self, subjects: &[&str]) -> Vec<String> {
+    pub(super) fn drawn_subjects(&self, subjects: &[&str]) -> Vec<String> {
         self.texts()
             .into_iter()
             .map(|(_, t)| t)
@@ -157,13 +166,13 @@ impl Fx {
 }
 
 /// A commit id made of `n` (below 256): `0909…09`, its short form `09090909`.
-fn oid(n: u32) -> Oid {
+pub(super) fn oid(n: u32) -> Oid {
     assert!(n < 256);
     Oid::parse(&format!("{n:02x}").repeat(20)).unwrap()
 }
 
 /// A log record: commit `n` with `parents`, by `author` at `time` (author and committer).
-fn commit(n: u32, parents: &[u32], author: &str, time: i64, subject: &str) -> CommitRow {
+pub(super) fn commit(n: u32, parents: &[u32], author: &str, time: i64, subject: &str) -> CommitRow {
     CommitRow {
         oid: oid(n),
         parents: parents.iter().map(|&p| oid(p)).collect(),
@@ -176,7 +185,7 @@ fn commit(n: u32, parents: &[u32], author: &str, time: i64, subject: &str) -> Co
 }
 
 /// A ref of the refs read; every label of these tests is made here.
-fn label(refname: &str, object: u32, peeled: Option<u32>) -> RefLabel {
+pub(super) fn label(refname: &str, object: u32, peeled: Option<u32>) -> RefLabel {
     let kind = if refname.starts_with("refs/heads/") {
         RefKind::LocalBranch
     } else if refname.starts_with("refs/remotes/") {
@@ -200,7 +209,7 @@ fn label(refname: &str, object: u32, peeled: Option<u32>) -> RefLabel {
     }
 }
 
-fn stash(n: u32, base: u32, selector: &str, subject: &str) -> StashRow {
+pub(super) fn stash(n: u32, base: u32, selector: &str, subject: &str) -> StashRow {
     StashRow {
         oid: oid(n),
         base: oid(base),
@@ -213,7 +222,7 @@ fn stash(n: u32, base: u32, selector: &str, subject: &str) -> StashRow {
 }
 
 /// Seconds of the fixture's commits: a day apart, the newest last.
-fn day(k: i64) -> i64 {
+pub(super) fn day(k: i64) -> i64 {
     1_790_000_000 + k * 86_400
 }
 
@@ -233,7 +242,7 @@ fn day(k: i64) -> i64 {
 /// │ │ ■  y: one                                         2
 /// ■      v1.0  Initial commit                           1
 /// ```
-fn history() -> Vec<CommitRow> {
+pub(super) fn history() -> Vec<CommitRow> {
     vec![
         commit(9, &[7, 8], "Ann", day(9), "Merge branch 'feature'"),
         commit(8, &[6], "Bob", day(8), "feature: second"),
@@ -246,7 +255,7 @@ fn history() -> Vec<CommitRow> {
     ]
 }
 
-fn refs() -> Vec<RefLabel> {
+pub(super) fn refs() -> Vec<RefLabel> {
     vec![
         label("refs/heads/feature", 8, None),
         label("refs/heads/main", 9, None),
@@ -259,18 +268,18 @@ fn refs() -> Vec<RefLabel> {
     ]
 }
 
-fn stashes() -> Vec<StashRow> {
+pub(super) fn stashes() -> Vec<StashRow> {
     vec![stash(50, 5, "stash@{0}", "WIP on main: prepare")]
 }
 
 /// The fixture's rows as the integration makes them: the row stream (03 §4.3) over `commits`.
-fn rows_of(commits: Vec<CommitRow>, show_stashes: bool) -> Vec<Row> {
+pub(super) fn rows_of(commits: Vec<CommitRow>, show_stashes: bool) -> Vec<Row> {
     let mut stream = RowStream::new(Some(oid(9)), true, stashes(), show_stashes);
     stream.page(commits)
 }
 
 /// A view of the whole fixture, the bar on the first row.
-fn fixture_view() -> GitView {
+pub(super) fn fixture_view() -> GitView {
     let mut view = GitView::new("box:/srv/repo");
     view.set_refs(refs(), HeadRef::Branch("refs/heads/main".into()));
     view.set_rows(rows_of(history(), true), false, 2);
@@ -278,7 +287,7 @@ fn fixture_view() -> GitView {
     view
 }
 
-const SUBJECTS: &[&str] = &[
+pub(super) const SUBJECTS: &[&str] = &[
     "Uncommitted changes (2)",
     "Merge branch 'feature'",
     "feature: second",
@@ -292,7 +301,7 @@ const SUBJECTS: &[&str] = &[
 ];
 
 /// The date column's text of `secs`, by this machine's local time.
-fn date_of(secs: i64) -> String {
+pub(super) fn date_of(secs: i64) -> String {
     let tm = chrome::local_tm(secs).unwrap();
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}",
@@ -316,8 +325,8 @@ fn rows_draw_their_labels_and_columns() {
             "◙",
             "►main↔origin,up",
             "Merge branch 'feature'",
-            &date_of(day(9)),
-            "Ann",
+            // In cells Date and Author are one blank apart: one run of text (X4-graph).
+            &format!("{} Ann", date_of(day(9))),
             "09090909"
         ],
         "the checked-out branch with both remotes, one label (03:405–407)"
@@ -400,62 +409,50 @@ fn the_colours_are_chrome_gits() {
     );
 }
 
-/// The lane layout drawn (03 §4.3, S2-C's API): every node segment of every visible row as one
-/// straight line from the node to the slot on the row's edge in its occupancy's colour, every
-/// pass-through of the visible rows as a vertical line, the uncommitted row's line dashed and dim.
+/// The lane layout drawn (03 §4.3, S2-C's API) in cells (X4-graph): every visible row's Graph
+/// column is X4-lanes' cells of `git::graph`'s node segments and the visible rows'
+/// pass-throughs, glyph and colour, each on the row's back — the uncommitted row's dotted line
+/// dim; the description starts right after the column.
 #[test]
 fn the_graph_draws_s2cs_segments() {
+    use super::tests_x4_graph::{graph_cells, panel};
     let fx = Fx::new(1000.0, 500.0, fixture_view());
     let view = fx.view();
     let geo = view.geometry().expect("a pass drew the graph");
-    let lines = fx.drv.segments();
-    let near = |a: Pos2, b: Pos2| (a - b).length() < 0.6;
-    let has = |from: Pos2, to: Pos2, colour: Color32| {
-        lines.iter().any(|(p, c)| {
-            *c == colour
-                && ((near(p[0], from) && near(p[1], to)) || (near(p[1], from) && near(p[0], to)))
-        })
-    };
-    let dashed_on = |from: Pos2, to: Pos2| {
-        let span = Rect::from_two_pos(from, to).expand(0.6);
-        lines
-            .iter()
-            .any(|(p, c)| *c == LOOK.uncommitted && span.contains(p[0]) && span.contains(p[1]))
-    };
     let range = view.on_screen();
     assert_eq!(range, 0..10, "every row fits");
-    let mut solid = 0;
-    for i in range.clone() {
-        let node = view.graph().row(i);
-        for s in view.graph().segments(i) {
-            let from = geo.node(i, node.column);
-            let to = match s.end {
-                End::Top => geo.top(i, s.slot),
-                End::Bottom => geo.bottom(i, s.slot),
-            };
-            if s.dashed {
-                assert!(dashed_on(from, to), "row {i}: the dashed piece {s:?}");
-            } else {
-                assert!(has(from, to, look::lane(s.colour)), "row {i}: {s:?}");
-                solid += 1;
-            }
-        }
+    let cols = graph_view::Columns::new(usize::from(geo.rows.width), view.graph().width());
+    let want = lanes::rows(view.graph(), range.clone(), &cols, false);
+    let seen = graph_cells(&fx, cols.graph);
+    let painted: usize = want.iter().flatten().flatten().count();
+    assert!(painted >= 25, "the fixture's lanes are drawn ({painted})");
+    for (i, (want, seen)) in want.iter().zip(&seen).enumerate() {
+        let want: Vec<(String, Option<Color32>)> = (want.iter())
+            .map(|c| c.map_or((" ".into(), None), |c| (c.glyph.into(), Some(c.colour))))
+            .collect();
+        let seen: Vec<(String, Option<Color32>)> = (seen.iter())
+            .map(|c| {
+                (
+                    c.symbol.clone(),
+                    (c.symbol != " ").then_some(c.fg).flatten(),
+                )
+            })
+            .collect();
+        assert_eq!(seen, want, "row {i}'s Graph column");
     }
     assert!(
-        solid >= 12,
-        "the fixture's node segments are drawn ({solid})"
+        seen[0].iter().all(|c| c.bg == Some(PALETTE.bar)),
+        "the bar's row: its lanes on the bar's back"
     );
-    let passes = view.graph().pass_throughs(range);
-    assert!(!passes.is_empty());
-    for p in passes {
-        let from = geo.top(p.rows.start, p.slot);
-        let to = geo.bottom(p.rows.end - 1, p.slot);
-        if p.dashed {
-            assert!(dashed_on(from, to), "{p:?}");
-        } else {
-            assert!(has(from, to, look::lane(p.colour)), "{p:?}");
-        }
-    }
+    assert!(
+        (seen.iter().skip(1)).all(|row| row.iter().all(|c| c.bg == Some(PALETTE.back))),
+        "the other rows on the body's"
+    );
+    let below = (seen.iter().map(|row| row[0].symbol.as_str())).collect::<Vec<_>>();
+    assert_eq!(below[0], look::UNCOMMITTED.to_string(), "{below:?}");
+    assert!(below[1..5].iter().all(|g| *g != " "), "{below:?}");
+    let l = panel(&fx);
+    assert_eq!(l.buf.area.width, geo.rows.width + 2, "inside the frame");
 }
 
 /// 03 §4.2: only the rows on screen are painted — 100 000 loaded rows draw no more than a screen
@@ -498,7 +495,20 @@ fn only_the_visible_rows_are_painted() {
         .filter(|(_, t)| t.starts_with("commit "))
         .count();
     assert_eq!(subjects, on_screen.len(), "one subject a visible row");
-    assert!(fx.drv.segments().len() < 200, "{}", fx.drv.segments().len());
+    // The cells: one layer of the panel's side, whatever the history's length.
+    let layers = crate::gui::cells::layers(&fx.drv.ctx);
+    let cells: usize = (layers.iter())
+        .map(|l| usize::from(l.buf.area.width) * usize::from(l.buf.area.height))
+        .sum();
+    assert!(cells <= 125 * 32, "{cells} cells");
+    let panel = fx.host.rect;
+    let lines = fx.drv.segments();
+    assert!(
+        !lines
+            .iter()
+            .any(|(p, _)| panel.contains(p[0]) || panel.contains(p[1])),
+        "no egui line in the panel: {lines:?}"
+    );
     assert!(fx.shows("100000 commits · all loaded"));
 }
 
@@ -1423,7 +1433,8 @@ fn control_characters_show_escaped_on_their_row() {
     let mut fx = Fx::new(1000.0, 800.0, view);
     assert!(fx.shows("x\\ny"), "{:?}", fx.texts());
     assert!(fx.shows("tab\\there\\nand a line"));
-    assert!(fx.shows("B\\rob"));
+    // In cells the author's run starts at the date's, one blank before it (X4-graph).
+    assert!(fx.texts().iter().any(|(_, t)| t.ends_with(" B\\rob")));
     fx.press(Key::ArrowDown);
     fx.press(Key::ArrowDown);
     fx.press(Key::Enter);

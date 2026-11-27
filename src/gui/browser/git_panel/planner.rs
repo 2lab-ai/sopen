@@ -39,6 +39,7 @@ use crate::git::rebase::{
     Toward, Verb,
 };
 use crate::gui::browser::keys::{self, Mods, Step};
+use crate::gui::cells::{Buffer, Cells, Grid};
 use crate::gui::chrome::git::LOOK;
 use crate::gui::chrome::{self, PALETTE};
 use eframe::egui::{self, Color32, Event, Key, Pos2, Rect, RichText, Sense, Vec2};
@@ -661,9 +662,22 @@ impl QuickDialog {
         }
     }
 
-    /// One pass: Esc and Enter are taken before its fields see them (Shift+Enter is a message
-    /// field's new line); `planner` plans the draft again whenever an option changed it.
-    pub fn ui(&mut self, ctx: &egui::Context, planner: EditPlanner) -> Option<QuickEnd> {
+    /// The cells of `grid` (the panels') the dialog covers, its box and its shadow, for the panel
+    /// and the other side to blank (10 §17, X4-graph's seam): none while egui draws it, until
+    /// X4-quick.
+    pub fn covers(&self, _grid: &Grid) -> Vec<Cells> {
+        Vec::new()
+    }
+
+    /// One pass on `grid` (the panels', where it stands once it is in cells): Esc and Enter are
+    /// taken before its fields see them (Shift+Enter is a message field's new line); `planner`
+    /// plans the draft again whenever an option changed it.
+    pub fn ui(
+        &mut self,
+        ctx: &egui::Context,
+        _grid: Grid,
+        planner: EditPlanner,
+    ) -> Option<QuickEnd> {
         if self.replan(planner) {
             ctx.request_repaint();
         }
@@ -885,6 +899,13 @@ impl PlannerView {
         self.inner.is_some()
     }
 
+    /// The cells of `grid` (the panels') the planner's own dialog covers, its box and its shadow,
+    /// for the panel and the other side to blank (10 §17, X4-graph's seam): none while egui draws
+    /// them, until X4-planner2.
+    pub fn covers(&self, _grid: &Grid) -> Vec<Cells> {
+        Vec::new()
+    }
+
     /// While the run's confirmation is up (Cmd/Ctrl+Enter): the edit it plans, for the reads
     /// its plan needs (`rebase::needs`), which the integration makes and hands back through
     /// [`PlannerView::set_repo`].
@@ -1076,8 +1097,9 @@ impl PlannerView {
         None
     }
 
-    /// The dialog over the pane, one pass.
-    fn inner_ui(&mut self, ctx: &egui::Context, seams: &Seams) -> Option<PlannerEnd> {
+    /// The dialog over the pane, one pass, on `grid` (the panels', where it stands once it is in
+    /// cells).
+    fn inner_ui(&mut self, ctx: &egui::Context, _grid: Grid, seams: &Seams) -> Option<PlannerEnd> {
         let inner = self.inner.take()?;
         let take = |key: Key| ctx.input_mut(|i| keys::take(i, key, Mods::None));
         // Enter, and the button that had the focus when it came (`None`: no button had it).
@@ -1574,19 +1596,29 @@ fn paint(
     clicked
 }
 
-/// The planner in `rect` (the git panel's body), one pass: its keys first while it has the
-/// keyboard (`active`) and no dialog of its own was up when the pass began — so a key that
+/// Whether [`draw`] paints the planner's cells (10 §17, X4-graph's seam): not yet — egui draws it
+/// at `grid.rect(cells)`, its scroll bar on the border cell right of them, and the panel leaves
+/// those cells to `term::compose` (a hand-off box in a terminal) until X4-planner makes it `true`.
+pub(super) const PAINTS_CELLS: bool = false;
+
+/// The planner at cells `cells` of `grid` (the git panel's body; `buf` the panel's buffer, for its
+/// cells once it paints them, [`PAINTS_CELLS`]), one pass, its own dialogs on `grid`: its keys
+/// first while it has the keyboard (`active`) and no dialog of its own was up when the pass
+/// began — so a key that
 /// closes a dialog never acts on the pane too — then the pane, then its dialog. While it is
 /// active or a dialog of its own is up it swallows every typed character, so no typed letter
 /// reaches the git context's Find. `seams` are `Model::apply`, `changed`, `problems` and
 /// `rebase::plan` ([`SEAMS`]).
 pub fn draw(
     ui: &mut egui::Ui,
-    rect: Rect,
+    grid: &Grid,
+    cells: Cells,
+    _buf: &mut Buffer,
     view: &mut PlannerView,
     active: bool,
     seams: &Seams,
 ) -> Option<PlannerEnd> {
+    let rect = grid.rect(cells);
     let ctx = ui.ctx().clone();
     let mut end = None;
     if active && view.inner.is_none() {
@@ -1603,7 +1635,7 @@ pub fn draw(
             }
         }
         if end.is_none() && view.inner.is_some() {
-            end = view.inner_ui(&ctx, seams);
+            end = view.inner_ui(&ctx, *grid, seams);
         }
     }
     if active || view.inner.is_some() {

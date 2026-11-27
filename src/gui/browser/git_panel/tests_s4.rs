@@ -342,22 +342,22 @@ fn quick(opened: QuickOpened) -> QuickDialog {
 // ---------------------------------------------------------------------------------------------
 // The host: every screen of S4-B drawn as the git panel will draw it, with what each returned.
 
-struct Host {
-    menu: Option<HistoryMenu>,
-    menu_ends: Vec<HistoryMenuEnd>,
-    quick: Option<QuickDialog>,
-    plan: EditPlanner,
-    quick_ends: Vec<QuickEnd>,
-    planner: Option<PlannerView>,
-    seams: Seams,
-    planner_ends: Vec<PlannerEnd>,
+pub(super) struct Host {
+    pub(super) menu: Option<HistoryMenu>,
+    pub(super) menu_ends: Vec<HistoryMenuEnd>,
+    pub(super) quick: Option<QuickDialog>,
+    pub(super) plan: EditPlanner,
+    pub(super) quick_ends: Vec<QuickEnd>,
+    pub(super) planner: Option<PlannerView>,
+    pub(super) seams: Seams,
+    pub(super) planner_ends: Vec<PlannerEnd>,
     /// The size of the pane's rectangle (the panel's body when `None`).
-    body: Option<egui::Vec2>,
+    pub(super) body: Option<egui::Vec2>,
     /// The git context's rows found after the pane's pass: what would reach the panel.
-    leaked: Vec<Command>,
-    banner: Option<BannerView>,
-    stop: Option<EditStop>,
-    stop_ends: Vec<StopEnd>,
+    pub(super) leaked: Vec<Command>,
+    pub(super) banner: Option<BannerView>,
+    pub(super) stop: Option<EditStop>,
+    pub(super) stop_ends: Vec<StopEnd>,
 }
 
 impl Default for Host {
@@ -393,27 +393,33 @@ impl Window for Host {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
-                let grid = crate::gui::cells::Grid::over(ui.max_rect());
-                let rect = grid.rect(grid.all());
-                let mut body = rect;
+                use crate::gui::cells::{Buffer, Cells, Grid};
+                let grid = Grid::over(ui.max_rect());
+                let all = grid.all();
+                let mut buf = Buffer::empty(all);
+                let mut body = all;
                 if let Some(b) = &self.banner {
-                    let h = crate::gui::chrome::CELL.y * b.rows() as f32;
-                    let top = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), h));
-                    body.min.y += h;
+                    let h = u16::try_from(b.rows()).unwrap_or(u16::MAX).min(all.height);
+                    let top = Cells::new(all.x, all.y, all.width, h);
+                    body = Cells::new(all.x, all.y + h, all.width, all.height - h);
                     match &self.stop {
                         Some(stop) => self
                             .stop_ends
-                            .extend(in_progress::draw_stop(ui, top, b, stop)),
-                        None => self
-                            .stop_ends
-                            .extend(in_progress::draw(ui, top, b).map(StopEnd::Banner)),
+                            .extend(in_progress::draw_stop(ui, &grid, top, &mut buf, b, stop)),
+                        None => self.stop_ends.extend(
+                            in_progress::draw(ui, &grid, top, &mut buf, b).map(StopEnd::Banner),
+                        ),
                     }
                 }
                 if let Some(size) = self.body {
-                    body = egui::Rect::from_min_size(body.min, size);
+                    // In whole cells, as the panel hands it over (a size under a cell: none).
+                    let cells = |v: f32, cell: f32| (v / cell).floor() as u16;
+                    let cell = crate::gui::chrome::CELL;
+                    let (w, h) = (cells(size.x, cell.x), cells(size.y, cell.y));
+                    body = Cells::new(body.x, body.y, w.min(body.width), h.min(body.height));
                 }
                 if let Some(p) = &mut self.planner {
-                    let end = planner::draw(ui, body, p, !modal, &self.seams);
+                    let end = planner::draw(ui, &grid, body, &mut buf, p, !modal, &self.seams);
                     if end.is_some() {
                         self.planner = None;
                     }
@@ -428,14 +434,15 @@ impl Window for Host {
                 self.leaked.push(c);
             }
         }
+        let grid = crate::gui::cells::Grid::over(ctx.content_rect());
         if let Some(m) = &mut self.menu {
-            if let Some(end) = m.ui(&ctx) {
+            if let Some(end) = m.ui(&ctx, grid) {
                 self.menu = None;
                 self.menu_ends.push(end);
             }
         }
         if let Some(d) = &mut self.quick {
-            if let Some(end) = d.ui(&ctx, self.plan) {
+            if let Some(end) = d.ui(&ctx, grid, self.plan) {
                 self.quick = None;
                 self.quick_ends.push(end);
             }
@@ -447,15 +454,15 @@ impl Window for Host {
     }
 }
 
-struct Fx {
-    drv: Driver,
-    host: Host,
+pub(super) struct Fx {
+    pub(super) drv: Driver,
+    pub(super) host: Host,
 }
 
 impl Fx {
     /// A window wider than any dialog, `host` laid out twice (a new modal is laid out unseen
     /// first).
-    fn new(host: Host) -> Fx {
+    pub(super) fn new(host: Host) -> Fx {
         let mut fx = Fx {
             drv: Driver::new(1200.0, 900.0),
             host,
@@ -465,20 +472,20 @@ impl Fx {
         fx
     }
 
-    fn idle(&mut self) {
+    pub(super) fn idle(&mut self) {
         self.drv.idle(&mut self.host, 1);
     }
 
-    fn key(&mut self, key: Key, mods: Modifiers) {
+    pub(super) fn key(&mut self, key: Key, mods: Modifiers) {
         self.drv.key(&mut self.host, key, mods);
     }
 
-    fn press(&mut self, key: Key) {
+    pub(super) fn press(&mut self, key: Key) {
         self.key(key, Modifiers::NONE);
     }
 
     /// `text` typed as one event (as egui-winit hands over a typed letter), then a pass.
-    fn type_text(&mut self, text: &str) {
+    pub(super) fn type_text(&mut self, text: &str) {
         self.drv.frame(
             &mut self.host,
             vec![egui::Event::Text(text.into())],
@@ -487,13 +494,13 @@ impl Fx {
         self.idle();
     }
 
-    fn click(&mut self, text: &str) {
+    pub(super) fn click(&mut self, text: &str) {
         self.drv.click_text_on_top(&mut self.host, text);
         self.idle();
     }
 
     /// A click into the field showing `shown`, Cmd/Ctrl+A, then `text` typed over all of it.
-    fn retype(&mut self, shown: &str, text: &str) {
+    pub(super) fn retype(&mut self, shown: &str, text: &str) {
         let at = self
             .drv
             .find_text(shown)
@@ -504,11 +511,11 @@ impl Fx {
         self.type_text(text);
     }
 
-    fn shows(&self, text: &str) -> bool {
+    pub(super) fn shows(&self, text: &str) -> bool {
         self.drv.find_text(text).is_some()
     }
 
-    fn assert_shows(&self, text: &str) {
+    pub(super) fn assert_shows(&self, text: &str) {
         assert!(
             self.shows(text),
             "{text:?} is not drawn; drawn: {:?}",
@@ -521,19 +528,19 @@ impl Fx {
     }
 
     /// Whether the last pass painted a rectangle in the dialog's cyan (a dialog's box).
-    fn dialog_box(&self) -> bool {
+    pub(super) fn dialog_box(&self) -> bool {
         self.drv
             .rects()
             .iter()
             .any(|(r, fill, _)| *fill == PALETTE.dialog_back && r.width() > 100.0)
     }
 
-    fn pane(&self) -> &PlannerView {
+    pub(super) fn pane(&self) -> &PlannerView {
         self.host.planner.as_ref().expect("the planner is open")
     }
 
     /// The top of the row that shows `text` (a hash, a word).
-    fn top_of(&self, text: &str) -> f32 {
+    pub(super) fn top_of(&self, text: &str) -> f32 {
         self.drv
             .find_text(text)
             .unwrap_or_else(|| panic!("{text:?} is not drawn"))
@@ -541,14 +548,14 @@ impl Fx {
     }
 }
 
-fn with_menu(menu: HistoryMenu) -> Fx {
+pub(super) fn with_menu(menu: HistoryMenu) -> Fx {
     Fx::new(Host {
         menu: Some(menu),
         ..Host::default()
     })
 }
 
-fn with_quick(d: QuickDialog, plan: EditPlanner) -> Fx {
+pub(super) fn with_quick(d: QuickDialog, plan: EditPlanner) -> Fx {
     Fx::new(Host {
         quick: Some(d),
         plan,
@@ -556,14 +563,14 @@ fn with_quick(d: QuickDialog, plan: EditPlanner) -> Fx {
     })
 }
 
-fn with_planner(model: Model, repo: &Repo) -> Fx {
+pub(super) fn with_planner(model: Model, repo: &Repo) -> Fx {
     Fx::new(Host {
         planner: Some(PlannerView::new(model, repo)),
         ..Host::default()
     })
 }
 
-fn cmd(key: Key) -> (Key, Modifiers) {
+pub(super) fn cmd(key: Key) -> (Key, Modifiers) {
     (key, testkit::command(false))
 }
 

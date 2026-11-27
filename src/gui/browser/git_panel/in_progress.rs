@@ -17,6 +17,7 @@ use crate::git::model::Oid;
 use crate::git::model::{InProgress, Status};
 use crate::git::rebase::Edit;
 use crate::gui::browser::keys::{self, Mods};
+use crate::gui::cells::{Buffer, Cells, Grid};
 use crate::gui::chrome::{self, PALETTE};
 use eframe::egui::{self, Key, Pos2, Rect, Vec2};
 
@@ -121,10 +122,23 @@ pub fn keys(ctx: &egui::Context, banner: &BannerView) -> Option<Pressed> {
     })
 }
 
-/// The banner in `rect` (the panel's top rows, [`BannerView::rows`] of them): its lines in the
-/// warning colour, the offered steps as buttons at the right of the first row — a click is the
-/// step's key.
-pub fn draw(ui: &mut egui::Ui, rect: Rect, banner: &BannerView) -> Option<Pressed> {
+/// Whether [`draw`] and [`draw_stop`] paint the banner's cells (10 §17, X4-graph's seam): not yet
+/// — egui draws it at `grid.rect(cells)` and the panel leaves those cells to `term::compose` (a
+/// hand-off box in a terminal) until X4-pane makes it `true`.
+pub(super) const PAINTS_CELLS: bool = false;
+
+/// The banner at cells `cells` of `grid` (the panel's top rows, [`BannerView::rows`] of them):
+/// its lines in the warning colour, the offered steps as buttons at the right of the first row —
+/// a click is the step's key. `buf` is the panel's buffer, for the banner's cells once it paints
+/// them ([`PAINTS_CELLS`]).
+pub fn draw(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    cells: Cells,
+    _buf: &mut Buffer,
+    banner: &BannerView,
+) -> Option<Pressed> {
+    let rect = grid.rect(cells);
     let ctx = ui.ctx().clone();
     let font = chrome::mono(ui);
     let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
@@ -331,15 +345,18 @@ pub fn stop_keys(
     })
 }
 
-/// The banner of an edit stop in `rect`, as [`draw`] draws a banner, with Amend and Split
-/// before S3-B's steps at the right of its first row (03 §8.5's order: Amend, Split, Continue,
-/// Abort); a click is the step's key.
+/// The banner of an edit stop at cells `cells` of `grid`, as [`draw`] draws a banner, with Amend
+/// and Split before S3-B's steps at the right of its first row (03 §8.5's order: Amend, Split,
+/// Continue, Abort); a click is the step's key.
 pub fn draw_stop(
     ui: &mut egui::Ui,
-    rect: Rect,
+    grid: &Grid,
+    cells: Cells,
+    _buf: &mut Buffer,
     banner: &BannerView,
     stop: &EditStop,
 ) -> Option<StopEnd> {
+    let rect = grid.rect(cells);
     let ctx = ui.ctx().clone();
     let font = chrome::mono(ui);
     let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
