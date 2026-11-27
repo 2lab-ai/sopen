@@ -207,11 +207,46 @@ pub fn set_presented(ctx: &egui::Context, presented: bool) {
     });
 }
 
-/// Whether the pass before this one reached the screen ([`set_presented`]): what the owner saw
-/// when they pressed this pass's keys. A screen that acts only on what was on screen (an action's
-/// dialog, X4-dialogs) counts a pass that did not as unseen.
+/// Whether the pass before this one reached the screen ([`set_presented`]). A screen that acts
+/// only on what was on screen keeps its paintings in an [`OnScreen`].
 pub fn presented(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<Unpresented>(unpresented_id()).is_none())
+}
+
+/// What a screen shows the owner (an action's dialog: what Run would run): the painting of the
+/// last pass that reached the screen ([`presented`]), and that of the pass just run, until the
+/// next pass knows whether it did. A Run or an Enter acts only on what [`OnScreen::start`] gives.
+#[derive(Debug, Clone)]
+pub struct OnScreen<T> {
+    shown: Option<T>,
+    last: Option<T>,
+}
+
+impl<T> Default for OnScreen<T> {
+    fn default() -> Self {
+        Self {
+            shown: None,
+            last: None,
+        }
+    }
+}
+
+impl<T> OnScreen<T> {
+    /// At the start of a pass: what the screen shows now, the owner's view as they pressed this
+    /// pass's keys. The pass before reached the screen: its painting, none if it painted nothing
+    /// (a new modal's unseen first layout); it did not: what was shown before stays.
+    pub fn start(&mut self, ctx: &egui::Context) -> Option<&T> {
+        let last = self.last.take();
+        if presented(ctx) {
+            self.shown = last;
+        }
+        self.shown.as_ref()
+    }
+
+    /// What this pass painted.
+    pub fn painted(&mut self, painting: T) {
+        self.last = Some(painting);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

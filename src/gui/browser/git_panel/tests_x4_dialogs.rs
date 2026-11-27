@@ -1056,6 +1056,108 @@ fn x4d_a_pass_the_terminal_never_printed_was_never_seen() {
     );
 }
 
+/// Review of X4-lists: what runs is compared with the painting of the last pass that reached the
+/// screen, not thrown away when the pass before did not. A printed pass shows the dialog, a pass
+/// the host did not print changes nothing, and Enter in the next pass runs — the screen still
+/// shows exactly that dialog.
+#[test]
+fn x4d_an_unprinted_pass_that_changes_nothing_keeps_what_shows() {
+    let stash = Target::Stash(stash_row());
+    let mut fx = Fx::new(open(A::StashDrop, stash, &repo(), fake), fake, 100, 30);
+    fx.raw(vec![]);
+    cells::set_presented(&fx.drv.ctx, false);
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(ran(&fx), "refused: {:?}", fx.host.ends);
+}
+
+/// The other side of the same rule: printed with plan A, then a pass the host did not print with
+/// plan B (a refresh), then Enter: nothing runs — the screen shows A and the end is B; once B is
+/// printed, Enter runs it.
+#[test]
+fn x4d_an_unprinted_pass_with_another_plan_runs_nothing() {
+    let d = open(A::Clean, Target::Uncommitted, &with_read("a.txt"), reads);
+    let mut fx = Fx::new(d, reads, 100, 30);
+    assert!(rows(&fx.boxed("Fake clean"))
+        .join("\n")
+        .contains("removes a.txt"));
+    fx.dialog_mut().set_repo(with_read("a.txt b.txt"));
+    fx.raw(vec![]);
+    cells::set_presented(&fx.drv.ctx, false);
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(
+        fx.host.ends.is_empty(),
+        "ran plan B unseen: {:?}",
+        fx.host.ends
+    );
+    cells::set_presented(&fx.drv.ctx, true);
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(ran(&fx), "{:?}", fx.host.ends);
+}
+
+/// Review of X4-lists through the terminal: a click is two passes (the press and the release are
+/// two events, `term_input`), and when they come together the press's pass is not printed — the
+/// click on `[ Run ]` still runs, since the screen shows exactly the dialog it ran.
+#[test]
+fn x4d_a_click_on_run_in_one_read_of_the_terminal_runs() {
+    use crossterm::event::{
+        Event as CEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    let stash = Target::Stash(stash_row());
+    let fx = Fx::new(
+        open(A::StashDrop, stash.clone(), &repo(), fake),
+        fake,
+        100,
+        30,
+    );
+    let run = place(&fx.boxed("Fake stash-drop"), "[ Run ]");
+    let mouse = |kind| {
+        CEvent::Mouse(MouseEvent {
+            kind,
+            column: run.x + 2,
+            row: run.y,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    let ends = std::rc::Rc::new(std::cell::Cell::new(0));
+    let sent_at = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let tty = Bursts {
+        bursts: [
+            vec![CEvent::FocusGained],
+            vec![CEvent::FocusGained],
+            vec![
+                mouse(MouseEventKind::Down(MouseButton::Left)),
+                mouse(MouseEventKind::Up(MouseButton::Left)),
+            ],
+        ]
+        .into(),
+        now: Default::default(),
+        asked: 0,
+        ends: ends.clone(),
+        sent_at,
+    };
+    let ctx = egui::Context::default();
+    chrome::install(&ctx);
+    let mut b = term::Backend::new(tty, std::io::sink(), ctx, true);
+    let mut win = InTerminal {
+        host: Host {
+            dialog: Some(open(A::StashDrop, stash, &repo(), fake)),
+            planner: fake,
+            ends: Vec::new(),
+            covers: Vec::new(),
+        },
+        ends,
+    };
+    let mut no_switch =
+        |_: &mut term::Backend<Bursts, std::io::Sink>| panic!("no switch in this test");
+    let end = b.run(&mut win, &mut no_switch).expect("the run");
+    assert_eq!(end, term::End::Signal(libc::SIGTERM));
+    assert!(
+        matches!(&win.host.ends[..], [DialogEnd::Run { .. }]),
+        "the click was refused: {:?}",
+        win.host.ends
+    );
+}
+
 /// A restore of more entries than the grid holds stands past its foot (its entries do not scroll
 /// yet): it says so first, Run is off and Enter restores nothing, Esc still cancels; on a taller
 /// window all of it shows and Enter runs.

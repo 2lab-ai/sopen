@@ -32,7 +32,7 @@
 //!   Tab gave it to — so Enter on a focused button is that button's press, and one after a
 //!   Shift+Tab or an arrow that moves the keyboard (egui moves it later) is dropped, a Space too;
 //!   only what the screen showed runs: a Run or an Enter runs when what would run is what the
-//!   pass before painted and the host put on screen (`cells::presented`), else it is dropped and
+//!   last pass the host put on screen painted (`cells::OnScreen`), else it is dropped and
 //!   [`CHANGED`] says so; after two moves in a pass every later Enter is dropped, a Space too
 //!   unless the pass began on a text field. Space is the kit's, once a
 //!   press in the pass's order; Esc, Cancel or a click outside cancels, and a pass that both
@@ -679,19 +679,19 @@ pub struct ActionDialog {
     /// In cells: a Run or an Enter came when what would run was not what the screen showed, and
     /// was not acted on — the hint says the plan changed and Enter runs it.
     changed: bool,
-    /// In cells: what the last pass painted, which the owner saw when they pressed this pass's
-    /// keys — `None` until a pass has painted where it can be seen (egui lays a new modal out
-    /// unseen the first time).
-    on_screen: Option<OnScreen>,
+    /// In cells: what the screen shows of the dialog — the painting of the last pass that reached
+    /// it — and the last pass's painting. Nothing until a pass has painted where it can be seen
+    /// (egui lays a new modal out unseen the first time).
+    screen: cells::OnScreen<Painting>,
     /// In cells: a pass has laid the box out (the next one paints where it can be seen).
     laid_once: bool,
 }
 
 /// What a pass of an action's dialog in cells painted: the draft, its plan's rows and whether its
-/// Run was on. A Run or an Enter runs only what the screen showed: the last pass's, equal to what
-/// would run at this pass's end.
+/// Run was on. A Run or an Enter runs only what the screen shows ([`cells::OnScreen`]), equal to
+/// what would run at its pass's end.
 #[derive(Debug, Clone, PartialEq)]
-struct OnScreen {
+struct Painting {
     draft: Action,
     plan: Vec<PlanRow>,
     runs: bool,
@@ -854,7 +854,7 @@ impl ActionDialog {
             plan_first: None,
             plan_top: 0,
             changed: false,
-            on_screen: None,
+            screen: cells::OnScreen::default(),
             laid_once: false,
         }))
     }
@@ -1140,8 +1140,8 @@ impl ActionDialog {
     }
 
     /// What a pass paints as the dialog stands now, the box `fits` its grid or not.
-    fn painted(&self, fits: bool) -> OnScreen {
-        OnScreen {
+    fn painted(&self, fits: bool) -> Painting {
+        Painting {
             draft: self.form.draft.clone(),
             plan: self.plan_lines(),
             runs: fits && self.ready(),
@@ -1162,12 +1162,12 @@ impl ActionDialog {
             .any(|n| began == Some(field_id(n)));
         let enters = take_enters(ctx, began.is_some() && !in_field, in_field);
         let (layout, fits) = self.layout(grid, &controls);
-        // What the owner saw (the last pass's painting), and what this pass paints.
-        // A pass the host did not put on screen was never seen (the terminal prints none while
-        // input waits): no record, so its Run or Enter waits for one that was.
-        let seen = self.on_screen.take().filter(|_| cells::presented(ctx));
+        // What the owner saw — the painting of the last pass that reached the screen (the
+        // terminal prints none while input waits) — and what this pass paints.
+        let seen = self.screen.start(ctx).cloned();
         if std::mem::replace(&mut self.laid_once, true) {
-            self.on_screen = Some(self.painted(fits));
+            let painting = self.painted(fits);
+            self.screen.painted(painting);
         }
         // The form's first text field takes the keyboard when it shows anew, or while nothing
         // has it.
