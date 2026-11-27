@@ -461,7 +461,11 @@ impl AddressWindow {
         let spawned = std::thread::Builder::new()
             .name("sopen-address-link".into())
             .spawn(move || {
-                let _ = tx.send(opener(&link).map(|()| to));
+                // An opener that panics still answers: `opening` never sticks.
+                let opened =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| opener(&link)))
+                        .unwrap_or_else(|_| Err("the opener failed".to_string()));
+                let _ = tx.send(opened.map(|()| to));
                 ctx.request_repaint();
             });
         self.line = Some(match spawned {
@@ -660,8 +664,10 @@ impl Window for AddressWindow {
         // Before the pass, should the shell's `logic` not have run first.
         self.heed_the_input(&ctx);
         self.make(&ctx);
-        self.events(&ctx);
+        // The last link's answer first: a click out in this pass's events is then not refused
+        // for a link that has opened already.
         self.take_answers();
+        self.events(&ctx);
         chrome::title_panel(ui, "sopen-address-title", &self.shown);
         crate::gui::own_keys(ui, self.fkeys());
         egui::CentralPanel::default()

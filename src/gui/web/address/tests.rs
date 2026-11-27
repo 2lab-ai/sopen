@@ -856,7 +856,8 @@ fn wv_e2_one_link_opens_at_a_time_off_the_windows_thread() {
         target: target.into(),
         clicked: true,
     };
-    let (first, second) = ("https://example.com/a?token=abc", "https://example.com/b");
+    let first = "https://example.com/a?token=abc";
+    let second = "https://me:s3cret@example.com/b?token=abc#frag9";
     events.send(click(first));
     r.idle(1);
     let wait = std::time::Duration::from_secs(10);
@@ -866,13 +867,16 @@ fn wv_e2_one_link_opens_at_a_time_off_the_windows_thread() {
     assert!(r.shows(opening), "the window drew on: {:?}", r.texts());
     events.send(click(second));
     r.idle(1);
+    // Said in the frame that refused it, without its secrets.
     assert!(
         r.shows(
-            "https://example.com/b: not opened — a link is still opening in the system browser"
+            "https://me:***@example.com/b?…#…: not opened — a link is still opening in the \
+             system browser"
         ),
         "{:?}",
         r.texts()
     );
+    no_secrets(&r.texts());
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert!(calls.try_recv().is_err(), "the second was not opened");
     release.send(()).unwrap();

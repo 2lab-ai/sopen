@@ -12,11 +12,12 @@ in an xtools window on the machine that shows things: the page with its scripts 
 off and on, reloading), kept to the address's origin — a link clicked elsewhere is handed to the
 default browser (only an `http` or `https` one), any other navigation away is refused with a line —
 and sopen returns when the window is closed (`Esc` — a second one while the page has the keyboard —
-`F3`, `Cmd/Ctrl+W`). `Cmd/Ctrl+R` reloads, or tries again when the page did not load (a dev server
-not up yet); an untrusted certificate is never accepted. With `--browser` the address goes to the
-default browser instead — `open` on macOS, `xdg-open` on Linux — exactly as written, and sopen ends;
-so it does on a machine with no display, and on one with no web engine after one line saying so
-(Linux, until sopen's Linux web engine lands).
+`F3`, `Cmd/Ctrl+W`). `Cmd/Ctrl+R` (after `Esc`, while the page has the keyboard) reloads, or tries
+again when the page did not load (a dev server not up yet); an untrusted certificate is never
+accepted. With `--browser` the address goes to the default browser instead — `open` on macOS,
+`xdg-open` on Linux — exactly as written, and sopen ends; so it does on a machine with no display,
+and on one with no web engine after one line saying so (Linux, until sopen's Linux web engine
+lands).
 
 With a target, an address that would mean `<host>` itself there — `localhost`, `127.x.y.z`, `[::1]`
 (and the other loopback names `--target` treats as this machine) — is served from this machine
