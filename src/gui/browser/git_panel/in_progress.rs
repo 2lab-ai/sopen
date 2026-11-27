@@ -153,9 +153,12 @@ pub fn draw(
 /// id cut there, shown on HEAD's row of the graph). The buttons
 /// come first, as egui's did: each that fits whole is laid, from the right, those that do not
 /// going from the left (Amend first), and the state is cut to what is left before them. Each is
-/// an `interact` rect at its cells, its id salted with the banner's cells, since two
+/// an `interact` rect at its cells, its id salted with the banner's first column, since two
 /// repositories' panels draw into one `ui` side by side (review round 1: with one id egui kept
-/// the right panel's rects for both, so the left buttons were dead and a click was both panels');
+/// the right panel's rects for both, so the left buttons were dead and a click was both panels') —
+/// the column alone: the two sides always differ in it (`cells::halves`), and an id that moved
+/// with a row would lose a click pressed before a layout change and released after it (egui gives
+/// the release to the id it pressed);
 /// the one clicked, by its place in `buttons`. They sense clicks alone (`Sense::CLICK`), never the
 /// focus: egui's `Sense::click()` is focusable, and Tab, then Space or Enter, would press a step.
 /// The banner's first row is one more such rect, under the buttons, so a click on the state or on
@@ -193,10 +196,7 @@ fn lay(
         right = at;
     }
     let state_end = laid.last().map_or(width, |&(_, at)| at.saturating_sub(1));
-    let id = |part: &str| {
-        ui.scope_id()
-            .with(("sopen-git-banner", area.x, area.y, part))
-    };
+    let id = |part: &str| ui.scope_id().with(("sopen-git-banner", area.x, part));
     let row = grid.rect(Cells::new(area.x, area.y, area.width, 1));
     ui.interact(row, id(""), Sense::CLICK);
     let mut pressed = None;

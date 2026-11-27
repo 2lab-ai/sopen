@@ -898,7 +898,8 @@ fn two_panes_take_their_own_clicks() {
     drv.click(&mut win, at_cell(70, 3));
     assert_eq!(win.clicked, [(1, 3, false)], "the right pane's line alone");
     win.clicked.clear();
-    // The same line on the left right after: a click of its own, never the right one's pair.
+    // The same line on the left right after: a click of its own — a control, since egui counts
+    // no double click across more than 6 points (`max_click_dist`), whatever the pair's key.
     drv.click(&mut win, at_cell(20, 3));
     assert_eq!(win.clicked, [(0, 3, false)], "the left pane's line, once");
     win.clicked.clear();
@@ -964,7 +965,8 @@ fn a_click_between_two_buttons_presses_none() {
         Vec::<Pressed>::new(),
         "the blank presses nothing"
     );
-    // On the state's text: nothing either.
+    // On the state's text: nothing either — a control, the state being far past egui's 5-point
+    // slop from any button.
     let state = fx.drv.find_text("MERGE of feature · 1 conflict").unwrap();
     fx.drv.idle(&mut fx.host, 30);
     fx.drv.click(&mut fx.host, state.center());
@@ -972,6 +974,109 @@ fn a_click_between_two_buttons_presses_none() {
         fx.host.pressed,
         Vec::<Pressed>::new(),
         "the state presses nothing"
+    );
+}
+
+/// Fix check: a click on a pane's line pressed before the banner grows a row and released after
+/// is that line's — the line's id holds the pane's first column alone, so the pane moving down
+/// under the taller banner (`Layout::of`) keeps its ids, and egui gives the release to the id it
+/// pressed (`interaction.rs:118-123, 174-181`; with its row in the id the click was dropped).
+#[test]
+fn a_pane_click_survives_the_banner_growing() {
+    let mut view = fixture_view();
+    let merge = |text: &str| BannerView::new(text, vec![Proceed::Continue, Proceed::Abort]);
+    view.banner = Some(merge("MERGE of feature · 1 conflict"));
+    let mut fx = Fx::new(1000.0, 800.0, view);
+    fx.press(Key::ArrowDown);
+    fx.press(Key::Enter);
+    fx.view_mut().set_details(merge_details(MERGE_MESSAGE));
+    fx.idle();
+    fx.press(Key::Escape);
+    let pane = |fx: &Fx| {
+        let p = fx.view().pane.as_ref().unwrap();
+        (p.keyboard, p.scroll.bar)
+    };
+    assert!(!pane(&fx).0, "the graph's keyboard");
+    let at = fx.drv.find_text("Author date").expect("the line").center();
+    fx.drv.move_to(&mut fx.host, at);
+    fx.drv.press(&mut fx.host, PointerButton::Primary);
+    fx.view_mut().banner = Some(merge("MERGE of feature · 1 conflict\nBISECT · Reset"));
+    fx.drv.release(&mut fx.host, PointerButton::Primary);
+    fx.idle();
+    assert_ne!(
+        fx.drv.find_text("Author date").unwrap().center(),
+        at,
+        "the control: the pane moved under the taller banner"
+    );
+    assert_eq!(pane(&fx), (true, 4), "the click is `Author date`'s");
+}
+
+/// Fix check (asked as the banner's case): a click on `[ Abort ]` pressed before the banner grows
+/// a row and released after is one Abort. A control in the panel: the banner stands at the
+/// frame's top whatever its rows (`Layout::of`), so its row never moved; its ids hold its first
+/// column alone all the same.
+#[test]
+fn a_banner_click_survives_its_rows_changing() {
+    use super::tests_s3::{Fx as S3, Host as S3Host};
+    let merge = |text: &str| BannerView::new(text, vec![Proceed::Continue, Proceed::Abort]);
+    let mut fx = S3::new(S3Host {
+        banner: Some(merge("MERGE of feature · 1 conflict")),
+        ..S3Host::default()
+    });
+    let at = fx.drv.find_text("[ Abort ]").expect("the button").center();
+    fx.drv.move_to(&mut fx.host, at);
+    fx.drv.press(&mut fx.host, PointerButton::Primary);
+    fx.host.banner = Some(merge("MERGE of feature · 1 conflict\nBISECT · Reset"));
+    fx.drv.release(&mut fx.host, PointerButton::Primary);
+    fx.idle();
+    assert_eq!(
+        fx.host.pressed,
+        [Pressed::Proceed(Action::Proceed(Proceed::Abort))]
+    );
+}
+
+/// Fix check: the pane's lines never take the keyboard either — Tab reaches none of them, so
+/// Space and Enter click none (the pane's keys are the panel's).
+#[test]
+fn the_pane_lines_never_take_the_keyboard() {
+    let pane = {
+        let subject = Subject::Row(RowKey::Uncommitted);
+        let mut pane = details::Pane::new(subject.clone(), true, Vec::new());
+        pane.set(Details {
+            subject,
+            summary: None,
+            contains: None,
+            groups: vec![FileGroup {
+                group: Group::NotStaged,
+                files: vec![file('M', "a.txt", None, None)],
+            }],
+            error: None,
+        });
+        pane
+    };
+    let other = pane.clone();
+    let mut win = TwoSides {
+        banners: None,
+        panes: Some([pane, other]),
+        pressed: Vec::new(),
+        clicked: Vec::new(),
+    };
+    let mut drv = crate::gui::testkit::Driver::new(800.0, 400.0);
+    drv.idle(&mut win, 2);
+    for _ in 0..3 {
+        drv.key(&mut win, Key::Tab, Modifiers::NONE);
+        assert_eq!(
+            drv.ctx.memory(|m| m.focused()),
+            None,
+            "nothing has the focus"
+        );
+    }
+    drv.key(&mut win, Key::Space, Modifiers::NONE);
+    drv.key(&mut win, Key::Enter, Modifiers::NONE);
+    assert_eq!(
+        win.clicked,
+        Vec::<(usize, usize, bool)>::new(),
+        "no line clicked"
     );
 }
 

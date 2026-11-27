@@ -519,25 +519,25 @@ pub(super) fn draw(
                 file_row(buf, x, y, chars, f, wide, &pen);
             }
         }
-        // Its id salted with the pane's cells: two repositories' panels draw into one `ui` side
-        // by side (review round 1). It senses clicks alone (`Sense::CLICK`): the pane's keys are
-        // the panel's, and egui's focusable `Sense::click()` would make Space or Enter a click.
-        let id = ui.scope_id().with(("sopen-git-pane", area.x, area.y, k));
+        // Its id salted with the pane's first column: two repositories' panels draw into one
+        // `ui` side by side (review round 1), always in two columns (`cells::halves`); never with
+        // its row, which moves when the banner's rows change (`Layout::of`), and egui gives a
+        // release to the id it pressed, so a click across that change would be lost. It senses
+        // clicks alone (`Sense::CLICK`): the pane's keys are the panel's, and egui's focusable
+        // `Sense::click()` would make Space or Enter a click.
+        let id = ui.scope_id().with(("sopen-git-pane", area.x, k));
         let resp = ui.interact(grid.rect(row), id, Sense::CLICK);
         if resp.clicked() {
             // The line by what it shows — a file by its group and path, as the graph's rows by
             // what they draw, so a refresh that moves the files between two clicks starts a pair
-            // of its own (review round 1) — in this pane's cells, for this subject.
+            // of its own (review round 1) — for this subject. No panel in it: egui counts no
+            // double click across more than 6 points (`max_click_dist`), and two panels' lines
+            // are a side apart.
             let shows = match line {
                 Line::File { group, file } => pane.file(*group, *file).map(|(g, f)| (g, &f.path)),
                 _ => None,
             };
-            let pair = egui::Id::unique((
-                "sopen-git-pane-line",
-                (area.x, area.y),
-                &pane.subject,
-                shows.ok_or(k),
-            ));
+            let pair = egui::Id::unique(("sopen-git-pane-line", &pane.subject, shows.ok_or(k)));
             clicked = Some((k, super::super::second_click(&resp, pair)));
         }
     }
