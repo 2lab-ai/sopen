@@ -347,7 +347,7 @@ impl Window for Host {
                         .extend(in_progress::draw(ui, &grid, top, &mut buf, b));
                 }
                 if let Some(v) = &mut self.backups {
-                    let end = backups::draw(ui, &grid, body, &mut buf, v, !modal);
+                    let end = backups::draw(ui, &grid, body, &mut buf, v, !modal, &[]);
                     self.backups_ends.extend(end);
                 } else if let Some(v) = &mut self.log {
                     log_view::draw(ui, &grid, body, &mut buf, v, !modal);

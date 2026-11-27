@@ -2848,6 +2848,15 @@ pub fn draw(
             }
             None => {}
         }
+        // What covers the Backups list this pass — a dialog of the list's or the panel's own, the
+        // key help — blanked over it below: its bar's line under one is not on screen (X4-lists).
+        let hidden: Vec<Cells> = match view.backups.is_some() {
+            true => (under.iter().copied())
+                .chain(view.covered(grid))
+                .chain(help::covered(&ctx, grid))
+                .collect(),
+            false => Vec::new(),
+        };
         if view.planner.is_some() {
             // The planner over the body (03 §7.8.2): its keys first while it has the keyboard and
             // no other dialog is up, then the pane, then its own dialog.
@@ -2873,7 +2882,8 @@ pub fn draw(
                 eguis.push(at.listing);
             }
         } else if let Some(list) = &mut view.backups {
-            let end = backups::draw(ui, grid, at.listing, &mut buf, list, active && !dialog);
+            let shown = active && !dialog;
+            let end = backups::draw(ui, grid, at.listing, &mut buf, list, shown, &hidden);
             if !backups::PAINTS_CELLS {
                 eguis.push(at.listing);
             }

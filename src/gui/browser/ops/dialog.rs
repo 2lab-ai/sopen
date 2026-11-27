@@ -144,12 +144,23 @@ pub enum Part {
     },
     /// A value after its name (X4-lists: the log's entry shown whole): the name in the weak ink,
     /// the value in the text's from cell `at` of the dialog's inside, wrapped there by cells, its
-    /// rows under its first — egui's grid of two columns.
+    /// rows under its first — egui's grid of two columns; on a dialog too narrow for a cell after
+    /// `at`, on rows of its own under the name, wrapped to the whole inside ([`named_room`]).
     Named {
         name: String,
         value: String,
         at: usize,
     },
+}
+
+/// The cells each row of a [`Part::Named`]'s value has in a dialog `width` cells wide inside: those
+/// after `at`, or — where `at` leaves none — the whole inside, the value on rows of its own under
+/// its name (none where the inside has no cell).
+pub fn named_room(width: usize, at: usize) -> usize {
+    match width > at {
+        true => width - at,
+        false => width,
+    }
 }
 
 /// A row of a [`Part::List`]: its label, and its key at the right (empty: none).
@@ -491,16 +502,21 @@ pub fn layout(grid: Grid, title: &str, nominal: usize, parts: &[Part]) -> Layout
         .max()
         .unwrap_or(nominal);
     let width = inside_width(grid.cols, nominal, wanted);
-    // The cells a text's rows have: a value after its name, those after `at`.
+    // The cells a text's rows have: a value after its name, those `named_room` gives it.
     let room_of = |part: &Part| match part {
-        Part::Named { at, .. } => width.saturating_sub(*at).max(1),
+        Part::Named { at, .. } => named_room(width, *at),
         _ => width,
     };
+    // A value with no cell beside its name stands under it: its name a row of its own.
+    let under = |part: &Part| matches!(part, Part::Named { at, .. } if width <= *at);
     // Each part's rows: texts wrapped, rows that scroll as many as they may show.
     let mut texts: Vec<Vec<String>> = (parts.iter())
         .map(|part| match part {
             Part::Text(text, _) | Part::Held(text, _, _) => wrap(text, width),
-            Part::Named { value, .. } => wrap(value, room_of(part)),
+            Part::Named { value, .. } => match room_of(part) {
+                0 => vec![],
+                room => wrap(value, room),
+            },
             _ => vec![],
         })
         .collect();
@@ -536,7 +552,8 @@ pub fn layout(grid: Grid, title: &str, nominal: usize, parts: &[Part]) -> Layout
     let fixed = |texts: &[Vec<String>]| -> usize {
         (parts.iter().zip(texts).zip(&places))
             .map(|((part, rows), places)| match part {
-                Part::Text(..) | Part::Held(..) | Part::Named { .. } => rows.len(),
+                Part::Text(..) | Part::Held(..) => rows.len(),
+                Part::Named { .. } => rows.len() + usize::from(under(part)),
                 Part::Scroll { .. } | Part::List { .. } => 0,
                 Part::Message { label, .. } => usize::from(!label.is_empty()),
                 Part::Choices { .. } => places.last().map_or(1, |p| p.0 + 1),
@@ -602,7 +619,14 @@ pub fn layout(grid: Grid, title: &str, nominal: usize, parts: &[Part]) -> Layout
             Part::Named { name, at, .. } => {
                 let name = cells::fit_start(name, usize::from(width));
                 placed.push(Placed::Text(Position::new(x0, y), name, Ink::Weak.pen()));
-                let x = x0 + u16::try_from(*at).unwrap_or(u16::MAX).min(width);
+                // Beside the name, from cell `at`; else on the rows under it, from the left.
+                let x = match under(part) {
+                    true => {
+                        y += 1;
+                        x0
+                    }
+                    false => x0 + u16::try_from(*at).unwrap_or(u16::MAX),
+                };
                 for row in rows {
                     placed.push(Placed::Text(Position::new(x, y), row, Ink::Text.pen()));
                     y += 1;

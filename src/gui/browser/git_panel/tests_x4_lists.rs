@@ -814,8 +814,15 @@ impl Window for Bare {
                 let grid = Grid::over(ui.max_rect());
                 let mut buf = Buffer::empty(grid.all());
                 let view = &mut self.view;
-                self.ends
-                    .extend(backups::draw(ui, &grid, grid.all(), &mut buf, view, true));
+                self.ends.extend(backups::draw(
+                    ui,
+                    &grid,
+                    grid.all(),
+                    &mut buf,
+                    view,
+                    true,
+                    &[],
+                ));
                 let painter = ui.painter_at(grid.rect(grid.all()));
                 cells::paint(&painter, grid.origin, &buf, None);
             });
@@ -981,25 +988,24 @@ fn a_64_kib_command_line_reaches_the_kit_cut_to_the_box() {
 /// command line, and one that fits.
 #[test]
 fn a_value_cut_to_the_box_lays_out_as_the_whole_value() {
-    // Longer than the cut on the short grids (their whole layouts are slow: the quadratic wrap).
+    // Longer than the cut on the short grids, and the first than the 125×60 grid's too (their
+    // whole layouts are slow: the quadratic wrap).
     let lines = [
-        long_line(3 * 1024),
+        long_line(6 * 1024),
         "커밋 메시지가 아주 긴 한글 경로/".repeat(100),
         format!("git add -- a{}b", " ".repeat(2000)),
         "git fetch --progress origin".to_string(),
     ];
     for line in lines {
         let e = entry(&line, Ending::Exit(0), "fatal: x", 0);
-        for (cols, rows) in [(125, 18), (125, 60), (60, 12), (20, 7)] {
+        // The narrow ones lay each value under its name (`dialog::named_room`).
+        for (cols, rows) in [(125, 18), (125, 60), (60, 12), (20, 7), (20, 40), (21, 24)] {
             let grid = Grid {
                 origin: Pos2::ZERO,
                 cols,
                 rows,
             };
-            let cut = log_view::entry_layout_in(grid, &e, 0, {
-                let width = crate::gui::browser::ops::dialog::inside_width(cols, 88, 0);
-                (usize::from(rows) + 2) * (width.saturating_sub(12).max(1) + 1)
-            });
+            let cut = log_view::entry_layout(grid, &e, 0);
             let whole = log_view::entry_layout_in(grid, &e, 0, usize::MAX);
             let at = format!("{} bytes at {cols}x{rows}", line.len());
             assert_eq!(format!("{cut:?}"), format!("{whole:?}"), "{at}");
@@ -1022,8 +1028,9 @@ fn a_rows_work_is_its_room() {
     let g = grid_of(&fx);
     let rows = usize::from(g.rows - 5);
     let width = usize::from(g.cols - 2);
+    // Each row walked to its room and a cell past it — not nothing, nor the whole line.
     assert!(
-        walked <= rows * (width + 2),
+        rows * width <= walked && walked <= rows * (width + 2),
         "{walked} for {rows} rows of {width}"
     );
     let row = text(&fx, FIRST_Y, 1, g.cols - 1);
@@ -1271,7 +1278,7 @@ impl Window for Alone {
                 let mut buf = Buffer::empty(grid.all());
                 let area = self.area.intersection(grid.all());
                 log_view::draw(ui, &grid, area, &mut buf, &mut self.log, true);
-                let _ = backups::draw(ui, &grid, area, &mut buf, &mut self.list, true);
+                let _ = backups::draw(ui, &grid, area, &mut buf, &mut self.list, true, &[]);
                 let painter = ui.painter_at(grid.rect(grid.all()));
                 cells::paint(&painter, grid.origin, &buf, None);
             });
@@ -1512,6 +1519,232 @@ fn m1_a_short_panels_enter_acts_on_nothing() {
     fx.press(Key::F8);
     assert_eq!(dialog_action(&fx), None, "F8");
     assert!(fx.view().backups().is_some());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The fix check.
+
+/// MUST 1: on a grid whose dialog leaves no cell after a field's name (`at` 12, the inside 11 to
+/// 14 cells), no cell of a value stands outside the box's content — the frame's border and the
+/// blank margin inside it untouched — and a value with no room beside its name goes on its own
+/// rows under it, from the content's left.
+#[test]
+fn a_value_never_stands_past_the_content_on_a_narrow_grid() {
+    for cols in [19u16, 20, 21, 22] {
+        let mut fx = log_fx(f32::from(cols) * 8.0, 500.0, entries(1));
+        fx.press(Key::Enter);
+        assert!(fx.view().dialog_up(), "{cols}");
+        let g = grid_of(&fx);
+        let frame = fx.view().covered(&g)[0];
+        let modal = fx
+            .drv
+            .ctx
+            .memory(|m| m.top_modal_layer())
+            .expect("the dialog");
+        let layer = (cells::layers(&fx.drv.ctx).into_iter())
+            .find(|l| l.layer == modal)
+            .expect("the dialog's cells");
+        let seen = layer.seen();
+        let a = layer.buf.area;
+        let at = |x: u16, y: u16| seen[usize::from(y - a.y)][usize::from(x - a.x)].clone();
+        let (left, right) = (frame.x, frame.right() - 1);
+        let (top, bottom) = (frame.y, frame.bottom() - 1);
+        for y in top + 1..bottom {
+            assert_eq!(at(left, y).symbol, "║", "{cols}: ({left}, {y})");
+            assert_eq!(at(right, y).symbol, "║", "{cols}: ({right}, {y})");
+            for x in [left + 1, right - 1] {
+                assert_eq!(at(x, y).symbol, " ", "{cols}: the margin at ({x}, {y})");
+            }
+        }
+        for x in left + 1..right {
+            for y in [top + 1, bottom - 1] {
+                assert_eq!(at(x, y).symbol, " ", "{cols}: the margin at ({x}, {y})");
+            }
+        }
+        // Where a text stands in the box: its row and first cell.
+        let place = |text: &str| {
+            (top..=bottom).find_map(|y| {
+                let row: String = (left..=right).map(|x| at(x, y).symbol).collect();
+                let i = row.find(text)?;
+                Some((y, left + row[..i].chars().count() as u16))
+            })
+        };
+        let (name_y, name_x) = place("Host").expect("the name");
+        let width = cols - 8;
+        if width <= 12 {
+            let value = place("box").expect("the host's value");
+            assert_eq!(value, (name_y + 1, name_x), "{cols}: under its name");
+        } else {
+            // Beside it, from cell 12, in the cell or two left there a row.
+            let first = at(name_x + 12, name_y).symbol;
+            assert_eq!(first, "b", "{cols}: beside its name");
+        }
+    }
+}
+
+/// SHOULD 3: in `sopen --tui`, the key help over the list (F1), then Esc and F8 read together:
+/// the screen had the help over the bar's line, so the F8 deletes nothing — the Esc's pass, which
+/// shows the list again, is not printed.
+#[test]
+fn f8_after_the_help_over_the_list_in_one_read_deletes_nothing() {
+    use crossterm::event::KeyCode;
+    let (asked, dialog) = in_terminal_with_help(vec![
+        vec![tui_key(KeyCode::F(1))],
+        vec![tui_key(KeyCode::Esc), tui_key(KeyCode::F(8))],
+    ]);
+    assert_eq!(asked, Vec::<GitAction>::new());
+    assert_eq!(dialog, None, "no delete asked");
+}
+
+/// SHOULD 3, the control: the help closed and printed, F8 deletes the group under the bar.
+#[test]
+fn f8_after_the_help_closed_deletes_the_group() {
+    use crossterm::event::KeyCode;
+    let (_, dialog) = in_terminal_with_help(vec![
+        vec![tui_key(KeyCode::F(1))],
+        vec![tui_key(KeyCode::Esc)],
+        vec![tui_key(KeyCode::F(8))],
+    ]);
+    let stamp = "20261128T010203Z".to_string();
+    assert_eq!(dialog, Some(Action::DeleteBackup { stamp }));
+}
+
+/// The panel's host in a terminal, opening the key help on the Help it asks for, as the browser
+/// does.
+struct WithHelp(super::tests::Host);
+
+impl Window for WithHelp {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        self.0.ui(ui);
+        let ctx = ui.ctx().clone();
+        self.0.actions.retain(|a| {
+            let help = *a == GitAction::Help;
+            if help {
+                let page = crate::gui::help::for_context(keys::Context::Git, Mode::Preview, &[]);
+                crate::gui::help::open(&ctx, page);
+            }
+            !help
+        });
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// What the panel asked for and the dialog it opened in `sopen --tui`, the key help working as the
+/// browser's, the Backups list of [`two_branches`] open, after `bursts`.
+fn in_terminal_with_help(
+    bursts: Vec<Vec<crossterm::event::Event>>,
+) -> (Vec<GitAction>, Option<Action>) {
+    use crate::gui::term::{Backend, End};
+    let mut view = fixture_view();
+    view.set_repo(repo());
+    view.open_backups(two_branches());
+    let mut win = WithHelp(super::tests::Host {
+        view,
+        active: true,
+        actions: Vec::new(),
+        rect: egui::Rect::NOTHING,
+        under: Vec::new(),
+        side: None,
+    });
+    let mut all = vec![
+        vec![crossterm::event::Event::FocusGained],
+        vec![crossterm::event::Event::FocusGained],
+    ];
+    all.extend(bursts);
+    let tty = Bursts {
+        bursts: all.into(),
+        now: Default::default(),
+        asked: 0,
+    };
+    let ctx = egui::Context::default();
+    chrome::install(&ctx);
+    let mut b = Backend::new(tty, std::io::sink(), ctx, true);
+    let mut no_switch = |_: &mut Backend<Bursts, std::io::Sink>| panic!("no switch in this test");
+    let end = b.run(&mut win, &mut no_switch).expect("the run");
+    assert_eq!(end, End::Signal(libc::SIGTERM));
+    let dialog = win.0.view.dialog.as_ref().map(|d| d.draft().clone());
+    (win.0.actions, dialog)
+}
+
+/// The panel's host, its pass run twice in a frame when asked (egui's discarded pass: a Grid
+/// sizing itself), as a terminal's `run_ui` can.
+struct Twice {
+    host: super::tests::Host,
+    discard: bool,
+}
+
+impl Window for Twice {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        if self.discard && ui.ctx().current_pass_index() == 0 {
+            ui.ctx().request_discard("the test's second pass");
+        }
+        self.host.ui(ui);
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// SHOULD 5: what the screen shows is a frame's — `cells::set_presented` describes the frame, and
+/// a frame can run two passes. A frame shows the group under the bar; the next, run twice (↓ on
+/// its first pass), is not printed; then Enter Shows nothing — the screen still has the group,
+/// not the ref the unprinted frame's passes put the bar on.
+#[test]
+fn a_frame_of_two_passes_unprinted_is_not_on_screen() {
+    let mut view = fixture_view();
+    view.set_repo(repo());
+    view.open_backups(two_branches());
+    let mut win = Twice {
+        host: super::tests::Host {
+            view,
+            active: true,
+            actions: Vec::new(),
+            rect: egui::Rect::NOTHING,
+            under: Vec::new(),
+            side: None,
+        },
+        discard: false,
+    };
+    let mut drv = crate::gui::testkit::Driver::new(1000.0, 400.0);
+    drv.idle(&mut win, 3);
+    win.discard = true;
+    drv.frame(
+        &mut win,
+        key_events(Key::ArrowDown, Modifiers::NONE),
+        Modifiers::NONE,
+    );
+    win.discard = false;
+    cells::set_presented(&drv.ctx, false);
+    drv.frame(
+        &mut win,
+        key_events(Key::Enter, Modifiers::NONE),
+        Modifiers::NONE,
+    );
+    assert_eq!(win.host.actions, Vec::<GitAction>::new());
+}
+
+/// SHOULD 5: a switch between the window and the terminal moves the view to another context,
+/// whose frames count apart: the first frame there has shown nothing of the list yet, so Enter
+/// in it Shows nothing, whatever its frame's number; the next Enter Shows.
+#[test]
+fn another_context_has_shown_nothing_yet() {
+    let mut a = backups_fx(1000.0, 400.0, two_branches());
+    a.idle();
+    let mut b = Fx::new(1000.0, 400.0, fixture_view());
+    // B's next frame is the one after A's last: the same count, another context.
+    let next = a.drv.ctx.cumulative_frame_nr();
+    while b.drv.ctx.cumulative_frame_nr() < next {
+        b.idle();
+    }
+    assert_eq!(b.drv.ctx.cumulative_frame_nr(), next);
+    std::mem::swap(&mut a.host.view, &mut b.host.view);
+    assert!(b.press(Key::Enter).is_empty(), "nothing on B's screen yet");
+    let both = two_branches()[0].group.refs[..2].to_vec();
+    assert_eq!(b.press(Key::Enter), [GitAction::ShowBackup(both)]);
 }
 
 // ---------------------------------------------------------------------------------------------

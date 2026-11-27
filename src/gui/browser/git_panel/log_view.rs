@@ -355,16 +355,17 @@ fn row_shown(entry: &LogEntry, room: usize) -> String {
 
 /// The dialog of `entry` shown whole (03 §3.7) on `grid`, its OK button the one of the panel at
 /// column `column`: each field its name in the weak ink and its value from the 13th cell, wrapped
-/// there by cells (`Part::Named`, egui's grid of two columns); then `Stderr`, weak, and its lines
-/// in rows that scroll, at most half the grid's rows and six at least (egui's half the window),
-/// `nothing` in the weak ink when there is none; then `[ OK ]` and the keys' hint. Each value
-/// reaches the kit cut to the cells the box can show — the grid's rows and two more, of its room
-/// and a cell more — since the kit's `dialog::wrap` measures the rest of a text again for each row
-/// and a command line can be 64 KiB (the files backup's batches of paths): what the box shows is
-/// the same, the rest being cut with `…` there.
-fn entry_layout(grid: Grid, entry: &LogEntry, column: u16) -> Layout {
+/// there by cells (`Part::Named`, egui's grid of two columns; on a dialog with no cell after the
+/// 12th, under its name); then `Stderr`, weak, and its lines in rows that scroll, at most half the
+/// grid's rows and six at least (egui's half the window), `nothing` in the weak ink when there is
+/// none; then `[ OK ]` and the keys' hint. Each value reaches the kit cut to the cells the box can
+/// show — the grid's rows and two more, of its room (`dialog::named_room`) and a cell more —
+/// since the kit's `dialog::wrap` measures the rest of a text again for each row and a command
+/// line can be 64 KiB (the files backup's batches of paths): what the box shows is the same, the
+/// rest being cut with `…` there.
+pub(super) fn entry_layout(grid: Grid, entry: &LogEntry, column: u16) -> Layout {
     let width = dialog::inside_width(grid.cols, WHOLE_WIDTH, 0);
-    let most = (usize::from(grid.rows) + 2) * (width.saturating_sub(NAME).max(1) + 1);
+    let most = (usize::from(grid.rows) + 2) * (dialog::named_room(width, NAME) + 1);
     entry_layout_in(grid, entry, column, most)
 }
 
