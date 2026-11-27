@@ -1518,11 +1518,13 @@ fn wv_b_a_file_views_main_frame_keeps_to_its_scheme() {
 }
 
 /// The commit's check, the last line: with the policy's `about:` refusal taken away (the tests'
-/// hook), a script sending the main frame to `about:blank` commits there — and the view stops,
-/// says it, and loads its own page back.
+/// hook), a page whose script leaves for `about:blank` at every load is sent home once — its page
+/// loaded back — and the second time only stopped and said: no loop, and the screen never shows
+/// the outside document (the copied picture stays the page's red). A user's reload (the real
+/// reload command) starts over: home once more, then stopped again.
 #[test]
-fn wv_b_a_document_outside_the_scheme_is_sent_home() {
-    let Some((_turn, engine)) = turn("wv_b_a_document_outside_the_scheme_is_sent_home") else {
+fn wv_b_a_document_outside_the_scheme_is_sent_home_once() {
+    let Some((_turn, engine)) = turn("wv_b_a_document_outside_the_scheme_is_sent_home_once") else {
         return;
     };
     /// The hook off again however the test ends.
@@ -1535,8 +1537,7 @@ fn wv_b_a_document_outside_the_scheme_is_sent_home() {
     let held = Held;
     ALLOW_ABOUT.store(true, Ordering::SeqCst);
     let page = b"<!doctype html><style>body{margin:0;background:#f00}</style>\
-        <script>setTimeout(() => { if (!sessionStorage.gone) { sessionStorage.gone = 1; \
-        location = 'about:blank' } }, 50)</script>";
+        <script>setTimeout(() => { location = 'about:blank' }, 300)</script>";
     let site = Site::with(&[("/p.html", "text/html", page)]);
     let before = COMMITS_SENT_HOME.load(Ordering::SeqCst);
     let mut shown = Shown::page(&engine, &site, true, Contain::ALL);
@@ -1546,18 +1547,39 @@ fn wv_b_a_document_outside_the_scheme_is_sent_home() {
         target: "about:blank".to_string(),
         clicked: false,
     };
-    shown.until("the commit sent home", 10.0, |e| e.contains(&out));
-    shown.until("its page loaded back", 10.0, |e| {
-        e.iter()
-            .filter(|e| **e == Event::Document("p.html".into()))
-            .count()
-            >= 2
-    });
-    drop(held);
-    shown.shows("its page again", 50.0, 50.0, "red");
+    let outs = |e: &[Event]| e.iter().filter(|e| **e == out).count();
+    shown.until("sent home, then stopped", 10.0, |e| outs(e) >= 2);
+    std::thread::sleep(Duration::from_millis(1500));
     shown.drain();
-    println!("sent home: said {:?}", shown.seen);
-    assert_eq!(COMMITS_SENT_HOME.load(Ordering::SeqCst), before + 1);
+    println!("first load: said {:?}", shown.seen);
+    assert_eq!(
+        COMMITS_SENT_HOME.load(Ordering::SeqCst),
+        before + 1,
+        "home once"
+    );
+    assert_eq!(outs(&shown.seen), 2, "no loop: {:?}", shown.seen);
+    assert_eq!(
+        shown.colour(50.0, 50.0),
+        "red",
+        "the outside document never reaches the screen"
+    );
+    // A user's reload: the check starts over.
+    shown.seen.clear();
+    shown.view.reload();
+    shown.until("after the reload: home, then stopped", 10.0, |e| {
+        outs(e) >= 2
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    shown.drain();
+    drop(held);
+    println!("after the reload: said {:?}", shown.seen);
+    assert_eq!(
+        COMMITS_SENT_HOME.load(Ordering::SeqCst),
+        before + 2,
+        "home once more"
+    );
+    assert_eq!(outs(&shown.seen), 2, "no loop: {:?}", shown.seen);
+    assert_eq!(shown.colour(50.0, 50.0), "red");
     assert!(
         !shown.seen.contains(&Event::Document("about:blank".into())),
         "never said as the document: {:?}",
@@ -1617,6 +1639,44 @@ fn the_commit_check_fails_once_and_sends_home_once() {
         Out::Home,
         "a new load asked: home once again"
     );
+    // A failure that is not the asked load's (a later read, a reload while the server is down)
+    // never silences the check; a page reached clears it.
+    let mut home = Home::default();
+    home.asked();
+    home.reached();
+    home.failed();
+    home.reached();
+    assert_eq!(
+        home.commit_out(),
+        Out::Home,
+        "failed, then reached again: home"
+    );
+    let mut home = Home::default();
+    home.asked();
+    home.reached();
+    home.failed();
+    assert_eq!(
+        home.commit_out(),
+        Out::Home,
+        "a failure after the page was reached: home"
+    );
+    // A user's reload is a load sopen asked for: the check starts over.
+    let mut home = Home::default();
+    home.asked();
+    home.reached();
+    assert_eq!(home.commit_out(), Out::Home);
+    home.reached();
+    assert_eq!(home.commit_out(), Out::Stop);
+    home.asked();
+    home.reached();
+    assert_eq!(
+        home.commit_out(),
+        Out::Home,
+        "after a reload: home once again"
+    );
+    // What the line shows of the address is redacted where it is made.
+    let why = not_reached(None, "http://user:pw@127.0.0.1:8080/x?token=SECRET");
+    assert!(!why.contains("pw@") && !why.contains("SECRET"), "{why}");
     // The reason a load that never reached its page gives.
     assert_eq!(
         not_reached(Some("http://127.0.0.1:9/"), "about:blank"),

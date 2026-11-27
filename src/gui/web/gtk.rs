@@ -63,8 +63,11 @@
 //!   to the view's scope as its main resource starts or is redirected ([`hold_main`]): a file
 //!   view's `data:` or `blob:` document, an address window's other origin. An address window's
 //!   frames load as in a browser; a click out and a new window out are refused at the policy.
-//!   Behind both, a main-frame document committed outside the scope is stopped, said and the
-//!   view's own page loaded back ([`send_home`]). A load sopen asks for outside the scope is
+//!   Behind both, the commit is checked ([`Home`]): a main-frame document committed outside the
+//!   scope is never copied to the screen (the last picture of the view's own stays) and is
+//!   stopped — as the asked load's failure when it never reached its page (a restricted port),
+//!   quietly after that load's own failure, with the view's page loaded back ([`send_home`]) for
+//!   a navigation away once per load sopen asked for, and only said after that. A load sopen asks for outside the scope is
 //!   refused before WebKit sees it. A response the engine cannot show is refused, never
 //!   downloaded, and a download that starts anyway is cancelled.
 
@@ -561,6 +564,12 @@ struct Gview {
     home: Option<String>,
     /// Where that load stands, for the commit's check ([`Home`]).
     homing: Home,
+    /// The document committed is outside the view's scope: nothing of it is copied to the
+    /// screen, which keeps the last picture of the view's own.
+    outside: bool,
+    /// An authentication request said this load's failure: WebKit's own failure after it is not
+    /// said over it.
+    asked_auth: bool,
     /// The load waiting for the filter.
     pending: Option<String>,
     scale: f32,
@@ -689,9 +698,25 @@ unsafe fn handle(api: &'static Api, cmd: Cmd) {
                 load(api, key, url)
             }
             Cmd::Reload(key) => {
-                let web = with_view(key, |v| v.pending.is_none().then_some(v.web)).flatten();
-                if let Some(web) = web {
-                    (api.webkit_web_view_reload)(web);
+                // A user's reload (Cmd/Ctrl+R, F2): a load sopen asked for. With a document
+                // outside the view's scope committed, WebKit's reload would ask for that one
+                // again: the view's own page is loaded instead.
+                let again = with_view(key, |v| {
+                    if v.pending.is_some() {
+                        return None;
+                    }
+                    v.homing.asked();
+                    Some(if v.outside { v.home.clone() } else { None })
+                })
+                .flatten();
+                match again {
+                    Some(Some(home)) => load(api, key, home),
+                    Some(None) => {
+                        if let Some(web) = with_view(key, |v| v.web) {
+                            (api.webkit_web_view_reload)(web);
+                        }
+                    }
+                    None => {}
                 }
             }
             Cmd::Scripts(key, on) => {
@@ -870,6 +895,8 @@ unsafe fn open(api: &'static Api, open: Open) {
             ruled: false,
             home: None,
             homing: Home::default(),
+            outside: false,
+            asked_auth: false,
             pending: None,
             scale: 1.0,
             shown: true,
@@ -1659,6 +1686,7 @@ unsafe extern "C" fn on_load_changed(web: P, event: c_int, data: P) {
             with_view(key, |v| {
                 v.failed = false;
                 v.finishing = false;
+                v.asked_auth = false;
                 v.events.send(Event::Loading);
             });
         }
@@ -1667,10 +1695,12 @@ unsafe extern "C" fn on_load_changed(web: P, event: c_int, data: P) {
             let url = unsafe { text((api.webkit_web_view_get_uri)(web)) };
             let out = with_view(key, |v| {
                 if !commit_out(&v.scope, &url) {
+                    v.outside = false;
                     v.homing.reached();
                     v.events.send(Event::Document(v.scope.document(&url)));
                     return None;
                 }
+                v.outside = true;
                 Some(v.homing.commit_out())
             })
             .flatten();
@@ -1684,7 +1714,8 @@ unsafe extern "C" fn on_load_changed(web: P, event: c_int, data: P) {
                 if v.failed {
                     return false;
                 }
-                if !v.shown {
+                // Nothing of an outside document is copied: no picture to wait for.
+                if !v.shown || v.outside {
                     v.events.send(Event::Finished);
                     return false;
                 }
@@ -1718,7 +1749,8 @@ pub(super) enum Out {
     /// A navigation away the policy and the main resource's hold missed: the view's page loaded
     /// back ([`send_home`]), once per load sopen asked for.
     Home,
-    /// Again after that: stopped and said, not loaded back (a home that leaves again would loop).
+    /// Again after that: stopped and said, not loaded back (a home that leaves again would loop);
+    /// the screen keeps the view's own last picture, and Cmd/Ctrl+R loads its page.
     Stop,
     /// The load had failed already (its line said): only stopped.
     Quiet,
@@ -1736,7 +1768,8 @@ pub(super) struct Home {
 }
 
 impl Home {
-    /// sopen asked for a load (not the check's own load back).
+    /// sopen asked for a load — the view's first, an address again, a user's reload — not the
+    /// check's own load back.
     pub(super) fn asked(&mut self) {
         *self = Home {
             asked: true,
@@ -1744,14 +1777,18 @@ impl Home {
         };
     }
 
-    /// A document in the view's scope committed.
+    /// A document in the view's scope committed: the asked load reached its page, and any
+    /// failure before is over.
     pub(super) fn reached(&mut self) {
         self.asked = false;
+        self.failed = false;
     }
 
-    /// The load failed (WebKit said why).
+    /// A load failed (WebKit said why): only the load sopen asked for, before it reached its
+    /// page, counts — a later failure (a read of the page's, a reload while the server is down)
+    /// never silences the check.
     pub(super) fn failed(&mut self) {
-        self.failed = true;
+        self.failed |= self.asked;
     }
 
     /// A document outside the view's scope committed: what to do.
@@ -1791,7 +1828,10 @@ pub(super) fn not_reached(asked: Option<&str>, shown: &str) -> String {
         Some(port) if RESTRICTED_PORTS.contains(&port) => {
             format!("port {port} is one WebKit never connects to (a restricted port)")
         }
-        _ => format!("WebKit showed {shown} instead of the page"),
+        _ => format!(
+            "WebKit showed {} instead of the page",
+            crate::url::redacted(shown)
+        ),
     }
 }
 
@@ -1895,8 +1935,11 @@ unsafe extern "C" fn on_load_failed(
             v.homing.failed();
             v.failed = true;
             v.finishing = false;
-            v.events
-                .send(Event::Failed(format!("{message} ({domain} {code})")));
+            // An authentication request said why already (its line names what was asked).
+            if !v.asked_auth {
+                v.events
+                    .send(Event::Failed(format!("{message} ({domain} {code})")));
+            }
         });
     }
     // WebKit's own error page is not shown: the row says why.
@@ -2071,7 +2114,10 @@ unsafe extern "C" fn on_authenticate(_web: P, request: P, data: P) -> GBoolean {
         (api.webkit_authentication_request_cancel)(request);
         scheme
     };
-    with_view(key_of(data), |v| v.events.send(Event::Failed(asks(scheme))));
+    with_view(key_of(data), |v| {
+        v.asked_auth = true;
+        v.events.send(Event::Failed(asks(scheme)));
+    });
     1
 }
 
@@ -2629,7 +2675,7 @@ unsafe fn copy_damaged(api: &Api) {
     let todo: Vec<(u64, P, Arc<Shared>, f32, bool)> = with(|gtk| {
         gtk.views
             .values_mut()
-            .filter(|v| v.damaged && v.shown)
+            .filter(|v| v.damaged && v.shown && !v.outside)
             .map(|v| {
                 v.damaged = false;
                 let finish = std::mem::take(&mut v.finish_on_copy);
