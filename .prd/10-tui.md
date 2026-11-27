@@ -177,7 +177,7 @@ The window changes to match the cells (*tui* §1.2 has the call-site counts):
 | Dialog margin; panel inset; status bar | 2 × 1.5 cells; 2 pt; `CELL.y + 4` tall | 1 cell; none; one row |
 | Frames; the rule above the foot | strokes; an `hline` at mid-cell | box glyphs; `─` with joints |
 | Text fields; buttons and choices | egui field, 2-pt caret; framed widgets | black cells, a cell caret; `[ Make ]`, the bar colour when focused |
-| Git lanes (design) | 1-pt segments, dashed when uncommitted | `│ ─ ╭ ╮ ╰ ╯ ┼` as `git log --graph` |
+| Git lanes (design) | 1-pt segments, a lane change one diagonal across half a row, dashed when uncommitted | code page 437's `│ ─ ┐ ┘ ├ ┤ ┬ ┴ ┼`, one row a commit, a lane change along its node's row; the uncommitted row's line `:` a cell (03 §4.3–§4.4, X4-lanes) |
 | Timeline, waveform (design) | segments per pixel column | `▁▂▃▄▅▆▇█` per cell, two rows for L/R |
 | Progress, spinner | egui widgets | `█▓░` cells; a one-cell ASCII spinner |
 
@@ -938,6 +938,14 @@ cut).**
   uncommitted row's line to HEAD dashed; a cell holds neither, and CP437 has no dashed line.
   `git log --graph` draws a lane change on a row of its own, where 03 §4.3's row stream keeps one
   row a commit. One row a commit stands; X4-lanes decides the corners and the dashed line.
+  **Decided (X4-lanes, 2026-11-27):** CP437's square corners for the rounded ones (the VGA font
+  has no others; the layout draws only `┐` and `┘`, joins coming from the right); a lane change runs
+  along its node's row, so no cell holds a half-row diagonal; `├ ┤ ┬ ┴` where lines join (without
+  them an octopus's or a criss-cross's shared row reads as lines ending) and `┼` where one crosses;
+  the uncommitted row's line `:` a cell, dim (CP437 has it, and it stays one cell, apart from
+  `|`, in an ambiguous-wide terminal); and a cell where lines meet takes the colour of the piece
+  drawn last in egui's order, lines passing by, then lane changes longest first, then the node, so
+  a line's colour changes where it turns (03 §4.3–§4.4, §6).
 - **03 §10.2's frame-title hover vs §6** (found cutting X4, 2026-11-27). 03 §10.2 put the host's
   git version "on the frame title's hover"; a frame in cells has no hover (§6: nothing changes
   under the pointer), and the panel drew none (no hover on its frame in `git_panel/`). 03 §10.2

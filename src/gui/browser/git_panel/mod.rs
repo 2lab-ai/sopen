@@ -37,6 +37,7 @@ mod filters;
 mod find;
 mod graph_view;
 mod in_progress;
+mod lanes;
 mod log_view;
 mod menu;
 mod planner;

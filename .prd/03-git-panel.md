@@ -399,8 +399,18 @@ For each row in order:
 touch its node — into it from above, joins, and out to each parent's slot. **Vertical pass-through
 lines are not stored**: the layout keeps one interval per slot occupancy (slot, colour, first row, last
 row), and painting derives the pass-throughs of the visible rows from those intervals. A slot keeps its
-colour index for one occupancy; a new occupancy takes the next index in turn. Painting draws straight
-segments (a lane change is one diagonal across half a row).
+colour index for one occupancy; a new occupancy takes the next index in turn. Painting draws the lanes
+in cells, two a lane (`git_panel/lanes.rs`, X4-lanes; 10 §6): a lane's first cell holds its node or its
+line, its second the line of a lane change, which runs along its node's row — `─` from the node, then a
+corner at the lane, `┐` down to a new lane, `┘` up from a lane that joins — since one row a commit
+leaves no row between for a diagonal, and a cell holds none. Where pieces meet, a cell joins them:
+`├ ┤ ┬ ┴` where lines join (an octopus's lines share its row; a line to a lane left of its node ends on
+the line passing by there, `├`), `┼` where a lane change crosses a line passing by. A cell takes the
+colour of the piece drawn last, in the window's egui order — lines passing by, then the row's lane
+changes, then the node — the lane changes longest first (on a tie the one coming in, then the one going
+down): a crossing is the crossing line's colour and a stretch two lane changes share the nearer lane's,
+so a line's colour changes where it turns. Until X4-graph draws these cells, the window's egui graph
+still draws a lane change as one diagonal across half a row, and the uncommitted row's line dashed.
 
 - **Measured** with these rules (a script over `git log --parents`, 2026-11-20): the 100 000-commit
   fixture of §4.5 has at most 2 slots, 2.0 node segments per row; a wide fixture (60 branches committed
@@ -425,7 +435,7 @@ above); the result does not depend on anything but the input (run twice, compare
 | a commit | `■` in its lane's colour |
 | the checked-out commit | `◙` |
 | a stash | `≡`, its row's text dim, the subject after a `stash@{n}` label |
-| the uncommitted row | `○` in the dim colour, a dashed dim line to HEAD's row; text `Uncommitted changes (N)`, author `*`, commit `*`, date blank |
+| the uncommitted row | `○` in the dim colour, a dotted dim line to HEAD's row, `:` a cell (code page 437 has no dashed line; `:` is in it, and stays one cell, apart from `\|`, in an ambiguous-wide terminal; egui's window draws it dashed until X4-graph); text `Uncommitted changes (N)`, author `*`, commit `*`, date blank |
 | local branch | its name, black on light green |
 | the checked-out branch | `►` before its name |
 | remote branch | `origin/main`, black on light cyan |
@@ -435,10 +445,13 @@ above); the result does not depend on anything but the input (run twice, compare
 | `origin/HEAD` | not drawn |
 | the label cursor (§9) | the label inverted |
 
-- Glyphs are code page 437 characters the VGA font has. Lane colours cycle through light cyan,
-  yellow, light green, light magenta and white — the bright CGA colours that read on blue and are not
-  the highlight bar's light red. Every colour comes from `chrome::git` (AGENTS.md "One look, one
-  place").
+- Glyphs are code page 437 characters the VGA font has: lanes are `│ ─ ┐ ┘ ├ ┤ ┬ ┴ ┼` (§4.3; joins
+  come only from the right, so `└` and a lone `┌` never stand), since CP437 has no rounded corner
+  (`╭ ╮ ╰ ╯`) and no dashed line. In an ambiguous-wide terminal they take 10 §10's stand-ins at the
+  source: `| - +`, `#` for `■`, `.` for `≡` and `○`; `◙`, `»` and `:` are narrow and stay. Lane
+  colours cycle through light cyan, yellow, light green, light magenta and white — the bright CGA
+  colours that read on blue and are not the highlight bar's light red. Every colour comes from
+  `chrome::git` (AGENTS.md "One look, one place").
 - Labels come before the subject, in this order: HEAD, the checked-out branch, other local branches,
   remote branches, tags, stashes. Labels that do not fit end in `+N`.
 
