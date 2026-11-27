@@ -519,14 +519,25 @@ pub(super) fn draw(
                 file_row(buf, x, y, chars, f, wide, &pen);
             }
         }
-        let resp = ui.interact(
-            grid.rect(row),
-            ui.scope_id().with(("sopen-git-pane", k)),
-            Sense::click(),
-        );
+        // Its id salted with the pane's cells: two repositories' panels draw into one `ui` side
+        // by side (review round 1). It senses clicks alone (`Sense::CLICK`): the pane's keys are
+        // the panel's, and egui's focusable `Sense::click()` would make Space or Enter a click.
+        let id = ui.scope_id().with(("sopen-git-pane", area.x, area.y, k));
+        let resp = ui.interact(grid.rect(row), id, Sense::CLICK);
         if resp.clicked() {
-            // The line by what the pane shows: another subject's line `k` starts no pair.
-            let pair = egui::Id::unique(("sopen-git-pane-line", &pane.subject, k));
+            // The line by what it shows — a file by its group and path, as the graph's rows by
+            // what they draw, so a refresh that moves the files between two clicks starts a pair
+            // of its own (review round 1) — in this pane's cells, for this subject.
+            let shows = match line {
+                Line::File { group, file } => pane.file(*group, *file).map(|(g, f)| (g, &f.path)),
+                _ => None,
+            };
+            let pair = egui::Id::unique((
+                "sopen-git-pane-line",
+                (area.x, area.y),
+                &pane.subject,
+                shows.ok_or(k),
+            ));
             clicked = Some((k, super::super::second_click(&resp, pair)));
         }
     }
@@ -604,25 +615,26 @@ fn file_row(
 }
 
 /// One message line as the pane's rows of `chars` cells: tabs to the next multiple of eight
-/// cells, counted as the row shows them (a wide glyph two, an escaped control character its
-/// escape's length), other control characters escaped, then wrapped by cells ([`wrap_cells`]).
+/// cells, counted as the row shows them, a grapheme at a time — a wide glyph two, an emoji's
+/// sequence the cells the buffer lays it in (`👩‍💻`, `❤️` two), an escaped control character its
+/// escape's length; other control characters escaped; then wrapped by cells ([`wrap_cells`]).
 fn wrap_line(line: &str, chars: usize) -> Vec<String> {
     let mut expanded = String::with_capacity(line.len());
     // The column, counted as the line is read (not measured again per tab).
     let mut column = 0;
-    for c in line.chars() {
-        if c == '\t' {
+    for g in line.graphemes(true) {
+        if g == "\t" {
             let n = 8 - column % 8;
             expanded.extend(std::iter::repeat_n(' ', n));
             column += n;
-        } else if c.is_control() {
+        } else if g.chars().any(char::is_control) {
+            // A control character is a grapheme of its own (`\r\n` the one pair): escaped.
             let at = expanded.len();
-            expanded.extend(c.escape_default());
+            expanded.extend(g.chars().flat_map(char::escape_default));
             column += expanded.len() - at;
         } else {
-            expanded.push(c);
-            let mut utf8 = [0u8; 4];
-            column += cells::width(c.encode_utf8(&mut utf8));
+            expanded.push_str(g);
+            column += cells::width(g);
         }
     }
     wrap_cells(&expanded, chars)

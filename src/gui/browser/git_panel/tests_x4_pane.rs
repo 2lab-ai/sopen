@@ -229,7 +229,7 @@ fn the_pane_is_cells_under_the_rule() {
     assert_eq!(
         cell(&fx, end, p.y + 1).bg,
         Some(PALETTE.thumb),
-        "the thumb at the top"
+        "nothing to scroll: the thumb rests at the top"
     );
     assert_eq!(cell(&fx, end, p.y - 1).symbol, "╢");
     assert_eq!(cell(&fx, 0, p.y).symbol, "║");
@@ -304,14 +304,31 @@ fn the_message_wraps_by_cells_at_a_blank() {
     }
 }
 
-/// 03 §6.1: a tab goes to the next eighth cell counted in cells as the row shows them — a Hangul
-/// glyph two, an escaped control character its escape's length.
+/// 03 §6.1: a tab goes to the next eighth cell counted in cells as the row shows them, a
+/// grapheme at a time — a Hangul glyph two, an emoji's sequence (a ZWJ sequence, a heart with its
+/// presentation selector) the two cells it is laid in, an escaped control character its escape's
+/// length.
 #[test]
 fn a_tab_after_hangul_stops_at_the_eighth_cell() {
-    let fx = with_pane(1000.0, 800.0, merge_details("M\n\n한\tx\n\u{1}\ty\n"));
+    let message = "M\n\n한\tx\n\u{1}\ty\n👩\u{200d}💻\tx\n❤\u{fe0f}\tx\n";
+    let fx = with_pane(1000.0, 800.0, merge_details(message));
     let p = pane_cells(&fx);
     assert_eq!(text(&fx, p.y + 11, p.x, p.x + 9), "한      x");
     assert_eq!(text(&fx, p.y + 12, p.x, p.x + 9), "\\u{1}   y");
+    for (k, glyph) in [(13, "👩\u{200d}💻"), (14, "❤\u{fe0f}")] {
+        assert_eq!(cell(&fx, p.x, p.y + k).symbol, glyph);
+        assert_eq!(
+            cells::width(glyph),
+            2,
+            "the control: {glyph:?} is two cells"
+        );
+        assert_eq!(cell(&fx, p.x + 8, p.y + k).symbol, "x", "{glyph:?}");
+        assert_eq!(
+            text(&fx, p.y + k, p.x + 2, p.x + 8),
+            " ".repeat(6),
+            "{glyph:?}"
+        );
+    }
 }
 
 /// The pane's bar is in the active bar's colours only while the panel and the pane have the
@@ -350,6 +367,12 @@ fn the_wheel_and_the_keys_scroll_the_pane_by_cells() {
     assert_eq!(read(&fx, p.x, p.y, "Commit"), "Commit");
     // Commit, Parents (2), Author, Author date, In, a blank: the message from line 7.
     assert_eq!(read(&fx, p.x, p.y + 7, "line 00"), "line 00");
+    // More lines than rows, scrolled to the top: the thumb at the top of the track.
+    assert!(fx.view().pane.as_ref().unwrap().lines.len() > usize::from(p.height));
+    let thumb_at = |fx: &Fx| {
+        (p.y + 1..p.bottom() - 1).find(|&y| cell(fx, p.right(), y).bg == Some(PALETTE.thumb))
+    };
+    assert_eq!(thumb_at(&fx), Some(p.y + 1));
     let over = centre(&fx, 40, p.y + 3);
     let wheel = |unit, dy: f32| Event::MouseWheel {
         unit,
@@ -372,11 +395,8 @@ fn the_wheel_and_the_keys_scroll_the_pane_by_cells() {
     );
     let bar = |fx: &Fx| fx.view().pane.as_ref().unwrap().scroll.bar;
     assert_eq!(bar(&fx), 0, "the bar stays");
-    assert_ne!(
-        cell(&fx, p.right(), p.y + 1).bg,
-        Some(PALETTE.thumb),
-        "the thumb moved"
-    );
+    let moved = thumb_at(&fx).expect("a thumb");
+    assert!(moved > p.y + 1, "the thumb moved down: {moved}");
     // The bar, off screen, scrolled back into view by a key.
     fx.press(Key::ArrowDown);
     assert_eq!(bar(&fx), 1);
@@ -386,11 +406,15 @@ fn the_wheel_and_the_keys_scroll_the_pane_by_cells() {
         Some(PALETTE.bar),
         "the bar on its row"
     );
+    // At the end, the thumb at the track's foot.
+    fx.press(Key::End);
+    assert_eq!(thumb_at(&fx), Some(p.bottom() - 2));
 }
 
 /// Clicks by cells: a click on a line of the pane puts its bar there and gives it the keyboard;
-/// two clicks on two lines in one pass, the second's; a double click on a file right after a
-/// click on another line is Enter there (its diff, the browser's `second_click`).
+/// two clicks in one pass, the line under the pointer at the pass's end (egui hit-tests the
+/// pass's press there); a double click on a file right after a click on another line is Enter
+/// there (its diff, the browser's `second_click`).
 #[test]
 fn clicks_and_double_clicks_on_the_pane_go_by_cells() {
     let mut fx = with_pane(1000.0, 800.0, merge_details(MERGE_MESSAGE));
@@ -410,7 +434,7 @@ fn clicks_and_double_clicks_on_the_pane_go_by_cells() {
     events.extend(click_events(centre(&fx, 40, p.y + 7)));
     fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
     fx.idle();
-    assert_eq!(line(&fx), 7, "the second click's line");
+    assert_eq!(line(&fx), 7, "the line under the pointer at the pass's end");
     fx.take();
     // Past egui's double-click time since the clicks above.
     fx.drv.idle(&mut fx.host, 30);
@@ -657,7 +681,8 @@ fn an_edit_stops_banner_has_amend_and_split_first() {
 
 /// 03 §8.5: a click on a button is its step's key: the banner's steps give S3-B's `Pressed`, an
 /// edit stop's Amend and Split S4-B's; a key and a click in one pass give both, the key first
-/// (it is read before the pass draws); two clicks on two buttons in one pass, the second's.
+/// (it is read before the pass draws); two clicks in one pass, the button under the pointer at
+/// the pass's end (egui hit-tests the pass's press there).
 #[test]
 fn a_click_on_a_button_is_its_steps_key() {
     use super::tests_s3::{Fx as S3, Host as S3Host};
@@ -704,7 +729,7 @@ fn a_click_on_a_button_is_its_steps_key() {
     assert_eq!(
         fx.host.pressed,
         [Pressed::Proceed(Action::Proceed(Proceed::Abort))],
-        "the second click's"
+        "the button under the pointer at the pass's end"
     );
 
     use super::tests_s4::{Fx as S4, Host as S4Host};
@@ -749,6 +774,245 @@ fn the_panels_banner_button_opens_the_steps_dialog() {
     fx.idle();
     fx.idle();
     assert!(fx.view().dialog_up(), "Abort's dialog");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1.
+
+/// Two banners, or two panes, side by side in one `ui` — two repositories' panels, a pin beside
+/// the other side's own (`browser.rs` `panels_ui`) — each at its side's cells, what each gave.
+struct TwoSides {
+    banners: Option<[BannerView; 2]>,
+    panes: Option<[details::Pane; 2]>,
+    pressed: Vec<(usize, Pressed)>,
+    clicked: Vec<(usize, usize, bool)>,
+}
+
+impl crate::gui::Window for TwoSides {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
+                let grid = Grid::over(ui.max_rect());
+                let mut buf = cells::Buffer::empty(grid.all());
+                let sides = cells::halves(grid.all());
+                if let Some(banners) = &self.banners {
+                    for (k, (side, b)) in sides.iter().zip(banners).enumerate() {
+                        let top = Cells::new(side.x, side.y, side.width, 1);
+                        if let Some(p) = in_progress::draw(ui, &grid, top, &mut buf, b) {
+                            self.pressed.push((k, p));
+                        }
+                    }
+                }
+                if let Some(panes) = &mut self.panes {
+                    for (k, (side, pane)) in sides.iter().zip(panes).enumerate() {
+                        // The border column right of the pane, for its scroll bar.
+                        let area = Cells::new(side.x, side.y, side.width - 1, side.height);
+                        let seen = |_: &FileRow| false;
+                        if let Some((line, twice)) =
+                            details::draw(ui, &grid, area, &mut buf, pane, &seen, true)
+                        {
+                            self.clicked.push((k, line, twice));
+                        }
+                    }
+                }
+                let painter = ui.painter_at(grid.rect(grid.all()));
+                cells::paint(&painter, grid.origin, &buf, None);
+            });
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// The centre of the cell `x` cells from the left of row `y`, in a window of the kit's grid.
+fn at_cell(x: u16, y: u16) -> Pos2 {
+    Grid::over(egui::Rect::from_min_size(
+        Pos2::ZERO,
+        Vec2::new(800.0, 400.0),
+    ))
+    .rect(Cells::new(x, y, 1, 1))
+    .center()
+}
+
+/// R1 MUST 1: two panels' banners in one `ui` are two sets of buttons — a click on the right
+/// panel's `[ Abort ]` is that panel's Abort alone, a click on the left one's the left's (the
+/// buttons' ids were the same in both, so egui kept the right ones' rects for both: the left
+/// buttons were dead, and a click on the right Abort was Abort in both repositories).
+#[test]
+fn two_panels_banners_take_their_own_clicks() {
+    let banner = || {
+        BannerView::new(
+            "MERGE of feature · 1 conflict",
+            vec![Proceed::Continue, Proceed::Abort],
+        )
+    };
+    let mut win = TwoSides {
+        banners: Some([banner(), banner()]),
+        panes: None,
+        pressed: Vec::new(),
+        clicked: Vec::new(),
+    };
+    let mut drv = crate::gui::testkit::Driver::new(800.0, 400.0);
+    drv.idle(&mut win, 2);
+    // 100 cells: the left side 0..50, the right 50..100; each `[ Abort ]` its side's last 9.
+    let abort = Pressed::Proceed(Action::Proceed(Proceed::Abort));
+    drv.click(&mut win, at_cell(100 - 5, 0));
+    assert_eq!(win.pressed, [(1, abort.clone())], "the right panel's alone");
+    win.pressed.clear();
+    drv.idle(&mut win, 30);
+    drv.click(&mut win, at_cell(50 - 5, 0));
+    assert_eq!(win.pressed, [(0, abort)], "the left panel's alone");
+}
+
+/// R1 MUST 1: two panels' details panes in one `ui` take their own clicks — a line's click, and a
+/// double click's pair (both panes show the uncommitted row: one subject).
+#[test]
+fn two_panes_take_their_own_clicks() {
+    let pane = || {
+        let subject = Subject::Row(RowKey::Uncommitted);
+        let mut pane = details::Pane::new(subject.clone(), true, Vec::new());
+        pane.set(Details {
+            subject,
+            summary: None,
+            contains: None,
+            groups: vec![FileGroup {
+                group: Group::NotStaged,
+                files: (0..6)
+                    .map(|k| file('M', &format!("f{k}.txt"), None, None))
+                    .collect(),
+            }],
+            error: None,
+        });
+        pane
+    };
+    let mut win = TwoSides {
+        banners: None,
+        panes: Some([pane(), pane()]),
+        pressed: Vec::new(),
+        clicked: Vec::new(),
+    };
+    let mut drv = crate::gui::testkit::Driver::new(800.0, 400.0);
+    drv.idle(&mut win, 2);
+    drv.click(&mut win, at_cell(70, 3));
+    assert_eq!(win.clicked, [(1, 3, false)], "the right pane's line alone");
+    win.clicked.clear();
+    // The same line on the left right after: a click of its own, never the right one's pair.
+    drv.click(&mut win, at_cell(20, 3));
+    assert_eq!(win.clicked, [(0, 3, false)], "the left pane's line, once");
+    win.clicked.clear();
+    drv.click(&mut win, at_cell(20, 3));
+    assert_eq!(
+        win.clicked,
+        [(0, 3, true)],
+        "the control: a double click on the left"
+    );
+}
+
+/// R1 MUST 2: the banner's buttons never take the keyboard — Tab does not reach them, so Space
+/// and Enter press nothing (egui's `Sense::click()` is focusable, and a focused widget's Space or
+/// Enter is a click).
+#[test]
+fn the_banner_buttons_never_take_the_keyboard() {
+    use super::tests_s3::{Fx as S3, Host as S3Host};
+    let mut fx = S3::new(S3Host {
+        banner: Some(BannerView::new(
+            "MERGE of feature · 1 conflict",
+            vec![Proceed::Continue, Proceed::Abort],
+        )),
+        ..S3Host::default()
+    });
+    for _ in 0..3 {
+        fx.press(Key::Tab);
+        assert_eq!(
+            fx.drv.ctx.memory(|m| m.focused()),
+            None,
+            "nothing has the focus"
+        );
+    }
+    fx.press(Key::Space);
+    fx.press(Key::Enter);
+    assert_eq!(fx.host.pressed, Vec::<Pressed>::new(), "no step pressed");
+    fx.click("[ Abort ]");
+    assert_eq!(
+        fx.host.pressed,
+        [Pressed::Proceed(Action::Proceed(Proceed::Abort))],
+        "the control: a click"
+    );
+}
+
+/// R1 S3: a click on the blank between two buttons presses neither — in a host with nothing
+/// behind the banner too, where egui's slop would give it to the nearer button.
+#[test]
+fn a_click_between_two_buttons_presses_none() {
+    use super::tests_s3::{Fx as S3, Host as S3Host};
+    let mut fx = S3::new(S3Host {
+        banner: Some(BannerView::new(
+            "MERGE of feature · 1 conflict",
+            vec![Proceed::Continue, Proceed::Abort],
+        )),
+        ..S3Host::default()
+    });
+    let abort = fx.drv.find_text("[ Abort ]").expect("the button");
+    // The blank cell left of `[ Abort ]`, at its centre.
+    let gap = Pos2::new(abort.left() - chrome::CELL.x / 2.0, abort.center().y);
+    fx.drv.click(&mut fx.host, gap);
+    fx.idle();
+    assert_eq!(
+        fx.host.pressed,
+        Vec::<Pressed>::new(),
+        "the blank presses nothing"
+    );
+    // On the state's text: nothing either.
+    let state = fx.drv.find_text("MERGE of feature · 1 conflict").unwrap();
+    fx.drv.idle(&mut fx.host, 30);
+    fx.drv.click(&mut fx.host, state.center());
+    assert_eq!(
+        fx.host.pressed,
+        Vec::<Pressed>::new(),
+        "the state presses nothing"
+    );
+}
+
+/// R1 S2: a double click's two clicks are on one file, by its group and path — a refresh between
+/// them that moves the files (`In` answered, the status read again) makes the second click a
+/// click of its own on the file now there, never a double click opening it.
+#[test]
+fn a_double_click_pairs_a_file_by_its_path() {
+    let with_files = |names: &[&str]| {
+        let mut d = merge_details(MERGE_MESSAGE);
+        d.groups[0].files = (names.iter())
+            .map(|n| file('M', n, None, Some((1, 1))))
+            .collect();
+        d
+    };
+    let mut fx = with_pane(1000.0, 800.0, with_files(&["a.txt", "b.txt"]));
+    let p = pane_cells(&fx);
+    fx.take();
+    fx.drv.idle(&mut fx.host, 30);
+    let first = centre(&fx, 40, p.y + 14);
+    fx.drv.click(&mut fx.host, first);
+    assert_eq!(read(&fx, p.x + 4, p.y + 14, "a.txt"), "a.txt");
+    // A file comes before it: line 14 is `new.txt` now.
+    fx.view_mut()
+        .set_details(with_files(&["new.txt", "a.txt", "b.txt"]));
+    fx.drv.click(&mut fx.host, first);
+    assert_eq!(read(&fx, p.x + 4, p.y + 14, "new.txt"), "new.txt");
+    assert_eq!(
+        fx.take(),
+        Vec::<GitAction>::new(),
+        "two clicks on two files: no diff"
+    );
+    // The control: two clicks on one file are its diff.
+    fx.drv.idle(&mut fx.host, 30);
+    fx.drv.click(&mut fx.host, first);
+    fx.drv.click(&mut fx.host, first);
+    let asked = fx.take();
+    assert!(
+        matches!(&asked[..], [GitAction::Diff { file, .. }] if file.path == "new.txt"),
+        "{asked:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

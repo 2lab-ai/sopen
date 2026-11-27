@@ -37,10 +37,11 @@ changes: a folder still opens in a window.
   status row), the preview of a text or hex file beside the list (its frame and rows), the
   directory tree (F10: its rows, sizes, bar and scroll bar; clicks and the wheel act on it) and
   the git panel's graph (its rows, lanes, labels, bar, scroll bar and paging line; clicks, the
-  right click and the wheel act on it) are drawn in the terminal as in the window. What the
-  terminal does not draw yet — the preview of a picture, a video or a sound, the other viewers,
-  the git panel's Find field, banner, details pane, command log, Backups list and planner, and
-  the dialogs of the viewers and of the git panel — is a box saying `F12 shows it in the window`
+  right click and the wheel act on it), its details pane and its banner (a click on a step's
+  button is the step's key) are drawn in the terminal as in the window. What the terminal does
+  not draw yet — the preview of a picture, a video or a sound, the other viewers, the git
+  panel's Find field, command log, Backups list and planner, and the dialogs of the viewers and
+  of the git panel — is a box saying `F12 shows it in the window`
   (inside the git panel's frame for its parts); a click on it is F12. F1's key help is drawn in
   the terminal as in the window.
 - **Keys**: where the terminal offers the kitty keyboard protocol sopen turns it on and every key

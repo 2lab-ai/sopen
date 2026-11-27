@@ -153,8 +153,15 @@ pub fn draw(
 /// id cut there, shown on HEAD's row of the graph). The buttons
 /// come first, as egui's did: each that fits whole is laid, from the right, those that do not
 /// going from the left (Amend first), and the state is cut to what is left before them. Each is
-/// an `interact` rect at its cells; the one clicked, by its place in `buttons`. The buttons have
-/// no hover (a cell has no place for it): the status row names their keys while the banner shows
+/// an `interact` rect at its cells, its id salted with the banner's cells, since two
+/// repositories' panels draw into one `ui` side by side (review round 1: with one id egui kept
+/// the right panel's rects for both, so the left buttons were dead and a click was both panels');
+/// the one clicked, by its place in `buttons`. They sense clicks alone (`Sense::CLICK`), never the
+/// focus: egui's `Sense::click()` is focusable, and Tab, then Space or Enter, would press a step.
+/// The banner's first row is one more such rect, under the buttons, so a click on the state or on
+/// the blank between two buttons presses none in any host (egui gives a click a few points off a
+/// widget to it when nothing is under the pointer). The buttons have no hover (a cell has no
+/// place for it): the status row names their keys while the banner shows
 /// (`GitView::status_line`).
 fn lay(
     ui: &mut egui::Ui,
@@ -186,15 +193,20 @@ fn lay(
         right = at;
     }
     let state_end = laid.last().map_or(width, |&(_, at)| at.saturating_sub(1));
+    let id = |part: &str| {
+        ui.scope_id()
+            .with(("sopen-git-banner", area.x, area.y, part))
+    };
+    let row = grid.rect(Cells::new(area.x, area.y, area.width, 1));
+    ui.interact(row, id(""), Sense::CLICK);
     let mut pressed = None;
     let button = Pen::new(p.dialog_text, p.dialog_back);
     for &(k, at) in &laid {
         let label = format!("[ {} ]", buttons[k]);
         let w = cells::width(&label);
         cells::put(buf, x(at), area.y, &label, w, button);
-        let id = ui.scope_id().with(("sopen-git-banner", buttons[k]));
         let rect = grid.rect(Cells::new(x(at), area.y, w as u16, 1));
-        if ui.interact(rect, id, Sense::click()).clicked() {
+        if ui.interact(rect, id(buttons[k]), Sense::CLICK).clicked() {
             pressed = Some(k);
         }
     }
