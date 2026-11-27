@@ -146,23 +146,35 @@ pub(crate) enum Failure {
     ClientCertificate,
 }
 
-/// What `why` — the engine's failure, macOS's `<description> (<domain> <code>)` — was: by its
-/// `NSURLErrorDomain` code (-1201…-1204 the server's certificate, -1205 and -1206 a client
-/// certificate, -1012 and -1013 a login), or a 401 or 407 with nothing to show (the engine's
-/// `the page answered <status>`). A 401 whose body the engine shows is the page, not a failure.
+/// What `why` — the engine's failure, `<description> (<domain> <code>)` on both engines — was:
+/// on macOS by its `NSURLErrorDomain` code (-1201…-1204 the server's certificate, -1205 and
+/// -1206 a client certificate, -1012 and -1013 a login); on Linux by GLib's `g-tls-error-quark`
+/// (2, a bad certificate — measured for a self-signed server — the server's; 5, a certificate
+/// required, a client certificate) or the WebKitGTK engine's `WebKitAuthenticationScheme` (7 and
+/// 9 a client certificate, 8 the server's trust, any other a login: `gtk::asks`); or a 401 or 407
+/// with nothing to show (the engine's `the page answered <status>`). A 401 whose body the engine
+/// shows is the page, not a failure.
 pub(crate) fn failure(why: &str) -> Failure {
     match why {
         "the page answered 401" | "the page answered 407" => return Failure::Login,
         _ => {}
     }
-    let code = why
-        .rsplit_once("(NSURLErrorDomain ")
-        .and_then(|(_, rest)| rest.strip_suffix(')'))
-        .and_then(|code| code.parse::<i64>().ok());
-    match code {
-        Some(-1204..=-1201) => Failure::Untrusted,
-        Some(-1206 | -1205) => Failure::ClientCertificate,
-        Some(-1013 | -1012) => Failure::Login,
+    let Some((domain, code)) = why
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once('('))
+        .and_then(|(_, inner)| inner.rsplit_once(' '))
+        .and_then(|(domain, code)| Some((domain, code.parse::<i64>().ok()?)))
+    else {
+        return Failure::Load;
+    };
+    match (domain, code) {
+        ("NSURLErrorDomain", -1204..=-1201) | ("g-tls-error-quark", 2) => Failure::Untrusted,
+        ("WebKitAuthenticationScheme", 8) => Failure::Untrusted,
+        ("NSURLErrorDomain", -1206 | -1205) | ("g-tls-error-quark", 5) => {
+            Failure::ClientCertificate
+        }
+        ("WebKitAuthenticationScheme", 7 | 9) => Failure::ClientCertificate,
+        ("NSURLErrorDomain", -1013 | -1012) | ("WebKitAuthenticationScheme", _) => Failure::Login,
         _ => Failure::Load,
     }
 }
