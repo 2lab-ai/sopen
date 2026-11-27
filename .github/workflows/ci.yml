@@ -146,14 +146,22 @@ jobs:
 
       # The Linux binary loads libasound and glibc's and GCC's own runtime at start: libc, libm,
       # libdl, libpthread, libgcc_s, and libstdc++ for sherpa-onnx / ONNX Runtime (`sopen stems`,
-      # linked statically); X11, Wayland, EGL, Vulkan and fontconfig are opened at runtime. Prove
-      # it on a clean system with just the ALSA runtime (the image has libstdc++6: apt needs it).
-      # Same Ubuntu release as the runner (read from its /etc/os-release, so a new runner image
-      # moves it too): the binary needs the build host's glibc or newer.
+      # linked statically); X11, Wayland, EGL, Vulkan and fontconfig are opened at runtime, and so
+      # is WebKitGTK, the page view's engine (`.prd/09-web-view.md` §2.3): nothing of it, GTK,
+      # libsoup or GLib is linked — checked below — so its tests build with nothing installed,
+      # and its engine tests, which need a private compositor, run only with
+      # SOPEN_REQUIRE_WEBKIT=1, which this job does not set on Linux. Prove it on a clean system
+      # with just the ALSA runtime (the image has libstdc++6: apt needs it), where a page shows
+      # its source (§4). Same Ubuntu release as the runner (read from its /etc/os-release, so a
+      # new runner image moves it too): the binary needs the build host's glibc or newer.
       - name: Runtime libraries (Linux)
         if: runner.os == 'Linux'
         run: |
           cargo build --release --locked
+          if ldd target/release/sopen | grep -E 'webkit|javascriptcore|gtk|gdk|soup|glib|gio|gobject|cairo'; then
+            echo "::error::the release binary links a library the page view loads at run time"
+            exit 1
+          fi
           image="ubuntu:$(. /etc/os-release && echo "$VERSION_ID")"
           echo "clean system: $image"
           # The image's sources name archive.ubuntu.com and security.ubuntu.com: through the same

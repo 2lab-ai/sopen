@@ -36,6 +36,8 @@
 
 #[cfg(test)]
 pub(crate) mod fake;
+#[cfg(target_os = "linux")]
+mod gtk;
 #[cfg(target_os = "macos")]
 mod mac;
 pub(crate) mod page;
@@ -473,8 +475,14 @@ fn platform() -> Result<Rc<dyn Engine>, String> {
     mac::engine()
 }
 
-/// The platform's engine: none in this build yet (WV-B).
-#[cfg(not(target_os = "macos"))]
+/// The platform's engine: WebKitGTK on Linux, loaded at run time (WV-B).
+#[cfg(target_os = "linux")]
+fn platform() -> Result<Rc<dyn Engine>, String> {
+    gtk::engine()
+}
+
+/// The platform's engine: none in this build.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn platform() -> Result<Rc<dyn Engine>, String> {
     Err("not in this build".to_string())
 }
@@ -594,6 +602,9 @@ impl Web {
         // Held unshown: no input, nothing painted.
         if shown && self.engine.placement() == Placement::Texture {
             self.forward(ui, rect);
+            if self.keyboard() == Keyboard::Page {
+                ime_for_page(ui, rect);
+            }
             let painter = ui.painter_at(rect);
             self.slot.borrow_mut().view.paint(&painter, rect);
         }
@@ -829,6 +840,30 @@ impl Drop for Web {
     fn drop(&mut self) {
         close_slot(&self.slot);
     }
+}
+
+/// A texture page has the keyboard (§2.3): the window's input method is asked for, as a text
+/// field asks for it, so it composes for the page and its committed text reaches it — winit
+/// allows an IME only while egui says something wants it. The page's caret is not known here: the
+/// composition is placed where the pointer last was in the page, else at its corner.
+fn ime_for_page(ui: &egui::Ui, rect: egui::Rect) {
+    let at = ui
+        .input(|i| i.pointer.latest_pos())
+        .filter(|p| rect.contains(*p))
+        .unwrap_or(rect.min);
+    let cursor = egui::Rect::from_min_size(at, egui::vec2(1.0, 16.0));
+    let to_global = ui
+        .ctx()
+        .layer_transform_to_global(ui.layer_id())
+        .unwrap_or_default();
+    ui.output_mut(|o| {
+        o.ime = Some(egui::output::IMEOutput {
+            purpose: egui::IMEPurpose::Normal,
+            rect: to_global * rect,
+            cursor_rect: to_global * cursor,
+            should_interrupt_composition: false,
+        });
+    });
 }
 
 /// A pointer event with its position in the page's own points (`origin`: the page's corner).
