@@ -2786,8 +2786,8 @@ impl Layout {
 }
 
 /// `c` and the border cell right of it on each of its rows, where the details pane egui draws
-/// puts its scroll bar (`details::draw`; the log, the Backups list and the planner put theirs in
-/// their own last column).
+/// puts its scroll bar (`details::draw`; the log and the Backups list put theirs in their own
+/// last column).
 fn with_border(c: Cells) -> Cells {
     Cells::new(c.x, c.y, c.width.saturating_add(1), c.height)
 }

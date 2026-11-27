@@ -765,11 +765,12 @@ fn g_t1_enter_shows_the_summary_and_files() {
     assert!(fx.shows(&date_of(day(9))) && fx.shows(&date_of(day(9) + 60)));
     assert!(fx.shows("…"), "In: not answered yet");
     assert!(fx.shows("Brings the feature in."), "the whole message");
-    assert_eq!(fx.row_of("new.txt"), ["A", "new.txt", "+3 -0"]);
-    assert_eq!(fx.row_of("src/lib.rs"), ["M", "src/lib.rs", "+10 -2"]);
-    assert_eq!(fx.row_of("old.txt"), ["D", "old.txt", "+0 -7"]);
-    assert_eq!(fx.row_of("a.txt → b.txt"), ["R", "a.txt → b.txt", "+1 -1"]);
-    assert_eq!(fx.row_of("logo.png"), ["M", "logo.png"], "binary: blank");
+    // In cells the letter and the path, a blank apart in one colour, are one text (X4-pane).
+    assert_eq!(fx.row_of("A new.txt"), ["A new.txt", "+3 -0"]);
+    assert_eq!(fx.row_of("M src/lib.rs"), ["M src/lib.rs", "+10 -2"]);
+    assert_eq!(fx.row_of("D old.txt"), ["D old.txt", "+0 -7"]);
+    assert_eq!(fx.row_of("R a.txt → b.txt"), ["R a.txt → b.txt", "+1 -1"]);
+    assert_eq!(fx.row_of("M logo.png"), ["M logo.png"], "binary: blank");
     // The keyboard is in the file list, its bar on the first file.
     let asked = fx.press(Key::Enter);
     assert_eq!(
@@ -781,8 +782,8 @@ fn g_t1_enter_shows_the_summary_and_files() {
         }]
     );
     assert_eq!(
-        fx.row_of("new.txt"),
-        ["√", "A", "new.txt", "+3 -0"],
+        fx.row_of("A new.txt"),
+        ["√", "A new.txt", "+3 -0"],
         "viewed"
     );
     fx.press(Key::ArrowDown);
@@ -843,7 +844,8 @@ fn the_uncommitted_rows_groups() {
     for head in ["Staged", "Not staged", "Untracked"] {
         assert!(fx.shows(head), "{head}");
     }
-    assert_eq!(fx.row_of("dir/"), ["►", "?", "dir/"]);
+    // In cells the folder's `►`, its letter and its name are one text (X4-pane).
+    assert_eq!(fx.row_of("► ? dir/"), ["► ? dir/"]);
     fx.press(Key::End);
     let asked = fx.press(Key::ArrowRight);
     assert_eq!(
@@ -1289,7 +1291,7 @@ fn a_lossy_file_row_opens_nothing() {
         error: None,
     });
     fx.idle();
-    assert!(fx.shows("caf\u{FFFD}.txt"));
+    assert!(fx.shows("M caf\u{FFFD}.txt"));
     assert!(fx.press(Key::Enter).is_empty());
     assert!(fx.key(Key::F3, Modifiers::SHIFT).is_empty());
     assert!(fx.press(Key::F4).is_empty());
@@ -1466,7 +1468,7 @@ fn control_characters_show_escaped_on_their_row() {
         error: None,
     });
     fx.idle();
-    assert!(fx.shows("new\\nline.txt"));
+    assert!(fx.shows("A new\\nline.txt"));
     for (_, t) in fx.texts() {
         // A scroll bar's column is the one text drawn over several rows.
         let column = t.starts_with('↑');

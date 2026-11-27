@@ -1311,7 +1311,8 @@ fn twice(fx: &mut Fx, at: Pos2) -> Vec<GitAction> {
 }
 
 /// A click on the details pane, a command log row or the planner acts on nothing while another
-/// panel's dialog is up — not only where egui's modal lies over it.
+/// panel's dialog is up — not only where egui's modal lies over it. (The pane and the planner
+/// are cells, read by where their texts stand.)
 #[test]
 fn clicks_on_the_pane_the_log_and_the_planner_wait_for_the_other_dialog() {
     use super::tests::{day, oid};
@@ -1350,8 +1351,10 @@ fn clicks_on_the_pane_the_log_and_the_planner_wait_for_the_other_dialog() {
     fx.press(Key::Escape);
     let at = fx
         .drv
-        .find_text("src/lib.rs")
+        .texts_starting_with("src/lib.rs")
+        .first()
         .expect("the file row")
+        .0
         .center();
     fx.view_mut().set_dialog_elsewhere(true);
     fx.idle();
@@ -1404,10 +1407,12 @@ fn clicks_on_the_pane_the_log_and_the_planner_wait_for_the_other_dialog() {
     let before = bar(&fx);
     let row = fx
         .drv
-        .find_text("third")
+        .texts_starting_with("third")
+        .first()
         .expect("the planner's row")
+        .0
         .center();
-    let run = fx.drv.find_text("Run…").expect("Run…").center();
+    let run = fx.drv.find_text("[ Run… ]").expect("Run…").center();
     fx.view_mut().set_dialog_elsewhere(true);
     fx.idle();
     pass(&mut fx, click_events(row, PointerButton::Primary));

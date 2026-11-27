@@ -19,14 +19,17 @@
 //!   ([`QuickOpened::Planner`]). [`QuickDialog::confirm`] is the dialog of an edit built
 //!   elsewhere: an edit stop's Split (`Edit::SplitStop`), a split's Continue.
 //! - **The planner** ([`PlannerView`], [`draw`]) lists the range newest first — verb, hash,
-//!   subject, author, date, and `A` where the author or a date changed — with a bar of its own.
-//!   Its keys, read first while it has the keyboard: ↑ ↓ PgUp PgDn Home End the bar; typed `P R
-//!   E S F D` the bar's verb, `A` its author and dates, every other typed character nothing (no
-//!   typed letter starts Find); Cmd/Ctrl+↑/↓ move the row; Enter the message of a `reword` or
-//!   `squash` row (a squash row's is its group's); Cmd/Ctrl+Enter the run's confirmation, with
-//!   its options (`--autostash`, `--update-refs`) and the checks that fail; Esc closes, asking
-//!   first when something changed. Each key becomes an [`Op`] the model applies or refuses; a
-//!   refusal is the pane's note, in the error colour.
+//!   subject, author, date, and `A` where the author or a date changed — with a bar of its own,
+//!   in cells over the panel's body (10 §17, X4-planner): the columns two blanks apart, cut by
+//!   cells, the scroll bar on the border beside the rows, and at its foot the checks that fail,
+//!   the note, `[ Run… ]`, `[ Close ]` and the keys' hint; its own dialogs are still egui's.
+//!   Its keys, read first while it has the keyboard, a press at a time in the pass's order: ↑ ↓
+//!   PgUp PgDn Home End the bar; typed `P R E S F D` the bar's verb, `A` its author and dates,
+//!   every other typed character nothing (no typed letter starts Find); Cmd/Ctrl+↑/↓ move the
+//!   row; Enter the message of a `reword` or `squash` row (a squash row's is its group's);
+//!   Cmd/Ctrl+Enter the run's confirmation, with its options (`--autostash`, `--update-refs`)
+//!   and the checks that fail; Esc closes, asking first when something changed. Each key becomes
+//!   an [`Op`] the model applies or refuses; a refusal is the pane's note, in the error colour.
 
 use super::dialogs::{remote_warning, step_line, width};
 use super::graph_view::{self, printable};
@@ -39,10 +42,11 @@ use crate::git::rebase::{
     Toward, Verb,
 };
 use crate::gui::browser::keys::{self, Mods, Step};
-use crate::gui::cells::{Buffer, Cells, Grid};
+use crate::gui::cells::{self, Buffer, Cells, Grid, Pen};
 use crate::gui::chrome::git::LOOK;
 use crate::gui::chrome::{self, PALETTE};
-use eframe::egui::{self, Color32, Event, Key, Pos2, Rect, RichText, Sense, Vec2};
+use crate::gui::term;
+use eframe::egui::{self, Color32, Event, Key, RichText, Sense};
 
 // ---------------------------------------------------------------------------------------------
 // The seams.
@@ -804,6 +808,16 @@ fn inner_id(kind: &str) -> egui::Id {
     egui::Id::unique(("sopen-git-planner", kind))
 }
 
+/// The message dialog's field: one id for every row's.
+fn message_field_id() -> egui::Id {
+    inner_id("message").with("field")
+}
+
+/// The author dialog's field `n` (the name, the email, the author date): one id for every row's.
+fn author_field_id(n: usize) -> egui::Id {
+    inner_id("author").with(("field", n))
+}
+
 /// The first line of `text`, at most `n` characters, control characters shown.
 fn first_line(text: &str, n: usize) -> String {
     let line = text.lines().next().unwrap_or("");
@@ -855,6 +869,65 @@ fn group_message(model: &Model, k: usize) -> Result<String, String> {
     let mut parts = parts.into_iter();
     let joined = parts.next().unwrap_or_default().to_string();
     Ok(parts.fold(joined, |older, newer| rebase::squash_message(&older, newer)))
+}
+
+/// One of the pane's presses (03 §7.8.2), as [`PlannerView::keys`] reads them.
+#[derive(Debug)]
+enum PaneKey {
+    /// Cmd/Ctrl+↑/↓: the bar's row moved.
+    Move(Toward),
+    /// Cmd/Ctrl+Enter: the run's confirmation.
+    Run,
+    /// Esc.
+    Close,
+    /// Enter: the message of a `reword` or `squash` row.
+    Message,
+    /// ↑ ↓ PgUp PgDn Home End: the bar.
+    Step(Step),
+    /// Typed text, or an input method's commit.
+    Typed(String),
+}
+
+impl PaneKey {
+    /// Takes the earliest of `events` that is one of the pane's: a press (or a repeat) of its
+    /// keys with exactly their modifiers, or typed text. The others stay where they are. With
+    /// it, where it stood, so what is left of a text can be put back there.
+    fn take(events: &mut Vec<Event>) -> Option<(usize, PaneKey)> {
+        let (at, pressed) =
+            (events.iter().enumerate()).find_map(|(at, e)| Some((at, PaneKey::of(e)?)))?;
+        events.remove(at);
+        Some((at, pressed))
+    }
+
+    fn of(e: &Event) -> Option<PaneKey> {
+        let (key, modifiers) = match e {
+            Event::Text(t) | Event::Ime(egui::ImeEvent::Commit(t)) => {
+                return Some(PaneKey::Typed(t.clone()))
+            }
+            Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => (*key, *modifiers),
+            _ => return None,
+        };
+        let with = |mods: Mods| mods.matches(modifiers);
+        Some(match key {
+            Key::ArrowUp if with(Mods::Command) => PaneKey::Move(Toward::Up),
+            Key::ArrowDown if with(Mods::Command) => PaneKey::Move(Toward::Down),
+            Key::Enter if with(Mods::Command) => PaneKey::Run,
+            Key::Escape if with(Mods::None) => PaneKey::Close,
+            Key::Enter if with(Mods::None) => PaneKey::Message,
+            Key::ArrowUp if with(Mods::None) => PaneKey::Step(Step::Up),
+            Key::ArrowDown if with(Mods::None) => PaneKey::Step(Step::Down),
+            Key::PageUp if with(Mods::None) => PaneKey::Step(Step::PageUp),
+            Key::PageDown if with(Mods::None) => PaneKey::Step(Step::PageDown),
+            Key::Home if with(Mods::None) => PaneKey::Step(Step::Home),
+            Key::End if with(Mods::None) => PaneKey::Step(Step::End),
+            _ => return None,
+        })
+    }
 }
 
 impl PlannerView {
@@ -1031,70 +1104,79 @@ impl PlannerView {
         });
     }
 
-    /// The pane's keys (03 §7.8.2), with exact modifiers, modifier variants first (03 §9).
+    /// The pane's keys (03 §7.8.2), with exact modifiers (03 §9), one press at a time in the
+    /// pass's order — two ↓ two rows, a letter typed before ↓ on the row it was typed on — until
+    /// one opens a dialog of the pane's or ends it. What the pass holds after a key that opens a
+    /// dialog — keys and text, the rest of a text that key was typed in too — stays where it
+    /// was, in its order, for the dialog [`draw`] shows in the same pass, as if typed once it
+    /// was open (10 §17, X4-planner).
     fn keys(&mut self, ctx: &egui::Context, seams: &Seams) -> Option<PlannerEnd> {
-        let take = |key: Key, mods: Mods| ctx.input_mut(|i| keys::take(i, key, mods));
-        for (key, toward) in [(Key::ArrowUp, Toward::Up), (Key::ArrowDown, Toward::Down)] {
-            if take(key, Mods::Command) {
-                if let Some(commit) = self.bar().cloned() {
-                    self.apply(Op::Move { commit, toward }, seams);
+        while let Some((at, pressed)) = ctx.input_mut(|i| PaneKey::take(&mut i.events)) {
+            match pressed {
+                PaneKey::Move(toward) => {
+                    if let Some(commit) = self.bar().cloned() {
+                        self.apply(Op::Move { commit, toward }, seams);
+                    }
+                }
+                PaneKey::Run => self.ask_run(),
+                PaneKey::Close => return self.close(seams),
+                PaneKey::Message => self.edit_message(),
+                PaneKey::Step(step) => {
+                    let delta = self.scroll.delta(step);
+                    self.scroll.step(delta, self.model.rows.len());
+                }
+                // Typed letters set verbs here, and never start Find (03 §7.8.2): every typed
+                // character is the pane's, as typed or as an input method commits it — up to
+                // one that opens a dialog, after which the rest of the text is the dialog's.
+                PaneKey::Typed(text) => {
+                    for (k, c) in text.char_indices() {
+                        if self.inner.is_some() {
+                            let rest = Event::Text(text[k..].to_string());
+                            ctx.input_mut(|i| i.events.insert(at, rest));
+                            break;
+                        }
+                        let Some(commit) = self.bar().cloned() else {
+                            break;
+                        };
+                        if c.eq_ignore_ascii_case(&'a') {
+                            self.edit_author();
+                        } else if let Some(verb) = Verb::of_letter(c) {
+                            self.apply(Op::Verb { commit, verb }, seams);
+                        }
+                    }
                 }
             }
-        }
-        if take(Key::Enter, Mods::Command) {
-            self.ask_run();
-            return None;
-        }
-        if take(Key::Escape, Mods::None) {
-            return self.close(seams);
-        }
-        if take(Key::Enter, Mods::None) {
-            self.edit_message();
             if self.inner.is_some() {
+                self.carets_at_the_end(ctx);
                 return None;
             }
         }
-        let len = self.model.rows.len();
-        for (key, step) in [
-            (Key::ArrowUp, Step::Up),
-            (Key::ArrowDown, Step::Down),
-            (Key::PageUp, Step::PageUp),
-            (Key::PageDown, Step::PageDown),
-            (Key::Home, Step::Home),
-            (Key::End, Step::End),
-        ] {
-            if take(key, Mods::None) {
-                let delta = self.scroll.delta(step);
-                self.scroll.step(delta, len);
-            }
-        }
-        // Typed letters set verbs here, and never start Find (03 §7.8.2): every typed character
-        // is the pane's, as typed or as an input method commits it.
-        let typed: Vec<char> = ctx.input_mut(|i| {
-            let mut typed = Vec::new();
-            i.events.retain(|e| match e {
-                Event::Text(t) | Event::Ime(egui::ImeEvent::Commit(t)) => {
-                    typed.extend(t.chars());
-                    false
-                }
-                _ => true,
-            });
-            typed
-        });
-        for c in typed {
-            if self.inner.is_some() {
-                break;
-            }
-            let Some(commit) = self.bar().cloned() else {
-                break;
-            };
-            if c.eq_ignore_ascii_case(&'a') {
-                self.edit_author();
-            } else if let Some(verb) = Verb::of_letter(c) {
-                self.apply(Op::Verb { commit, verb }, seams);
-            }
-        }
         None
+    }
+
+    /// A dialog of the pane's has just opened: each of its fields' carets at the end of its
+    /// text, as egui puts a field's caret the first time — it keeps a field's caret between
+    /// dialogs, and every row's dialog has the same field ids, so the caret left in one row's
+    /// message would stand in the middle of the next row's.
+    fn carets_at_the_end(&self, ctx: &egui::Context) {
+        let fields = match &self.inner {
+            Some(Inner::Message { text, .. }) => vec![(message_field_id(), text)],
+            Some(Inner::Author { form, .. }) => {
+                let texts = [&form.name, &form.email, &form.date];
+                (0..)
+                    .zip(texts)
+                    .map(|(n, t)| (author_field_id(n), t))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        for (id, text) in fields {
+            let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+            let end = egui::text::CCursor::new(text.chars().count());
+            let at = egui::text::CCursorRange::one(end);
+            state.cursor.set_char_range(Some(at));
+            state.store(ctx, id);
+        }
     }
 
     /// The dialog over the pane, one pass, on `grid` (the panels', where it stands once it is in
@@ -1118,7 +1200,7 @@ impl PlannerView {
                 if take(Key::Escape) {
                     return None;
                 }
-                let id = inner_id("message").with("field");
+                let id = message_field_id();
                 type_into(ctx, id);
                 let at = enter(ctx);
                 if is(at, cancel_button) {
@@ -1173,7 +1255,7 @@ impl PlannerView {
                 if take(Key::Escape) {
                     return None;
                 }
-                let id = |n: usize| inner_id("author").with(("field", n));
+                let id = author_field_id;
                 type_into(ctx, id(0));
                 let at = enter(ctx);
                 if is(at, cancel_button) {
@@ -1358,40 +1440,78 @@ enum Foot {
     Close,
 }
 
-/// The keys' hint at the pane's foot.
-fn hint() -> String {
+/// The keys' hint at the pane's foot. In an ambiguous-wide terminal (`wide`) its own `↑↓` and
+/// `·` are 10 §10's stand-ins (`term::narrow`: `^v`, `.`), put at the source: the hint is cut to
+/// its row, so the printer has no blanks to move a glyph laid in two cells into (T38).
+fn hint(wide: bool) -> String {
     let cmd = Mods::Command.prefix();
-    format!(
+    let hint = format!(
         "P R E S F D verb · A author and dates · {cmd}↑↓ move · Enter message · {cmd}Enter run · Esc closes"
-    )
+    );
+    if !wide {
+        return hint;
+    }
+    hint.chars()
+        .map(|c| {
+            let mut utf8 = [0u8; 4];
+            let s: &str = c.encode_utf8(&mut utf8);
+            term::narrow(s).map_or_else(|| s.to_string(), str::to_string)
+        })
+        .collect()
 }
 
-/// Column widths in cells: the verb, the `A` mark, the hash, then the subject up to the author
-/// and the date at the right end.
+/// The columns of a row, in cells from the pane's first: the verb (`reword`, `squash`: 6 cells),
+/// the `A` mark, the hash (8), the subject, and at the right end the author and the date (16
+/// each) — each [`GAP`] blanks from the next, so each reads as a text of its own (10 §17,
+/// X4-planner's decision).
+const GAP: usize = 2;
 const VERB: usize = 0;
-const MARK: usize = 7;
-const HASH: usize = 9;
-const SUBJECT: usize = 18;
+const VERB_CELLS: usize = 6;
+const MARK: usize = VERB + VERB_CELLS + GAP;
+const HASH: usize = MARK + 1 + GAP;
+const HASH_CELLS: usize = 8;
+const SUBJECT: usize = HASH + HASH_CELLS + GAP;
 const AUTHOR_CELLS: usize = 16;
 const DATE_CELLS: usize = 16;
+/// The subject keeps at least this many cells, or the author and the date are left out.
+const SUBJECT_MIN: usize = 10;
 
-/// The pane in `rect`: the column heads, the rows with the bar, the scroll bar, then at the foot
-/// the checks that fail, the note, and the Run… and Close buttons with the keys' hint. A click
-/// puts the bar on a row.
+/// Where a pane `chars` cells wide puts the author and the date, if it has room for them with
+/// [`SUBJECT_MIN`] cells of subject before them.
+fn right_columns(chars: usize) -> Option<(usize, usize)> {
+    let need = SUBJECT + SUBJECT_MIN + GAP + AUTHOR_CELLS + GAP + DATE_CELLS;
+    (chars >= need).then(|| {
+        let date = chars - DATE_CELLS;
+        (date - GAP - AUTHOR_CELLS, date)
+    })
+}
+
+/// A button's text: `[ word ]`.
+fn button(word: &str) -> String {
+    format!("[ {word} ]")
+}
+
+/// The pane at cells `area` of `buf` (on `grid`), cut by cells (unicode-width: a Hangul glyph two
+/// cells, never half of one, `…` where a text stops) and never written past `area` — but for the
+/// scroll bar, on the border right of it, beside the rows, as the graph's: over the panel's body,
+/// the column heads; the rows from the newest, each a cell tall, with the bar; then at the foot
+/// the checks that fail and the note (an op's refusal in the error colour, a key's hint dim), a
+/// row each, and `[ Run… ]`, `[ Close ]` and the keys' hint. A click on a row's cells puts the bar
+/// there, the wheel over the rows scrolls them by cells; what a button's click asked is returned.
 fn paint(
     ui: &mut egui::Ui,
-    rect: Rect,
+    grid: &Grid,
+    area: Cells,
+    buf: &mut Buffer,
     view: &mut PlannerView,
     active: bool,
     problems: &[String],
 ) -> Option<Foot> {
     let ctx = ui.ctx().clone();
-    let font = chrome::mono(ui);
-    let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-    let (cw, row_h) = (cw.max(1.0), text_h.ceil().max(1.0));
-    let painter = ui.painter_at(rect);
-    // Over the git panel: the graph under it does not show through.
-    painter.rect_filled(rect, 0.0, PALETTE.back);
+    let p = PALETTE;
+    let wide = cells::ambiguous_wide(&ctx);
+    // Over the git panel's body: the graph under it does not show through.
+    cells::fill(buf, area, Pen::new(p.text, p.back));
     let mut foot_lines: Vec<(String, Color32)> =
         problems.iter().map(|p| (p.clone(), LOOK.error)).collect();
     match &view.note {
@@ -1408,77 +1528,50 @@ fn paint(
             ));
         }
     }
-    let foot_h = row_h * (foot_lines.len() + 1) as f32;
-    let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), row_h));
-    let foot_top = (rect.bottom() - foot_h).max(header.bottom());
-    let list = Rect::from_min_max(
-        Pos2::new(rect.left(), header.bottom()),
-        Pos2::new((rect.right() - chrome::CELL.x).max(rect.left()), foot_top),
-    );
-    let chars = (list.width() / cw).floor().max(0.0) as usize;
-    let fit =
-        |s: &str, cells: usize| chrome::fit_start(&ctx, &printable(s), &font, cw * cells as f32);
-    // The author and the date only where the subject keeps ten cells.
-    let wide = chars > SUBJECT + 10 + AUTHOR_CELLS + 1 + DATE_CELLS;
-    let date_at = if wide { chars - DATE_CELLS } else { chars };
-    let author_at = if wide {
-        date_at - AUTHOR_CELLS - 1
-    } else {
-        chars
-    };
-    let room = |at: usize, end: usize| end.saturating_sub(at + 1).max(1);
-    let put = |painter: &egui::Painter, y: f32, at: usize, cells: usize, s: &str, c: Color32| {
-        if at < chars {
-            painter.text(
-                Pos2::new(list.left() + cw * at as f32, y),
-                egui::Align2::LEFT_TOP,
-                fit(s, cells),
-                font.clone(),
-                c,
-            );
+    let chars = usize::from(area.width);
+    // Cell `c` of the pane, on the grid (every `c` here is below `chars`).
+    let x = |c: usize| area.x.saturating_add(u16::try_from(c).unwrap_or(u16::MAX));
+    // `text` (its control characters shown) from cell `c` of row `y` in at most `room` cells, cut
+    // by cells; nothing past the pane's cells.
+    let put = |buf: &mut Buffer, y: u16, c: usize, room: usize, text: &str, pen: Pen| {
+        if c < chars && (area.top()..area.bottom()).contains(&y) {
+            let room = room.min(chars - c);
+            let shown = cells::fit_start(&printable(text), room);
+            cells::put(buf, x(c), y, &shown, room, pen);
         }
     };
-    let heads = painter.with_clip_rect(header.intersect(rect));
-    put(&heads, header.top(), VERB, MARK, "Verb", LOOK.dim);
-    put(
-        &heads,
-        header.top(),
-        HASH,
-        SUBJECT - HASH,
-        "Commit",
-        LOOK.dim,
-    );
-    put(
-        &heads,
-        header.top(),
-        SUBJECT,
-        room(SUBJECT, author_at),
-        "Subject",
-        LOOK.dim,
-    );
-    if wide {
-        put(
-            &heads,
-            header.top(),
-            author_at,
-            AUTHOR_CELLS,
-            "Author",
-            LOOK.dim,
-        );
-        put(&heads, header.top(), date_at, DATE_CELLS, "Date", LOOK.dim);
+    let right = right_columns(chars);
+    let subject_room = match right {
+        Some((author, _)) => author - GAP - SUBJECT,
+        None => chars.saturating_sub(SUBJECT),
+    };
+    // The heads.
+    let dim = Pen::new(LOOK.dim, p.back);
+    put(buf, area.y, VERB, VERB_CELLS, "Verb", dim);
+    put(buf, area.y, HASH, HASH_CELLS, "Commit", dim);
+    put(buf, area.y, SUBJECT, subject_room, "Subject", dim);
+    if let Some((author, date)) = right {
+        put(buf, area.y, author, AUTHOR_CELLS, "Author", dim);
+        put(buf, area.y, date, DATE_CELLS, "Date", dim);
     }
+    // The rows between the heads and the foot: its lines, then the buttons' row.
+    let foot_rows = u16::try_from(foot_lines.len() + 1).unwrap_or(u16::MAX);
+    let list_top = area.y.saturating_add(1).min(area.bottom());
+    let foot_top = area.bottom().saturating_sub(foot_rows).max(list_top);
+    let list = Cells::new(area.x, list_top, area.width, foot_top - list_top);
     let len = view.model.rows.len();
     if len == 0 {
-        put(&painter, list.top(), 0, chars, NO_ROWS, LOOK.dim);
+        put(buf, list.y, 0, chars, NO_ROWS, dim);
     }
-    let visible = ((list.height() / row_h).floor().max(0.0) as usize).max(1);
-    if ui.rect_contains_pointer(list) {
+    // A page is the rows shown, one at least for the keys' steps; only those shown are drawn.
+    let visible = usize::from(list.height).max(1);
+    if super::super::pointer_on_pane(ui, grid.rect(list)) {
         let lines: f32 = ctx.input(|i| {
             i.events
                 .iter()
                 .map(|e| match e {
                     Event::MouseWheel { unit, delta, .. } => match unit {
-                        egui::MouseWheelUnit::Point => -delta.y / row_h,
+                        egui::MouseWheelUnit::Point => -delta.y / chrome::CELL.y,
                         _ => -delta.y * 3.0,
                     },
                     _ => 0.0,
@@ -1490,60 +1583,44 @@ fn paint(
     }
     view.scroll.settle(visible, len);
     let range = view.scroll.range(len);
-    let mut clicked = None;
-    for k in range.clone() {
+    let shown = range.start..range.end.min(range.start + usize::from(list.height));
+    let mut clicked_row = None;
+    for (n, k) in shown.clone().enumerate() {
         let r = &view.model.rows[k];
-        let y = list.top() + row_h * (k - range.start) as f32;
-        let row = Rect::from_min_size(Pos2::new(list.left(), y), Vec2::new(list.width(), row_h));
-        let row_painter = painter.with_clip_rect(row.intersect(list));
+        let y = list.y + n as u16;
+        let row_cells = Cells::new(area.x, y, area.width, 1);
         let on_bar = k == view.scroll.bar;
-        if on_bar {
-            chrome::bar(&row_painter, row, active);
-        }
-        let base = if r.verb == Verb::Drop {
+        let back = match (on_bar, active) {
+            (false, _) => p.back,
+            (true, true) => p.bar,
+            (true, false) => p.bar_idle,
+        };
+        let fg = if on_bar && active {
+            LOOK.on_bar
+        } else if r.verb == Verb::Drop {
             LOOK.dim
         } else {
             LOOK.text
         };
-        let c = if on_bar && active { LOOK.on_bar } else { base };
+        let pen = Pen::new(fg, back);
+        cells::fill(buf, row_cells, pen);
         let row_commit = &r.commit.row;
-        let (name, time) = match &r.author {
-            Some(a) => (a.name.as_str(), a.date.seconds),
-            None => (row_commit.author_name.as_str(), row_commit.author_time),
-        };
-        put(&row_painter, y, VERB, MARK - 1, r.verb.word(), c);
+        put(buf, y, VERB, VERB_CELLS, r.verb.word(), pen);
         if r.author.is_some() {
-            put(&row_painter, y, MARK, 1, "A", c);
+            put(buf, y, MARK, 1, "A", pen);
         }
-        put(
-            &row_painter,
-            y,
-            HASH,
-            SUBJECT - HASH - 1,
-            row_commit.oid.short(),
-            c,
-        );
-        put(
-            &row_painter,
-            y,
-            SUBJECT,
-            room(SUBJECT, author_at),
-            &row_commit.subject,
-            c,
-        );
-        if wide {
-            put(&row_painter, y, author_at, AUTHOR_CELLS, name, c);
-            put(
-                &row_painter,
-                y,
-                date_at,
-                DATE_CELLS,
-                &graph_view::date_text(time),
-                c,
-            );
+        put(buf, y, HASH, HASH_CELLS, row_commit.oid.short(), pen);
+        put(buf, y, SUBJECT, subject_room, &row_commit.subject, pen);
+        if let Some((author, date)) = right {
+            let (name, time) = match &r.author {
+                Some(a) => (a.name.as_str(), a.date.seconds),
+                None => (row_commit.author_name.as_str(), row_commit.author_time),
+            };
+            put(buf, y, author, AUTHOR_CELLS, name, pen);
+            put(buf, y, date, DATE_CELLS, &graph_view::date_text(time), pen);
         }
         let resp = ui.interact(
-            row,
+            grid.rect(row_cells),
             ui.scope_id().with(("sopen-git-planner-row", k)),
             if active && view.inner.is_none() {
                 Sense::click()
@@ -1552,77 +1629,76 @@ fn paint(
             },
         );
         if resp.clicked() {
-            view.scroll.to(k);
+            clicked_row = Some(k);
         }
     }
-    let max_top = len.saturating_sub(visible);
-    let column = Rect::from_min_max(
-        Pos2::new(list.right(), list.top()),
-        Pos2::new(list.right() + chrome::CELL.x, list.bottom()),
-    );
-    chrome::scroll_bar(
-        &ui.painter_at(column),
-        column,
-        (max_top > 0).then(|| view.scroll.top as f32 / max_top as f32),
-    );
+    if let Some(k) = clicked_row {
+        view.scroll.to(k);
+    }
+    // The scroll bar on the border beside the rows.
+    if list.height > 0 {
+        let max_top = len.saturating_sub(visible);
+        let at = (max_top > 0).then(|| view.scroll.top as f32 / max_top as f32);
+        cells::scroll_bar(buf, area.right(), list.y, list.height, at);
+    }
     // The foot.
-    let foot_painter = painter.with_clip_rect(rect);
     for (n, (text, colour)) in foot_lines.iter().enumerate() {
-        put(
-            &foot_painter,
-            foot_top + row_h * n as f32,
-            0,
-            chars,
-            text,
-            *colour,
-        );
+        let y = foot_top.saturating_add(u16::try_from(n).unwrap_or(u16::MAX));
+        put(buf, y, 0, chars, text, Pen::new(*colour, p.back));
     }
-    let y = foot_top + row_h * foot_lines.len() as f32;
-    let mut x = rect.left();
-    for (word, foot) in [("Run…", Foot::Run), ("Close", Foot::Close)] {
-        let w = cw * (word.chars().count() + 2) as f32;
-        let at = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, row_h));
-        if at.right() <= rect.right() && ui.put(at, egui::Button::new(word)).clicked() && active {
-            clicked = Some(foot);
+    let y = foot_top.saturating_add(u16::try_from(foot_lines.len()).unwrap_or(u16::MAX));
+    let mut clicked = None;
+    let mut c = 0;
+    if (area.top()..area.bottom()).contains(&y) {
+        for (word, foot, salt) in [
+            ("Run…", Foot::Run, "sopen-git-planner-run"),
+            ("Close", Foot::Close, "sopen-git-planner-close"),
+        ] {
+            let label = button(word);
+            let w = cells::width(&label);
+            // A button is drawn, and acts, only where it fits whole.
+            if c + w <= chars {
+                let at = Cells::new(x(c), y, w as u16, 1);
+                let id = ui.scope_id().with(salt);
+                // Acts only while nothing else's dialog is up (`active` carries it: X4-menu).
+                if ui.interact(grid.rect(at), id, Sense::click()).clicked() && active {
+                    clicked = Some(foot);
+                }
+                // egui's button colours: black on cyan, the bar's when it has the focus (10 §6).
+                let pen = if ctx.memory(|m| m.has_focus(id)) {
+                    Pen::new(p.bar_text, p.bar)
+                } else {
+                    Pen::new(p.dialog_text, p.dialog_back)
+                };
+                cells::put(buf, x(c), y, &label, w, pen);
+            }
+            c += w + GAP;
         }
-        x += w + cw;
-    }
-    let hint_cells = ((rect.right() - x - cw) / cw).floor().max(0.0) as usize;
-    if hint_cells > 0 {
-        foot_painter.text(
-            Pos2::new(x + cw, y),
-            egui::Align2::LEFT_TOP,
-            fit(&hint(), hint_cells),
-            font.clone(),
-            LOOK.dim,
-        );
+        put(buf, y, c, chars.saturating_sub(c), &hint(wide), dim);
     }
     clicked
 }
 
-/// Whether [`draw`] paints the planner's cells (10 §17, X4-graph's seam): not yet — egui draws it
-/// at `grid.rect(cells)`, its scroll bar in its own last column, and the panel leaves
-/// those cells to `term::compose` (a hand-off box in a terminal) until X4-planner makes it `true`.
-pub(super) const PAINTS_CELLS: bool = false;
+/// Whether [`draw`] paints the planner's cells (10 §17, X4-graph's seam): it does (X4-planner) —
+/// the pane is cells in the panel's buffer; its own dialogs are still egui's (X4-planner2).
+pub(super) const PAINTS_CELLS: bool = true;
 
-/// The planner at cells `cells` of `grid` (the git panel's body; `buf` the panel's buffer, for its
-/// cells once it paints them, [`PAINTS_CELLS`]), one pass, its own dialogs on `grid`: its keys
-/// first while it has the keyboard (`active`) and no dialog of its own was up when the pass
-/// began — so a key that
-/// closes a dialog never acts on the pane too — then the pane, then its dialog. While it is
-/// active or a dialog of its own is up it swallows every typed character, so no typed letter
-/// reaches the git context's Find. `seams` are `Model::apply`, `changed`, `problems` and
+/// The planner at cells `cells` of `grid` (the git panel's body), painted into `buf` (the panel's
+/// buffer, painted once by the panel), one pass, its own dialogs on `grid`: its keys first while
+/// it has the keyboard (`active`) and no dialog of its own was up when the pass began — so a key
+/// that closes a dialog never acts on the pane too — then the pane ([`paint`]), then its dialog.
+/// While it is active or a dialog of its own is up it swallows every typed character, so no typed
+/// letter reaches the git context's Find. `seams` are `Model::apply`, `changed`, `problems` and
 /// `rebase::plan` ([`SEAMS`]).
 pub fn draw(
     ui: &mut egui::Ui,
     grid: &Grid,
     cells: Cells,
-    _buf: &mut Buffer,
+    buf: &mut Buffer,
     view: &mut PlannerView,
     active: bool,
     seams: &Seams,
 ) -> Option<PlannerEnd> {
-    let rect = grid.rect(cells);
     let ctx = ui.ctx().clone();
     let mut end = None;
     if active && view.inner.is_none() {
@@ -1630,7 +1706,7 @@ pub fn draw(
     }
     if end.is_none() {
         let problems = (seams.problems)(&view.model, &view.repo);
-        let clicked = paint(ui, rect, view, active, &problems);
+        let clicked = paint(ui, grid, cells, buf, view, active, &problems);
         if view.inner.is_none() {
             match clicked {
                 Some(Foot::Run) => view.ask_run(),
