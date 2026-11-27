@@ -26,12 +26,15 @@
 //!   it ends on (the layout gives it that occupancy's), so where it joins a line passing by the
 //!   two are one colour — but on the dotted line, which is dim, as the uncommitted row's node is
 //!   (egui's too). A join a longer lane change goes on past is `┼`, as a crossing is: only that
-//!   colour tells them apart, and two lanes five apart share it (03 §4.3's limit).
+//!   colour tells them apart, and two lanes share it when their occupancies began a multiple of
+//!   five apart in turn (03 §4.3's colour index), adjacent lanes too — about one such join in
+//!   five (03 §4.3's limit).
 //! - **The cut** (03 §4.2): a row with a piece on a lane past those shown has `»` in the cut's
 //!   first cell, dim, as `lanes_of` marks it; the pieces stop at the column's edge. A column of no
 //!   cells (a panel under 6 cells wide) has no `»` either, where `lanes_of` paints one over the
-//!   description. Nothing past the lanes shown is drawn, so a call's work is bounded by the
-//!   column, not by the history's width.
+//!   description. Nothing past the lanes shown is drawn: a call's cells, and each piece's draws,
+//!   are bounded by the column; a piece past the shown lanes costs one count, not a run of cells
+//!   (the pass-throughs and the row's segments are still visited).
 //! - **An ambiguous-wide terminal** (`wide`, 10 §10, T38) gets §10's stand-ins here, at the
 //!   source, as the viewers' own glyphs do: `| - +` for box lines, `#` for `■`, `.` for `≡` and
 //!   `○`; `◙`, `»` and `:` are narrow and stay.
@@ -128,9 +131,10 @@ const ACROSS: [bool; 4] = [false, false, true, true];
 /// list of `cols.graph` cells for each row, `None` where a cell is blank. `wide`: the cells go to
 /// an ambiguous-wide terminal (10 §10), which gets the stand-ins.
 ///
-/// Its work is bounded by the column, not by the history's width: only the lanes shown have
-/// cells, a lane change is drawn only across them, and a piece on a lane past them only marks its
-/// row as cut.
+/// Its cells, and each piece's draws, are bounded by the column: only the lanes shown have cells,
+/// a lane change is drawn only across them, and a piece past the shown lanes costs one count, not
+/// a run of cells — it only marks its row as cut. The pass-throughs and the row's segments are
+/// still visited.
 pub fn rows(
     graph: &Graph,
     rows: Range<usize>,
@@ -140,6 +144,10 @@ pub fn rows(
     let end = rows.end.min(graph.len());
     let start = rows.start.min(end);
     let lanes = cols.lanes;
+    debug_assert!(
+        2 * lanes as usize <= cols.graph,
+        "Columns::new's lanes fit its column"
+    );
     let shown = (2 * lanes as usize).min(cols.graph);
     let mut ink = vec![vec![Ink::Blank; shown]; end - start];
     work(shown * (end - start));

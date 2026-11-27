@@ -947,7 +947,8 @@ cut).**
   drawn last — in egui's order (lines passing by, then lane changes, then the node), lane changes
   among themselves longest first, as egui's diagonals share no stretch — so a line's colour changes
   where it turns; a join a longer lane change goes on past is told from a crossing by colour alone,
-  which two lanes five apart share (03 §4.3–§4.4, §6).
+  which two lanes share when their occupancies began a multiple of five apart in turn (03 §4.3's
+  colour index), adjacent lanes too — about one such join in five (03 §4.3–§4.4, §6).
 - **03 §10.2's frame-title hover vs §6** (found cutting X4, 2026-11-27). 03 §10.2 put the host's
   git version "on the frame title's hover"; a frame in cells has no hover (§6: nothing changes
   under the pointer), and the panel drew none (no hover on its frame in `git_panel/`). 03 §10.2

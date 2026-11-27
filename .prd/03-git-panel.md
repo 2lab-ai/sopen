@@ -412,10 +412,11 @@ in, then the one going down; egui's diagonals share no stretch, so it has no suc
 is the crossing line's colour and a stretch two lane changes share the nearer lane's, so a line's
 colour changes where it turns. **A limit**: where a longer lane change goes on past a join onto a lane
 passing by (a merge whose parents two lanes on one side await), the join is `┼`, as a crossing is,
-told apart only by its colour, the joined lane's; where the two lanes share a colour (five apart, the
-cycle's length) the row reads as a crossing. One row a commit has no room to show more; the details
-pane lists the parents (§6.1). Until X4-graph draws these cells, the window's egui graph still draws a
-lane change as one diagonal across half a row, and the uncommitted row's line dashed.
+told apart only by its colour, the joined lane's; where the two lanes share a colour — their
+occupancies began a multiple of five apart in turn (the colour index above), adjacent lanes too, so
+about one such join in five — the row reads as a crossing. One row a commit has no room to show more;
+the details pane lists the parents (§6.1). Until X4-graph draws these cells, the window's egui graph
+still draws a lane change as one diagonal across half a row, and the uncommitted row's line dashed.
 
 - **Measured** with these rules (a script over `git log --parents`, 2026-11-20): the 100 000-commit
   fixture of §4.5 has at most 2 slots, 2.0 node segments per row; a wide fixture (60 branches committed

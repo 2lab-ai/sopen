@@ -208,10 +208,13 @@ fn a_merge_goes_down_into_a_lane_passing_on_its_right() {
 }
 
 /// A join a longer lane change goes on past is `┼`, as a crossing is; only its colour, the
-/// joined lane's, tells them apart (03 §4.3), so where the two lanes share one — five apart, the
-/// lane colours' cycle — the rows read the same. `m`'s line to `a` crosses lanes 1–5; with `f` as
-/// a parent too it also joins lane 5, whose colour is lane 0's, and every row is drawn as before.
-/// With `e` instead (lane 4, white) the stretch from the join to the node is white.
+/// joined lane's, tells them apart (03 §4.3), so where the two lanes share one — their
+/// occupancies began a multiple of five apart in turn (03 §4.3's colour index), adjacent lanes
+/// too — the rows read the same. `m`'s line to `a` crosses lanes 1–5; with `f` as a parent too it
+/// also joins lane 5, whose colour is lane 0's, and every row is drawn as before. With `e` instead
+/// (lane 4, white) the stretch from the join to the node is white. Adjacent lanes collide too:
+/// four roots reopen lane 1 in turn, so `y`'s occupancy is the sixth, lane 0's colour, and `m`
+/// joining it reads as `m` crossing it.
 #[test]
 fn a_join_a_line_goes_on_past_is_told_from_a_crossing_by_colour_alone() {
     let lines = "x0:a x1:b x2:c x3:d x4:e x5:f m:z,a z:a a: b: c: d: e: f:";
@@ -265,6 +268,36 @@ fn a_join_a_line_goes_on_past_is_told_from_a_crossing_by_colour_alone() {
     let white = layout(&commits(&lines.replace("m:z,a ", "m:z,a,e ")), false);
     assert_eq!(drawn(&white, &cols, false)[6], "├─┼─┼─┼─┼─┼─■ ");
     assert_eq!(coloured(&white, &cols, false)[6], "ccccccccwwwwy ");
+
+    let adjacent = "x:a q1: q2: q3: q4: y:b m:z,a,b z:a a:b b:";
+    let joining = check(
+        &commits(adjacent),
+        false,
+        &[
+            "■     ",
+            "│ ■   ",
+            "│ ■   ",
+            "│ ■   ",
+            "│ ■   ",
+            "│ ■   ",
+            "├─┼─■ ",
+            "│ │ ■ ",
+            "■─┼─┘ ",
+            "■─┘   ",
+        ],
+        Some(&[
+            "c     ", "c y   ", "c g   ", "c m   ", "c w   ", "c c   ", "ccccy ", "c c y ",
+            "cyyyy ", "ccc   ",
+        ]),
+    );
+    let crossing = layout(&commits(&adjacent.replace("m:z,a,b ", "m:z,a ")), false);
+    assert_eq!(crossing.segments(6).len() + 1, joining.segments(6).len());
+    let cols = every_lane(&joining);
+    let row_m = |graph: &Graph| {
+        let cells = rows(graph, 6..7, &cols, false);
+        (text(&cells[0]), letters(&cells[0]))
+    };
+    assert_eq!(row_m(&crossing), row_m(&joining));
 }
 
 /// A parent not loaded: its lane runs to the bottom of the loaded rows.
