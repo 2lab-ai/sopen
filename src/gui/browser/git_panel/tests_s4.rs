@@ -95,14 +95,14 @@ fn find(c: char) -> Commit {
 }
 
 /// The planner's model above `a`: `e` `d` `c` `b`, newest first, each a `pick`.
-fn model() -> Model {
+pub(super) fn model() -> Model {
     let mut rows = chain();
     rows.pop();
     Model::new(Base::Commit(oid('a')), rows)
 }
 
 /// `main` checked out at `e`, a clean work tree. The one place a `Repo` is built.
-fn repo() -> Repo {
+pub(super) fn repo() -> Repo {
     Repo {
         top: "/srv/sopen".into(),
         git_dir: "/srv/sopen/.git".into(),

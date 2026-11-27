@@ -2344,7 +2344,10 @@ impl Browser {
             self.git.focus = true;
         }
         let active = self.git.focus && side == 1 - self.active && self.viewer.is_none();
-        let under = self.ops.covered(grid);
+        // Under the list's dialogs, and under the other git panel's when two repositories' panels
+        // stand side by side (a pin and the other side's own; its own covers twice is harmless).
+        let mut under = self.ops.covered(grid);
+        under.extend(self.git_covered(grid));
         let view = &mut self.git.panels[i].view;
         let mut actions = git_panel::draw(ui, grid, cells, view, active, &under);
         if self.ops.holds_keyboard() || self.tree.is_some() {

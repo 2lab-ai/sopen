@@ -478,6 +478,78 @@ fn q1_tab_and_clicks_move_the_keyboard_between_the_cell_list_and_the_git_panel()
     assert!(!whole(&g), "the control: a side again");
 }
 
+/// X4-graph (review round 1): the cells a pinned git panel's dialog covers are blank in the tree
+/// beside it (F10; a pinned panel stands beside the tree, 02 §3.1) and in the preview — every
+/// side the panel's dialogs stand over (`Browser::git_covered`), as the list's are. The preview
+/// beside a pin on the list's own side is a constructed state: the view's rules give a pinned
+/// side's other side the list (O3), and the preview blanks them all the same.
+#[test]
+fn x4_graph_the_tree_and_the_preview_blank_a_git_panels_dialog() {
+    let Some(git) = crate::git::history::fixture::git() else {
+        return;
+    };
+    let mut g = super::s2::Gx::new(super::s2::small(&git));
+    g.wait_for_the_panel();
+    let gr = grid(1000.0, 700.0);
+    let [left, right] = sides(&gr);
+    let blank = |g: &super::s2::Gx, at: Rect| {
+        (cells_in(&g.fx, at).iter()).all(|(_, t)| t.trim().is_empty())
+    };
+    // The tree on the list's side, the panel pinned beside it.
+    g.cmd(Key::G);
+    g.settle();
+    let _tree = tree_at_root(&mut g.fx);
+    g.key(Key::F10);
+    g.settle();
+    assert!(g.b().tree.is_some(), "F10 opened the tree");
+    assert_eq!(panes(&g.fx), [left, right]);
+    let covered = cells::Cells::new(1, 1, 6, 2);
+    assert!(
+        !blank(&g, gr.rect(covered)),
+        "the control: the tree's rows there"
+    );
+    g.panel_mut().view.test_covers = vec![covered];
+    g.idle(2);
+    assert!(
+        blank(&g, gr.rect(covered)),
+        "{:?}",
+        cells_in(&g.fx, gr.rect(covered))
+    );
+    g.panel_mut().view.test_covers.clear();
+    g.key(Key::F10);
+    g.settle();
+    assert!(g.b().tree.is_none());
+    // The preview of a text file beside the panel pinned on the list's side.
+    g.fx.select("b.txt");
+    g.rest();
+    let top = g.top();
+    g.fx.b.git.pin = Some(view::Pin { side: 0, repo: top });
+    g.rest();
+    assert!(
+        matches!(
+            g.shown(),
+            [view::Content::Git(_), view::Content::Preview(_)]
+        ),
+        "{:?}",
+        g.shown()
+    );
+    // On the preview's frame (its host's cells; the text's own cells inside it are the
+    // viewer's, which no cover blanks yet — not the list's either).
+    let half = gr.cols / 2;
+    let covered = cells::Cells::new(half + 1, 0, 4, 1);
+    assert!(
+        !blank(&g, gr.rect(covered)),
+        "the control: the preview's frame there"
+    );
+    g.panel_mut().view.test_covers = vec![covered];
+    g.idle(2);
+    assert!(
+        blank(&g, gr.rect(covered)),
+        "{:?}",
+        cells_in(&g.fx, gr.rect(covered))
+    );
+}
+
 /// The topmost rectangle the last pass filled under `p`: the colour a cell's background is
 /// painted in there.
 fn background_at(fx: &Fx, p: Pos2) -> Option<egui::Color32> {

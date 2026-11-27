@@ -392,17 +392,39 @@ fn own(glyph: char, wide: bool) -> String {
 
 /// A label as a row shows it in at most `room` cells' worth of characters ([`capped`]), its
 /// control characters escaped: in an ambiguous-wide terminal the `↔` that joins a local branch to
-/// its remotes is §10's stand-in — the panel's own glyph — while the names stay as written.
-fn label_text(label: &Label, room: usize, wide: bool) -> String {
-    let text: Cow<str> = match label.joined.filter(|_| wide) {
+/// its remotes is §10's stand-in — the panel's own glyph — while the names stay as written. Only
+/// the shown start is built, the joiner substituted there when it is in it, so a pass costs the
+/// room, never a copy of the whole name (review round 1).
+pub(super) fn label_text(label: &Label, room: usize, wide: bool) -> String {
+    // `capped` cuts at a character and the joiner is one: it is whole in `shown` or not in it.
+    let shown = capped(&label.text, room);
+    let shown = match label.joined.filter(|&at| wide && at < shown.len()) {
         Some(at) => {
-            let mut s = label.text.clone();
+            let mut s = shown.into_owned();
+            copied(s.len());
             s.replace_range(at..at + look::BOTH.len_utf8(), &own(look::BOTH, wide));
             Cow::Owned(s)
         }
-        None => Cow::Borrowed(&label.text),
+        None => shown,
     };
-    printable(&capped(&text, room)).into_owned()
+    let out = printable(&shown).into_owned();
+    copied(out.len());
+    out
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bytes [`label_text`] has copied on this thread: its work, which the tests bound by the
+    /// room a label has, however long its name.
+    pub(super) static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `bytes` copied ([`COPIED`], in the tests only).
+fn copied(bytes: usize) {
+    #[cfg(test)]
+    COPIED.with(|c| c.set(c.get() + bytes));
+    #[cfg(not(test))]
+    let _ = bytes;
 }
 
 /// `list` in cells `area` of `buf` (on `grid`): its column heads in `head` (none while Find's

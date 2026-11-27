@@ -195,7 +195,7 @@ fn whole_ui(ctx: &egui::Context, _grid: Grid, entry: &LogEntry) -> bool {
 }
 
 /// Whether [`draw`] paints the log's cells (10 §17, X4-graph's seam): not yet — egui draws it at
-/// `grid.rect(cells)`, its scroll bar on the border cell right of them, and the panel leaves
+/// `grid.rect(cells)`, its scroll bar in its own last column, and the panel leaves
 /// those cells to `term::compose` (a hand-off box in a terminal) until X4-lists makes it `true`.
 pub(super) const PAINTS_CELLS: bool = false;
 

@@ -312,20 +312,26 @@ fn labels_stop_with_plus_n_and_the_label_cursor_swaps_colours() {
         refs.push(label(&format!("refs/tags/release-{k}"), 9, None));
     }
     view.set_refs(refs, HeadRef::Branch("refs/heads/main".into()));
-    // 40 cells inside: the description keeps 16 less the graph's.
+    // 40 cells inside, five lanes (10 cells, under a third): Date and Author dropped, Commit
+    // kept (9 cells with its blank), so the description holds 40 - 10 - 9 = 21 cells.
     let mut fx = Fx::new(42.0 * 8.0, 400.0, view);
+    assert_eq!(fx.view().graph().width(), 5);
+    let cols = columns(&fx);
+    assert_eq!((cols.graph, cols.desc_w), (10, 21));
+    // The merge's seven labels: `►main↔origin,up` (15 cells) and `release-0` … `release-5` (9
+    // each). The first fits with room kept for `+6` (15 + 1 + 2 ≤ 21); the second does not
+    // (16 + 9 + 1 + 2 > 21): `+6`, and no subject.
     let y = y_of(&fx, 1);
-    let row = line(&fx, y);
-    let plus = row.find('+').expect("+N");
-    let n: String = row[plus + 1..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    let n: usize = n.parse().unwrap();
-    let all = fx.view().labels_of(&fx.view().rows()[1]).len();
-    let shown = all - n;
-    assert!(shown >= 1 && n >= 1, "{row:?}");
-    let px = at(&fx, y, &format!("+{n}")).unwrap();
+    let desc = 1 + cols.desc as u16;
+    let shown = text(&fx, y, desc, desc + 21);
+    assert_eq!(
+        shown,
+        format!("{:<21}", "►main↔origin,up +6"),
+        "{:?}",
+        line(&fx, y)
+    );
+    let px = at(&fx, y, "+6").unwrap();
+    assert_eq!(px, desc + 16);
     assert_eq!(cell(&fx, px, y).fg, Some(LOOK.dim));
     // The bar on the merge, the cursor on its first label.
     fx.press(Key::ArrowDown);
@@ -531,14 +537,16 @@ fn clicks_and_the_right_click_go_by_cells() {
         Some(PALETTE.bar),
         "the bar's cells"
     );
-    // Two clicks on two rows in one pass: the last one's row.
+    // Two clicks on two rows in one pass: egui keeps one press a pass, the last one's place
+    // (its `press_origin`), so the bar goes to the second click's row, row 7 — never row 5,
+    // and never a row between.
     let (a, b) = (centre(&fx, 40, y_of(&fx, 5)), centre(&fx, 40, y_of(&fx, 7)));
     let mut events = click_events(a, PointerButton::Primary);
     events.extend(click_events(b, PointerButton::Primary));
     fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
     fx.idle();
-    let (bar, _) = fx.view().bar_place();
-    assert!(bar == 5 || bar == 7, "a row clicked in that pass: {bar}");
+    assert_eq!(fx.view().bar_place().0, 7, "the second click's row");
+    assert_eq!(cell(&fx, 40, y_of(&fx, 7)).bg, Some(PALETTE.bar));
     // A double click on row 2 right after a click on row 7: the details pane of row 2 (egui
     // alone counts it a triple click; the list's and the tree's rule, `second_click`).
     let c = centre(&fx, 40, y_of(&fx, 2));
@@ -934,4 +942,129 @@ mod ts4 {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1.
+
+/// The cells the composed screen leaves to hand-off boxes, inside the panel's grid.
+fn boxes(fx: &Fx) -> Vec<Cells> {
+    let g = grid_of(fx);
+    let layers = cells::layers(&fx.drv.ctx);
+    let screen = crate::gui::term::compose(&fx.drv.ctx, &layers, g.cols, g.rows);
+    screen
+        .hand_offs
+        .into_iter()
+        .filter(|r| r.y < g.rows)
+        .collect()
+}
+
+/// R1 MUST 1: the log, the Backups list and the planner draw their egui scroll bar inside their
+/// own cells, so the frame's right border stays the panel's on every body row (`║` in the window
+/// and the terminal), and the box a terminal shows is exactly their cells: the heads' row and the
+/// body. The details pane, whose scroll bar egui draws on the border, takes the border cell too.
+#[test]
+fn the_log_backups_and_planner_leave_the_frames_right_border() {
+    for open in ["log", "backups", "planner"] {
+        let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+        let v = fx.view_mut();
+        match open {
+            "log" => v.open_log(vec![super::tests_s3::entry(
+                "git fetch",
+                crate::git::runner::Ending::Exit(0),
+                "",
+                0,
+            )]),
+            "backups" => v.open_backups(super::tests_s3::records()),
+            _ => {
+                v.set_repo(super::tests_s4::repo());
+                v.open_planner(super::tests_s4::model());
+            }
+        }
+        fx.idle();
+        fx.idle();
+        let g = grid_of(&fx);
+        let (w, h) = (g.cols, g.rows);
+        for y in 1..h - 3 {
+            assert_eq!(cell(&fx, w - 1, y).symbol, "║", "{open}: row {y}");
+            assert_eq!(cell(&fx, 0, y).symbol, "║", "{open}: row {y}");
+        }
+        assert_eq!(boxes(&fx), [Cells::new(1, 1, w - 2, h - 4)], "{open}");
+    }
+}
+
+/// R1 MUST 2: a panel too short for its parts still runs those that hold the keyboard: the log's
+/// entry shown whole closes with Esc, and text typed into an open Find goes into it, the bar on
+/// the match.
+#[test]
+fn a_panel_too_short_still_runs_the_logs_entry_and_find() {
+    let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+    fx.view_mut().open_log(vec![super::tests_s3::entry(
+        "git fetch origin",
+        crate::git::runner::Ending::Exit(1),
+        "fatal: no",
+        0,
+    )]);
+    fx.idle();
+    fx.press(Key::Enter);
+    assert!(fx.view().dialog_up(), "the entry shown whole");
+    // Four rows of grid: the frame and two rows inside, no room for the heads, rule and foot.
+    fx.drv.resize(1000.0, 80.0);
+    fx.idle();
+    fx.idle();
+    assert_eq!(grid_of(&fx).rows, 4);
+    // Drawn (the window is shorter than the dialog: part of it is off the window).
+    let drawn = |fx: &Fx| fx.drv.texts().iter().any(|(_, _, t)| t == "Command");
+    assert!(drawn(&fx), "the entry still shows");
+    fx.press(Key::Escape);
+    assert!(!fx.view().dialog_up(), "Esc closed it");
+    assert!(!drawn(&fx));
+    // Find in the short panel.
+    fx.press(Key::Escape);
+    assert!(fx.view().log_newest().is_none(), "the log closed");
+    fx.typed("y");
+    assert_eq!(fx.view().find_text(), Some("y"));
+    fx.typed(":");
+    assert_eq!(fx.view().find_text(), Some("y:"), "typed into the field");
+    assert_eq!(
+        fx.view().bar_place().0,
+        index_of(&fx, "y: one"),
+        "the bar on the match"
+    );
+}
+
+/// R1 MUST 3: a label's text in an ambiguous-wide terminal costs the room it is shown in, never
+/// a copy of the whole name: only the shown start is built, its joiner substituted there.
+#[test]
+fn a_long_joined_label_costs_its_room_only() {
+    let long = format!("►{}↔origin", "b".repeat(100_000));
+    let joined = long.find('↔');
+    let label = Label {
+        text: long.clone(),
+        kind: LabelKind::CheckedOut,
+        lossy: false,
+        joined,
+    };
+    let short = Label {
+        text: "►main↔origin,up".into(),
+        kind: LabelKind::CheckedOut,
+        lossy: false,
+        joined: "►main↔origin,up".find('↔'),
+    };
+    let copied = |f: &dyn Fn() -> String| {
+        graph_view::COPIED.with(|c| c.set(0));
+        let out = f();
+        (out, graph_view::COPIED.with(|c| c.get()))
+    };
+    for wide in [false, true] {
+        let (out, bytes) = copied(&|| graph_view::label_text(&label, 30, wide));
+        assert_eq!(out.chars().count(), 31, "the room and one more: {out:?}");
+        assert!(bytes <= 4 * 31 * 2, "{wide}: {bytes} bytes copied");
+    }
+    let (out, _) = copied(&|| graph_view::label_text(&short, 30, true));
+    assert_eq!(out, "►main-origin,up", "the joiner's stand-in");
+    let (out, _) = copied(&|| graph_view::label_text(&short, 30, false));
+    assert_eq!(out, "►main↔origin,up");
+    let (out, _) = copied(&|| graph_view::label_text(&short, 3, true));
+    assert_eq!(out, "►mai", "a joiner past the room: not built");
 }

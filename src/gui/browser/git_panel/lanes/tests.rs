@@ -691,8 +691,8 @@ fn every_side(graph: &Graph, cells: &[Vec<Option<Cell>>]) -> Vec<Vec<[bool; 4]>>
     cells.iter().enumerate().map(row).collect()
 }
 
-/// Whether row `i` has a piece on a lane at or past `lanes`: what `graph_view::lanes_of` marks
-/// with the cut.
+/// Whether row `i` has a piece on a lane at or past `lanes`: what the cut marks (as the egui
+/// graph's `lanes_of` did, before X4-graph).
 fn past(graph: &Graph, i: usize, lanes: u32) -> bool {
     graph.row(i).column >= lanes
         || graph.segments(i).iter().any(|s| s.slot >= lanes)
@@ -704,8 +704,8 @@ fn past(graph: &Graph, i: usize, lanes: u32) -> bool {
 /// ambiguous-wide terminal, none of ambiguous width; a lane's second cell holds only a lane
 /// change's line; lines meet across cells and rows; the visible rows' cells are those of the
 /// whole, and the first rows' those of all rows (paging never redraws the rows above); a narrower
-/// column only cuts, with `»` where `lanes_of` puts it — in the column: one of no cells has none,
-/// where `lanes_of` paints it over the description.
+/// column only cuts, with `»` where `lanes_of` put it — in the column: one of no cells has none,
+/// where `lanes_of` painted it over the description.
 #[test]
 fn properties_over_a_thousand_graphs() {
     let mut rng = Lcg(0x5eed_1a9e);

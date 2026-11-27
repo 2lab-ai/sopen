@@ -1165,7 +1165,7 @@ fn a_restore_never_writes_over_anything_unless_chosen() {
 // ---------------------------------------------------------------------------------------------
 // The result dialog (03 §3.8, §8.3).
 
-fn entry(line: &str, ending: Ending, stderr: &str, secs: u64) -> LogEntry {
+pub(super) fn entry(line: &str, ending: Ending, stderr: &str, secs: u64) -> LogEntry {
     LogEntry {
         time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_794_389_040 + secs),
         host: "box".into(),
@@ -1272,7 +1272,7 @@ fn the_result_dialog_lists_each_step_and_the_error() {
 // ---------------------------------------------------------------------------------------------
 // The Backups list (03 §8.2, §9.2).
 
-fn records() -> Vec<Record> {
+pub(super) fn records() -> Vec<Record> {
     let group = |stamp: &str, message: &str, refs: Vec<(BackupKind, &str, char, &str)>| Record {
         group: Backup {
             stamp: stamp.into(),

@@ -2762,8 +2762,9 @@ impl Layout {
     }
 }
 
-/// `c` and the border cell right of it on each of its rows, where a part egui draws puts its
-/// scroll bar.
+/// `c` and the border cell right of it on each of its rows, where the details pane egui draws
+/// puts its scroll bar (`details::draw`; the log, the Backups list and the planner put theirs in
+/// their own last column).
 fn with_border(c: Cells) -> Cells {
     Cells::new(c.x, c.y, c.width.saturating_add(1), c.height)
 }
@@ -2863,18 +2864,18 @@ pub fn draw(
                 )
             });
             if !planner::PAINTS_CELLS {
-                eguis.push(with_border(at.listing));
+                eguis.push(at.listing);
             }
             asked.extend(view.planner_end(end));
         } else if let Some(log) = &mut view.log {
             log_view::draw(ui, grid, at.listing, &mut buf, log, active && !dialog);
             if !log_view::PAINTS_CELLS {
-                eguis.push(with_border(at.listing));
+                eguis.push(at.listing);
             }
         } else if let Some(list) = &mut view.backups {
             let end = backups::draw(ui, grid, at.listing, &mut buf, list, active && !dialog);
             if !backups::PAINTS_CELLS {
-                eguis.push(with_border(at.listing));
+                eguis.push(at.listing);
             }
             let end = end.filter(|_| !dialog);
             asked.extend(view.backups_end(end));
@@ -2954,15 +2955,31 @@ pub fn draw(
                 asked.push(GitAction::MoreRows);
             }
         }
-    } else if view.planner.is_some() {
-        // No room for the parts: the planner still takes its own keys (in its draw), at no cells.
+    } else {
+        // No room for the parts: those that hold the keyboard still run, at no cells — the
+        // planner's keys and its dialogs, the log's entry shown whole, Find's field and its bar —
+        // so no key or typing goes nowhere (review round 1).
         let none = Cells::new(inner.x, inner.y, 0, 0);
-        let pane_active = active && !view.other_dialog_up();
-        let end = view
-            .planner
-            .as_mut()
-            .and_then(|p| planner::draw(ui, grid, none, &mut buf, p, pane_active, &planner::SEAMS));
-        asked.extend(view.planner_end(end));
+        if view.planner.is_some() {
+            let pane_active = active && !view.other_dialog_up();
+            let end = view.planner.as_mut().and_then(|p| {
+                planner::draw(ui, grid, none, &mut buf, p, pane_active, &planner::SEAMS)
+            });
+            asked.extend(view.planner_end(end));
+        } else if let Some(log) = &mut view.log {
+            log_view::draw(ui, grid, none, &mut buf, log, active && !dialog);
+        } else if let Some(list) = &mut view.backups {
+            let end = backups::draw(ui, grid, none, &mut buf, list, active && !dialog);
+            let end = end.filter(|_| !dialog);
+            asked.extend(view.backups_end(end));
+        } else if let Some(find) = view.find.as_mut().filter(|_| view.search.is_none()) {
+            caret = find::field(ui, grid, none, &mut buf, find, !dialog);
+            if view.refresh_find() {
+                if let Some(to) = view.find.as_ref().and_then(find::Find::first) {
+                    asked.extend(view.move_bar(to));
+                }
+            }
+        }
     }
     for r in eguis {
         leave_to_egui(&mut buf, r);
