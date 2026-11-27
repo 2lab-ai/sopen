@@ -649,7 +649,8 @@ impl TreeSide {
     /// ([`crate::tree::Tree::in_flight`]: the listings of the screen and of a screen above and
     /// below it, whose sums an open folder on screen shows, the filesystems' figures, the scans),
     /// so the receipt holds final sizes and no moving mark; a request reported not answering is
-    /// left out — it may never answer — and its row is taken saying so. `SOPEN_WATCHDOG` caps
+    /// left out — locally it never answers, remotely it may not before the watchdog — and its row
+    /// is taken saying so. `SOPEN_WATCHDOG` caps
     /// the wait.
     fn settled(&self, whole: bool) -> bool {
         match &self.model {

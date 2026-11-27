@@ -948,21 +948,30 @@ fn a_wheel_in_points_scrolls_by_cells() {
     let mut fx = Fx::new(1000.0, TreeView::new("box:/", long(200), 0));
     let middle = fx.on_screen(10, 10, 1).center();
     fx.drv.move_to(&mut fx.host, middle);
-    let wheel = || Event::MouseWheel {
+    let wheel = |points: f32| Event::MouseWheel {
         unit: egui::MouseWheelUnit::Point,
-        delta: egui::vec2(0.0, -32.0),
+        delta: egui::vec2(0.0, -points),
         phase: egui::TouchPhase::Move,
         source: egui::MouseWheelSource::Unknown,
         modifiers: Modifiers::NONE,
     };
-    fx.drv.frame(&mut fx.host, vec![wheel()], Modifiers::NONE);
+    fx.drv
+        .frame(&mut fx.host, vec![wheel(32.0)], Modifiers::NONE);
     fx.idle();
     assert_eq!((fx.host.view.top, fx.host.view.bar), (2, 0));
-    fx.drv
-        .frame(&mut fx.host, vec![wheel(), wheel()], Modifiers::NONE);
+    fx.drv.frame(
+        &mut fx.host,
+        vec![wheel(32.0), wheel(32.0)],
+        Modifiers::NONE,
+    );
     fx.idle();
     assert_eq!((fx.host.view.top, fx.host.view.bar), (6, 0));
     assert_eq!(fx.find("f005"), Some((4, 0)));
+    // 160 points are ten rows: a cell's 16 points, no other divisor.
+    fx.drv
+        .frame(&mut fx.host, vec![wheel(160.0)], Modifiers::NONE);
+    fx.idle();
+    assert_eq!((fx.host.view.top, fx.host.view.bar), (16, 0));
 }
 
 /// Every glyph of the tree is a VGA font glyph, one cell wide (05:82–83).
@@ -1679,6 +1688,8 @@ mod ts4 {
         real: Arc<dyn Disk>,
         home: String,
         held: Mutex<(HashSet<String>, bool)>,
+        /// The mount table waits, with no beat (a call the watchdog abandons), until released.
+        mounts_held: Mutex<bool>,
         moved: Condvar,
     }
 
@@ -1688,12 +1699,14 @@ mod ts4 {
                 real: LocalFs::disk(),
                 home: home.to_string(),
                 held: Mutex::new((paths.iter().cloned().collect(), scans)),
+                mounts_held: Mutex::new(false),
                 moved: Condvar::new(),
             })
         }
 
         fn release(&self) {
             *self.held.lock().unwrap() = (HashSet::new(), false);
+            *self.mounts_held.lock().unwrap() = false;
             self.moved.notify_all();
         }
     }
@@ -1732,6 +1745,11 @@ mod ts4 {
         }
 
         fn mounts(&self) -> std::io::Result<Mounts> {
+            let mut held = self.mounts_held.lock().unwrap();
+            while *held {
+                held = self.moved.wait(held).unwrap();
+            }
+            drop(held);
             self.real.mounts()
         }
 
@@ -1804,8 +1822,20 @@ mod ts4 {
         whole: bool,
         keys: &str,
     ) -> (Browser, TreePool) {
+        browser_timed(h, disk, host, whole, keys, Timing::default())
+    }
+
+    /// [`browser`] with its tree's pool on `timing` (a shorter watchdog).
+    fn browser_timed(
+        h: &Home,
+        disk: Arc<dyn Disk>,
+        host: &str,
+        whole: bool,
+        keys: &str,
+        timing: Timing,
+    ) -> (Browser, TreePool) {
         let mut b = Browser::new(start(h));
-        let pool = Pool::new(Timing::default());
+        let pool = Pool::new(timing);
         let p = pool.clone();
         let connect: TreeConnect =
             Arc::new(move |_: &AtomicBool| Ok((LocalFs::tree_with(disk.clone(), p.clone()), None)));
@@ -2177,6 +2207,35 @@ mod ts4 {
             .unwrap();
             assert_eq!(seen, Some(want));
         }
+    }
+
+    /// Fix-check of review round 1: a local call the watchdog abandons never answers (its late
+    /// answer is dropped, `tree/watchdog.rs`), so its not-answering report is its last and it is
+    /// no request on its way. Here the mount table never comes: the tree goes on without one (an
+    /// empty table, `Tree::apply`), and a `SOPEN_CELLS` run settles with its rows — it does not
+    /// wait for its watchdog.
+    #[test]
+    fn a_cells_run_settles_past_a_local_call_the_watchdog_abandoned() {
+        let h = home();
+        let disk = HoldDisk::new(&h.root, &[], false);
+        *disk.mounts_held.lock().unwrap() = true;
+        let timing = Timing {
+            watchdog: Duration::from_millis(300),
+            tick: Duration::from_millis(10),
+            progress: Duration::from_millis(100),
+        };
+        let (mut b, _p) = browser_timed(&h, disk.clone(), "x4-tree-abandoned", true, "F10", timing);
+        let mut drv = Driver::new(1000.0, 700.0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(b.ready() && b.tree.is_some()) {
+            drv.idle(&mut b, 1);
+            std::thread::sleep(Duration::from_millis(5));
+            assert!(Instant::now() < deadline, "the cells run settles");
+        }
+        let t = b.tree.as_ref().unwrap();
+        assert!(t.view.rows.iter().any(|r| r.name == "프로젝트"), "its rows");
+        assert!(!model(&mut b).in_flight());
+        disk.release();
     }
 
     /// X4-tree, AGENTS.md: a `SOPEN_CELLS` run whose tree never settles — a scan that never
