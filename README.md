@@ -23,7 +23,7 @@ sopen myserver:/tmp/a.mp3          # audio → play, cut / copy / paste, mono �
 sopen stems myserver:/tmp/a.mp3    # voice and music → two new files next to it
 sopen myserver:/tmp/a.zip          # anything else → asks: hex editor (default) or save it to a path
 sopen --target <host> myserver:/tmp/a.mp3   # the same, on <host>'s screen instead of this one
-sopen --target <host> http://127.0.0.1:1234/  # this machine's web page in <host>'s browser, tunnelled
+sopen --target <host> http://127.0.0.1:1234/  # this machine's web page in xtools on <host>, tunnelled
 ```
 
 Same syntax as `scp`. Uses your `ssh` and `~/.ssh/config`; the remote needs nothing but sshd.
@@ -138,13 +138,17 @@ Details: [docs/tui.md](docs/tui.md).
 sopen --target <host> myserver:/tmp/a.html    # opens on <host>'s screen (sopen runs there, over ssh)
 sopen config target <host>                    # from now on `sopen SOURCE` opens on <host>
 sopen --here myserver:/tmp/a.html             # …but this one here
-sopen --target <host> http://127.0.0.1:1234/  # a page served here, opened on <host> through an ssh tunnel
+sopen --target <host> http://127.0.0.1:1234/  # a page served here, in xtools on <host> through an ssh tunnel
 ```
 
 Type on one machine, see it on another: `<host>` runs its own installed sopen with `--here`, and
-the file's remote still needs only sshd. An `http://` or `https://` address opens in the default
-browser of the machine that shows things; with a target, a loopback one (`localhost`, `127.x.y.z`,
-`[::1]`) is served from this machine through an ssh tunnel of its own, closed when this sopen ends.
+the file's remote still needs only sshd. An `http://` or `https://` address opens in an xtools
+window on the machine that shows things — its scripts on (`F2` turns them off), kept to the
+address's origin, a link clicked elsewhere handed to the default browser — and `sopen` returns when
+the window is closed; `--browser` opens the default browser instead, as does a machine with no
+display or no web engine (on Linux, until sopen's Linux web engine lands, after one line saying
+so). With a target, a loopback one (`localhost`, `127.x.y.z`, `[::1]`) is served from this machine
+through an ssh tunnel of its own, closed when this sopen ends or the window there is closed.
 
 ```sh
 sopen --tui --target <host> ~/src   # the file browser here; F12 moves it to a window on <host>

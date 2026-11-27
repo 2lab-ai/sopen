@@ -37,12 +37,13 @@ const EXIT_CONFLICT: u8 = 3;
         present, otherwise Zed; images, video and audio in an xtools window. Any other file (a \
         zip, a binary) asks first: open it in the xtools hex editor (the default) or save it to a \
         path you choose. --hex opens any file in \
-        the hex editor. An http:// or https:// address opens in the default browser.\n\n\
+        the hex editor. An http:// or https:// address opens in an xtools window (--browser: the \
+        default browser).\n\n\
         It opens on this machine, or with --target HOST on HOST's screen (sopen runs there, \
         started over ssh). SOPEN_TARGET or `sopen config target HOST` make a HOST the default; \
         --here opens on this machine anyway. A loopback address (localhost, 127.0.0.1, [::1]) \
         opens on HOST through an ssh tunnel from this machine that closes when sopen ends \
-        (Ctrl-C).\n\n\
+        (Ctrl-C) or its window there is closed.\n\n\
         `sopen channel` shows the release channel (stable or preview) and `sopen channel \
         stable|preview` switches it; `sopen update` updates sopen on its channel — both \
         through Homebrew. A file named like a command (cut, stems, config, channel, update) is \
@@ -662,10 +663,10 @@ fn run_source(
     Ok(code)
 }
 
-/// `sopen URL` (spec §4a): opened in this machine's browser; with a HOST, in HOST's — a
-/// loopback address served from here through a tunnel that lives as long as this sopen, any
-/// other passed to HOST's sopen as it is. `browser` (`--browser`, 09 §7) goes to HOST's sopen on
-/// both routes; here the system browser is the only route there is yet. `gui` (`--gui`) stays
+/// `sopen URL` (spec §4a, 09 §7): opened here ([`open_url`]: an xtools window); with a HOST, on
+/// HOST — a loopback address served from here through a tunnel that lives as long as this sopen
+/// (or HOST's window), any other passed to HOST's sopen as it is. `browser` (`--browser`) is the
+/// system browser, as before 09, and goes to HOST's sopen on both routes. `gui` (`--gui`) stays
 /// here, never forwarded with an address (10 §11 row 4): here it asks for a display.
 #[allow(clippy::too_many_arguments)]
 fn run_url(
@@ -683,11 +684,7 @@ fn run_url(
 ) -> Result<u8> {
     for (given, flag_name) in [(app_name.is_some(), "--app"), (hex, "--hex")] {
         if given {
-            return Err(Usage(format!(
-                "{flag_name} opens a file; {} is an address (it opens in the browser)",
-                sopen::url::redacted(source)
-            ))
-            .into());
+            return Err(Usage(address_not_a_file(flag_name, source, browser)).into());
         }
     }
     let url = url.map_err(|why| anyhow::anyhow!("not an address sopen can open: {why}"))?;
@@ -702,7 +699,7 @@ fn run_url(
             if gui {
                 window_here(gui::display_available())?;
             }
-            return open_url(&url, hold).map(|()| 0);
+            return open_url(&url, hold, browser, dirs).map(|()| 0);
         }
     };
     rec.target = Some(host.clone());
@@ -719,19 +716,55 @@ fn run_url(
     }
 }
 
-/// Opens `url` in this machine's browser and says so. With `hold` (HOST's half of a tunnel) it
-/// first checks that the tunnel's port — the address's — listens on loopback only here, and
-/// refuses otherwise; then says [`sopen::url::TUNNEL_OPEN`] and waits for the input's end —
-/// the other side's sopen ending, however it ends. It opens the system browser, `--browser` or
-/// not: it never says [`sopen::url::TUNNEL_WINDOW`], so the other side says today's line (09 §7,
-/// whose window is WV-E2's).
-fn open_url(url: &sopen::url::Url, hold: bool) -> Result<()> {
+/// `--app` / `--hex` (`flag_name`) given an address: the usage line, saying where it opens.
+fn address_not_a_file(flag_name: &str, source: &str, browser: bool) -> String {
+    let opens = match browser {
+        true => "the system browser",
+        false => "an xtools window",
+    };
+    format!(
+        "{flag_name} opens a file; {} is an address (it opens in {opens})",
+        sopen::url::redacted(source)
+    )
+}
+
+/// Opens `url` on this machine (09 §7): in an xtools window, until it is closed — or, with
+/// `browser` (`--browser`) or no display here, in the system browser as before 09; and so after
+/// §4's line when this process has no web engine (the window's view not made included). With
+/// `hold` (HOST's half of a tunnel) it first checks that the tunnel's port — the address's —
+/// listens on loopback only here, and refuses otherwise. The window then says the window cue,
+/// the open cue and, closed here, the closed cue, and closes at the input's end
+/// ([`address::run`]); the system browser says [`sopen::url::TUNNEL_OPEN`] alone and waits for
+/// the input's end — the other side's sopen ending, however it ends.
+fn open_url(url: &sopen::url::Url, hold: bool, browser: bool, dirs: &Dirs) -> Result<()> {
+    use gui::web::address::{self, Shown, Way};
     if hold {
         forward::tunnel_port_is_private(url.port())?;
     }
+    let shown = url.shown();
+    let without = match address::way(browser, gui::display_available(), address::engine_here) {
+        Way::Browser => None,
+        Way::Fallback(why) => Some(why),
+        Way::Window => {
+            // The window's F-keys feed the macOS F-key switch (04 §6.2), as every window's do.
+            gui::fkeys_for_run(dirs.state.clone());
+            match address::run(url, hold, &gui::Hooks::from_env()?)? {
+                Shown::Closed => return Ok(()),
+                Shown::Unavailable(why) => Some(why),
+            }
+        }
+    };
+    if let Some(why) = without {
+        // Ignoring a write error: HOST's half writes into a session that may be gone.
+        let line = address::fallback_line(&why, &shown);
+        let _ = writeln!(std::io::stderr(), "sopen: {line}");
+    }
     sopen::url::open(url)?;
     if !hold {
-        println!("{}", sopen::url::opened_line(&url.shown()));
+        // The same line `println!` wrote, a write error ignored: nothing may read the output (a
+        // closed pipe, a session gone), and the address is open all the same.
+        let line = sopen::url::opened_line(&url.shown());
+        sopen::url::write_cue(&mut std::io::stdout(), &line);
         return Ok(());
     }
     // Ignoring a write error: the other side may be gone already — its end is seen below.
@@ -756,7 +789,7 @@ fn run_open(
                 sopen::url::redacted(arg)
             )));
         }
-        return open_url(&url.map_err(anyhow::Error::msg)?, false);
+        return open_url(&url.map_err(anyhow::Error::msg)?, false, false, dirs);
     }
     // The windows of this run feed the macOS F-key switch (04 §6.2), its files in the state
     // folder; nothing is read or started before the first window.
@@ -2060,6 +2093,21 @@ mod tests {
         assert!(Cli::try_parse_from(["sopen", "stems", "--work-dir", "/w", "a.mp3"]).is_err());
         assert!(Cli::try_parse_from(["sopen", "stems", "--wait-to-publish", "a.mp3"]).is_err());
         assert!(Cli::try_parse_from(["sopen"]).is_err());
+    }
+
+    /// `--app` / `--hex` with an address (09 §7): the usage line says where the address opens —
+    /// the system browser with `--browser`, else an xtools window — shown without its secrets.
+    #[test]
+    fn an_address_is_not_a_file_said_by_where_it_opens() {
+        let url = "http://me:pw@box/x?t=1";
+        assert_eq!(
+            address_not_a_file("--app", url, false),
+            "--app opens a file; http://me:***@box/x?… is an address (it opens in an xtools window)"
+        );
+        assert_eq!(
+            address_not_a_file("--hex", url, true),
+            "--hex opens a file; http://me:***@box/x?… is an address (it opens in the system browser)"
+        );
     }
 
     /// `--state-stdin` (10 §7.3, X2-host), hidden: as HOST's half of the switch is given it —

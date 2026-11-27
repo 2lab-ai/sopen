@@ -740,6 +740,47 @@ within 2 s, else 1 with `… ended while ssh stayed for the browser's connection
   `SOPEN_BROWSER` row then serves `--browser`, the fallbacks and the address window's outside links
   (a file view sends none, §3.4).
 
+**As built (WV-E2, 2026-11-27)** — `src/gui/web/address.rs`; each a **[decision]**:
+- **Where the way is decided** (`address::way`): `--browser` and no display take the system browser
+  before the engine is asked for; otherwise the engine is picked **before the window opens**
+  (`address::engine_here`), so a process without one (Linux until WV-B, `SOPEN_WEB=off`) takes §4's
+  fallback with no window flashing up. HOST's side decides the same on every route. A view the engine
+  still refuses at the window's first pass closes the window and takes the same fallback, no cue
+  said. Under `--hold-until-eof` the port check stays first.
+- **The cues**: `sopen-tunnel-window` right after `Web::new` made the view; `sopen-tunnel-open` right
+  after its load is asked for — not on the engine's `Loading`, which a load refused before WebKit
+  sees it never sends, leaving the other side without its open line. `sopen-tunnel-closed` only after
+  the owner closed a view that was made, once the window is gone (the view torn down first) — never
+  after the input's end (the other side is gone; the window closes for it), never after a refused
+  view. An input that ends before the first pass makes no view at all and says nothing (review round
+  1). A scripted run (`SOPEN_SCREENSHOT`, `SOPEN_CELLS`) ends by its hook and ignores the input's
+  end; its hook's close is a close here, so it says the closed cue. Route 1 and HOST's half of route 3 print `opened <shown> in xtools` once the view is made; all
+  of it, and §4's stderr line, written ignoring errors.
+- **The screen**: the title row is the program's block and `<shown>` (the window's title `xtools —
+  <shown>`); under it the page's frame `Web Page`, single- or double-lined by §2.4, whose first row is
+  the bar — the document on screen (`url::redacted`), and at its right `scripts ON` (the warn colour)
+  or `scripts off`, `loading…` — and whose second row, when there is one, is the line; the page at
+  the rest of the frame's cells; the F-key row `1Help 2JS off 3Exit` (`2JS on` while off).
+- **Links out**: only an address `url::parse` takes (`http`, `https`, written plainly) goes to the
+  system browser, on a thread of its own (`url::open` waits for the opener), one at a time — another
+  click out while one is opening (route 3 opens any site with scripts on, and a script's `a.click()`
+  may count as a click) says `<target>: not opened — a link is still opening in the system browser`
+  (review round 1); any other scheme, or an
+  address sopen refuses, is said — `<target>: not opened — only an http:// or https:// link goes to
+  the system browser` — and never opened, since the system's opener starts an application for a
+  `file:` link. The line says `<target>: opened in the system browser` (or the opener's error); any
+  other navigation out `<target>: a navigation away from <origin>, refused`.
+- **Again before anything was on screen**: Cmd/Ctrl+R and F2 load the address again while no
+  document has been on screen (the first load failed: a dev server not up yet) — WebKit's reload has
+  nothing to reload then; after one, they reload.
+- **The failure lines** are told apart by the engine's error as macOS says it (`… (NSURLErrorDomain
+  <code>)`): -1201…-1204 the certificate line, -1205 and -1206 the client-certificate line, -1012 and
+  -1013 and a 401 or 407 with nothing to show the login line; anything else `cannot load …`.
+  **Open**: a 401 whose body the engine shows is shown as the page — `Event` carries no status, so
+  the login line needs the engine to say it (WV-A's file); WebKitGTK's errors are WV-B's to map.
+- **Open**: Cmd/Ctrl+R while the page holds the keyboard on macOS reaches the page, not sopen: R is
+  not among §2.4's always-sopen keys (`route`, `mod.rs`). Esc takes the keyboard back first.
+
 ## 8. The TUI
 
 Message 23 makes xtools one cell-grid core with a terminal and a GUI backend (*XR-T* §0; 10). A page,
@@ -961,8 +1002,9 @@ looked at (06 §13).
   one, as 06 §5's "replaced"), and ranges answered from kept blocks never see a change for the view's
   life; a whole file asked again is a reopen, so a reload does see it. No reconnect: a connection that
   stops replying fails the view's later requests until WV-F's reconnect (§3.1 "Channels") covers it.
-- **01 A10a vs §7 route 1.** A10a: `sopen URL` opens the default browser and exits 0; from 09 it lasts
-  until its window closes. WV-E2 rewrites A10a.
+- **01 A10a vs §7 route 1.** A10a: `sopen URL` opened the default browser and exited 0; from 09 it lasts
+  until its window closes. Resolved: WV-E2 rewrote A10a (and §4a) to the window, `--browser` keeping
+  the old route.
 - **libtest vs AppKit's main thread (WV-A).** AppKit and WebKit run only on a process's main thread,
   and libtest runs every test on a thread of its own. The macOS window tests (§11) therefore run
   each scenario in a child process — the test binary again — whose main thread a Mach-O initializer

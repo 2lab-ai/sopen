@@ -1242,12 +1242,15 @@ pub(crate) fn run_tunnel(
     stop: &dyn Fn() -> Option<i32>,
     say: &mut dyn FnMut(&str),
 ) -> Result<u8> {
+    use std::io::Write as _;
     for (i, &port) in ports.iter().enumerate() {
         if let Attempt::Done(result) = attempt(t, port, stop, say)? {
             return result;
         }
         if let Some(next) = ports.get(i + 1) {
-            eprintln!(
+            // Not `eprintln!`, which panics on a closed stderr: the tunnel goes on all the same.
+            let _ = writeln!(
+                std::io::stderr(),
                 "sopen: port {port} could not be forwarded on {} (taken there, or forwarding \
                  refused) — trying {next}",
                 t.host
@@ -1272,6 +1275,7 @@ fn attempt(
     stop: &dyn Fn() -> Option<i32>,
     say: &mut dyn FnMut(&str),
 ) -> Result<Attempt> {
+    use std::io::Write as _;
     use std::process::Stdio;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1341,7 +1345,11 @@ fn attempt(
         if is_open {
             Attempt::Done(Ok(0))
         } else {
-            eprintln!("sopen: stopped before {shown} opened on {}", t.host);
+            let _ = writeln!(
+                std::io::stderr(),
+                "sopen: stopped before {shown} opened on {}",
+                t.host
+            );
             Attempt::Done(Ok(128u8.saturating_add(u8::try_from(signal).unwrap_or(0))))
         }
     };
