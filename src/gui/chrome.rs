@@ -844,6 +844,9 @@ pub fn title_row_with(ui: &mut egui::Ui, place: &str, strip: Option<&Strip>) {
     cells::put(&mut buf, clock_x as u16, 0, &clock, cols, pen);
     let x = block + 1;
     let (room, mode) = mode_button(ui.ctx(), &mut buf, x, clock_x, pen);
+    // From the button's place (the clock's, where it has no room) to the row's end: what a
+    // `SOPEN_CELLS` receipt leaves blank, the clock with the button (X4-tree).
+    let blank = cells::Cells::new(room as u16, 0, cols.saturating_sub(room) as u16, 1);
     // The strip stands right before the mode button's cells (or the clock), a blank either side;
     // the place has what is left.
     let mut end = room;
@@ -887,9 +890,11 @@ pub fn title_row_with(ui: &mut egui::Ui, place: &str, strip: Option<&Strip>) {
         ui.interact(rect, ui.scope_id().with("title"), egui::Sense::hover())
             .on_hover_text(place);
     }
-    let at = mode.map(|at| grid.rect(at));
-    ui.ctx()
-        .data_mut(|d| d.insert_temp(mode_rect_id(), ModeRect(at)));
+    let at = ModeRect {
+        button: mode.map(|at| grid.rect(at)),
+        blank: Some(grid.rect(blank)),
+    };
+    ui.ctx().data_mut(|d| d.insert_temp(mode_rect_id(), at));
     for (slot, at) in clicks {
         // Not focusable, as the F-key row's slots: a click leaves the keyboard where it was.
         let id = ui.scope_id().with(("sopen-view-strip", slot));
@@ -909,9 +914,13 @@ pub fn title_row_with(ui: &mut egui::Ui, place: &str, strip: Option<&Strip>) {
 #[derive(Debug, Clone, Copy)]
 struct ModeButton(&'static str);
 
-/// Where the title row drew the mode button in its last pass (`None`: nowhere).
+/// Where the title row drew the mode button in its last pass (`None`: nowhere), and the cells a
+/// receipt leaves blank there: from the button's place to the row's end.
 #[derive(Debug, Clone, Copy, Default)]
-struct ModeRect(Option<Rect>);
+struct ModeRect {
+    button: Option<Rect>,
+    blank: Option<Rect>,
+}
 
 fn mode_button_id() -> egui::Id {
     egui::Id::unique("sopen-mode-button")
@@ -937,7 +946,17 @@ pub fn clear_mode_button(ctx: &egui::Context) {
 /// whatever is open; a modal's backdrop never gets it.
 pub fn mode_button_rect(ctx: &egui::Context) -> Option<Rect> {
     ctx.data(|d| d.get_temp::<ModeRect>(mode_rect_id()))
-        .and_then(|r| r.0)
+        .and_then(|r| r.button)
+}
+
+/// What a `SOPEN_CELLS` receipt leaves blank on the title row, as the last pass drew it: from the
+/// mode button's place — `[GUI]` in the terminal, `[TUI]` in a switched window, blank cells in a
+/// window started directly; the clock's place where the row has no room for the button — to the
+/// row's end, the clock with it: the two differences between two backends' receipts (10 §5),
+/// and the clock between two runs (X4-tree).
+pub fn mode_clock_rect(ctx: &egui::Context) -> Option<Rect> {
+    ctx.data(|d| d.get_temp::<ModeRect>(mode_rect_id()))
+        .and_then(|r| r.blank)
 }
 
 /// The mode button's cells: `[GUI]` and `[TUI]` alike.

@@ -349,6 +349,7 @@ fn the_tree_and_a_git_pin_cross() {
         return;
     };
     let mut a = pinned(&repo, connect());
+    let _pa = rooted_tree(&mut a.b, repo.top());
     a.key(Key::F10);
     a.settle();
     let before = a.cells();
@@ -356,9 +357,75 @@ fn the_tree_and_a_git_pin_cross() {
     assert!(state.panels[0].tree);
     assert_eq!(state.panels[1].pin.as_deref(), Some(repo.top()));
     assert!(!state.git_focus);
-    let (b, after) = given(repo.top(), Some(connect()), through_the_line(&state));
+    let mut b = Side::new(repo.top(), Some(connect()));
+    let _pb = rooted_tree(&mut b.b, repo.top());
+    b.b.give_state(through_the_line(&state))
+        .expect("the state is this machine's");
+    b.settle();
+    let after = b.cells();
     same_screen(&before, &after);
     assert_eq!(b.take(), state);
+}
+
+/// The real disk with the home at `home`.
+struct HomeAt {
+    real: Arc<dyn crate::remote::treefs::Disk>,
+    home: String,
+}
+
+impl crate::remote::treefs::Disk for HomeAt {
+    fn list(
+        &self,
+        path: &str,
+        budget: Option<crate::remote::treefs::Budget>,
+        full: bool,
+        guard: &[String],
+        live: &crate::remote::treefs::Live,
+    ) -> std::io::Result<crate::remote::treefs::Listing> {
+        self.real.list(path, budget, full, guard, live)
+    }
+
+    fn resolve(&self, path: &str) -> std::io::Result<crate::remote::treefs::Resolved> {
+        self.real.resolve(path)
+    }
+
+    fn home(&self) -> std::io::Result<crate::remote::treefs::Resolved> {
+        self.real.resolve(&self.home)
+    }
+
+    fn mounts(&self) -> std::io::Result<crate::remote::treefs::Mounts> {
+        self.real.mounts()
+    }
+
+    fn statvfs(&self, path: &str) -> std::io::Result<crate::remote::treefs::FsStat> {
+        self.real.statvfs(path)
+    }
+}
+
+/// The pool a tree's reads run on, shut down with the test.
+struct TreePool(crate::tree::watchdog::Pool);
+
+impl Drop for TreePool {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
+/// `b`'s tree rooted at `home` — never `/`, whose temporary folder other tests change while this
+/// one runs — and settled with every size final, as a `SOPEN_CELLS` run settles it (X4-tree).
+fn rooted_tree(b: &mut Browser, home: &str) -> TreePool {
+    use crate::tree::watchdog::{Pool, Timing};
+    let disk: Arc<dyn crate::remote::treefs::Disk> = Arc::new(HomeAt {
+        real: LocalFs::disk(),
+        home: home.to_string(),
+    });
+    let pool = Pool::new(Timing::default());
+    let p = pool.clone();
+    let connect: crate::gui::browser::TreeConnect =
+        Arc::new(move |_| Ok((LocalFs::tree_with(disk.clone(), p.clone()), None)));
+    b.set_tree_connect(connect, "switch-state-tree");
+    b.whole_sizes = true;
+    TreePool(pool)
 }
 
 /// Tab into the pinned git panel: the keyboard is there (its F-key row, its frame active, the
