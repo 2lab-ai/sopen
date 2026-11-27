@@ -313,3 +313,45 @@ Three units merged and shipped one by one. The Linux host was back for #149's pr
 | X3-questions | ✅ done 2026-11-26 | 10 §17's X3: the hex window's questions and rows, and Save As, in cells (#149) | coder |
 | X3-preview | ✅ done 2026-11-26 | 10 §17's X3: the preview side's frame and progress line in cells (#151) | coder |
 | X2-host | ✅ done 2026-11-26 | 10 §17's X2: HOST's half, `--state-stdin` and its two cues (#150) | coder |
+
+## R1 (part 9) — the switch across machines, and the editor's screen and dialogs, closed 2026-11-27
+
+Three units merged and shipped one by one, each prerelease installed on the Mac and the Linux host. With X2-switch, **X2 ships**: F12 in `sopen --tui` with a target opens the window on HOST, and its close brings the TUI back with HOST's state.
+
+- **X2-switch** (#154): the TUI's half of 10 §7.3.
+  - **The run:** HOST's half goes over the forward's ssh (`-T`, `BatchMode=yes`, `SSH_ASKPASS_REQUIRE=never`) with the state on its input. Meanwhile the terminal is dimmed under §7.3's line with only Ctrl+C read.
+  - **Coming back:** HOST's cue gives its state to a fresh browser; when HOST keeps its window, our ssh client ends at once; each outcome is its line. What HOST says is bounded and matched exactly.
+  - **Before the switch:** it waits for every running write, including one a closed viewer left. Unsaved edits ask (Save, Save As, Discard, Cancel); Discard drops them only once HOST's state is back. An open git dialog or plan asks too.
+  - **HOST's side:** it now hands back the viewer after its close prompt is answered, and the windows' Discard is one path (`Window::discard`).
+- **ED-screen** (#153): 12 §4 in cells.
+  - The frame, gutter, syntect rows, caret, block, scroll bar and the three rows.
+  - One highlighter for the viewer and the editor through `LineSource`. The editor's worker reads a snapshot; a one-slot mailbox; no reply painted on a newer document; kept states every 64 lines.
+  - EH-3: 18.73 MiB over a 16 MiB Rust file; its 16 MiB run is a hand run.
+  - Release frame cost: 0.34 ms.
+- **ED-dialogs** (#155): the editor's dialogs in cells.
+  - **E6:** every prompt opens on Cancel; Enter presses the focused button; letters answer nothing.
+  - **The boxes:** the close prompt, the conflict dialog, Ctrl/⌘+R's question, the encoding question and the F10 menus. Find, Replace's question and Go to line are on the status row.
+  - **The exit protocol and E24** (no edits while a Save runs).
+  - **The binding contract** for ED-layout: inputs to `press()` until a dialog is up, then `dialogs_ui` reads only the rest.
+- **Receipts:**
+  - **X2-switch, live across machines** (the TUI on the Linux host in a pty, the window on the Mac):
+    - Branch builds: F12 at 4.07 s, the dimmed screen at 4.60 s; a folder made in HOST's window by F7 was listed in the TUI at 8.73 s; a second run shot HOST's window.
+    - The installed builds after the release: the dimmed screen 0.5 s after F12, back with HOST's folder at 2.1 s.
+  - **ED-dialogs:** the close prompt and the File menu over Hangul text at 80×25 are the same cell by cell in the window and the terminal.
+- **Reviews.**
+  - Two engines per unit (GPT by area, Claude whole), then one fix-check; the orchestrator verified the last fixes at their lines.
+  - The editor units' reviewers found the multi-event-per-frame class: the kit's key helpers add idle frames that had hidden it. Briefs for UI units now ask for two events in one `drv.frame`.
+- **CI:** CI-only failures were timing tests outside the units (F-timing), passed on a rerun of the failed job. #153's Preview needed three runs (one cancelled for runner capacity, one on F-timing's macOS web view test).
+- **Prereleases:**
+  - preview-2026-11-26-1849-258c75bf71fd (the ledger, #152);
+  - preview-2026-11-26-2121-bd0433d29ce1 (ED-screen);
+  - preview-2026-11-26-2308-51f7d3e6373d (X2-switch);
+  - preview-2026-11-27-0001-405242b80cf8 (ED-dialogs).
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| X2-switch | ✅ done 2026-11-26 | 10 §17's X2: the TUI's half over ssh, §7.3's outcomes, the question before switching; ships X2 (#154) | coder |
+| ED-screen | ✅ done 2026-11-26 | 12 §16: §4 in cells, the shared highlighter, EH-1–EH-3 (#153) | coder |
+| ED-dialogs | ✅ done 2026-11-27 | 12 §16: the editor's dialogs in cells with E6, ES-5 (#155) | coder |
