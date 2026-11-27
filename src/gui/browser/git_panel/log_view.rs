@@ -14,6 +14,7 @@ use super::graph_view::printable;
 use super::Scroll;
 use crate::git::runner::LogEntry;
 use crate::gui::browser::keys::{self, Command, Mods};
+use crate::gui::cells::{Buffer, Cells, Grid};
 use crate::gui::chrome;
 use crate::gui::chrome::git::LOOK;
 use eframe::egui::{self, Key, Pos2, Rect, RichText, Sense, Vec2};
@@ -111,6 +112,13 @@ impl LogView {
         self.whole.and_then(|k| self.entries.get(k))
     }
 
+    /// The cells of `grid` (the panels') the entry shown whole covers, its box and its shadow,
+    /// for the panel and the other side to blank (10 §17, X4-graph's seam): none while egui draws
+    /// it, until X4-lists.
+    pub fn covers(&self, _grid: &Grid) -> Vec<Cells> {
+        Vec::new()
+    }
+
     /// A row of the git context's key table while the log is open (03 §9.2).
     pub fn run(&mut self, command: Command) -> Option<LogEnd> {
         match command {
@@ -136,9 +144,9 @@ fn whole_id() -> egui::Id {
     egui::Id::unique("sopen-git-log-entry")
 }
 
-/// The entry shown whole (03 §3.7): every field, stderr whole and scrollable. Enter, Esc or a
-/// click outside closes it.
-fn whole_ui(ctx: &egui::Context, entry: &LogEntry) -> bool {
+/// The entry shown whole (03 §3.7) on `grid` (the panels', where it stands once it is in
+/// cells): every field, stderr whole and scrollable. Enter, Esc or a click outside closes it.
+fn whole_ui(ctx: &egui::Context, _grid: Grid, entry: &LogEntry) -> bool {
     let close = ctx.input_mut(|i| {
         keys::take(i, Key::Enter, Mods::None) | keys::take(i, Key::Escape, Mods::None)
     });
@@ -186,10 +194,24 @@ fn whole_ui(ctx: &egui::Context, entry: &LogEntry) -> bool {
     close || ok || response.should_close()
 }
 
-/// The log in `rect` (the git panel's body): the header, one line an entry with the bar, the
-/// scroll bar; and the entry shown whole, over everything. A click puts the bar on an entry, a
-/// double click shows it whole.
-pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut LogView, active: bool) {
+/// Whether [`draw`] paints the log's cells (10 §17, X4-graph's seam): not yet — egui draws it at
+/// `grid.rect(cells)`, its scroll bar in its own last column, and the panel leaves
+/// those cells to `term::compose` (a hand-off box in a terminal) until X4-lists makes it `true`.
+pub(super) const PAINTS_CELLS: bool = false;
+
+/// The log at cells `cells` of `grid` (the git panel's body): the header, one line an entry with
+/// the bar, the scroll bar; and the entry shown whole, over everything, on `grid`. `buf` is the
+/// panel's buffer, for the log's cells once it paints them ([`PAINTS_CELLS`]). A click puts the
+/// bar on an entry, a double click shows it whole.
+pub fn draw(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    cells: Cells,
+    _buf: &mut Buffer,
+    view: &mut LogView,
+    active: bool,
+) {
+    let rect = grid.rect(cells);
     let ctx = ui.ctx().clone();
     let font = chrome::mono(ui);
     let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
@@ -283,7 +305,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut LogView, active: bool) {
         (max_top > 0).then(|| view.scroll.top as f32 / max_top as f32),
     );
     if let Some(entry) = view.whole().cloned() {
-        if whole_ui(&ctx, &entry) {
+        if whole_ui(&ctx, *grid, &entry) {
             view.whole = None;
         }
     }

@@ -391,9 +391,11 @@ fn q1_the_keyboard_moves_between_the_grid_and_egui_fields_dialogs_and_the_viewer
     );
 }
 
-/// Q1 (TS-8): Tab and clicks move the keyboard between the cell list and the git panel (egui at
-/// the right side's cells), and back. The negative controls: Down in the list leaves the git
-/// panel's bar, and a click a cell left of the git panel's side is the list's.
+/// Q1 (TS-8): Tab and clicks move the keyboard between the cell list and the git panel (cells
+/// over the right side, X4-graph), and back. The negative controls: Down in the list leaves the
+/// git panel's bar, and a click a cell left of the git panel's side is the list's. The cells a
+/// git panel's dialog covers are blank in the list too (`Browser::git_covered`), and wide
+/// (Cmd/Ctrl+Shift+G) the panel's cells are the whole grid.
 #[test]
 fn q1_tab_and_clicks_move_the_keyboard_between_the_cell_list_and_the_git_panel() {
     let Some(git) = crate::git::history::fixture::git() else {
@@ -401,9 +403,16 @@ fn q1_tab_and_clicks_move_the_keyboard_between_the_cell_list_and_the_git_panel()
     };
     let mut g = super::s2::Gx::new(super::s2::small(&git));
     g.wait_for_the_panel();
-    let [left, right] = sides(&grid(1000.0, 700.0));
+    let gr = grid(1000.0, 700.0);
+    let [left, right] = sides(&gr);
     assert_eq!(panes(&g.fx), [left, right], "the list and the git panel");
-    assert!(cells_in(&g.fx, right).is_empty(), "the git panel is egui's");
+    let panel = cells_in(&g.fx, right);
+    assert_eq!(
+        panel.len(),
+        usize::from(gr.rows),
+        "the git panel's cells: {panel:?}"
+    );
+    assert!(panel.iter().all(|(at, _)| at.width() == right.width()));
     assert_eq!(cells_in(&g.fx, left).len(), 40, "the list in cells");
     each_in_its_place(&g.fx, 1000.0, 700.0);
     let list_bar = g.fx.current();
@@ -445,6 +454,105 @@ fn q1_tab_and_clicks_move_the_keyboard_between_the_cell_list_and_the_git_panel()
     g.settle();
     assert!(g.b().git_focused().is_none(), "a click on the cell list");
     assert_eq!(g.fx.current(), "..");
+    // A git panel's dialog over the list: the list's cells under it blank (X4-graph).
+    let covered = cells::Cells::new(1, 2, 6, 2);
+    let blank = |g: &super::s2::Gx| {
+        (cells_in(&g.fx, gr.rect(covered)).iter()).all(|(_, t)| t.trim().is_empty())
+    };
+    assert!(!blank(&g), "the control: the list's rows there");
+    g.panel_mut().view.test_covers = vec![covered];
+    g.idle(2);
+    assert!(blank(&g), "{:?}", cells_in(&g.fx, gr.rect(covered)));
+    g.panel_mut().view.test_covers.clear();
+    // Wide: the panel's one layer of cells over all of the grid.
+    g.tab_into_git();
+    g.with(Key::G, Modifiers::COMMAND | Modifiers::SHIFT);
+    g.settle();
+    let whole = |g: &super::s2::Gx| {
+        (cells::layers(&g.fx.drv.ctx).iter())
+            .any(|l| l.buf.area == gr.all() && l.origin == gr.origin)
+    };
+    assert!(whole(&g), "wide: the grid's cells");
+    g.with(Key::G, Modifiers::COMMAND | Modifiers::SHIFT);
+    g.settle();
+    assert!(!whole(&g), "the control: a side again");
+}
+
+/// X4-graph (review round 1): the cells a pinned git panel's dialog covers are blank in the tree
+/// beside it (F10; a pinned panel stands beside the tree, 02 §3.1) and in the preview — every
+/// side the panel's dialogs stand over (`Browser::git_covered`), as the list's are. The preview
+/// beside a pin on the list's own side is a constructed state: the view's rules give a pinned
+/// side's other side the list (O3), and the preview blanks them all the same.
+#[test]
+fn x4_graph_the_tree_and_the_preview_blank_a_git_panels_dialog() {
+    let Some(git) = crate::git::history::fixture::git() else {
+        return;
+    };
+    let mut g = super::s2::Gx::new(super::s2::small(&git));
+    g.wait_for_the_panel();
+    let gr = grid(1000.0, 700.0);
+    let [left, right] = sides(&gr);
+    let blank = |g: &super::s2::Gx, at: Rect| {
+        (cells_in(&g.fx, at).iter()).all(|(_, t)| t.trim().is_empty())
+    };
+    // The tree on the list's side, the panel pinned beside it.
+    g.cmd(Key::G);
+    g.settle();
+    let _tree = tree_at_root(&mut g.fx);
+    g.key(Key::F10);
+    g.settle();
+    assert!(g.b().tree.is_some(), "F10 opened the tree");
+    assert_eq!(panes(&g.fx), [left, right]);
+    let covered = cells::Cells::new(1, 1, 6, 2);
+    assert!(
+        !blank(&g, gr.rect(covered)),
+        "the control: the tree's rows there"
+    );
+    g.panel_mut().view.test_covers = vec![covered];
+    g.idle(2);
+    assert!(
+        blank(&g, gr.rect(covered)),
+        "{:?}",
+        cells_in(&g.fx, gr.rect(covered))
+    );
+    // The panel's own covers are never handed back to it (round 2): it blanks them as its pass
+    // leaves them.
+    let i = g.b().git.panel(&g.top()).expect("the panel");
+    assert_eq!(g.b().git_covered(&gr, None), [covered]);
+    assert!(g.b().git_covered(&gr, Some(i)).is_empty());
+    g.panel_mut().view.test_covers.clear();
+    g.key(Key::F10);
+    g.settle();
+    assert!(g.b().tree.is_none());
+    // The preview of a text file beside the panel pinned on the list's side.
+    g.fx.select("b.txt");
+    g.rest();
+    let top = g.top();
+    g.fx.b.git.pin = Some(view::Pin { side: 0, repo: top });
+    g.rest();
+    assert!(
+        matches!(
+            g.shown(),
+            [view::Content::Git(_), view::Content::Preview(_)]
+        ),
+        "{:?}",
+        g.shown()
+    );
+    // On the preview's frame (its host's cells; the text's own cells inside it are the
+    // viewer's, which no cover blanks yet — not the list's either).
+    let half = gr.cols / 2;
+    let covered = cells::Cells::new(half + 1, 0, 4, 1);
+    assert!(
+        !blank(&g, gr.rect(covered)),
+        "the control: the preview's frame there"
+    );
+    g.panel_mut().view.test_covers = vec![covered];
+    g.idle(2);
+    assert!(
+        blank(&g, gr.rect(covered)),
+        "{:?}",
+        cells_in(&g.fx, gr.rect(covered))
+    );
 }
 
 /// The topmost rectangle the last pass filled under `p`: the colour a cell's background is

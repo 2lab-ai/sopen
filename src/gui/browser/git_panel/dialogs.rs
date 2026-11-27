@@ -31,6 +31,7 @@ use crate::git::backup::{RestoreEntry, Subject, Value};
 use crate::git::model::{ObjectType, RefKind, RefLabel, StatusEntry};
 use crate::git::runner::mask_credentials;
 use crate::gui::browser::keys::{self, Mods};
+use crate::gui::cells::{Cells, Grid};
 use crate::gui::chrome;
 use eframe::egui::{self, Key, RichText};
 use std::collections::BTreeMap;
@@ -806,9 +807,17 @@ impl ActionDialog {
         }
     }
 
-    /// One pass: Esc and Enter are taken before its widgets see them (Shift+Enter is a message
-    /// field's new line); `planner` plans the draft again whenever an option changed it.
-    pub fn ui(&mut self, ctx: &egui::Context, planner: Planner) -> Option<DialogEnd> {
+    /// The cells of `grid` (the panels') the dialog covers, its box and its shadow, for the panel
+    /// and the other side to blank (10 §17, X4-graph's seam): none while egui draws it, until
+    /// X4-dialogs (X4-dialogs2 for 03 §7.1–§7.5's forms).
+    pub fn covers(&self, _grid: &Grid) -> Vec<Cells> {
+        Vec::new()
+    }
+
+    /// One pass on `grid` (the panels', where it stands once it is in cells): Esc and Enter are
+    /// taken before its widgets see them (Shift+Enter is a message field's new line); `planner`
+    /// plans the draft again whenever an option changed it.
+    pub fn ui(&mut self, ctx: &egui::Context, _grid: Grid, planner: Planner) -> Option<DialogEnd> {
         if self.replan(planner) {
             ctx.request_repaint();
         }
@@ -1683,8 +1692,16 @@ impl ResultDialog {
         }
     }
 
-    /// One pass; `true` once Enter, Esc, OK or a click outside closed it.
-    pub fn ui(&mut self, ctx: &egui::Context) -> bool {
+    /// The cells of `grid` (the panels') the result covers, its box and its shadow, for the panel
+    /// and the other side to blank (10 §17, X4-graph's seam): none while egui draws it, until
+    /// X4-dialogs2.
+    pub fn covers(&self, _grid: &Grid) -> Vec<Cells> {
+        Vec::new()
+    }
+
+    /// One pass on `grid` (the panels', where it stands once it is in cells); `true` once Enter,
+    /// Esc, OK or a click outside closed it.
+    pub fn ui(&mut self, ctx: &egui::Context, _grid: Grid) -> bool {
         let close = ctx.input_mut(|i| {
             keys::take(i, Key::Enter, Mods::None) | keys::take(i, Key::Escape, Mods::None)
         });

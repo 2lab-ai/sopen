@@ -19,7 +19,7 @@ use crate::git::model::{
 };
 use crate::git::runner::{Class, Done, Ending, GitCommand, LogEntry};
 use crate::gui::browser::keys::{self, Context};
-use crate::gui::chrome::{self, PALETTE};
+use crate::gui::chrome::PALETTE;
 use crate::gui::testkit::{self, Driver};
 use crate::gui::Window;
 use eframe::egui::{self, Key, Modifiers};
@@ -123,7 +123,7 @@ fn conflict(path: &str) -> StatusEntry {
 
 /// `main` checked out at `a`, `feature` at `b`, both on `origin` too, tags `v1` (lightweight) and
 /// `v2` (annotated), one stash, a clean work tree. The one place a `Repo` is built.
-fn repo() -> Repo {
+pub(super) fn repo() -> Repo {
     Repo {
         top: "/srv/sopen".into(),
         git_dir: "/srv/sopen/.git".into(),
@@ -275,20 +275,20 @@ fn dialog(opened: Opened) -> ActionDialog {
 // ---------------------------------------------------------------------------------------------
 // The host: every screen of S3-B drawn as the git panel will draw it, with what each returned.
 
-struct Host {
-    menu: Option<Menu>,
-    menu_ends: Vec<MenuEnd>,
-    dialog: Option<ActionDialog>,
-    planner: Planner,
-    dialog_ends: Vec<DialogEnd>,
-    result: Option<ResultDialog>,
-    results_closed: usize,
-    backups: Option<BackupsView>,
-    backups_ends: Vec<BackupsEnd>,
-    log: Option<LogView>,
-    log_ends: Vec<LogEnd>,
-    banner: Option<BannerView>,
-    pressed: Vec<Pressed>,
+pub(super) struct Host {
+    pub(super) menu: Option<Menu>,
+    pub(super) menu_ends: Vec<MenuEnd>,
+    pub(super) dialog: Option<ActionDialog>,
+    pub(super) planner: Planner,
+    pub(super) dialog_ends: Vec<DialogEnd>,
+    pub(super) result: Option<ResultDialog>,
+    pub(super) results_closed: usize,
+    pub(super) backups: Option<BackupsView>,
+    pub(super) backups_ends: Vec<BackupsEnd>,
+    pub(super) log: Option<LogView>,
+    pub(super) log_ends: Vec<LogEnd>,
+    pub(super) banner: Option<BannerView>,
+    pub(super) pressed: Vec<Pressed>,
 }
 
 impl Default for Host {
@@ -335,34 +335,39 @@ impl Window for Host {
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 let grid = crate::gui::cells::Grid::over(ui.max_rect());
-                let rect = grid.rect(grid.all());
-                let mut body = rect;
+                let all = grid.all();
+                let mut buf = crate::gui::cells::Buffer::empty(all);
+                let mut body = all;
                 if let Some(b) = &self.banner {
-                    let h = chrome::CELL.y * b.rows() as f32;
-                    let top = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), h));
-                    body.min.y += h;
-                    self.pressed.extend(in_progress::draw(ui, top, b));
+                    let h = u16::try_from(b.rows()).unwrap_or(u16::MAX).min(all.height);
+                    let top = crate::gui::cells::Cells::new(all.x, all.y, all.width, h);
+                    body =
+                        crate::gui::cells::Cells::new(all.x, all.y + h, all.width, all.height - h);
+                    self.pressed
+                        .extend(in_progress::draw(ui, &grid, top, &mut buf, b));
                 }
                 if let Some(v) = &mut self.backups {
-                    self.backups_ends.extend(backups::draw(ui, body, v, !modal));
+                    let end = backups::draw(ui, &grid, body, &mut buf, v, !modal);
+                    self.backups_ends.extend(end);
                 } else if let Some(v) = &mut self.log {
-                    log_view::draw(ui, body, v, !modal);
+                    log_view::draw(ui, &grid, body, &mut buf, v, !modal);
                 }
             });
+        let grid = crate::gui::cells::Grid::over(ctx.content_rect());
         if let Some(m) = &mut self.menu {
-            if let Some(end) = m.ui(&ctx) {
+            if let Some(end) = m.ui(&ctx, grid) {
                 self.menu = None;
                 self.menu_ends.push(end);
             }
         }
         if let Some(d) = &mut self.dialog {
-            if let Some(end) = d.ui(&ctx, self.planner) {
+            if let Some(end) = d.ui(&ctx, grid, self.planner) {
                 self.dialog = None;
                 self.dialog_ends.push(end);
             }
         }
         if let Some(r) = &mut self.result {
-            if r.ui(&ctx) {
+            if r.ui(&ctx, grid) {
                 self.result = None;
                 self.results_closed += 1;
             }
@@ -374,15 +379,15 @@ impl Window for Host {
     }
 }
 
-struct Fx {
-    drv: Driver,
-    host: Host,
+pub(super) struct Fx {
+    pub(super) drv: Driver,
+    pub(super) host: Host,
 }
 
 impl Fx {
     /// A window wider than any dialog, `host` laid out twice (a new modal is laid out unseen
     /// first).
-    fn new(host: Host) -> Fx {
+    pub(super) fn new(host: Host) -> Fx {
         let mut fx = Fx {
             drv: Driver::new(1200.0, 900.0),
             host,
@@ -392,28 +397,28 @@ impl Fx {
         fx
     }
 
-    fn idle(&mut self) {
+    pub(super) fn idle(&mut self) {
         self.drv.idle(&mut self.host, 1);
     }
 
-    fn key(&mut self, key: Key, mods: Modifiers) {
+    pub(super) fn key(&mut self, key: Key, mods: Modifiers) {
         self.drv.key(&mut self.host, key, mods);
     }
 
-    fn press(&mut self, key: Key) {
+    pub(super) fn press(&mut self, key: Key) {
         self.key(key, Modifiers::NONE);
     }
 
-    fn click(&mut self, text: &str) {
+    pub(super) fn click(&mut self, text: &str) {
         self.drv.click_text_on_top(&mut self.host, text);
         self.idle();
     }
 
-    fn shows(&self, text: &str) -> bool {
+    pub(super) fn shows(&self, text: &str) -> bool {
         self.drv.find_text(text).is_some()
     }
 
-    fn assert_shows(&self, text: &str) {
+    pub(super) fn assert_shows(&self, text: &str) {
         assert!(
             self.shows(text),
             "{text:?} is not drawn; drawn: {:?}",
@@ -426,7 +431,7 @@ impl Fx {
     }
 
     /// Whether the last pass painted a rectangle in the dialog's cyan (a dialog's box).
-    fn dialog_box(&self) -> bool {
+    pub(super) fn dialog_box(&self) -> bool {
         self.drv
             .rects()
             .iter()
@@ -434,14 +439,14 @@ impl Fx {
     }
 }
 
-fn with_menu(target: Target, repo: &Repo) -> Fx {
+pub(super) fn with_menu(target: Target, repo: &Repo) -> Fx {
     Fx::new(Host {
         menu: Some(Menu::new(target, repo)),
         ..Host::default()
     })
 }
 
-fn with_dialog(d: ActionDialog, planner: Planner) -> Fx {
+pub(super) fn with_dialog(d: ActionDialog, planner: Planner) -> Fx {
     Fx::new(Host {
         dialog: Some(d),
         planner,
@@ -449,7 +454,7 @@ fn with_dialog(d: ActionDialog, planner: Planner) -> Fx {
     })
 }
 
-fn ids(target: &Target, repo: &Repo) -> Vec<ActionId> {
+pub(super) fn ids(target: &Target, repo: &Repo) -> Vec<ActionId> {
     menu::items(target, repo).iter().map(|i| i.id).collect()
 }
 
@@ -1160,7 +1165,7 @@ fn a_restore_never_writes_over_anything_unless_chosen() {
 // ---------------------------------------------------------------------------------------------
 // The result dialog (03 §3.8, §8.3).
 
-fn entry(line: &str, ending: Ending, stderr: &str, secs: u64) -> LogEntry {
+pub(super) fn entry(line: &str, ending: Ending, stderr: &str, secs: u64) -> LogEntry {
     LogEntry {
         time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_794_389_040 + secs),
         host: "box".into(),
@@ -1267,7 +1272,7 @@ fn the_result_dialog_lists_each_step_and_the_error() {
 // ---------------------------------------------------------------------------------------------
 // The Backups list (03 §8.2, §9.2).
 
-fn records() -> Vec<Record> {
+pub(super) fn records() -> Vec<Record> {
     let group = |stamp: &str, message: &str, refs: Vec<(BackupKind, &str, char, &str)>| Record {
         group: Backup {
             stamp: stamp.into(),

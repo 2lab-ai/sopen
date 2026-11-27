@@ -1,7 +1,8 @@
 //! Lanes as glyphs (10 §6; 03 §4.3–§4.4): the Graph column of the visible rows in cells, each
 //! cell's glyph and colour, from `git::graph`'s node segments and the visible rows'
 //! pass-throughs ([`Graph::pass_throughs`]). Pure: it draws nothing; the panel draws its cells
-//! (X4-graph), as `graph_view::lanes_of` draws the same pieces as egui lines today.
+//! (`graph_view::draw`, X4-graph), where the window's egui graph (`lanes_of`, gone with X4-graph)
+//! drew the same pieces as lines.
 //!
 //! - **Two cells a lane** (03 §4.2): a lane's first cell holds its node or its line, its second
 //!   the line of a lane change. The row stream keeps one row a commit (03 §4.3) and a cell holds
@@ -18,9 +19,9 @@
 //!   0, and HEAD's node takes the lowest lane awaiting it — so only a line passing by is dotted;
 //!   a cell where a solid line meets it is that line's glyph.
 //! - **Colour**: a cell takes the colour of the piece drawn last — the lines passing by, then
-//!   the row's lane changes, then the node, as `lanes_of` draws lines, segments and nodes — and
+//!   the row's lane changes, then the node, as `lanes_of` drew lines, segments and nodes — and
 //!   the lane changes among themselves longest first (on a tie the one coming in before the one
-//!   going down; egui's diagonals share no stretch, so `lanes_of` needs no such order). So a
+//!   going down; egui's diagonals shared no stretch, so `lanes_of` needed no such order). So a
 //!   crossing is the crossing line's colour, a stretch two lane changes share is the nearer
 //!   lane's, and the colour changes where a line turns. A lane change is the colour of the lane
 //!   it ends on (the layout gives it that occupancy's), so where it joins a line passing by the
@@ -30,16 +31,14 @@
 //!   five apart in turn (03 §4.3's colour index), adjacent lanes too — about one such join in
 //!   five (03 §4.3's limit).
 //! - **The cut** (03 §4.2): a row with a piece on a lane past those shown has `»` in the cut's
-//!   first cell, dim, as `lanes_of` marks it; the pieces stop at the column's edge. A column of no
-//!   cells (a panel under 6 cells wide) has no `»` either, where `lanes_of` paints one over the
+//!   first cell, dim, as `lanes_of` marked it; the pieces stop at the column's edge. A column of
+//!   no cells (a panel under 6 cells wide) has no `»` either, where `lanes_of` painted one over the
 //!   description. Nothing past the lanes shown is drawn: a call's cells, and each piece's draws,
 //!   are bounded by the column; a piece past the shown lanes costs one count, not a run of cells
 //!   (the pass-throughs and the row's segments are still visited).
 //! - **An ambiguous-wide terminal** (`wide`, 10 §10, T38) gets §10's stand-ins here, at the
 //!   source, as the viewers' own glyphs do: `| - +` for box lines, `#` for `■`, `.` for `≡` and
 //!   `○`; `◙`, `»` and `:` are narrow and stay.
-
-#![cfg_attr(not(test), allow(dead_code))] // X4-graph draws through it.
 
 use super::graph_view::Columns;
 use crate::git::graph::{End, Graph, Node, RowGraph};

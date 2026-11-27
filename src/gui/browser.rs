@@ -2376,7 +2376,9 @@ impl Browser {
     /// phase 3 sizes on it (05 §6.3). Called only while the tree is open
     /// ([`Browser::panels_ui`] lists the side otherwise).
     fn tree_ui(&mut self, ui: &mut egui::Ui, grid: &Grid, side: cells::Cells) {
-        let under = self.ops.covered(grid);
+        let mut under = self.ops.covered(grid);
+        // A pinned git panel stands beside the tree (02 §3.1): its dialogs' cells too (X4-graph).
+        under.extend(self.git_covered(grid, None));
         let Some(t) = self.tree.as_mut() else {
             return;
         };
@@ -2690,15 +2692,17 @@ impl Browser {
         // Wide (Cmd/Ctrl+Shift+G): the git panel over both sides.
         if let Some([view::Content::Git(a), view::Content::Git(b)]) = self.shown.clone() {
             if a == b {
-                self.git_ui(ui, 1 - self.active, grid.rect(grid.all()), &a);
+                self.git_ui(ui, 1 - self.active, &grid, grid.all(), &a);
                 return;
             }
         }
         for (i, side) in cells::halves(grid.all()).into_iter().enumerate() {
-            let rect = grid.rect(side);
             match self.shown.as_ref().map(|s| s[i].clone()) {
                 Some(view::Content::Preview(_)) => {
-                    self.preview.ui(ui, &grid, side, &self.ops.covered(&grid));
+                    // The cells under a dialog of the list's or of the git panel's (X4-graph).
+                    let mut under = self.ops.covered(&grid);
+                    under.extend(self.git_covered(&grid, None));
+                    self.preview.ui(ui, &grid, side, &under);
                     // 09 §4: the engine refused the preview's page — the preview shows the
                     // source now, and page files open as their source in this window.
                     if let Some(why) = self.preview.take_refused() {
@@ -2707,7 +2711,7 @@ impl Browser {
                     }
                 }
                 Some(view::Content::Tree) if self.tree.is_some() => self.tree_ui(ui, &grid, side),
-                Some(view::Content::Git(top)) => self.git_ui(ui, i, rect, &top),
+                Some(view::Content::Git(top)) => self.git_ui(ui, i, &grid, side, &top),
                 _ => self.panel_cells(ui, i, &grid, side),
             }
         }

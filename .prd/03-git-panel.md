@@ -415,8 +415,8 @@ passing by (a merge whose parents two lanes on one side await), the join is `┼
 told apart only by its colour, the joined lane's; where the two lanes share a colour — their
 occupancies began a multiple of five apart in turn (the colour index above), adjacent lanes too, so
 about one such join in five — the row reads as a crossing. One row a commit has no room to show more;
-the details pane lists the parents (§6.1). Until X4-graph draws these cells, the window's egui graph
-still draws a lane change as one diagonal across half a row, and the uncommitted row's line dashed.
+the details pane lists the parents (§6.1). The window draws these cells too since X4-graph (its egui
+graph, a lane change one diagonal across half a row and the uncommitted row's line dashed, is gone).
 
 - **Measured** with these rules (a script over `git log --parents`, 2026-11-20): the 100 000-commit
   fixture of §4.5 has at most 2 slots, 2.0 node segments per row; a wide fixture (60 branches committed
@@ -441,7 +441,7 @@ above); the result does not depend on anything but the input (run twice, compare
 | a commit | `■` in its lane's colour |
 | the checked-out commit | `◙` |
 | a stash | `≡`, its row's text dim, the subject after a `stash@{n}` label |
-| the uncommitted row | `○` in the dim colour, a dotted dim line to HEAD's row, `:` a cell (code page 437 has no dashed line; `:` is in it, and stays one cell, apart from `\|`, in an ambiguous-wide terminal; egui's window draws it dashed until X4-graph); text `Uncommitted changes (N)`, author `*`, commit `*`, date blank |
+| the uncommitted row | `○` in the dim colour, a dotted dim line to HEAD's row, `:` a cell (code page 437 has no dashed line; `:` is in it, and stays one cell, apart from `\|`, in an ambiguous-wide terminal; the window draws the same `:` since X4-graph); text `Uncommitted changes (N)`, author `*`, commit `*`, date blank |
 | local branch | its name, black on light green |
 | the checked-out branch | `►` before its name |
 | remote branch | `origin/main`, black on light cyan |

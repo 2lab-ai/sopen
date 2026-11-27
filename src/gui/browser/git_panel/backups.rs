@@ -18,6 +18,7 @@ use crate::git::actions::Action;
 use crate::git::backup::Record;
 use crate::git::model::{BackupKind, BackupRef};
 use crate::gui::browser::keys::{Command, Mods};
+use crate::gui::cells::{Buffer, Cells, Grid};
 use crate::gui::chrome;
 use crate::gui::chrome::git::LOOK;
 use eframe::egui::{self, Pos2, Rect, Sense, Vec2};
@@ -211,15 +212,24 @@ fn hint() -> String {
     )
 }
 
-/// The Backups list in `rect` (the git panel's body): the header, the lines with the bar, the
-/// scroll bar, and the Restore, Show and Delete buttons with the keys' hint at the foot. A click
-/// puts the bar on a line, a double click Shows it.
+/// Whether [`draw`] paints the list's cells (10 §17, X4-graph's seam): not yet — egui draws it at
+/// `grid.rect(cells)`, its scroll bar in its own last column, and the panel leaves
+/// those cells to `term::compose` (a hand-off box in a terminal) until X4-lists makes it `true`.
+pub(super) const PAINTS_CELLS: bool = false;
+
+/// The Backups list at cells `cells` of `grid` (the git panel's body): the header, the lines with
+/// the bar, the scroll bar, and the Restore, Show and Delete buttons with the keys' hint at the
+/// foot. `buf` is the panel's buffer, for the list's cells once it paints them
+/// ([`PAINTS_CELLS`]). A click puts the bar on a line, a double click Shows it.
 pub fn draw(
     ui: &mut egui::Ui,
-    rect: Rect,
+    grid: &Grid,
+    cells: Cells,
+    _buf: &mut Buffer,
     view: &mut BackupsView,
     active: bool,
 ) -> Option<BackupsEnd> {
+    let rect = grid.rect(cells);
     let ctx = ui.ctx().clone();
     let font = chrome::mono(ui);
     let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));

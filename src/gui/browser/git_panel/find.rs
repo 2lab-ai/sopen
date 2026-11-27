@@ -16,9 +16,18 @@ use super::graph_view::row_labels;
 use super::{Label, Paging, Scroll};
 use crate::git::graph::Row;
 use crate::git::model::Oid;
+use crate::gui::cells::{Buffer, Cells, Grid, Position};
 use crate::gui::chrome;
 use eframe::egui::{self, Key, Modifiers};
 use std::collections::HashMap;
+
+/// What the status row says while Find is open.
+pub(super) const FIND_HINT: &str = "Enter next · Shift+Enter previous · Esc closes Find";
+
+/// Whether [`field`] paints Find's cells (10 §17, X4-graph's seam): not yet — egui draws the field
+/// at `grid.rect(cells)` and the panel leaves those cells to `term::compose` until X4-find makes
+/// it `true`.
+pub(super) const PAINTS_CELLS: bool = false;
 
 /// Find's state while its field is open.
 #[derive(Debug, Clone)]
@@ -151,10 +160,22 @@ fn find_id() -> egui::Id {
     egui::Id::unique("sopen-git-find")
 }
 
-/// Find's field in `rect` (the heads' row): `Find` and the field, then the `Aa` case toggle. It
-/// has the typing while it is open (`typing`: no dialog over it): the focus is asked for before
-/// it is laid out, so the typing of this pass goes there (a typed letter's rest included).
-pub(super) fn field(ui: &mut egui::Ui, rect: egui::Rect, find: &mut Find, cw: f32, typing: bool) {
+/// Find's field at cells `cells` of `grid` (the heads' row): `Find` and the field, then the `Aa`
+/// case toggle. It has the typing while it is open (`typing`: no dialog over it): the focus is
+/// asked for before it is laid out, so the typing of this pass goes there (a typed letter's rest
+/// included). `buf` is the panel's buffer, for the field's cells once it paints them
+/// ([`PAINTS_CELLS`]); the caret's cell is returned then, for the panel's paint (none while egui
+/// draws it).
+pub(super) fn field(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    cells: Cells,
+    _buf: &mut Buffer,
+    find: &mut Find,
+    typing: bool,
+) -> Option<Position> {
+    let rect = grid.rect(cells);
+    let cw = chrome::CELL.x;
     let ctx = ui.ctx().clone();
     let id = find_id();
     if std::mem::take(&mut find.fresh) {
@@ -205,6 +226,7 @@ pub(super) fn field(ui: &mut egui::Ui, rect: egui::Rect, find: &mut Find, cw: f3
     if aa.clicked() {
         find.case = !find.case;
     }
+    None
 }
 
 /// A history search (03 §4.7): what its dialog asked for. The integration runs `git log` with
@@ -272,8 +294,16 @@ const SEARCH_FIELDS: [&str; 6] = [
 ];
 
 impl SearchDialog {
-    /// One pass: Esc and Enter are taken before its widgets see them.
-    pub fn ui(&mut self, ctx: &egui::Context) -> Option<SearchEnd> {
+    /// The cells of `grid` (the panels') the dialog covers, its box and its shadow, for the panel
+    /// and the other side to blank (10 §17, X4-graph's seam): none while egui draws it, until
+    /// X4-find.
+    pub fn covers(&self, _grid: &Grid) -> Vec<Cells> {
+        Vec::new()
+    }
+
+    /// One pass on `grid` (the panels', where it stands once it is in cells): Esc and Enter are
+    /// taken before its widgets see them.
+    pub fn ui(&mut self, ctx: &egui::Context, _grid: Grid) -> Option<SearchEnd> {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             return Some(SearchEnd::Cancel);
         }

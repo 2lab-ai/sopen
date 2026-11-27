@@ -2313,12 +2313,22 @@ impl Browser {
         }
     }
 
-    /// The git panel shown on side `side` in `rect` (the keyboard's when `active`), its clicks
-    /// carried out; a press on it gives it the keyboard.
-    pub(super) fn git_ui(&mut self, ui: &mut egui::Ui, side: usize, rect: Rect, top: &str) {
+    /// The git panel shown on side `side` at cells `cells` of `grid` (the panels' grid; all of it
+    /// when wide), in cells (10 §4, X4-graph) — those under a dialog of the list's blanked first,
+    /// as the list's are (`Ops::covered`) — its clicks carried out; a press on it gives it the
+    /// keyboard.
+    pub(super) fn git_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        side: usize,
+        grid: &Grid,
+        cells: cells::Cells,
+        top: &str,
+    ) {
         let Some(i) = self.git.panel(top) else {
             return;
         };
+        let rect = grid.rect(cells);
         let pressed = ui.input(|inp| {
             inp.pointer.any_pressed()
                 && inp
@@ -2334,12 +2344,40 @@ impl Browser {
             self.git.focus = true;
         }
         let active = self.git.focus && side == 1 - self.active && self.viewer.is_none();
-        let mut actions = git_panel::draw(ui, rect, &mut self.git.panels[i].view, active);
+        // Under the list's dialogs, and under the other git panel's when two repositories' panels
+        // stand side by side (a pin and the other side's own) — never its own, which it takes
+        // after this pass's dialogs have opened or closed (`GitView::covered`).
+        let mut under = self.ops.covered(grid);
+        under.extend(self.git_covered(grid, Some(i)));
+        let view = &mut self.git.panels[i].view;
+        let mut actions = git_panel::draw(ui, grid, cells, view, active, &under);
         if self.ops.holds_keyboard() || self.tree.is_some() {
             actions.clear();
         }
         let ctx = ui.ctx().clone();
         self.git_actions(&ctx, i, actions);
+    }
+
+    /// The cells of `grid` (the panels' grid) that the dialogs of the git panels on screen cover
+    /// (`GitView::covered`), for the other side's list, preview or tree to blank before it is
+    /// painted (10 §17, X4-graph), as it blanks those under the list's dialogs — all of them but
+    /// panel `except`'s (a panel blanks its own as its pass leaves them).
+    pub(super) fn git_covered(&self, grid: &Grid, except: Option<usize>) -> Vec<cells::Cells> {
+        let Some(shown) = &self.shown else {
+            return Vec::new();
+        };
+        let mut tops: Vec<&str> = (shown.iter())
+            .filter_map(|c| match c {
+                view::Content::Git(top) => Some(top.as_str()),
+                _ => None,
+            })
+            .collect();
+        tops.dedup();
+        (tops.into_iter())
+            .filter_map(|top| self.git.panel(top))
+            .filter(|&i| Some(i) != except)
+            .flat_map(|i| self.git.panels[i].view.covered(grid))
+            .collect()
     }
 }
 

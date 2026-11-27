@@ -1,28 +1,33 @@
-//! The graph (03 §4.2–§4.4): the columns, lanes, nodes and labels of the visible rows only, the
-//! bar, the label cursor and the marked rows, and the foot.
+//! The graph (03 §4.2–§4.4) in cells (10 §4, X4-graph): the columns, lanes, nodes and labels of
+//! the visible rows only, the bar, the label cursor and the marked rows, written into the
+//! panel's buffer, so the window and the terminal show the same cells — every width a count of
+//! cells (unicode-width), a Hangul subject or author two cells a glyph, a cut never half a glyph.
 //!
 //! - **Columns**, in cells (03 §4.2): Graph (2 a lane, at most a third of the panel, the lanes
 //!   beyond it cut with `»`), Description (labels, then the subject), Date 16, Author 14, Commit
 //!   8. Narrowing drops Author first, then Date, then Commit, so the description keeps
 //!   [`MIN_DESCRIPTION`] cells. A history search's flat list has no Graph column.
-//! - **Lanes** are `git::graph`'s, drawn for the rows on screen only: each row's node segments,
-//!   straight from the node (mid-row, on its lane) to a slot on the row's top or bottom edge, and
-//!   the pass-throughs of the visible rows ([`Graph::pass_throughs`], once a pass) as vertical
-//!   lines; the uncommitted row's line to HEAD's row dashed and dim (03 §4.4). A lane's x is the
-//!   middle of its first cell ([`Geometry`]).
+//! - **Lanes** are `git::graph`'s, as glyphs ([`lanes::rows`], X4-lanes), for the rows on screen
+//!   only: each row's node segments and the visible rows' pass-throughs.
 //! - **Labels** are built once when the refs, HEAD or the filters change ([`index`]), in 03 §4.4's
 //!   order, a local branch and the remotes having it on the same commit merged (`main↔origin,up`);
-//!   a row shows as many as fit, then `+N`.
+//!   a row shows as many as fit, then `+N`. The label cursor's label has its colours swapped (03
+//!   §4.4's "inverted": no modifier, T37).
+//! - **An ambiguous-wide terminal** (10 §10, T38): the panel's own `↔` (a label's joiner) and the
+//!   foot's `↑ ↓` are §10's stand-ins, at the source, as the nodes and lanes are through
+//!   [`lanes::rows`]; labels, subjects and names are content and stay as written.
 
 use super::filters::{short_name, split_remote, Filters};
-use super::{HeadRef, Label, LabelKind, Paging, RowKey, Scroll, Tracking};
-use crate::git::graph::{Graph, Node, Row};
+use super::{lanes, HeadRef, Label, LabelKind, Paging, RowKey, Scroll, Tracking};
+use crate::git::graph::{Graph, Row};
 use crate::git::model::{Oid, RefKind, RefLabel};
+use crate::gui::cells::{self, Buffer, Cells, Grid, Pen};
 use crate::gui::chrome;
 use crate::gui::chrome::git::{self as look, LOOK};
-use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use crate::gui::term;
+use eframe::egui::{self, Pos2, Sense};
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 /// The cells the description keeps however narrow the panel: Author, Date and Commit go first.
 pub const MIN_DESCRIPTION: usize = 16;
@@ -33,44 +38,6 @@ const DATE: usize = 16;
 const AUTHOR: usize = 14;
 /// The Commit column: the first 8 hex digits.
 const COMMIT: usize = 8;
-
-/// Where a pass drew the graph's rows: the Graph column's left edge, a cell's width, the first
-/// drawn row's top and index, a row's height.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct Geometry {
-    pub left: f32,
-    pub cell: f32,
-    pub rows_top: f32,
-    pub row_h: f32,
-    pub first: usize,
-}
-
-impl Geometry {
-    /// A lane's x: the middle of the first of its two cells.
-    pub fn lane_x(&self, slot: u32) -> f32 {
-        self.left + self.cell * (2 * slot) as f32 + self.cell / 2.0
-    }
-
-    /// Row `i`'s top edge.
-    pub fn y(&self, i: usize) -> f32 {
-        self.rows_top + self.row_h * i.saturating_sub(self.first) as f32
-    }
-
-    /// Row `i`'s node at `column`: mid-row.
-    pub fn node(&self, i: usize, column: u32) -> Pos2 {
-        Pos2::new(self.lane_x(column), self.y(i) + self.row_h / 2.0)
-    }
-
-    /// `slot` on row `i`'s top edge.
-    pub fn top(&self, i: usize, slot: u32) -> Pos2 {
-        Pos2::new(self.lane_x(slot), self.y(i))
-    }
-
-    /// `slot` on row `i`'s bottom edge.
-    pub fn bottom(&self, i: usize, slot: u32) -> Pos2 {
-        Pos2::new(self.lane_x(slot), self.y(i) + self.row_h)
-    }
-}
 
 /// The columns of a panel `chars` cells wide whose graph has `lanes` lanes (0: no Graph column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +128,7 @@ pub(super) fn index(
             text: "HEAD".to_string(),
             kind: LabelKind::Head,
             lossy: false,
+            joined: None,
         });
     }
     for (at, refs) in by {
@@ -186,7 +154,9 @@ pub(super) fn index(
                 text.push(look::CURRENT);
             }
             text.push_str(name);
+            let mut joined = None;
             if !with.is_empty() {
+                joined = Some(text.len());
                 text.push(look::BOTH);
                 text.push_str(&with.join(","));
             }
@@ -198,12 +168,14 @@ pub(super) fn index(
                     LabelKind::Local
                 },
                 lossy: lossy(local),
+                joined,
             });
         }
         labels.extend(remotes.iter().map(|r| Label {
             text: short_name(&r.refname).to_string(),
             kind: LabelKind::Remote,
             lossy: lossy(r),
+            joined: None,
         }));
         labels.extend(
             refs.iter()
@@ -212,6 +184,7 @@ pub(super) fn index(
                     text: short_name(&r.refname).to_string(),
                     kind: LabelKind::Tag,
                     lossy: lossy(r),
+                    joined: None,
                 }),
         );
         let list = out.entry(at).or_default();
@@ -232,7 +205,10 @@ fn lossy(r: &RefLabel) -> bool {
 /// out, however long the ref's name.
 pub(super) fn capped(text: &str, room: usize) -> Cow<'_, str> {
     match text.char_indices().nth(room + 1) {
-        Some((at, _)) => Cow::Owned(text[..at].to_string()),
+        Some((at, _)) => {
+            copied(at);
+            Cow::Owned(text[..at].to_string())
+        }
         None => Cow::Borrowed(text),
     }
 }
@@ -265,6 +241,7 @@ pub(super) fn row_labels<'a>(
             text: stash.selector.clone(),
             kind: LabelKind::Stash,
             lossy: false,
+            joined: None,
         }]),
         Row::Commit { commit, .. } => index
             .get(&commit.oid)
@@ -340,14 +317,15 @@ pub(super) fn paging_text(paging: &Paging, n: usize, noun: &str) -> (String, boo
     }
 }
 
-/// The foot's right end: `main ↑2 ↓1 origin/main` (a zero count is left out).
-pub(super) fn tracking_text(t: &Tracking) -> String {
+/// The foot's right end: `main ↑2 ↓1 origin/main` (a zero count is left out); in an
+/// ambiguous-wide terminal (`wide`) the arrows are §10's `^ v`, the names as written (T38).
+pub(super) fn tracking_text(t: &Tracking, wide: bool) -> String {
     let mut s = t.branch.clone();
     if t.ahead > 0 {
-        s.push_str(&format!(" {}{}", look::AHEAD, t.ahead));
+        s.push_str(&format!(" {}{}", own(look::AHEAD, wide), t.ahead));
     }
     if t.behind > 0 {
-        s.push_str(&format!(" {}{}", look::BEHIND, t.behind));
+        s.push_str(&format!(" {}{}", own(look::BEHIND, wide), t.behind));
     }
     s.push(' ');
     s.push_str(&t.upstream);
@@ -377,76 +355,128 @@ pub(super) struct Drawn {
     pub clicked: Option<(usize, bool)>,
 }
 
-/// Text cells on a painter: each left-aligned at a cell of a row.
-#[derive(Clone, Copy)]
-struct Cells<'a> {
-    painter: &'a egui::Painter,
-    font: &'a FontId,
-    /// The cells' left edge and width.
-    left: f32,
-    cw: f32,
+/// Where a pass drew the graph's rows: the grid, the rows' cells inside the frame (from the
+/// Graph column's first cell to the description's last, the scroll bar on the border after
+/// them), and the first drawn row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Geometry {
+    pub grid: Grid,
+    pub rows: Cells,
+    pub first: usize,
 }
 
-impl Cells<'_> {
-    /// `text` at cell `x` on the row at `y`.
-    fn put(&self, x: usize, y: f32, text: &str, c: Color32) {
-        self.painter.text(
-            Pos2::new(self.left + self.cw * x as f32, y),
-            egui::Align2::LEFT_TOP,
-            text,
-            self.font.clone(),
-            c,
-        );
+impl Geometry {
+    /// The drawn row whose cells are under `p`, if one is.
+    pub fn row_at(&self, p: Pos2) -> Option<usize> {
+        let at = self.grid.at(p)?;
+        let k = usize::from(at.y.checked_sub(self.rows.y)?);
+        self.rows.contains(at).then_some(self.first + k)
+    }
+
+    /// Row `i`'s cells, where it is drawn.
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
+    pub fn row(&self, i: usize) -> Option<Cells> {
+        let k = u16::try_from(i.checked_sub(self.first)?).ok()?;
+        (k < self.rows.height).then(|| Cells::new(self.rows.x, self.rows.y + k, self.rows.width, 1))
     }
 }
 
-/// `list` in `area`, its column heads in `head` (none while Find's field is there), the scroll
-/// bar on the right border beside the rows. Only the rows on screen are painted; the wheel
-/// scrolls them, the bar stays.
+/// `glyph` as this pass's screen shows it: in a terminal that draws a glyph of ambiguous width in
+/// two cells (`wide`), 10 §10's stand-in (`term::narrow`: `↔` `-`, `↑` `^`, `↓` `v`), put here
+/// where the glyph is known to be the panel's own, never a name's (T38).
+fn own(glyph: char, wide: bool) -> String {
+    let mut utf8 = [0u8; 4];
+    let s: &str = glyph.encode_utf8(&mut utf8);
+    match term::narrow(s).filter(|_| wide) {
+        Some(stand_in) => stand_in.to_string(),
+        None => s.to_string(),
+    }
+}
+
+/// A label as a row shows it in at most `room` cells' worth of characters ([`capped`]), its
+/// control characters escaped: in an ambiguous-wide terminal the `↔` that joins a local branch to
+/// its remotes is §10's stand-in — the panel's own glyph — while the names stay as written. Only
+/// the shown start is built, the joiner substituted there when it is in it, so a pass costs the
+/// room, never a copy of the whole name (review round 1).
+pub(super) fn label_text(label: &Label, room: usize, wide: bool) -> String {
+    // `capped` cuts at a character and the joiner is one: it is whole in `shown` or not in it.
+    let shown = capped(&label.text, room);
+    let shown = match label.joined.filter(|&at| wide && at < shown.len()) {
+        Some(at) => {
+            let mut s = shown.into_owned();
+            copied(s.len());
+            s.replace_range(at..at + look::BOTH.len_utf8(), &own(look::BOTH, wide));
+            Cow::Owned(s)
+        }
+        None => shown,
+    };
+    let out = printable(&shown).into_owned();
+    copied(out.len());
+    out
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bytes [`label_text`] has copied on this thread, [`capped`]'s cut among them: its work,
+    /// which the tests bound by the room a label has, however long its name.
+    pub(super) static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `bytes` copied ([`COPIED`], in the tests only).
+fn copied(bytes: usize) {
+    #[cfg(test)]
+    COPIED.with(|c| c.set(c.get() + bytes));
+    #[cfg(not(test))]
+    let _ = bytes;
+}
+
+/// `list` in cells `area` of `buf` (on `grid`): its column heads in `head` (none while Find's
+/// field stands there), each row a cell tall — the lanes ([`lanes::rows`]), the labels in their
+/// colours (the label cursor's swapped, 03 §4.4) then `+N` where they stop, the subject, Date,
+/// Author and Commit, cut by cells — the bar, and the scroll bar on the border right of `area`.
+/// Only the rows on screen are drawn; the wheel scrolls them, the bar stays. Each row is an
+/// `interact` rect at its cells: a click puts the bar there, a double click on one row is Enter
+/// (the browser's `second_click`, as the list's and the tree's: egui alone misses a double click
+/// right after a click on another row).
 pub(super) fn draw(
     ui: &mut egui::Ui,
-    head: Option<Rect>,
-    area: Rect,
+    grid: &Grid,
+    buf: &mut Buffer,
+    head: Option<Cells>,
+    area: Cells,
     scroll: &mut Scroll,
     list: &List,
 ) -> Drawn {
     let ctx = ui.ctx().clone();
-    let font = chrome::mono(ui);
-    let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-    let row_h = text_h.ceil();
-    let chars = (area.width() / cw).floor().max(0.0) as usize;
+    let p = chrome::PALETTE;
+    let wide = cells::ambiguous_wide(&ctx);
+    let chars = usize::from(area.width);
     let lanes = list.graph.map_or(0, |g| g.width().max(1));
     let cols = Columns::new(chars, lanes);
-    let left = area.left();
+    // Cell `c` of the room, on the grid (every `c` here is below `chars`).
+    let x = |c: usize| area.x.saturating_add(u16::try_from(c).unwrap_or(u16::MAX));
     if let Some(head) = head {
-        let painter = ui.painter_at(head);
-        let grid = Cells {
-            painter: &painter,
-            font: &font,
-            left,
-            cw,
-        };
-        let y = head.top();
-        grid.put(cols.desc, y, "Description", LOOK.dim);
-        for (at, word) in [
-            (cols.date, "Date"),
-            (cols.author, "Author"),
-            (cols.commit, "Commit"),
+        let dim = Pen::new(LOOK.dim, p.back);
+        cells::put(buf, x(cols.desc), head.y, "Description", cols.desc_w, dim);
+        for (at, word, w) in [
+            (cols.date, "Date", DATE),
+            (cols.author, "Author", AUTHOR),
+            (cols.commit, "Commit", COMMIT),
         ] {
             if let Some(at) = at {
-                grid.put(at, y, word, LOOK.dim);
+                cells::put(buf, x(at), head.y, word, w, dim);
             }
         }
     }
     let len = list.rows.len();
-    let visible = ((area.height() / row_h).floor() as usize).max(1);
-    if ui.rect_contains_pointer(area) {
+    let visible = usize::from(area.height).max(1);
+    if super::super::pointer_on_pane(ui, grid.rect(area)) {
         let lines: f32 = ctx.input(|i| {
             i.events
                 .iter()
                 .map(|e| match e {
                     egui::Event::MouseWheel { unit, delta, .. } => match unit {
-                        egui::MouseWheelUnit::Point => -delta.y / row_h,
+                        egui::MouseWheelUnit::Point => -delta.y / chrome::CELL.y,
                         _ => -delta.y * 3.0,
                     },
                     _ => 0.0,
@@ -458,42 +488,28 @@ pub(super) fn draw(
     }
     scroll.settle(visible, len);
     let range = scroll.range(len);
-    let painter = ui.painter_at(area);
-    let grid = Cells {
-        painter: &painter,
-        font: &font,
-        left,
-        cw,
-    };
-    let geo = Geometry {
-        left,
-        cell: cw,
-        rows_top: area.top(),
-        row_h,
-        first: range.start,
-    };
-    let row_rect = |i: usize| {
-        Rect::from_min_size(
-            Pos2::new(area.left(), geo.y(i)),
-            Vec2::new(area.width(), row_h),
-        )
-    };
-    if range.contains(&scroll.bar) {
-        chrome::bar(&painter, row_rect(scroll.bar), list.active);
-    }
-    if let Some(graph) = list.graph {
-        lanes_of(&painter, graph, &range, &geo, &cols, &font);
-    }
+    let shown = range.start..range.end.min(range.start + usize::from(area.height));
+    let graph_cells = list
+        .graph
+        .map(|g| lanes::rows(g, shown.clone(), &cols, wide));
+    let desc_right = cols.desc + cols.desc_w;
     let mut clicked = None;
-    for (i, row) in list
+    for (k, (i, row)) in list
         .rows
         .iter()
         .enumerate()
-        .skip(range.start)
-        .take(range.len())
+        .skip(shown.start)
+        .take(shown.len())
+        .enumerate()
     {
-        let y = geo.y(i);
+        let y = area.y + k as u16;
+        let row_cells = Cells::new(area.x, y, area.width, 1);
         let on_bar = i == scroll.bar;
+        let back = match (on_bar, list.active) {
+            (false, _) => p.back,
+            (true, true) => p.bar,
+            (true, false) => p.bar_idle,
+        };
         let marked = list.marks.contains(&RowKey::of(row));
         let muted = match row {
             Row::Commit { commit, .. } => commit.parents.len() > 1,
@@ -508,188 +524,98 @@ pub(super) fn draw(
         } else {
             LOOK.text
         };
+        let pen = Pen::new(colour, back);
+        cells::fill(buf, row_cells, pen);
+        // The lanes, each cell in its own colour on the row's back.
+        if let Some(row_lanes) = graph_cells.as_ref().and_then(|g| g.get(k)) {
+            for (c, cell) in row_lanes.iter().enumerate() {
+                if let Some(cell) = cell {
+                    let glyph = cell.glyph.to_string();
+                    cells::put(buf, x(c), y, &glyph, 1, Pen::new(cell.colour, back));
+                }
+            }
+        }
         let (subject, date, author, commit) = cells(row, list.uncommitted);
-        // Everything of the row is painted inside it.
-        let painter = painter.with_clip_rect(row_rect(i).intersect(area));
-        let grid = Cells {
-            painter: &painter,
-            ..grid
-        };
         // The description: the labels, then the subject in what is left.
-        let desc_left = left + cw * cols.desc as f32;
-        let desc_right = desc_left + cw * cols.desc_w as f32;
-        let mut x = desc_left;
+        let mut at = cols.desc;
         let labels = row_labels(row, list.labels);
         let cursor = if on_bar { list.label_cursor } else { 0 };
-        for (k, label) in labels.iter().enumerate() {
+        for (n, label) in labels.iter().enumerate() {
             let mut colours = label_look(label.kind);
-            if cursor == k + 1 {
+            if cursor == n + 1 {
                 colours = colours.inverted();
             }
             // No more of a name than the description holds is laid out.
-            let text = capped(&label.text, cols.desc_w);
-            let galley =
-                painter.layout_no_wrap(printable(&text).into_owned(), font.clone(), colours.text);
-            let w = galley.size().x;
-            let more = labels.len() - k - 1;
+            let text = label_text(label, cols.desc_w, wide);
+            let w = cells::width(&text);
+            let more = labels.len() - n - 1;
             let reserve = if more > 0 {
-                cw * (2 + more.to_string().len()) as f32
+                2 + more.to_string().len()
             } else {
-                0.0
+                0
             };
-            if x + w + reserve > desc_right {
-                let rest = format!("+{}", labels.len() - k);
-                if x + cw * rest.len() as f32 <= desc_right {
-                    painter.text(
-                        Pos2::new(x, y),
-                        egui::Align2::LEFT_TOP,
-                        rest,
-                        font.clone(),
-                        LOOK.dim,
-                    );
+            if at + w + reserve > desc_right {
+                let rest = format!("+{}", labels.len() - n);
+                if at + rest.len() <= desc_right {
+                    let dim = Pen::new(LOOK.dim, back);
+                    cells::put(buf, x(at), y, &rest, rest.len(), dim);
                 }
-                x = desc_right;
+                at = desc_right;
                 break;
             }
-            painter.rect_filled(
-                Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, row_h)),
-                0.0,
-                colours.back,
+            cells::put(
+                buf,
+                x(at),
+                y,
+                &text,
+                w,
+                Pen::new(colours.text, colours.back),
             );
-            painter.galley(Pos2::new(x, y), galley, colours.text);
-            x += w + cw;
+            at += w + 1;
         }
-        if x < desc_right {
-            let shown = chrome::fit_start(&ctx, &subject, &font, desc_right - x);
-            painter.text(
-                Pos2::new(x, y),
-                egui::Align2::LEFT_TOP,
-                shown,
-                font.clone(),
-                colour,
-            );
+        if at < desc_right {
+            let room = desc_right - at;
+            cells::put(buf, x(at), y, &cells::fit_start(&subject, room), room, pen);
         }
         if let Some(at) = cols.date {
-            if !date.is_empty() {
-                grid.put(at, y, &date, colour);
-            }
+            cells::put(buf, x(at), y, &date, DATE, pen);
         }
         if let Some(at) = cols.author {
-            if !author.is_empty() {
-                let shown = chrome::fit_start(&ctx, &author, &font, cw * AUTHOR as f32);
-                grid.put(at, y, &shown, colour);
-            }
+            cells::put(
+                buf,
+                x(at),
+                y,
+                &cells::fit_start(&author, AUTHOR),
+                AUTHOR,
+                pen,
+            );
         }
         if let Some(at) = cols.commit {
-            grid.put(at, y, &commit, colour);
+            cells::put(buf, x(at), y, &commit, COMMIT, pen);
         }
         let resp = ui.interact(
-            row_rect(i),
+            grid.rect(row_cells),
             ui.scope_id().with((list.salt, i)),
             Sense::click(),
         );
-        if resp.double_clicked() {
-            clicked = Some((i, true));
-        } else if resp.clicked() {
-            clicked = Some((i, false));
+        if resp.clicked() {
+            // The row by what it draws: rows come and go above it between two clicks (03 §5).
+            let pair = egui::Id::unique(("sopen-git-row-click", list.salt, RowKey::of(row)));
+            clicked = Some((i, super::super::second_click(&resp, pair)));
         }
     }
+    // The scroll bar on the border, beside the rows.
     let max_top = len.saturating_sub(visible);
-    let column = Rect::from_min_max(
-        Pos2::new(area.right(), area.top()),
-        Pos2::new(area.right() + chrome::CELL.x, area.bottom()),
-    );
-    chrome::scroll_bar(
-        &ui.painter_at(column),
-        column,
-        (max_top > 0).then(|| scroll.top as f32 / max_top as f32),
-    );
+    let at = (max_top > 0).then(|| scroll.top as f32 / max_top as f32);
+    if area.height > 0 {
+        cells::scroll_bar(buf, area.right(), area.y, area.height, at);
+    }
     Drawn {
-        geometry: list.graph.map(|_| geo),
+        geometry: list.graph.map(|_| Geometry {
+            grid: *grid,
+            rows: area,
+            first: range.start,
+        }),
         clicked,
-    }
-}
-
-/// The lanes of the rows in `range`: the pass-throughs, each row's node segments and its node,
-/// clipped to the Graph column; `»` on a row whose lanes run past the cut.
-fn lanes_of(
-    painter: &egui::Painter,
-    graph: &Graph,
-    range: &std::ops::Range<usize>,
-    geo: &Geometry,
-    cols: &Columns,
-    font: &FontId,
-) {
-    let column = Rect::from_min_max(
-        Pos2::new(geo.left, geo.rows_top),
-        Pos2::new(
-            geo.left + geo.cell * (2 * cols.lanes) as f32,
-            geo.rows_top + geo.row_h * range.len() as f32,
-        ),
-    );
-    let lanes = painter.with_clip_rect(column.intersect(painter.clip_rect()));
-    let line = |from: Pos2, to: Pos2, colour: u32, dashed: bool| {
-        if dashed {
-            let stroke = Stroke::new(1.0, LOOK.uncommitted);
-            lanes.extend(Shape::dashed_line(&[from, to], stroke, 2.0, 2.0));
-        } else {
-            lanes.line_segment([from, to], Stroke::new(1.0, look::lane(colour)));
-        }
-    };
-    // Rows with something past the cut.
-    let mut cut: BTreeSet<usize> = BTreeSet::new();
-    for p in graph.pass_throughs(range.clone()) {
-        if p.slot >= cols.lanes {
-            cut.extend(p.rows.clone());
-            continue;
-        }
-        line(
-            geo.top(p.rows.start, p.slot),
-            geo.bottom(p.rows.end - 1, p.slot),
-            p.colour,
-            p.dashed,
-        );
-    }
-    for i in range.clone() {
-        let node = graph.row(i);
-        for s in graph.segments(i) {
-            if s.slot >= cols.lanes || node.column >= cols.lanes {
-                cut.insert(i);
-            }
-            let to = match s.end {
-                crate::git::graph::End::Top => geo.top(i, s.slot),
-                crate::git::graph::End::Bottom => geo.bottom(i, s.slot),
-            };
-            line(geo.node(i, node.column), to, s.colour, s.dashed);
-        }
-        if node.column >= cols.lanes {
-            cut.insert(i);
-            continue;
-        }
-        let (glyph, colour) = match node.node {
-            Node::Commit => (look::COMMIT, look::lane(node.colour)),
-            Node::CheckedOut => (look::CHECKED_OUT, look::lane(node.colour)),
-            Node::Stash => (look::STASH, look::lane(node.colour)),
-            Node::Uncommitted => (look::UNCOMMITTED, LOOK.uncommitted),
-        };
-        lanes.text(
-            Pos2::new(geo.left + geo.cell * (2 * node.column) as f32, geo.y(i)),
-            egui::Align2::LEFT_TOP,
-            glyph,
-            font.clone(),
-            colour,
-        );
-    }
-    if cols.cut {
-        let at = geo.left + geo.cell * (2 * cols.lanes) as f32;
-        for &i in &cut {
-            painter.text(
-                Pos2::new(at, geo.y(i)),
-                egui::Align2::LEFT_TOP,
-                look::CUT,
-                font.clone(),
-                LOOK.cut,
-            );
-        }
     }
 }

@@ -12,6 +12,7 @@
 use super::graph_view::{date_text, printable};
 use super::{Scroll, Subject};
 use crate::git::model::Oid;
+use crate::gui::cells::{Buffer, Cells, Grid};
 use crate::gui::chrome;
 use crate::gui::chrome::git::{self as look, LOOK};
 use eframe::egui::{self, Pos2, Rect, Sense, Vec2};
@@ -382,16 +383,26 @@ impl Pane {
     }
 }
 
-/// The pane in `area`, the scroll bar on the right border beside it; `viewed` says which files
-/// were opened (`√`), `active` whether the pane's bar is the active one. A click puts the pane's
-/// bar on a line and gives it the keyboard; returns the line clicked and whether twice.
+/// Whether [`draw`] paints the pane's cells (10 §17, X4-graph's seam): not yet — egui draws it at
+/// `grid.rect(cells)`, its scroll bar on the border cell right of them, and the panel leaves
+/// those cells to `term::compose` (a hand-off box in a terminal) until X4-pane makes it `true`.
+pub(super) const PAINTS_CELLS: bool = false;
+
+/// The pane at cells `cells` of `grid` (the panel hands it the rows under the graph's rule), the
+/// scroll bar on the right border beside it; `viewed` says which files were opened (`√`), `active`
+/// whether the pane's bar is the active one. `buf` is the panel's buffer, for the pane's cells
+/// once it paints them ([`PAINTS_CELLS`]). A click puts the pane's bar on a line and gives it the
+/// keyboard; returns the line clicked and whether twice.
 pub(super) fn draw(
     ui: &mut egui::Ui,
-    area: Rect,
+    grid: &Grid,
+    cells: Cells,
+    _buf: &mut Buffer,
     pane: &mut Pane,
     viewed: &dyn Fn(&FileRow) -> bool,
     active: bool,
 ) -> Option<(usize, bool)> {
+    let area = grid.rect(cells);
     let ctx = ui.ctx().clone();
     let font = chrome::mono(ui);
     let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
