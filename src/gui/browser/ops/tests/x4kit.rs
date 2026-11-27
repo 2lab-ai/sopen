@@ -10,7 +10,7 @@ use super::*;
 use crate::gui::browser::keys::{self, Mods};
 use crate::gui::cells::{Layer, Pen};
 use crate::gui::term::{self, Screen};
-use dialog::{choice_id, Bar, Input, Row};
+use dialog::{choice_id, work, Bar, Input, Row, Rows};
 use std::sync::Arc;
 
 const CELL: Vec2 = chrome::CELL;
@@ -48,6 +48,8 @@ struct Host {
     hidden: bool,
     /// The text the dialog left in each pass's input, for what is behind it.
     left: Vec<String>,
+    /// The first row a report's rows that scroll show.
+    report_top: usize,
 }
 
 impl Host {
@@ -74,6 +76,7 @@ impl Host {
             modal: Rect::NOTHING,
             hidden: false,
             left: vec![],
+            report_top: 0,
         }
     }
 
@@ -135,8 +138,8 @@ impl Window for Host {
         let inputs = Inputs {
             field,
             check,
+            top: Some(&mut self.report_top),
             by_id,
-            ..Inputs::default()
         };
         let shown = dialog::show(&ctx, id("dialog"), &layout, inputs);
         self.clicked
@@ -194,7 +197,7 @@ fn message(label: &str, rows: u16) -> Part {
 
 fn list(rows: &[(&str, &str)], most: u16) -> Part {
     Part::List {
-        rows: rows.iter().map(|(l, k)| Row::new(l, k)).collect(),
+        rows: Rows::new(rows.iter().map(|(l, k)| Row::new(l, k)).collect()),
         id: id("list"),
         most,
     }
@@ -629,8 +632,8 @@ fn x4kit_space_turns_a_choice_of_any_once_a_press() {
 }
 
 /// Space as the window sends it — the key and its text in one pass — is one press, and its
-/// text goes nowhere: not into the message field a Tab in the same pass gives the keyboard to,
-/// nor to what is behind the dialog.
+/// text is taken with it: nothing behind the dialog sees it, in a pass alone or with a Tab after
+/// it.
 #[test]
 fn x4kit_space_with_its_text_is_one_press_and_types_nothing() {
     let mut h = tab_dialog();
@@ -649,12 +652,114 @@ fn x4kit_space_with_its_text_is_one_press_and_types_nothing() {
     drv.frame(&mut h, pass, Modifiers::NONE);
     drv.idle(&mut h, 2);
     assert_eq!((h.one, focused(&drv)), (Some(2), Some(id("message"))));
-    assert_eq!(h.message, "", "the Space's text typed nothing");
+    assert_eq!(std::mem::take(&mut h.left), Vec::<String>::new());
     // The list: one choice of its bar's row.
     focus(&mut drv, &mut h, id("list"));
     drv.press_typed(&mut h, Key::Space, " ");
     assert_eq!(h.chosen, vec![0]);
     assert_eq!(h.left, Vec::<String>::new());
+}
+
+/// A Space with modifiers is not a choice's: Shift+Space or Ctrl+Space on a focused choice
+/// chooses nothing (the kit's keys are taken with exactly no modifiers, as `keys::take`'s
+/// `Mods::None`).
+#[test]
+fn x4kit_a_space_with_modifiers_chooses_nothing() {
+    let mut h = tab_dialog();
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut h, 2);
+    focus(&mut drv, &mut h, choice_id(id("one"), 1));
+    for mods in [Modifiers::SHIFT, Modifiers::COMMAND] {
+        let pass = vec![down(Key::Space, mods), Event::Text(" ".into())];
+        drv.frame(&mut h, pass, mods);
+        drv.idle(&mut h, 1);
+        assert_eq!(h.one, None, "{mods:?}");
+    }
+    drv.press_typed(&mut h, Key::Space, " ");
+    assert_eq!(h.one, Some(1));
+}
+
+/// One Space in the pass a Tab leaves a field or a message field for a choice or a list acts
+/// once: the field that had the keyboard read the pass and typed it, so the choice it reaches
+/// neither turns nor is chosen, nor the list's row (`[Tab, Space, its text]`).
+#[test]
+fn x4kit_one_space_after_a_tab_from_a_field_acts_once() {
+    let tab_space = || {
+        vec![
+            down(Key::Tab, Modifiers::NONE),
+            down(Key::Space, Modifiers::NONE),
+            Event::Text(" ".into()),
+        ]
+    };
+    let mut h = any_dialog();
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut h, 2);
+    focus(&mut drv, &mut h, id("a"));
+    drv.frame(&mut h, tab_space(), Modifiers::NONE);
+    drv.idle(&mut h, 2);
+    assert_eq!(focused(&drv), Some(choice_id(id("any"), 0)));
+    assert_eq!((h.a.as_str(), &h.any[..3]), (" ", &[false; 3][..]));
+    // A field before a list.
+    let mut h = list_dialog();
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut h, 2);
+    focus(&mut drv, &mut h, id("a"));
+    drv.frame(&mut h, tab_space(), Modifiers::NONE);
+    drv.idle(&mut h, 2);
+    assert_eq!(focused(&drv), Some(id("list")));
+    assert_eq!((h.a.as_str(), h.chosen.as_slice()), (" ", &[][..]));
+    // A message field before a list.
+    let mut h = tab_dialog();
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut h, 2);
+    focus(&mut drv, &mut h, id("message"));
+    drv.frame(&mut h, tab_space(), Modifiers::NONE);
+    drv.idle(&mut h, 2);
+    assert_eq!(focused(&drv), Some(id("list")));
+    assert_eq!((h.message.as_str(), h.chosen.as_slice()), (" ", &[][..]));
+}
+
+/// Space then Tab in one pass on check boxes given by id turns the one that had the keyboard,
+/// and the keyboard goes on: neither the next box nor the next button acts.
+#[test]
+fn x4kit_space_then_tab_turns_the_check_box_that_had_the_keyboard() {
+    let parts = vec![
+        check("Sign off", "on"),
+        check("한글 확인", "also"),
+        buttons(),
+    ];
+    let mut h = Host::new("Checks", 40, parts);
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut h, 2);
+    focus(&mut drv, &mut h, id("on"));
+    let space_tab = || {
+        vec![
+            down(Key::Space, Modifiers::NONE),
+            Event::Text(" ".into()),
+            down(Key::Tab, Modifiers::NONE),
+        ]
+    };
+    drv.frame(&mut h, space_tab(), Modifiers::NONE);
+    drv.idle(&mut h, 2);
+    assert_eq!((h.on, h.also), (true, false));
+    assert_eq!(focused(&drv), Some(id("also")));
+    assert_eq!(h.take_clicked(), vec![id("on")]);
+    drv.frame(&mut h, space_tab(), Modifiers::NONE);
+    drv.idle(&mut h, 2);
+    assert_eq!((h.on, h.also), (true, true));
+    assert_eq!(focused(&drv), Some(id("ok")));
+    assert_eq!(h.take_clicked(), vec![id("also")], "Run is not clicked");
+    // Space, Space in one pass: twice.
+    focus(&mut drv, &mut h, id("on"));
+    let space = || down(Key::Space, Modifiers::NONE);
+    drv.frame(&mut h, vec![space(), space()], Modifiers::NONE);
+    drv.idle(&mut h, 1);
+    assert_eq!((h.on, h.also), (true, true));
+    // A click still turns it.
+    let l = boxed(&drv, "Checks");
+    let on = place(&l, "[X] Sign off");
+    drv.click(&mut h, at_cell(on.x + 1, on.y));
+    assert!(!h.on, "a click turns it off");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -963,6 +1068,108 @@ fn x4kit_the_scroll_bars_of_a_message_and_a_list_take_clicks() {
     same_in_a_terminal(&drv);
 }
 
+/// A selection in a message field — over every row (Ctrl/⌘+A), or a part of one row (Shift+→)
+/// — shows in the bar's colours where it is, and the field goes on editing: typing replaces it.
+#[test]
+fn x4kit_a_selection_over_rows_of_a_message_shows_and_types_over() {
+    let mut h = message_dialog(3, 40);
+    h.message = "one\ntwo\nthree".into();
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut h, 2);
+    focus(&mut drv, &mut h, id("message"));
+    drv.key(&mut h, Key::A, Modifiers::COMMAND);
+    let l = boxed(&drv, "Commit");
+    for word in ["one", "two", "three"] {
+        let at = place(&l, word);
+        assert_eq!(pen_at(&l, at.x, at.y), bar_pen(), "{word}");
+    }
+    same_in_a_terminal(&drv);
+    // Cmd/Ctrl+↑: the text's start (egui's Home is the row's).
+    drv.key(&mut h, Key::ArrowUp, Modifiers::COMMAND);
+    for _ in 0..2 {
+        drv.key(&mut h, Key::ArrowRight, Modifiers::SHIFT);
+    }
+    let l = boxed(&drv, "Commit");
+    let one = place(&l, "one");
+    assert_eq!(pen_at(&l, one.x + 1, one.y), bar_pen());
+    assert_eq!(pen_at(&l, one.x + 2, one.y), field_pen());
+    drv.frame(&mut h, vec![Event::Text("새".into())], Modifiers::NONE);
+    drv.idle(&mut h, 1);
+    assert_eq!(h.message, "새e\ntwo\nthree");
+}
+
+/// A message of 200 KB on one line in a narrow field of three rows: a pass without input cuts
+/// only the rows it shows and lays no glyph; a typed character lays the text once again, in
+/// work linear in its length; the rows it shows follow the caret to the end.
+#[test]
+fn x4kit_a_long_message_costs_its_rows_not_its_length_a_pass() {
+    let mut h = Host::new("Long", 16, vec![message("", 3)]);
+    h.message = "word ".repeat(40_960);
+    let len = h.message.len();
+    let mut drv = Driver::new(640.0, 400.0);
+    work::take();
+    work::budget(Some(3 * len));
+    drv.idle(&mut h, 2);
+    let idle = |drv: &mut Driver, h: &mut Host| {
+        work::take();
+        work::budget(Some(200));
+        drv.idle(h, 1);
+        let done = work::take();
+        assert_eq!(done.glyphs, 0, "{done:?}");
+        assert!(done.cut <= 3 * 16, "{done:?}");
+    };
+    idle(&mut drv, &mut h);
+    focus(&mut drv, &mut h, id("message"));
+    idle(&mut drv, &mut h);
+    work::budget(Some(3 * len));
+    drv.key(&mut h, Key::ArrowDown, Modifiers::COMMAND);
+    drv.frame(&mut h, vec![Event::Text("!".into())], Modifiers::NONE);
+    let done = work::take();
+    assert!(done.glyphs <= 2 * len && done.cut <= 3 * len, "{done:?}");
+    idle(&mut drv, &mut h);
+    work::budget(None);
+    assert!(h.message.ends_with("word !"));
+    let l = boxed(&drv, "Long");
+    assert!(rows(&l).join("\n").contains("word !"), "{:#?}", rows(&l));
+}
+
+/// The wheel over a message field scrolls its rows and leaves a report's rows that scroll in
+/// the same dialog where they were; over the report's rows it scrolls those.
+#[test]
+fn x4kit_the_wheel_over_a_message_leaves_the_reports_rows() {
+    let report: Vec<(String, Ink)> = (0..30).map(|k| (format!("step {k}"), Ink::Text)).collect();
+    let parts = vec![
+        Part::Scroll {
+            rows: report,
+            most: 4,
+            top: 0,
+        },
+        message("Message", 3),
+        buttons(),
+    ];
+    let mut h = Host::new("Report", 40, parts);
+    h.message = (0..10)
+        .map(|k| format!("line {k}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut h, 2);
+    let l = boxed(&drv, "Report");
+    let line0 = place(&l, "line 0");
+    drv.wheel(&mut h, at_cell(line0.x + 2, line0.y), -1.0);
+    assert_eq!(h.report_top, 0, "the report's rows stay");
+    let l = boxed(&drv, "Report");
+    assert_eq!(
+        place(&l, "line 3").y,
+        line0.y,
+        "the message's rows scrolled"
+    );
+    let step0 = place(&l, "step 0");
+    drv.wheel(&mut h, at_cell(step0.x + 2, step0.y), -1.0);
+    assert_eq!(h.report_top, 3);
+    assert_eq!(place(&boxed(&drv, "Report"), "line 3").y, line0.y);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The list.
 
@@ -1122,6 +1329,37 @@ fn x4kit_the_lists_first_arrow_after_tab_is_its_own() {
     );
     drv.idle(&mut h, 2);
     assert_eq!((focused(&drv), h.bar.at), (Some(id("list")), 1));
+}
+
+/// A list of 20,000 rows (the branch chooser's): a pass without input, and one that moves the
+/// bar, measures none of its rows and draws only the rows it shows; its part is the same rows,
+/// shared, pass after pass (nothing copies them).
+#[test]
+fn x4kit_a_long_list_costs_its_view_not_its_length_a_pass() {
+    let names: Vec<String> = (0..20_000).map(|k| format!("branch-{k}")).collect();
+    let refs: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "")).collect();
+    let mut h = Host::new("Branches", 40, vec![list(&refs, 8), buttons()]);
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut h, 2);
+    focus(&mut drv, &mut h, id("list"));
+    let pass = |drv: &mut Driver, h: &mut Host, events: Vec<Event>| {
+        work::take();
+        work::budget(Some(100));
+        drv.frame(h, events, Modifiers::NONE);
+        let done = work::take();
+        work::budget(None);
+        assert_eq!(done.measured, 0, "{done:?}");
+        assert!(done.drawn <= 8, "{done:?}");
+    };
+    pass(&mut drv, &mut h, vec![]);
+    pass(&mut drv, &mut h, vec![down(Key::End, Modifiers::NONE)]);
+    assert_eq!((h.bar.at, h.bar.top), (19_999, 19_992));
+    let l = boxed(&drv, "Branches");
+    assert!(rows(&l).join("\n").contains("branch-19999"));
+    let Part::List { rows: shared, .. } = &h.parts[0] else {
+        unreachable!()
+    };
+    assert_eq!(Arc::strong_count(shared), 1, "no pass keeps a copy");
 }
 
 // ---------------------------------------------------------------------------------------------
