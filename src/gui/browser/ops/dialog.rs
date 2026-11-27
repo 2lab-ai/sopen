@@ -30,7 +30,9 @@
 //! given by the id of each part ([`Inputs::by_id`], [`Input`]). A chosen choice reads as its
 //! mark, never as a colour: the bar's colours are the focus's (10 §6), so the two never look
 //! alike, and `SOPEN_CELLS`' text rows say which is chosen; `•` is of ambiguous width, so an
-//! ambiguous-wide terminal gets §10's `.` there, at the source (T38).
+//! ambiguous-wide terminal gets §10's `.` there, at the source (T38). A button its dialog names
+//! there ([`Input::Button`], X4-dialogs) takes the kit's presses as a choice does, so a Tab in the
+//! same pass never hands a Space to the button it reaches (F-kit-tab).
 
 use crate::gui::browser::keys::Mods;
 use crate::gui::cells::{self, Buffer, Cells, Grid, Pen, Position};
@@ -112,7 +114,6 @@ pub enum Part {
     /// several (`[X] word`, its [`Input::Any`]). Each choice is a control of its own
     /// ([`choice_id`]): a click, or Space or Enter while it has the keyboard, chooses it — or
     /// turns it on or off — once a press.
-    #[cfg_attr(not(test), allow(dead_code))] // X4-dialogs uses it; the tests till then.
     Choices {
         label: String,
         id: egui::Id,
@@ -124,7 +125,6 @@ pub enum Part {
     /// ↑ ░ ↓ on the box's right border. Shift+Enter is a new line; a plain Enter is never
     /// typed, it is the dialog's — which takes it with exactly no modifiers (`keys::take`'s
     /// `Mods::None`): egui's `consume_key(Modifiers::NONE, …)` would take Shift+Enter too.
-    #[cfg_attr(not(test), allow(dead_code))] // X4-dialogs uses it; the tests till then.
     Message {
         label: String,
         id: egui::Id,
@@ -684,6 +684,12 @@ impl Layout {
         [self.frame, right, under]
     }
 
+    /// Whether the box stands whole on its grid: one whose parts that never give way (choices,
+    /// fields, buttons) are more than the grid holds stands past its foot (X4-dialogs).
+    pub fn fits(&self) -> bool {
+        self.frame.intersection(self.grid.all()) == self.frame
+    }
+
     /// The box and its shadow, cut to the grid.
     pub fn covers(&self) -> Vec<Cells> {
         let all = self.grid.all();
@@ -708,7 +714,7 @@ pub struct Inputs<'a> {
 }
 
 /// A control's state while its dialog is shown ([`Inputs::by_id`]).
-#[cfg_attr(not(test), allow(dead_code))] // X4-dialogs uses it; the tests till then.
+#[cfg_attr(not(test), allow(dead_code))] // X4-menu uses `List`; the tests till then.
 pub enum Input<'a> {
     /// A field's or a message field's text.
     Text(&'a mut String),
@@ -720,6 +726,11 @@ pub enum Input<'a> {
     Any(&'a mut [bool]),
     /// A list: where it stands.
     List(&'a mut Bar),
+    /// A button that takes the kit's presses (X4-dialogs, F-kit-tab): Space and Enter count once
+    /// a press, in the pass's order, as a choice's — never egui's keyboard click, which goes to
+    /// the control a Tab reaches in the same pass, a press before the Tab too, and a Space a field
+    /// typed. A button no input names keeps egui's click, as the list's dialogs have it.
+    Button,
 }
 
 /// The text `by_id` gives the part `id`.
@@ -1141,10 +1152,17 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
         Placed::Check(_, _, id) if !named(*id) => Some(*id),
         _ => None,
     });
-    // The check boxes `by_id` names: the kit's presses are theirs; the others keep egui's click.
+    // The check boxes and buttons `by_id` names: the kit's presses are theirs; the others keep
+    // egui's click.
     let named_checks: Vec<egui::Id> = (layout.placed.iter())
         .filter_map(|p| match p {
             Placed::Check(_, _, id) if named(*id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let named_buttons: Vec<egui::Id> = (layout.placed.iter())
+        .filter_map(|p| match p {
+            Placed::Button(_, b) if named(b.id) => Some(b.id),
             _ => None,
         })
         .collect();
@@ -1249,10 +1267,18 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                         let Some(cells) = visible(cells) else {
                             continue;
                         };
-                        let sense = if b.on { Sense::click() } else { Sense::hover() };
-                        if ui.interact(grid.rect(cells), b.id, sense).clicked() {
-                            clicked.push(b.id);
-                        }
+                        let rect = grid.rect(cells);
+                        let times = match (b.on, named_buttons.contains(&b.id)) {
+                            (true, true) => acts(ui, rect, b.id, after_tab),
+                            (true, false) => {
+                                usize::from(ui.interact(rect, b.id, Sense::click()).clicked())
+                            }
+                            (false, _) => {
+                                ui.interact(rect, b.id, Sense::hover());
+                                0
+                            }
+                        };
+                        clicked.extend(std::iter::repeat_n(b.id, times));
                         controls.push(b.id);
                     }
                     Placed::Scroll { .. } => {}

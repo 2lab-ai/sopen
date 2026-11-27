@@ -1881,12 +1881,17 @@ impl<T: Tty, O: Write> Backend<T, O> {
                     return Ok(End::Signal(signal));
                 }
                 self.said = switch(self)?;
+                // That pass was not printed (a switch, or the dimmed screen of one).
+                cells::set_presented(&self.ctx, false);
                 due = Some(Instant::now());
                 continue;
             }
-            if !self.tty.pending()? {
+            // Printed only once no input waits; the screens say whether this pass reached it.
+            let printed = !self.tty.pending()?;
+            if printed {
                 self.draw()?;
             }
+            cells::set_presented(&self.ctx, printed);
             // A close asked for is delivered with the next pass, at once (as eframe does).
             let repaint = if self.close_pending {
                 Duration::ZERO
