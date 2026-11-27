@@ -1665,8 +1665,9 @@ fn an_edit_stop_offers_amend_and_split() {
         ..Host::default()
     });
     fx.assert_shows("stopped to edit cccccccc");
+    // The buttons in cells, `[ Amend ]`-style (X4-pane).
     for word in ["Continue", "Abort", "Amend", "Split"] {
-        fx.assert_shows(word);
+        fx.assert_shows(&format!("[ {word} ]"));
     }
     fx.key(Key::M, testkit::command(true));
     assert_eq!(fx.host.stop_ends, [StopEnd::Stop(StopPressed::Amend)]);
@@ -1675,13 +1676,13 @@ fn an_edit_stop_offers_amend_and_split() {
     let split = StopPressed::Split(Edit::SplitStop { commit: c.clone() });
     assert_eq!(fx.host.stop_ends, [StopEnd::Stop(split.clone())]);
     fx.host.stop_ends.clear();
-    fx.click("Split");
+    fx.click("[ Split ]");
     assert_eq!(fx.host.stop_ends, [StopEnd::Stop(split)]);
     fx.host.stop_ends.clear();
-    fx.click("Amend");
+    fx.click("[ Amend ]");
     assert_eq!(fx.host.stop_ends, [StopEnd::Stop(StopPressed::Amend)]);
     fx.host.stop_ends.clear();
-    fx.click("Continue");
+    fx.click("[ Continue ]");
     assert_eq!(
         fx.host.stop_ends,
         [StopEnd::Banner(Pressed::Proceed(Action::Proceed(
@@ -1711,7 +1712,7 @@ fn an_edit_stop_offers_amend_and_split() {
         banner: Some(merge),
         ..Host::default()
     });
-    assert!(!fx.shows("Amend") && !fx.shows("Split"));
+    assert!(!fx.shows("[ Amend ]") && !fx.shows("[ Split ]"));
     fx.key(Key::M, testkit::command(true));
     fx.key(Key::P, testkit::command(true));
     assert!(
@@ -1735,8 +1736,8 @@ fn an_edit_stop_offers_amend_and_split() {
         stop: Some(stop),
         ..Host::default()
     });
-    fx.assert_shows("Amend");
-    assert!(!fx.shows("Split"));
+    fx.assert_shows("[ Amend ]");
+    assert!(!fx.shows("[ Split ]"));
     fx.key(Key::P, testkit::command(true));
     assert!(
         matches!(&fx.host.stop_ends[..], [StopEnd::Stop(StopPressed::NotOffered(s))] if s.starts_with("Split: ")),
