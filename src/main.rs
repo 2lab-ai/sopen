@@ -43,7 +43,11 @@ const EXIT_CONFLICT: u8 = 3;
         started over ssh). SOPEN_TARGET or `sopen config target HOST` make a HOST the default; \
         --here opens on this machine anyway. A loopback address (localhost, 127.0.0.1, [::1]) \
         opens on HOST through an ssh tunnel from this machine that closes when sopen ends \
-        (Ctrl-C) or its window there is closed.",
+        (Ctrl-C) or its window there is closed.\n\n\
+        `sopen channel` shows the release channel (stable or preview) and `sopen channel \
+        stable|preview` switches it; `sopen update` updates sopen on its channel — both \
+        through Homebrew. A file named like a command (cut, stems, config, channel, update) is \
+        given as ./NAME.",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true
 )]
@@ -191,6 +195,15 @@ enum Cmd {
         #[command(subcommand)]
         key: Option<ConfigKey>,
     },
+    /// Show the release channel this sopen is on (stable or preview), or switch to CHANNEL
+    /// through Homebrew (a file named `channel` is `./channel`)
+    Channel {
+        /// stable or preview: install that channel's formula and remove the other one
+        #[arg(value_name = "CHANNEL", value_parser = ["stable", "preview"])]
+        channel: Option<String>,
+    },
+    /// Update sopen through Homebrew on its channel (a file named `update` is `./update`)
+    Update,
 }
 
 #[derive(Subcommand)]
@@ -273,6 +286,8 @@ fn main() -> ExitCode {
     let result = match cli.cmd {
         // Not a run on a file: no usage line.
         Some(Cmd::Config { key }) => return exit(run_config(key).map(|()| 0)),
+        Some(Cmd::Channel { channel }) => return exit(run_channel(channel.as_deref()).map(|()| 0)),
+        Some(Cmd::Update) => return exit(run_update().map(|()| 0)),
         Some(Cmd::Cut {
             target,
             start,
@@ -543,6 +558,23 @@ fn run_config(key: Option<ConfigKey>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `sopen channel [stable|preview]` (spec §4b): the channel, or a switch through brew.
+fn run_channel(word: Option<&str>) -> Result<()> {
+    use sopen::channel::{self, Channel, RealHost};
+    let host = RealHost::new();
+    let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
+    match word.and_then(Channel::from_word) {
+        Some(target) => channel::switch(&host, target, &mut out, &mut err),
+        None => channel::show(&host, &mut out, &mut err),
+    }
+}
+
+/// `sopen update` (spec §4b): brew upgrades this sopen on its channel.
+fn run_update() -> Result<()> {
+    let host = sopen::channel::RealHost::new();
+    sopen::channel::update(&host, &mut std::io::stdout(), &mut std::io::stderr())
 }
 
 /// `sopen SOURCE`: on this machine, or forwarded to the target HOST (spec §4a). Returns the exit
@@ -1946,7 +1978,7 @@ mod tests {
         assert!(Cli::try_parse_from(["sopen", "--browser", "cut", "a", "1", "2"]).is_err());
         // What HOST's sopen is given: after `--`, even a subcommand's name or a leading `-` is
         // SOURCE, and so is an empty SOURCE (HOST's home).
-        for source in ["cut", "config", "-x.png", ""] {
+        for source in ["cut", "config", "channel", "update", "-x.png", ""] {
             let cli = Cli::try_parse_from(["sopen", "--here", "--", source]).unwrap();
             assert!(cli.cmd.is_none(), "{source}");
             assert_eq!(cli.source.as_deref(), Some(source));
@@ -1978,6 +2010,31 @@ mod tests {
         ));
         assert!(Cli::try_parse_from(["sopen", "config", "fkeys", "media"]).is_err());
         assert!(Cli::try_parse_from(["sopen", "config", "fkeys"]).is_err());
+        // `sopen channel [stable|preview]`, `sopen update` (spec §4b).
+        let cli = Cli::try_parse_from(["sopen", "channel"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Channel { channel: None })));
+        for word in ["stable", "preview"] {
+            let cli = Cli::try_parse_from(["sopen", "channel", word]).unwrap();
+            assert!(
+                matches!(cli.cmd, Some(Cmd::Channel { channel: Some(ref c) }) if c == word),
+                "{word}"
+            );
+        }
+        assert!(Cli::try_parse_from(["sopen", "channel", "beta"]).is_err());
+        assert!(Cli::try_parse_from(["sopen", "channel", "stable", "preview"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["sopen", "update"]).unwrap().cmd,
+            Some(Cmd::Update)
+        ));
+        assert!(Cli::try_parse_from(["sopen", "update", "now"]).is_err());
+        // After a flag it is a SOURCE, as `config` is: the file `update` on box.
+        let cli = Cli::try_parse_from(["sopen", "--target", "box", "update"]).unwrap();
+        assert!(cli.cmd.is_none());
+        assert_eq!(cli.source.as_deref(), Some("update"));
+        // A file of that name is `./channel`.
+        let cli = Cli::try_parse_from(["sopen", "./channel"]).unwrap();
+        assert!(cli.cmd.is_none());
+        assert_eq!(cli.source.as_deref(), Some("./channel"));
         // The watchdog child's hidden flags: both or neither, and nothing else.
         let cli =
             Cli::try_parse_from(["sopen", "--fkeys-watchdog", "1:2", "--fkeys-dir", "/s"]).unwrap();

@@ -13,11 +13,14 @@
 //! browser's git panel (`.prd/03-git-panel.md`), [`tree`] is the browser's directory tree
 //! (F10): its root, the folders that open by themselves, each row's counts and growing size, read
 //! through [`remote::treefs`]'s worker — locally behind a watchdog, remotely on a connection of its
-//! own (`.prd/05-directory-tree.md`), and [`scheme`] is the contract between a page view's web
-//! engine and the page server behind its `sopen-page` scheme (`.prd/09-web-view.md` §3.1).
+//! own (`.prd/05-directory-tree.md`), [`scheme`] is the contract between a page view's web
+//! engine and the page server behind its `sopen-page` scheme (`.prd/09-web-view.md` §3.1), and
+//! [`channel`] reports and switches the release channel and updates sopen through Homebrew
+//! (`.prd/01-spec.md` §4b).
 
 pub mod app;
 pub mod cache;
+pub mod channel;
 pub mod config;
 pub mod cut;
 pub mod edit;
@@ -46,11 +49,18 @@ pub mod zed;
 #[cfg(test)]
 pub(crate) mod testutil;
 
+/// The build marker: `SOPEN_BUILD_CHANNEL` at compile time — `preview` from preview.yml,
+/// `release` from release.yml — or `dev` when it was not set. [`channel`] falls back on it when
+/// brew cannot say.
+pub fn build_channel() -> &'static str {
+    option_env!("SOPEN_BUILD_CHANNEL").unwrap_or("dev")
+}
+
 /// `<ver> (<channel> <sha12>)` — `sopen --version` prints `sopen ` before it. Channel and build id
 /// come from `SOPEN_BUILD_CHANNEL` / `SOPEN_BUILD_ID` at compile time (`dev` / `unknown` otherwise);
 /// the build id is a commit sha, of which the first 12 characters are kept.
 pub fn version_text() -> String {
-    let channel = option_env!("SOPEN_BUILD_CHANNEL").unwrap_or("dev");
+    let channel = build_channel();
     let rev12: String = option_env!("SOPEN_BUILD_ID")
         .unwrap_or("unknown")
         .chars()

@@ -5224,3 +5224,100 @@ fn without_browser_host_is_given_no_browser_flag() {
     // The stand-in HOST opened nothing.
     assert!(browser_calls(&calls).is_empty());
 }
+
+/// `sopen channel` and `sopen update` are commands (spec §4b): their help parses, and a file or
+/// folder of that name is given as `./channel`, as `./config` is.
+#[test]
+fn channel_and_update_are_commands_and_a_file_of_that_name_is_dot_slash() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (args, usage) in [
+        (&["channel", "--help"][..], "Usage: sopen channel [CHANNEL]"),
+        (&["update", "--help"], "Usage: sopen update"),
+    ] {
+        let out = sopen(tmp.path(), args, &[]);
+        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+        let help = text(&out.stdout);
+        assert!(help.lines().any(|l| l.trim() == usage), "{help}");
+        assert!(help.contains("Homebrew"), "{help}");
+    }
+    let bad = sopen(tmp.path(), &["channel", "beta"], &[]);
+    assert_eq!(bad.status.code(), Some(2), "{}", text(&bad.stderr));
+    for name in ["channel", "update"] {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "text").unwrap();
+        let out = sopen_command(tmp.path())
+            .current_dir(tmp.path())
+            .args([format!("./{name}")])
+            .env("SOPEN_LIST", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{name}: {}", text(&out.stderr));
+        let listed = text(&out.stdout);
+        let real = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(listed.lines().next(), real.to_str(), "{listed}");
+    }
+}
+
+/// A sopen brew did not install — this test's own build — never runs brew (spec §4b): `sopen
+/// update` and a switch refuse with the install line, `sopen channel` answers from the build
+/// marker, which for a `dev` build is no channel. A stand-in `brew` first on PATH records any
+/// call.
+#[test]
+fn a_build_brew_did_not_install_refuses_update_and_switch_and_runs_no_brew() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let record = tmp.path().join("brew-calls");
+    executable(
+        &bin.join("brew"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n",
+            record.display()
+        ),
+    );
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let run = |args: &[&str]| sopen(tmp.path(), args, &[("PATH", path.as_str())]);
+    let dev = sopen::channel::marker_channel(sopen::build_channel()).is_none();
+    let why = if dev {
+        "it is a dev build"
+    } else {
+        "it does not run from a sopen keg in brew's Cellar"
+    };
+    let refusal = format!(
+        "sopen: this sopen was not installed by brew ({why}); install it with: brew install \
+         2lab-ai/tap/sopen-preview\n"
+    );
+    for args in [
+        &["update"][..],
+        &["channel", "stable"],
+        &["channel", "preview"],
+    ] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(text(&out.stderr), refusal, "{args:?}");
+        assert_eq!(text(&out.stdout), "", "{args:?}");
+    }
+    let out = run(&["channel"]);
+    if dev {
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(
+            text(&out.stderr),
+            "sopen: this sopen has no channel: it was not installed by brew and its build \
+             marker is dev\n"
+        );
+    } else {
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let line = text(&out.stdout);
+        assert!(
+            line.ends_with(" (via build marker (not installed by brew))\n"),
+            "{line}"
+        );
+    }
+    assert!(
+        !record.exists(),
+        "brew ran: {}",
+        std::fs::read_to_string(&record).unwrap_or_default()
+    );
+}

@@ -726,8 +726,8 @@ fn press(code: KeyCode) -> CEvent {
     CEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
-/// The terminal's `SOPEN_CELLS` receipt (`term::cells_text` of its screen, its mode button left
-/// out) of the browser on `fx`, `cols` × `rows`, once `events` have been played into it through
+/// The terminal's `SOPEN_CELLS` receipt (`term::cells_text` of its screen, its mode button and
+/// the clock after it left out) of the browser on `fx`, `cols` × `rows`, once `events` have been played into it through
 /// the translator — keys a receipt run itself would not read: there they are `SOPEN_KEYS`'.
 fn terminal_receipt(fx: &Fx, cols: u16, rows: u16, events: Vec<CEvent>) -> String {
     chrome::set_test_now(Some(crate::gui::testkit::START_OF_A_MINUTE));
@@ -747,7 +747,7 @@ fn terminal_receipt(fx: &Fx, cols: u16, rows: u16, events: Vec<CEvent>) -> Strin
     };
     let end = backend.run(&mut win, &mut no_switch).unwrap();
     assert_eq!(end, End::Signal(libc::SIGTERM), "settled");
-    let mode = chrome::mode_button_rect(&ctx).map(|r| {
+    let mode = chrome::mode_clock_rect(&ctx).map(|r| {
         let (x, y) = ((r.min.x / CELL.x) as u16, (r.min.y / CELL.y) as u16);
         cells::Cells::new(x, y, (r.width() / CELL.x).round() as u16, 1)
     });

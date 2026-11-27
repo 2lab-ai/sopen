@@ -22,9 +22,10 @@
 //!   Hangul composition there, 10 §4), else it is hidden.
 //! - **Hand-off boxes** (T17, 10 §11): cells no layer covers are a pane the window draws in egui
 //!   (a viewer not yet in cells; the preview side of an image, a video, a sound or the info card;
-//!   the tree, the git panel) — in the terminal a frame saying `F12 shows it in the window`; a
-//!   click on it is the switch. The text viewer (X3-text), the hex view (X3-hex) and the preview
-//!   side around them (X3-preview) are cells, so they are drawn here as in the window.
+//!   the git panel) — in the terminal a frame saying `F12 shows it in the window`; a click on it
+//!   is the switch. The text viewer (X3-text), the hex view (X3-hex), the preview side around
+//!   them (X3-preview) and the directory tree (X4-tree) are cells, so they are drawn here as in
+//!   the window.
 //! - **Colours** are sent as RGB when `COLORTERM` says `truecolor` or `24bit`, else through
 //!   [`cells::index256`]; never the 16 indexes a theme repaints (T15).
 //! - **Ambiguous width** (10 §10, TS-6): the first time the terminal is taken, `─` is written at
@@ -35,7 +36,8 @@
 //!   ([`for_ambiguous_wide`]), so no row is broken; the grid itself is the window's.
 //! - **The receipt** (10 §15): with `SOPEN_CELLS` the grid is written as text once the screen has
 //!   settled ([`cells_text`]), and the run ends; a window writes its own the same way
-//!   ([`window_receipt`]), so the two are compared by a diff.
+//!   ([`window_receipt`]), so the two are compared by a diff. Both leave the title row blank from
+//!   the mode button's place to its end, the clock with it ([`mode_cells`]).
 //! - **The clipboard** (§4): egui's `CopyText` is OSC 52; the terminal's paste arrives bracketed.
 //! - **The switch** (§7.1–§7.3, T4): F12, Alt+G (the shell's hook, in the terminal only) or a
 //!   click on a hand-off box. Where the window would open is read then, as 01 §4a resolves a run;
@@ -1179,8 +1181,9 @@ const KEYS: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01
 ///   second cell has its first's, as a terminal paints it), then a line per key in the order the
 ///   keys first appear: the key, its foreground and its background as `rrggbb`.
 ///
-/// The cells of `masked` — the mode button: `[GUI]` in the terminal, none in a window started
-/// directly, the one difference 10 §5 allows — are blanks in their colours. The grid is the one
+/// The cells of `masked` — the title row from the mode button's place to its end ([`mode_cells`]):
+/// `[GUI]` in the terminal, none in a window started directly, the one difference 10 §5 allows,
+/// and the clock, which differs between two runs — are blanks in their colours. The grid is the one
 /// both backends lay: an ambiguous-wide terminal's stand-ins ([`narrow`]) are its printing's.
 pub(crate) fn cells_text(screen: &Screen, masked: Option<Cells>) -> String {
     let mut buf = screen.buf.clone();
@@ -1266,17 +1269,20 @@ pub(crate) fn keep_window_pass(ctx: &egui::Context) -> WindowPass {
 /// The window's `SOPEN_CELLS` receipt (10 §15) of the pass `pass` was taken in, once that pass
 /// has ended (before anything of the next is recorded): the cells it painted ([`cells::layers`],
 /// recording on) — what its end painted above the window's own, F1's help, included, as the
-/// terminal's receipt has it — laid as the terminal lays its own ([`screen_of`]), its mode button
-/// left out ([`cells_text`]).
+/// terminal's receipt has it — laid as the terminal lays its own ([`screen_of`]), its mode
+/// button's place and clock left out ([`cells_text`], [`mode_cells`]).
 pub(crate) fn window_receipt(ctx: &egui::Context, pass: &WindowPass) -> String {
     let (cols, rows) = (pass.cols, pass.rows);
     let screen = screen_of(ctx, &cells::layers(ctx), &pass.titles, cols, rows, None);
     cells_text(&screen, mode_cells(ctx, cols, rows))
 }
 
-/// The mode button's cells on a `cols` × `rows` grid, where the last pass drew it.
+/// What the receipt leaves blank on a `cols` × `rows` grid, where the last pass drew the title
+/// row: one rect from the mode button's place — `[GUI]` here, blank cells in a window started
+/// directly — to the row's end, the clock with it ([`chrome::mode_clock_rect`]), so the two
+/// backends' receipts of one screen are the same bytes in any minute (X4-tree).
 fn mode_cells(ctx: &egui::Context, cols: u16, rows: u16) -> Option<Cells> {
-    chrome::mode_button_rect(ctx).and_then(|r| cells_over(r, cols, rows))
+    chrome::mode_clock_rect(ctx).and_then(|r| cells_over(r, cols, rows))
 }
 
 /// The `SOPEN_CELLS` receipt of a run of the terminal (10 §15): where it goes, written once the

@@ -1670,6 +1670,44 @@ fn the_mode_button_switches_from_the_terminal_and_back_from_the_window() {
     assert_eq!(vt.part(0, 85, 90), "[GUI]", "{}", vt.row(0));
 }
 
+/// Review round 1 of X4-tree: the receipt leaves the clock out with the mode button
+/// (`chrome::mode_clock_rect`), but only `[GUI]` is the switch — clicks on the blank before it,
+/// on the clock's `│` and digits and on the row's last cell switch nothing; then a click on
+/// `[GUI]` does.
+#[test]
+fn a_click_on_the_clock_is_no_switch_and_one_on_the_mode_button_is() {
+    let fx = fixture(0);
+    let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+    // `[GUI]` at 85–89, a blank, `│` at 91, the clock at 92–98, a blank at 99.
+    let mut events = vec![];
+    for column in [90, 91, 92, 95, 98, 99] {
+        events.extend(click(column, 0));
+    }
+    events.extend(click(87, 0));
+    events.push(ctrl_q());
+    tape.0.borrow_mut().events.extend(events);
+    let switched = std::rc::Rc::new(std::cell::Cell::new(0));
+    let clicks_left = tape.clone();
+    let seen = switched.clone();
+    let mut switch = move |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
+        // At most `[GUI]`'s release and Ctrl+Q are left when the switch is asked for: had a
+        // click on the clock switched, `[GUI]`'s press would be left too.
+        let left = clicks_left.0.borrow().events.len();
+        assert!(
+            left <= 2,
+            "a click before [GUI]'s switched: {left} events left"
+        );
+        seen.set(seen.get() + 1);
+        Ok(None)
+    };
+    let mut win = Shared(fx.b.clone());
+    assert_eq!(b.run(&mut win, &mut switch).unwrap(), End::Closed);
+    assert_eq!(switched.get(), 1, "only the click on [GUI] is the switch");
+    let vt = bytes.last_screen(100, 30);
+    assert_eq!(vt.part(0, 85, 90), "[GUI]", "{}", vt.row(0));
+    assert_eq!(vt.part(0, 91, 92), "│", "{}", vt.row(0));
+}
+
 // ---------------------------------------------------------------------------------------------
 // The key help, and what the terminal cannot show yet (10 §11, T17).
 
@@ -2872,6 +2910,24 @@ fn dump_differences(d: &Dumped, window: &WindowCells) -> Vec<String> {
     out
 }
 
+/// `window` as its receipt shows it: the title row from the mode button's place to its end — the
+/// clock with it — blanks in their colours ([`mode_cells`], X4-tree), as `ctx`'s last pass drew
+/// the row.
+fn as_its_receipt(
+    mut window: WindowCells,
+    ctx: &egui::Context,
+    cols: u16,
+    rows: u16,
+) -> WindowCells {
+    let masked = mode_cells(ctx, cols, rows).expect("the title row's");
+    for y in masked.top()..masked.bottom() {
+        for x in masked.left()..masked.right() {
+            window.0[usize::from(y) * usize::from(cols) + usize::from(x)].symbol = " ".into();
+        }
+    }
+    window
+}
+
 /// One pass of `win` in `ctx` (`cols` × `rows`) as a window with `SOPEN_CELLS` runs it: the
 /// receipt its shell writes of it — the pass kept inside it ([`keep_window_pass`]), the receipt
 /// laid once it has ended ([`window_receipt`]) — and its shapes.
@@ -2933,8 +2989,9 @@ fn terminal_receipt(fx: &Fx, ctx: egui::Context, cols: u16, rows: u16) -> String
 
 /// `SOPEN_CELLS` (10 §15): the terminal's receipt of the list — Korean names, U+1F3B5 — and the
 /// window's of the same screen are the same bytes, the mode button (`[GUI]` in the terminal, none
-/// in a window started directly: 10 §5's one difference) left out of both; read back, its rows
-/// and attribute table are what the window painted, cell by cell, colours and all (a cell of the
+/// in a window started directly: 10 §5's one difference) left out of both with the clock after it
+/// (X4-tree); read back, its rows and attribute table are what the window painted, those cells
+/// blank, cell by cell, colours and all (a cell of the
 /// window's changed is one difference). Again with the bar on a song, whose preview egui draws
 /// — in both a hand-off box titled with the file — and with F1's help open, which the end of a
 /// pass paints above the window.
@@ -2944,11 +3001,12 @@ fn the_cells_receipt_of_both_backends_is_the_same_bytes() {
     let terminal = terminal_receipt(&fx, skin(), 100, 30);
     let (drv, mut win) = window(&fx, 100, 30);
     let (in_window, shapes) = receipt_pass(&drv.ctx, &mut win, 100, 30);
-    let painted = window_cells(&shapes, 100, 30);
+    let painted = as_its_receipt(window_cells(&shapes, 100, 30), &drv.ctx, 100, 30);
     for shown in ["한글 폴더", "\u{1F3B5} song", "7MkDir"] {
         assert!(terminal.contains(shown), "{shown:?} in:\n{terminal}");
     }
     assert!(!terminal.contains("[GUI]"), "the mode button left out");
+    assert!(!terminal.contains(" 9:24am"), "the clock left out with it");
     assert_eq!(terminal, in_window, "the same bytes");
     let dumped = read_cells(&terminal);
     assert_eq!((dumped.cols, dumped.rows), (100, 30));
@@ -2989,7 +3047,8 @@ fn the_cells_receipt_of_both_backends_is_the_same_bytes() {
     let terminal = terminal_receipt(&fx, drv.ctx.clone(), 100, 30);
     assert!(in_window.contains("Keys in the file list"), "{in_window}");
     assert_eq!(terminal, in_window, "the same bytes with the help open");
-    let d = dump_differences(&read_cells(&in_window), &window_cells(&shapes, 100, 30));
+    let painted = as_its_receipt(window_cells(&shapes, 100, 30), &drv.ctx, 100, 30);
+    let d = dump_differences(&read_cells(&in_window), &painted);
     assert!(d.is_empty(), "the help as painted:\n{}", d.join("\n"));
 }
 
