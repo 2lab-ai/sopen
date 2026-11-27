@@ -1054,9 +1054,9 @@ impl GitView {
         vec![GitAction::Details(subject)]
     }
 
-    /// Carries out `command` (the key table's git context) on the view, and gives what is left
-    /// for the integration.
-    fn run(&mut self, command: Command) -> Vec<GitAction> {
+    /// Carries out `command` (the key table's git context) on the view in a pass of `ctx`, and
+    /// gives what is left for the integration.
+    fn run(&mut self, ctx: &egui::Context, command: Command) -> Vec<GitAction> {
         use GitAction as A;
         match command {
             Command::Help => return vec![A::Help],
@@ -1075,7 +1075,7 @@ impl GitView {
         // Cmd/Ctrl+L and B to switch or close it; every other key does nothing — the graph under
         // it, and so its bar's object, is not on screen.
         if self.log.is_some() || self.backups.is_some() {
-            return self.run_list(command);
+            return self.run_list(ctx, command);
         }
         match command {
             Command::HistorySearch => {
@@ -2039,7 +2039,7 @@ impl GitView {
     /// rows (the log: the bar, Enter or F3 to show an entry whole, Esc; the Backups list: also
     /// Cmd/Ctrl+Z and F8 on the line under its bar); Cmd/Ctrl+L or B closes its list or opens the
     /// other; anything else is taken and does nothing.
-    fn run_list(&mut self, command: Command) -> Vec<GitAction> {
+    fn run_list(&mut self, ctx: &egui::Context, command: Command) -> Vec<GitAction> {
         if let Some(log) = &mut self.log {
             return match command {
                 Command::Bar(_) | Command::Details | Command::Back => {
@@ -2063,7 +2063,7 @@ impl GitView {
                 | Command::Undo
                 | Command::Remove
                 | Command::Back => {
-                    let end = list.run(command);
+                    let end = list.run(ctx, command);
                     self.backups_end(end)
                 }
                 Command::Backups => {
@@ -2670,7 +2670,7 @@ pub fn keys(ctx: &egui::Context, view: &mut GitView) -> Vec<GitAction> {
                 break;
             };
             view.said = None;
-            asked.extend(view.run(command));
+            asked.extend(view.run(ctx, command));
             continue;
         }
         if view.search.is_some() {
@@ -2702,7 +2702,7 @@ pub fn keys(ctx: &egui::Context, view: &mut GitView) -> Vec<GitAction> {
             break;
         };
         view.said = None;
-        asked.extend(view.run(command));
+        asked.extend(view.run(ctx, command));
     }
     asked
 }

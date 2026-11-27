@@ -322,7 +322,7 @@ impl Window for Host {
                 ctx.input_mut(|i| keys::find(&mut i.events, Context::Git, WITH_SLICE_3))
             {
                 if let Some(v) = &mut self.backups {
-                    self.backups_ends.extend(v.run(c));
+                    self.backups_ends.extend(v.run(&ctx, c));
                 } else if let Some(v) = &mut self.log {
                     self.log_ends.extend(v.run(c));
                 }

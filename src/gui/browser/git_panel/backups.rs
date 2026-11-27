@@ -8,7 +8,8 @@
 //! Home End move the bar, Enter and F3 (`Details`) Show, Cmd/Ctrl+Z (`Undo`) restores the group or
 //! ref under the bar, F8 (`Remove`) deletes its group, Esc (`Back`) closes the list — and its
 //! `[ Restore ]`, `[ Show ]` and `[ Delete ]` buttons do the same. Each of those acts only as the
-//! last pass painted the bar's line ([`BackupsView::as_painted`]). What they give back
+//! last pass that reached the screen painted the bar's line ([`BackupsView::as_painted`]). What
+//! they give back
 //! ([`BackupsEnd`]) is the integration's to carry out: a restore through its dialog
 //! ([`super::dialogs::ActionDialog::restore`], once the values now are read), a delete through its
 //! confirmation (`Action::DeleteBackup`), Show into the graph's revisions with a dim `backup`
@@ -24,6 +25,7 @@ use crate::gui::cells::{self, Buffer, Cells, Grid, Pen};
 use crate::gui::chrome;
 use crate::gui::chrome::git::LOOK;
 use eframe::egui::{self, Sense};
+use std::sync::Arc;
 
 /// The list's header (03 §8.2: "`git push --mirror` would publish them (the Backups list's
 /// header says so)").
@@ -63,10 +65,16 @@ pub struct BackupsView {
     scroll: Scroll,
     /// The records' revision: one more each time they are read again.
     revision: u64,
-    /// What the bar's line asked for as the last pass painted it ([`Ends`]): `None` until a pass
-    /// has painted the bar's line, and after one that did not (an empty list, the bar scrolled
-    /// off the rows by the wheel).
-    painted: Option<Ends>,
+    /// What the bar's line asked for as each pass painted it ([`Ends`]), and so as the last pass
+    /// that reached the screen did (`cells::OnScreen`: a terminal prints no pass while input
+    /// waits): nothing for a pass that painted no bar's line (an empty list, the bar scrolled off
+    /// the rows by the wheel, a panel too short for the list).
+    screen: cells::OnScreen<Arc<Ends>>,
+    /// The pass the screen was last asked about ([`BackupsView::on_screen`]) and its answer.
+    asked: Option<(u64, Option<Arc<Ends>>)>,
+    /// The bar's line's [`Ends`] as last made, kept while it is of the same line of the same
+    /// records: a pass copies no ref.
+    ends: Option<Arc<Ends>>,
 }
 
 /// What the line under the bar asks for: its Restore, its Show and its Delete.
@@ -145,7 +153,9 @@ impl BackupsView {
             records,
             scroll: Scroll::default(),
             revision: 0,
-            painted: None,
+            screen: cells::OnScreen::default(),
+            asked: None,
+            ends: None,
         }
     }
 
@@ -217,19 +227,19 @@ impl BackupsView {
         }))
     }
 
-    /// A row of the git context's key table while the list is open (03 §9.2): Show, Restore and
-    /// Delete as the last pass painted the bar's line ([`BackupsView::as_painted`]); the bar's
-    /// moves and Esc always.
-    pub fn run(&mut self, command: Command) -> Option<BackupsEnd> {
+    /// A row of the git context's key table while the list is open (03 §9.2), in a pass of `ctx`:
+    /// Show, Restore and Delete as the last pass that reached the screen painted the bar's line
+    /// ([`BackupsView::as_painted`]); the bar's moves and Esc always.
+    pub fn run(&mut self, ctx: &egui::Context, command: Command) -> Option<BackupsEnd> {
         match command {
             Command::Bar(step) => {
                 let delta = self.scroll.delta(step);
                 self.scroll.step(delta, self.lines.len());
                 None
             }
-            Command::Details => self.as_painted(Act::Show),
-            Command::Undo => self.as_painted(Act::Restore),
-            Command::Remove => self.as_painted(Act::Delete),
+            Command::Details => self.as_painted(ctx, Act::Show),
+            Command::Undo => self.as_painted(ctx, Act::Restore),
+            Command::Remove => self.as_painted(ctx, Act::Delete),
             Command::Back => Some(BackupsEnd::Close),
             _ => None,
         }
@@ -245,15 +255,32 @@ impl BackupsView {
         }
     }
 
-    /// `act` on the line under the bar, only if it asks for exactly what it asked for as the last
-    /// pass painted it — what the owner saw when they pressed. Else nothing, and the next pass
-    /// shows the list as it is: a re-read that landed in this pass (a delete's, a restore's), the
-    /// bar moved since that pass (`[↓, Cmd/Ctrl+Z]` in one pass restores nothing — unless the line
-    /// it lands on asks for the same thing: F8 on a group's ref deletes its group, as on the group's
-    /// line), a pass that did not paint the bar's line (the list's first, the bar off the rows). A
-    /// re-read that changed nothing under the bar keeps the press.
-    fn as_painted(&self, act: Act) -> Option<BackupsEnd> {
-        let painted = self.painted.as_ref()?;
+    /// What the screen shows of the bar's line in this pass of `ctx`: what the last pass that
+    /// reached it painted (`cells::OnScreen::start`, taken once a pass — the keys and the draw ask
+    /// in turn). A pass that did not draw the list at all (not shown, or in a panel too short for
+    /// it) left no bar on screen: after one, nothing until a pass has painted again.
+    fn on_screen(&mut self, ctx: &egui::Context) -> Option<Arc<Ends>> {
+        let now = ctx.cumulative_pass_nr();
+        match &self.asked {
+            Some((pass, shown)) if *pass == now => return shown.clone(),
+            Some((pass, _)) if *pass + 1 == now => {}
+            _ => self.screen = cells::OnScreen::default(),
+        }
+        let shown = self.screen.start(ctx).cloned();
+        self.asked = Some((now, shown.clone()));
+        shown
+    }
+
+    /// `act` on the line under the bar, in a pass of `ctx`, only if it asks for exactly what it
+    /// asked for as the last pass that reached the screen painted it — what the owner saw when
+    /// they pressed. Else nothing, and the next pass shows the list as it is: a re-read that
+    /// landed since (a delete's, a restore's), the bar moved since (`[↓, Cmd/Ctrl+Z]` in one pass,
+    /// or in one read of a terminal, restores nothing — unless the line it lands on asks for the
+    /// same thing: F8 on a group's ref deletes its group, as on the group's line), a pass on
+    /// screen that painted no bar's line (the list's first, the bar off the rows, a panel too
+    /// short for the list). A re-read that changed nothing under the bar keeps the press.
+    fn as_painted(&mut self, ctx: &egui::Context, act: Act) -> Option<BackupsEnd> {
+        let painted = self.on_screen(ctx)?;
         let (now, then) = match act {
             Act::Restore => (self.restore(), &painted.restore),
             Act::Show => (self.show(), &painted.show),
@@ -271,10 +298,32 @@ fn hint() -> String {
     )
 }
 
-/// `rect` and egui's reach for a click below it (`interact_radius`): a list's cells, and the
-/// points of the row under them a click on which egui would give to a widget of the list.
-pub(super) fn below(ui: &egui::Ui, rect: egui::Rect) -> egui::Rect {
+/// The keys' hint in `room` cells: as many of its keys as fit, whole and in order — none rather
+/// than one cut short (`En…` on an 80-column terminal's side).
+fn hint_in(room: usize) -> String {
+    let mut shown = String::new();
+    for key in hint().split(" · ") {
+        let more = match shown.is_empty() {
+            true => key.to_string(),
+            false => format!("{shown} · {key}"),
+        };
+        if cells::width(&more) > room {
+            break;
+        }
+        shown = more;
+    }
+    shown
+}
+
+/// Where a click on a blank of a list at cells `area` of `grid` goes (an `interact` rect under
+/// its rows and buttons): its cells, the frame's border cell either side (the panel's own) and
+/// egui's reach below them (`interact_radius`, into the frame's rule) — every point a click on
+/// which egui would otherwise give to the nearest of the list's widgets.
+pub(super) fn blank_clicks(ui: &egui::Ui, grid: &Grid, area: Cells) -> egui::Rect {
+    let left = area.x.saturating_sub(1);
+    let borders = Cells::new(left, area.y, area.right() + 1 - left, area.height);
     let reach = ui.style().interaction.interact_radius;
+    let rect = grid.rect(borders);
     egui::Rect::from_min_max(rect.min, rect.max + egui::vec2(0.0, reach))
 }
 
@@ -303,15 +352,17 @@ pub(super) const PAINTS_CELLS: bool = true;
 /// subject — each column cut by cells a blank before the next, the bar on its line, and the scroll
 /// bar on the border right of `area`; at the foot `[ Restore ]`, `[ Show ]` and `[ Delete ]` two
 /// blank cells apart in the dialog's colours (10 §6's buttons; never focused: the list's keys are
-/// the git context's), then the keys' hint dim, cut by cells. Only the lines on screen are drawn;
-/// the wheel scrolls them by `CELL.y`, the bar stays. Every control is an `interact` rect at its
-/// cells, its id salted with the panel's column (two repositories' panels draw into one `ui`),
-/// sensing clicks alone (`Sense::CLICK`: egui's `Sense::click()` takes the focus, so Tab, then
-/// Space, would press a button); the foot's row is one more under the buttons, so a click on the
-/// blank between two presses nothing. A click puts the bar on a line, a double click on one line
+/// the git context's), then as many of the keys' hint's keys, whole and in order, as fit, dim
+/// ([`hint_in`]). Only the lines on screen are drawn; the wheel scrolls them by `CELL.y`, the bar
+/// stays. Every control is an `interact` rect at its cells, its id salted with the panel's column
+/// (two repositories' panels draw into one `ui`), sensing clicks alone (`Sense::CLICK`: egui's
+/// `Sense::click()` takes the focus, so Tab, then Space, would press a button), over one more under
+/// them all ([`blank_clicks`]: the list's cells, the frame's border either side, egui's reach below),
+/// so a click on a blank presses nothing. A click puts the bar on a line, a double click on one line
 /// Shows it (the browser's `second_click`, the pair the line itself), a button asks for its
-/// action — each of those as the last pass painted the bar's line ([`BackupsView::as_painted`]),
-/// what this pass paints kept for the next. A list of one or two rows has no foot.
+/// action — each of those as the last pass that reached the screen painted the bar's line
+/// ([`BackupsView::as_painted`]), what this pass paints kept for the passes after it
+/// (`cells::OnScreen`). A list of one or two rows has no foot.
 pub fn draw(
     ui: &mut egui::Ui,
     grid: &Grid,
@@ -367,15 +418,16 @@ pub fn draw(
     let range = view.scroll.range(len);
     let shown = range.start..range.end.min(range.start + usize::from(list.height));
     let id = |part: &str, k: usize| ui.scope_id().with(("sopen-git-backups", area.x, part, k));
-    // The bar's line if this pass paints it, and what it asks for where the last pass's is not
-    // of the same line of the same records.
-    let (mut bar_drawn, mut fresh) = (false, None);
+    // Whether this pass paints the bar's line (what it asks for made again only where the last
+    // made is not of the same line of the same records).
+    let mut bar_drawn = false;
+    // What the screen shows (asked before anything of this pass is painted).
+    let _ = view.on_screen(&ctx);
     let mut clicked = None;
-    // Under the lines and the buttons, all of the list's cells and egui's reach below them (the
-    // frame's rule, where nothing is clickable): a click on a blank of them — between two buttons,
-    // beside one, on a row with no line, just under the foot — presses nothing (egui gives a click
-    // a few points off a widget to it where nothing is under the pointer).
-    ui.interact(below(ui, grid.rect(area)), id("under", 0), Sense::CLICK);
+    // Under the lines and the buttons, the list's cells, the frame's border either side and egui's
+    // reach below them ([`blank_clicks`]): a click on a blank of them — between two buttons, beside
+    // one, on the border, on a row with no line, just under the foot — presses nothing.
+    ui.interact(blank_clicks(ui, grid, area), id("under", 0), Sense::CLICK);
     for (n, k) in shown.enumerate() {
         let y = list.y + n as u16;
         let row = Cells::new(list.x, y, list.width, 1);
@@ -384,8 +436,8 @@ pub fn draw(
         if on_bar {
             let of = (k, view.revision);
             bar_drawn = true;
-            if !matches!(&view.painted, Some(e) if e.of == of) {
-                fresh = Some(view.ends(of));
+            if !matches!(&view.ends, Some(e) if e.of == of) {
+                view.ends = Some(Arc::new(view.ends(of)));
             }
         }
         let back = match (on_bar, active) {
@@ -458,27 +510,25 @@ pub fn draw(
             c += w + 2;
         }
         if all && c < width {
-            let shown = cells::fit_start(&hint(), width - c);
+            let shown = hint_in(width - c);
             cells::fill(buf, Cells::new(x(c), y, (width - c) as u16, 1), dim);
             cells::put(buf, x(c), y, &shown, width - c, dim);
         }
     }
-    // What the clicks ask for, as the last pass painted the bar's line: a click moves the bar
-    // first, so a double click Shows only the line the bar was on there.
+    // What the clicks ask for, as the last pass on screen painted the bar's line: a click moves
+    // the bar first, so a double click Shows only the line the bar was on there.
     let mut asked = None;
     if let Some((k, twice)) = clicked {
         view.scroll.to(k);
         if twice {
-            asked = view.as_painted(Act::Show);
+            asked = view.as_painted(&ctx, Act::Show);
         }
     }
     if let Some(act) = pressed {
-        asked = view.as_painted(act);
+        asked = view.as_painted(&ctx, act);
     }
-    view.painted = match (bar_drawn, fresh) {
-        (true, Some(ends)) => Some(ends),
-        (true, None) => view.painted.take(),
-        (false, _) => None,
-    };
+    if let (true, Some(ends)) = (bar_drawn, &view.ends) {
+        view.screen.painted(ends.clone());
+    }
     asked
 }

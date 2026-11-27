@@ -86,7 +86,9 @@ fn date_time_text(t: SystemTime) -> String {
     }
 }
 
-/// An entry's line in the log: `10:24:05  host  git push origin main · exit 0 · 1.2 s`.
+/// An entry's line in the log: `10:24:05  host  git push origin main · exit 0 · 1.2 s` (drawn cut
+/// to its room by [`row_shown`], which never builds it whole).
+#[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
 pub fn row_text(entry: &LogEntry) -> String {
     format!(
         "{}  {}  {}",
@@ -193,8 +195,8 @@ impl LogView {
 /// kit's rule (`dialog::inside_width`), for its long command lines and stderr.
 const WHOLE_WIDTH: usize = 88;
 
-/// A field's name and the blanks after it: the widest, `Repository`, and two, so each value is a
-/// text of its own (10 §6's two blank cells between two texts).
+/// Where a field's value starts after its name (`Part::Named`'s `at`): the widest name,
+/// `Repository`, and two blank cells (10 §6's two between two texts).
 const NAME: usize = 12;
 
 /// The modal of the entry shown whole, in the panel at column `column`: two repositories' panels
@@ -240,6 +242,8 @@ pub(super) fn cut(line: &str, room: usize) -> Vec<String> {
     // The row's last blank after a glyph: its byte and the cells before it.
     let mut blank: Option<(usize, usize)> = None;
     for g in line.graphemes(true) {
+        #[cfg(test)]
+        counted(&CUT, 1);
         let w = cells::width(g);
         if used + w > room && !row.is_empty() {
             if g == " " {
@@ -270,14 +274,102 @@ pub(super) fn cut(line: &str, room: usize) -> Vec<String> {
     if !row.trim().is_empty() || rows.is_empty() {
         rows.push(row);
     }
+    // A text's own blanks after its last word make no rows, however many (`dialog::wrap` stops
+    // at them).
+    while rows.len() > 1 && rows.last().is_some_and(|r| r.trim().is_empty()) {
+        rows.pop();
+    }
     rows
 }
 
+/// `text` whole if it holds at most `most` cells, else its longest start within them and `…`, in
+/// one walk that stops there. The `…` keeps a cut in a run of blanks a text's middle, as it was:
+/// the kit's wrap makes no rows of the blanks a text ends in.
+fn head(text: &str, most: usize) -> String {
+    let mut used = 0;
+    for (i, g) in text.grapheme_indices(true) {
+        used += cells::width(g);
+        if used > most {
+            return format!("{}…", &text[..i]);
+        }
+    }
+    text.to_string()
+}
+
+/// Text taken a grapheme at a time, its control characters escaped, until it holds more cells
+/// than `room` ([`row_shown`]).
+struct Walk {
+    out: String,
+    used: usize,
+    room: usize,
+}
+
+impl Walk {
+    /// `piece` taken; false once the text holds more than `room` cells (and nothing more is).
+    fn take(&mut self, piece: &str) -> bool {
+        // A piece whose bytes fit, with no control character (so no glyph wider than its bytes), is
+        // taken whole, measured once: most rows' every piece.
+        if self.used + piece.len() <= self.room && !piece.chars().any(char::is_control) {
+            #[cfg(test)]
+            counted(&ROWS_WALKED, piece.len());
+            self.used += cells::width(piece);
+            self.out.push_str(piece);
+            return true;
+        }
+        for g in piece.graphemes(true) {
+            #[cfg(test)]
+            counted(&ROWS_WALKED, 1);
+            let g = printable(g);
+            self.used += cells::width(&g);
+            self.out.push_str(&g);
+            if self.used > self.room {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// An entry's row in `room` cells as `cells::fit_start(&printable(&row_text(entry)), room)` cuts
+/// it, in one walk that stops a cell past `room`: a command line can be 64 KiB (03 §3.7), and a
+/// pass draws a screen of rows. Its ending (`status_line`'s, which reads stderr for a failure's
+/// first error line) is read only when the command line fits.
+fn row_shown(entry: &LogEntry, room: usize) -> String {
+    let mut walk = Walk {
+        out: String::new(),
+        used: 0,
+        room,
+    };
+    let whole = walk.take(&time_text(entry.time))
+        && walk.take("  ")
+        && walk.take(&entry.host)
+        && walk.take("  ")
+        && walk.take(&entry.line)
+        && walk.take(&entry.status_line()[entry.line.len()..]);
+    match whole {
+        // All of it in its room: as `fit_start` would give it, not measured again.
+        true => walk.out,
+        false => cells::fit_start(&walk.out, room),
+    }
+}
+
 /// The dialog of `entry` shown whole (03 §3.7) on `grid`, its OK button the one of the panel at
-/// column `column`: each field a text, `Name       value`, wrapped by cells; then `Stderr` and
-/// its lines in rows that scroll, at most half the grid's rows and six at least (egui's half the
-/// window), `nothing` in the weak colour when there is none; then `[ OK ]` and the keys' hint.
+/// column `column`: each field its name in the weak ink and its value from the 13th cell, wrapped
+/// there by cells (`Part::Named`, egui's grid of two columns); then `Stderr`, weak, and its lines
+/// in rows that scroll, at most half the grid's rows and six at least (egui's half the window),
+/// `nothing` in the weak ink when there is none; then `[ OK ]` and the keys' hint. Each value
+/// reaches the kit cut to the cells the box can show — the grid's rows and two more, of its room
+/// and a cell more — since the kit's `dialog::wrap` measures the rest of a text again for each row
+/// and a command line can be 64 KiB (the files backup's batches of paths): what the box shows is
+/// the same, the rest being cut with `…` there.
 fn entry_layout(grid: Grid, entry: &LogEntry, column: u16) -> Layout {
+    let width = dialog::inside_width(grid.cols, WHOLE_WIDTH, 0);
+    let most = (usize::from(grid.rows) + 2) * (width.saturating_sub(NAME).max(1) + 1);
+    entry_layout_in(grid, entry, column, most)
+}
+
+/// [`entry_layout`] with each value cut to `most` cells (the tests: none, to see it the same).
+pub(super) fn entry_layout_in(grid: Grid, entry: &LogEntry, column: u16, most: usize) -> Layout {
     let stdin = entry.stdin.as_deref().unwrap_or("nothing");
     let fields = [
         ("Time", date_time_text(entry.time)),
@@ -289,12 +381,22 @@ fn entry_layout(grid: Grid, entry: &LogEntry, column: u16) -> Layout {
         ("Duration", format!("{:.1} s", entry.duration.as_secs_f64())),
         ("Stdout", format!("{} bytes", entry.stdout_bytes)),
     ];
-    let mut parts: Vec<Part> = (fields.into_iter())
-        .map(|(name, value)| Part::Text(format!("{name:<NAME$}{}", printable(&value)), Ink::Text))
-        .collect();
     // The box's inside: egui's 88 cells, or the grid less eight, whatever its texts want (88 is
     // above the kit's widest, 76), so its rows of stderr are cut to it here, once.
     let width = dialog::inside_width(grid.cols, WHOLE_WIDTH, 0);
+    let mut parts: Vec<Part> = (fields.into_iter())
+        .map(|(name, value)| Part::Named {
+            name: name.to_string(),
+            value: head(&printable(&value), most),
+            at: NAME,
+        })
+        .collect();
+    #[cfg(test)]
+    for p in &parts {
+        if let Part::Named { name, value, .. } = p {
+            counted(&HANDED, name.len() + value.len());
+        }
+    }
     let rows: Vec<(String, Ink)> = match entry.stderr.as_str() {
         "" => vec![("nothing".to_string(), Ink::Weak)],
         all => (all.strip_suffix('\n').unwrap_or(all).split('\n'))
@@ -303,7 +405,7 @@ fn entry_layout(grid: Grid, entry: &LogEntry, column: u16) -> Layout {
             .collect(),
     };
     parts.extend([
-        Part::Text("Stderr".to_string(), Ink::Text),
+        Part::Text("Stderr".to_string(), Ink::Weak),
         Part::Scroll {
             rows,
             most: (grid.rows / 2).max(6),
@@ -323,6 +425,19 @@ thread_local! {
     /// How many times [`entry_layout`] laid out an entry on this thread: its work, which the
     /// tests bound to once for a grid, however many passes show it.
     pub(super) static LAID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The characters of entries' texts walked to draw their rows: a pass's work, which the tests
+    /// bound by the rows' room, however long a command line.
+    pub(super) static ROWS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The bytes of the fields' texts handed to the kit, which wraps them by `dialog::wrap`.
+    pub(super) static HANDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The graphemes [`cut`] walked.
+    pub(super) static CUT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `n` more on the counter `key` (the tests' only).
+#[cfg(test)]
+fn counted(key: &'static std::thread::LocalKey<std::cell::Cell<usize>>, n: usize) {
+    key.with(|c| c.set(c.get() + n));
 }
 
 /// The entry shown whole (03 §3.7) on `grid` (the panels'), in the panel at column `column`: an
@@ -353,12 +468,13 @@ pub(super) const PAINTS_CELLS: bool = true;
 
 /// The log at cells `area` of `grid` (the git panel's body), written into `buf`, the panel's
 /// buffer (10 §4, X4-lists): the header dim in the heads' row, then one row an entry — a failed
-/// one in the error colour — the bar on its entry, cut by cells, and the scroll bar on the
-/// border right of `area`; and the entry shown whole, over everything, on `grid`. Only the rows
-/// on screen are drawn; the wheel scrolls them by `CELL.y`, the bar stays. Each row is an
-/// `interact` rect at its cells, its id salted with the panel's column (two repositories' panels
-/// draw into one `ui`), sensing clicks alone (`Sense::CLICK`, never the keyboard's focus): a
-/// click puts the bar on its entry, a double click on one entry shows it whole (the browser's
+/// one in the error colour — the bar on its entry, cut by cells in one walk ([`row_shown`]), and
+/// the scroll bar on the border right of `area`; and the entry shown whole, over everything, on
+/// `grid`. Only the rows on screen are drawn; the wheel scrolls them by `CELL.y`, the bar stays.
+/// Each row is an `interact` rect at its cells, its id salted with the panel's column (two
+/// repositories' panels draw into one `ui`), sensing clicks alone (`Sense::CLICK`, never the
+/// keyboard's focus), over one more under them all (`backups::blank_clicks`): a click on a blank
+/// moves no bar; a click puts the bar on its entry, a double click on one entry shows it whole (the browser's
 /// `second_click`, the pair the entry itself, never its place: an entry logged between the two
 /// clicks moves the rows). At no cells (a panel too short for its parts) only the entry shown
 /// whole is drawn, so its keys still reach it.
@@ -415,15 +531,12 @@ pub fn draw(
     let range = view.scroll.range(len);
     let shown = range.start..range.end.min(range.start + usize::from(list.height));
     let mut clicked = None;
-    // Under the rows, all of the log's cells and egui's reach below them (the frame's rule): a click
-    // on a blank of them moves no bar (egui gives a click a few points off a widget to it where
-    // nothing is under the pointer).
+    // Under the rows, the log's cells, the frame's border either side and egui's reach below them
+    // (the frame's rule): a click on a blank of them moves no bar (egui gives a click a few points
+    // off a widget to it where nothing is under the pointer).
     let under = ui.scope_id().with(("sopen-git-log-under", area.x));
-    ui.interact(
-        super::backups::below(ui, grid.rect(area)),
-        under,
-        Sense::CLICK,
-    );
+    let blank = super::backups::blank_clicks(ui, grid, area);
+    ui.interact(blank, under, Sense::CLICK);
     for (n, k) in shown.enumerate() {
         let y = list.y + n as u16;
         let row = Cells::new(list.x, y, list.width, 1);
@@ -442,7 +555,7 @@ pub fn draw(
         };
         let pen = Pen::new(fg, back);
         cells::fill(buf, row, pen);
-        let text = cells::fit_start(&printable(&row_text(entry)), width);
+        let text = row_shown(entry, width);
         cells::put(buf, list.x, y, &text, width, pen);
         let id = ui.scope_id().with(("sopen-git-log", area.x, k));
         let resp = ui.interact(grid.rect(row), id, Sense::CLICK);

@@ -25,13 +25,17 @@ fn grid_of(fx: &Fx) -> Grid {
     Grid::over(fx.host.rect)
 }
 
-/// The panel's layer of cells: the one over all of its side.
+/// The panel's layer of cells: the one over all of its side (the host's side of the window's
+/// grid, or all of the panel's grid).
 fn panel(fx: &Fx) -> Arc<Layer> {
     let grid = grid_of(fx);
-    let side = fx.host.side.unwrap_or(grid.all());
+    let mine = |l: &Arc<Layer>| match fx.host.side {
+        Some(side) => l.buf.area == side,
+        None => l.buf.area == grid.all() && l.origin == grid.origin,
+    };
     cells::layers(&fx.drv.ctx)
         .into_iter()
-        .find(|l| l.buf.area == side && l.origin == grid.origin)
+        .find(mine)
         .expect("the panel's cells over its side")
 }
 
@@ -438,6 +442,11 @@ fn stderr_is_cut_as_the_kit_wraps() {
         "a  b   c    d",
         "",
         "   ",
+        // A run of blanks longer than the room after a break (review round 1, S1).
+        "a          ",
+        "abc            ",
+        "a          b",
+        "fatal: x                                                                              ",
     ];
     for text in texts {
         for room in [1, 2, 5, 9, 20, 76] {
@@ -919,6 +928,590 @@ fn two_panels_side_by_side_each_take_their_own_clicks() {
         assert_eq!(whole(&two.views[i]).as_ref(), Some(&log[3]), "panel {i}");
         assert_eq!(whole(&two.views[1 - i]), None, "panel {i}: not the other's");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1.
+
+/// `f`'s count on the counter `key` of `log_view` (its test-only work counters).
+fn counted(key: &'static std::thread::LocalKey<std::cell::Cell<usize>>, f: impl FnOnce()) -> usize {
+    key.with(|c| c.set(0));
+    f();
+    key.with(|c| c.get())
+}
+
+/// A command line of `bytes` bytes, as the files backup's batches of paths make them.
+fn long_line(bytes: usize) -> String {
+    let mut line = String::from("git add --");
+    let mut k = 0;
+    while line.len() < bytes {
+        line.push_str(&format!(" dir/file-{k:05}.txt"));
+        k += 1;
+    }
+    line.truncate(bytes);
+    line
+}
+
+/// M2: the entry's fields reach the kit — which wraps them by `dialog::wrap`, its work growing
+/// with the square of a text — cut to the cells the box can show: a 64 KiB command line hands it
+/// a few screens of text, not 64 KiB.
+#[test]
+fn a_64_kib_command_line_reaches_the_kit_cut_to_the_box() {
+    let line = long_line(64 * 1024);
+    let mut fx = log_fx(1000.0, 500.0, vec![entry(&line, Ending::Exit(0), "", 0)]);
+    let handed = counted(&log_view::HANDED, || {
+        fx.press(Key::Enter);
+    });
+    assert!(fx.view().dialog_up());
+    let g = grid_of(&fx);
+    let width = crate::gui::browser::ops::dialog::inside_width(g.cols, 88, 0);
+    let screens = (usize::from(g.rows) + 2) * (width + 1);
+    assert!(
+        handed <= 2 * screens + 1024,
+        "{handed} bytes handed to the kit"
+    );
+    let shown = fx
+        .drv
+        .text_starting_with("git add -- dir/file-00000.txt dir/file-00001.txt");
+    assert!(shown.is_some(), "its first row");
+}
+
+/// M2: what the box shows of a value cut to its cells is what it shows of the whole value — the
+/// same layout, row for row — on grids short and tall, for a long Latin, Hangul or blank-run
+/// command line, and one that fits.
+#[test]
+fn a_value_cut_to_the_box_lays_out_as_the_whole_value() {
+    // Longer than the cut on the short grids (their whole layouts are slow: the quadratic wrap).
+    let lines = [
+        long_line(3 * 1024),
+        "커밋 메시지가 아주 긴 한글 경로/".repeat(100),
+        format!("git add -- a{}b", " ".repeat(2000)),
+        "git fetch --progress origin".to_string(),
+    ];
+    for line in lines {
+        let e = entry(&line, Ending::Exit(0), "fatal: x", 0);
+        for (cols, rows) in [(125, 18), (125, 60), (60, 12), (20, 7)] {
+            let grid = Grid {
+                origin: Pos2::ZERO,
+                cols,
+                rows,
+            };
+            let cut = log_view::entry_layout_in(grid, &e, 0, {
+                let width = crate::gui::browser::ops::dialog::inside_width(cols, 88, 0);
+                (usize::from(rows) + 2) * (width.saturating_sub(12).max(1) + 1)
+            });
+            let whole = log_view::entry_layout_in(grid, &e, 0, usize::MAX);
+            let at = format!("{} bytes at {cols}x{rows}", line.len());
+            assert_eq!(format!("{cut:?}"), format!("{whole:?}"), "{at}");
+        }
+    }
+}
+
+// S1: a run of blanks longer than the room after a break makes no rows of blanks — see
+// `stderr_is_cut_as_the_kit_wraps`, whose inputs hold such runs.
+
+/// S3: a pass walks an entry's row up to its room and a cell more, however long its command line
+/// (64 KiB); the row it draws is the one `cells::fit_start` cuts.
+#[test]
+fn a_rows_work_is_its_room() {
+    let log: Vec<LogEntry> = (0..30)
+        .map(|k| entry(&long_line(64 * 1024 + k), Ending::Exit(0), "", k as u64))
+        .collect();
+    let mut fx = log_fx(1000.0, 300.0, log.clone());
+    let walked = counted(&log_view::ROWS_WALKED, || fx.idle());
+    let g = grid_of(&fx);
+    let rows = usize::from(g.rows - 5);
+    let width = usize::from(g.cols - 2);
+    assert!(
+        walked <= rows * (width + 2),
+        "{walked} for {rows} rows of {width}"
+    );
+    let row = text(&fx, FIRST_Y, 1, g.cols - 1);
+    let want = cells::fit_start(&graph_view::printable(&log_view::row_text(&log[0])), width);
+    assert_eq!(row.trim_end(), want.trim_end());
+}
+
+/// S4: a double click is on the entry itself, never on its place: a click, an entry logged that
+/// moves the rows down one, a second click on the same cells — the other entry there now — shows
+/// nothing whole and puts the bar there. The control: the same entries again, and the second click
+/// shows the clicked entry whole.
+#[test]
+fn a_double_click_across_a_reread_of_the_log_is_its_entrys_own() {
+    let log = entries(10);
+    for moved in [true, false] {
+        let mut fx = log_fx(1000.0, 300.0, log.clone());
+        let p = centre(&fx, 20, FIRST_Y + 3);
+        fx.drv.frame(&mut fx.host, click_events(p), Modifiers::NONE);
+        fx.idle();
+        let mut again = log.clone();
+        if moved {
+            let new = entry("git fetch --progress origin new", Ending::Exit(0), "", 99);
+            again.insert(0, new);
+        }
+        fx.view_mut().set_log(again);
+        fx.drv.frame(&mut fx.host, click_events(p), Modifiers::NONE);
+        fx.idle();
+        let whole = fx.view().log.as_ref().and_then(LogView::whole).cloned();
+        match moved {
+            true => {
+                assert_eq!(whole, None, "another entry under the second click");
+                assert_eq!(cell(&fx, 1, FIRST_Y + 3).bg, Some(PALETTE.bar));
+            }
+            false => assert_eq!(whole.as_ref(), Some(&log[3]), "the same entry"),
+        }
+    }
+}
+
+/// S4: the same for the Backups list's lines: a click on a group's line, a re-read that moves the
+/// lines up one — a group above gone — and a second click on the same cells, now the group's own
+/// ref (which would Show the same ref), Shows nothing. The control: the same records again, and
+/// the second click Shows the group.
+#[test]
+fn a_double_click_across_a_reread_of_the_list_is_its_lines_own() {
+    let gone = group("20261124T000000Z", "sopen: nothing left", vec![]);
+    for moved in [true, false] {
+        let mut before = vec![gone.clone()];
+        before.extend(records());
+        let mut fx = backups_fx(1000.0, 400.0, before.clone());
+        let p = centre(&fx, 5, FIRST_Y + 1);
+        fx.drv.frame(&mut fx.host, click_events(p), Modifiers::NONE);
+        fx.idle();
+        assert!(fx.take().is_empty());
+        let again = if moved { records() } else { before };
+        fx.view_mut().open_backups(again);
+        fx.drv.frame(&mut fx.host, click_events(p), Modifiers::NONE);
+        fx.idle();
+        let asked = fx.take();
+        match moved {
+            true => assert!(asked.is_empty(), "{asked:?}"),
+            false => {
+                let refs = vec![records()[0].group.refs[0].clone()];
+                assert_eq!(asked, [GitAction::ShowBackup(refs)]);
+            }
+        }
+    }
+}
+
+/// S5: stderr is cut in one walk of its graphemes — `log_view::cut`, never `dialog::wrap`, which
+/// measures the rest of a line again for each row.
+#[test]
+fn stderr_is_walked_once() {
+    let stderr = "y".repeat(64 * 1024);
+    let mut fx = log_fx(
+        1000.0,
+        500.0,
+        vec![entry("git fetch", Ending::Exit(1), &stderr, 0)],
+    );
+    let walked = counted(&log_view::CUT, || {
+        fx.press(Key::Enter);
+    });
+    assert!(fx.view().dialog_up());
+    assert_eq!(walked, stderr.len(), "each grapheme once");
+}
+
+/// S7: the entry's field names and `Stderr` in the dialog's weak colour, as egui had them, the
+/// values in its text colour.
+#[test]
+fn the_entrys_names_are_weak_and_its_values_black() {
+    let e = entry("git fetch", Ending::Exit(1), "fatal: no", 0);
+    let mut fx = log_fx(1000.0, 500.0, vec![e]);
+    fx.press(Key::Enter);
+    let weak = Some(vec![PALETTE.dialog_weak]);
+    let text = Some(vec![PALETTE.dialog_text]);
+    // `Command` is the title's word too: the names but that one.
+    for name in [
+        "Time",
+        "Host",
+        "Repository",
+        "Stdin",
+        "Ending",
+        "Duration",
+        "Stdout",
+        "Stderr",
+    ] {
+        assert_eq!(fx.drv.colors_of(name), weak, "{name}");
+    }
+    for value in ["/srv/sopen", "exit 1", "fatal: no"] {
+        assert_eq!(fx.drv.colors_of(value), text, "{value}");
+    }
+    // A value too long for its row goes on under its first row's start (`Part::Named`).
+    let mut e = entry("git fetch", Ending::Exit(0), "", 0);
+    e.repo = format!("/srv/{}/end", "a".repeat(120));
+    let mut fx = log_fx(1000.0, 500.0, vec![e]);
+    fx.press(Key::Enter);
+    let row = |prefix: &str| {
+        let text = fx.drv.text_starting_with(prefix).expect(prefix);
+        fx.drv.find_text(&text).expect(prefix)
+    };
+    let (start, rest) = (row("/srv/aaaa"), row("aaaa"));
+    assert!(
+        fx.shows(&format!("{}/end", "a".repeat(120 - 71))),
+        "the second row"
+    );
+    assert_eq!(rest.left(), start.left(), "under the first");
+    assert_eq!(rest.top() - start.top(), chrome::CELL.y);
+}
+
+/// S7: the keys' hint stands as many of its keys whole as fit after the buttons — on an 80-column
+/// terminal's side none, never `En…`; on a 1000-point window's side `Enter Show`.
+#[test]
+fn the_hint_shows_its_keys_whole_or_not_at_all() {
+    for (w, want) in [(640.0, ""), (1000.0, "Enter Show")] {
+        let mut fx = Fx::new(w, 400.0, fixture_view());
+        let g = Grid::over(egui::Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(w, 400.0 - 16.0),
+        ));
+        let [_, side] = cells::halves(g.all());
+        fx.host.side = Some(side);
+        fx.view_mut().set_repo(repo());
+        fx.view_mut().open_backups(records());
+        fx.idle();
+        fx.idle();
+        let foot = foot_y(g.rows);
+        let delete = at(&fx, foot, "[ Delete ]").expect("the buttons");
+        let after = text(&fx, foot, delete + 10, side.right() - 1);
+        assert_eq!(after.trim(), want, "{w}");
+    }
+}
+
+/// GPT: in the panel at the right side, a click a cell or two left of the buttons — the frame's
+/// border, the other side — or right of them, on the frame's border at the foot, or on the rule
+/// under them presses nothing, and the list stays.
+#[test]
+fn a_click_beside_the_buttons_in_the_panel_presses_nothing() {
+    let mut fx = Fx::new(1000.0, 400.0, fixture_view());
+    let g = Grid::over(egui::Rect::from_min_size(
+        Pos2::ZERO,
+        Vec2::new(1000.0, 384.0),
+    ));
+    let [_, side] = cells::halves(g.all());
+    fx.host.side = Some(side);
+    fx.view_mut().set_repo(repo());
+    fx.view_mut().open_backups(records());
+    fx.idle();
+    fx.idle();
+    let foot = foot_y(g.rows);
+    let restore = at(&fx, foot, "[ Restore ]").expect("the buttons");
+    let delete = at(&fx, foot, "[ Delete ]").expect("the buttons");
+    let cells_at = [
+        (restore - 1, foot),
+        (restore - 2, foot),
+        (delete + 10, foot),
+        (delete + 11, foot),
+        (side.right() - 1, foot),
+        (restore + 3, foot + 1),
+        (restore - 1, foot + 1),
+    ];
+    for (x, y) in cells_at {
+        let p = g.rect(Cells::new(x, y, 1, 1)).center();
+        fx.drv.frame(&mut fx.host, click_events(p), Modifiers::NONE);
+        fx.idle();
+        assert!(fx.take().is_empty(), "({x}, {y})");
+        assert!(dialog_action(&fx).is_none(), "({x}, {y})");
+        assert!(fx.view().backups().is_some(), "({x}, {y})");
+    }
+}
+
+/// GPT: ten thousand entries draw a screen of rows, a pass walking no more than their room.
+#[test]
+fn ten_thousand_entries_draw_a_screen_of_rows() {
+    let mut fx = log_fx(1000.0, 300.0, entries(10_000));
+    let walked = counted(&log_view::ROWS_WALKED, || fx.idle());
+    let g = grid_of(&fx);
+    let rows = usize::from(g.rows - 5);
+    assert!(walked <= rows * usize::from(g.cols), "{walked}");
+    fx.press(Key::End);
+    assert_eq!(
+        at(&fx, g.rows - 4, "git fetch --progress origin b9999"),
+        Some(16)
+    );
+}
+
+/// GPT: a MiB of stderr is cut once and laid out once; the passes after it do neither again.
+#[test]
+fn a_mebibyte_of_stderr_is_cut_and_laid_out_once() {
+    let stderr: String = (0..13_274).map(|k| format!("remote: {k:070}\n")).collect();
+    let mut fx = log_fx(
+        1000.0,
+        500.0,
+        vec![entry("git fetch", Ending::Exit(1), &stderr, 0)],
+    );
+    let walked = counted(&log_view::CUT, || {
+        fx.press(Key::Enter);
+    });
+    assert!(stderr.len() >= 1024 * 1024);
+    assert_eq!(
+        walked,
+        stderr.len() - 13_274,
+        "each grapheme once, the newlines apart"
+    );
+    assert!(fx.shows(&format!("remote: {:070}", 0)));
+    let laid = log_view::LAID.with(|c| c.get());
+    let again = counted(&log_view::CUT, || {
+        fx.idle();
+        fx.idle();
+    });
+    assert_eq!((again, log_view::LAID.with(|c| c.get())), (0, laid));
+}
+
+/// The log and the Backups list drawn alone at `area` of the window's grid.
+struct Alone {
+    log: LogView,
+    list: BackupsView,
+    area: Cells,
+}
+
+impl Window for Alone {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
+                let grid = Grid::over(ui.max_rect());
+                let mut buf = Buffer::empty(grid.all());
+                let area = self.area.intersection(grid.all());
+                log_view::draw(ui, &grid, area, &mut buf, &mut self.log, true);
+                let _ = backups::draw(ui, &grid, area, &mut buf, &mut self.list, true);
+                let painter = ui.painter_at(grid.rect(grid.all()));
+                cells::paint(&painter, grid.origin, &buf, None);
+            });
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// GPT: no cells to draw in — no width, no height, one, two or three rows — draws what fits and
+/// never panics; nor does the entry shown whole on a grid of one row.
+#[test]
+fn no_width_and_a_row_of_grid_never_panic() {
+    for (w, h) in [
+        (0, 10),
+        (10, 0),
+        (0, 0),
+        (1, 1),
+        (40, 1),
+        (40, 2),
+        (40, 3),
+        (2, 5),
+    ] {
+        let mut drv = crate::gui::testkit::Driver::new(800.0, 400.0);
+        let mut alone = Alone {
+            log: LogView::new(entries(5)),
+            list: BackupsView::new(records()),
+            area: Cells::new(3, 2, w, h),
+        };
+        drv.idle(&mut alone, 2);
+        drv.key(&mut alone, Key::ArrowDown, Modifiers::NONE);
+    }
+    let mut fx = log_fx(1000.0, 32.0, entries(3));
+    assert_eq!(grid_of(&fx).rows, 1);
+    fx.press(Key::Enter);
+    assert!(fx.view().dialog_up(), "shown whole on one row");
+    fx.press(Key::Escape);
+    assert!(!fx.view().dialog_up());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1, M1: what the list acts on is what reached the screen.
+
+/// A group of two branches and its manifest: its Show is both refs, each ref's line its own.
+fn two_branches() -> Vec<Record> {
+    vec![group(
+        "20261128T010203Z",
+        "sopen: rebase main",
+        vec![
+            (BackupKind::Head("main".into()), "heads/main", 'a', "first"),
+            (BackupKind::Head("b".into()), "heads/b", 'b', "second"),
+            (BackupKind::Manifest, "manifest", 'e', "sopen: rebase main"),
+        ],
+    )]
+}
+
+/// A terminal that sends its bursts of events back to back — each waiting while the next is
+/// unread, so the backend prints only the last pass of a burst — one burst once the backend has
+/// asked three times since the last (its passes done and printed), then ends the run (X4-dialogs'
+/// `Bursts`, without its counts).
+struct Bursts {
+    bursts: std::collections::VecDeque<Vec<crossterm::event::Event>>,
+    now: std::collections::VecDeque<crossterm::event::Event>,
+    asked: usize,
+}
+
+impl crate::gui::term::Tty for Bursts {
+    fn raw(&mut self, _on: bool) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn size(&mut self) -> std::io::Result<(u16, u16)> {
+        Ok((100, 30))
+    }
+    fn probe(&mut self) -> crate::gui::term::Probed {
+        crate::gui::term::Probed {
+            kitty: false,
+            ambiguous: false,
+        }
+    }
+    fn drop_input(&mut self) {}
+    fn next(
+        &mut self,
+        _wait: std::time::Duration,
+    ) -> std::io::Result<Option<crossterm::event::Event>> {
+        if let Some(ev) = self.now.pop_front() {
+            return Ok(Some(ev));
+        }
+        self.asked += 1;
+        assert!(self.asked < 20_000, "the script ran out without an end");
+        if self.asked >= 3 {
+            if let Some(burst) = self.bursts.pop_front() {
+                self.asked = 0;
+                self.now.extend(burst);
+                return Ok(self.now.pop_front());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        Ok(None)
+    }
+    fn pending(&mut self) -> std::io::Result<bool> {
+        Ok(!self.now.is_empty())
+    }
+    fn stopped(&self) -> Option<i32> {
+        (self.bursts.is_empty() && self.now.is_empty() && self.asked >= 3).then_some(libc::SIGTERM)
+    }
+}
+
+/// What the panel asked for in `sopen --tui` (a 100×30 terminal), the Backups list of
+/// [`two_branches`] open, after `bursts`.
+fn in_terminal(bursts: Vec<Vec<crossterm::event::Event>>) -> Vec<GitAction> {
+    use crate::gui::term::{Backend, End};
+    let mut view = fixture_view();
+    view.set_repo(repo());
+    view.open_backups(two_branches());
+    let mut host = super::tests::Host {
+        view,
+        active: true,
+        actions: Vec::new(),
+        rect: egui::Rect::NOTHING,
+        under: Vec::new(),
+        side: None,
+    };
+    let mut all = vec![
+        vec![crossterm::event::Event::FocusGained],
+        vec![crossterm::event::Event::FocusGained],
+    ];
+    all.extend(bursts);
+    let tty = Bursts {
+        bursts: all.into(),
+        now: Default::default(),
+        asked: 0,
+    };
+    let ctx = egui::Context::default();
+    chrome::install(&ctx);
+    let mut b = Backend::new(tty, std::io::sink(), ctx, true);
+    let mut no_switch = |_: &mut Backend<Bursts, std::io::Sink>| panic!("no switch in this test");
+    let end = b.run(&mut host, &mut no_switch).expect("the run");
+    assert_eq!(end, End::Signal(libc::SIGTERM));
+    host.actions
+}
+
+/// A key's press, as the terminal sends it.
+fn tui_key(code: crossterm::event::KeyCode) -> crossterm::event::Event {
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    crossterm::event::Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+/// M1: in `sopen --tui`, ↓ and Enter read together: the ↓'s pass is not printed (input waits),
+/// so the screen still has the group under the bar, and the Enter Shows nothing — not the ref the
+/// unprinted pass put the bar on.
+#[test]
+fn m1_down_and_enter_in_one_read_of_the_terminal_show_nothing() {
+    use crossterm::event::KeyCode;
+    let asked = in_terminal(vec![vec![tui_key(KeyCode::Down), tui_key(KeyCode::Enter)]]);
+    assert_eq!(asked, Vec::<GitAction>::new());
+}
+
+/// M1, the control: ↓ printed, then Enter Shows the ref the screen has under the bar.
+#[test]
+fn m1_down_printed_then_enter_shows_its_ref() {
+    use crossterm::event::KeyCode;
+    let asked = in_terminal(vec![
+        vec![tui_key(KeyCode::Down)],
+        vec![tui_key(KeyCode::Enter)],
+    ]);
+    let main = two_branches()[0].group.refs[0].clone();
+    assert_eq!(asked, [GitAction::ShowBackup(vec![main])]);
+}
+
+/// M1: a click in `sopen --tui` is two passes (the press and the release, `term_input`); read
+/// together, the press's pass is not printed, and the click on `[ Show ]` still Shows — the screen
+/// still has the group under the bar, which is what the pass before showed (the unprinted pass's
+/// painting does not replace it, nor is it dropped).
+#[test]
+fn m1_a_click_in_one_read_of_the_terminal_shows() {
+    use crossterm::event::{
+        Event as CEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    // The panel over the terminal's grid but its F-key row (29 rows): the foot on row 25,
+    // `[ Show ]` 11 cells and two blanks in, inside the frame.
+    let mouse = |kind| {
+        CEvent::Mouse(MouseEvent {
+            kind,
+            column: 1 + 13 + 2,
+            row: foot_y(29),
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    let asked = in_terminal(vec![vec![
+        mouse(MouseEventKind::Down(MouseButton::Left)),
+        mouse(MouseEventKind::Up(MouseButton::Left)),
+    ]]);
+    let refs = two_branches()[0].group.refs[..2].to_vec();
+    assert_eq!(asked, [GitAction::ShowBackup(refs)]);
+}
+
+/// M1: a double click on a line in `sopen --tui` — two clicks, each its press and release read
+/// together, the second read after the first's passes — Shows that line: the first click's bar is
+/// printed before the second comes. (Both clicks in one read Show nothing: the screen never had
+/// the bar there, the guard's reading of a terminal that lags.)
+#[test]
+fn m1_a_double_click_in_the_terminal_shows_its_line() {
+    use crossterm::event::{
+        Event as CEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    // The `heads/b` line: the third of the list, on row 4 of the terminal.
+    let mouse = |kind| {
+        CEvent::Mouse(MouseEvent {
+            kind,
+            column: 10,
+            row: FIRST_Y + 2,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    let click = || {
+        vec![
+            mouse(MouseEventKind::Down(MouseButton::Left)),
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+        ]
+    };
+    let asked = in_terminal(vec![click(), click()]);
+    let b = two_branches()[0].group.refs[1].clone();
+    assert_eq!(asked, [GitAction::ShowBackup(vec![b])]);
+}
+
+/// M1: a pass that drew no list leaves nothing under the bar on screen: in a panel too short for
+/// its parts the list is not drawn, and Enter or F8 there acts on nothing.
+#[test]
+fn m1_a_short_panels_enter_acts_on_nothing() {
+    let mut fx = backups_fx(1000.0, 400.0, two_branches());
+    fx.idle();
+    fx.drv.resize(1000.0, 80.0);
+    fx.idle();
+    fx.idle();
+    assert_eq!(grid_of(&fx).rows, 4);
+    assert!(fx.press(Key::Enter).is_empty(), "Enter");
+    fx.press(Key::F8);
+    assert_eq!(dialog_action(&fx), None, "F8");
+    assert!(fx.view().backups().is_some());
 }
 
 // ---------------------------------------------------------------------------------------------
