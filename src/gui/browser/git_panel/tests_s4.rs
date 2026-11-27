@@ -881,7 +881,8 @@ fn the_shown_confirmation_is_the_edit_enter_returns() {
         message: find('c').message,
     });
     fx.assert_shows(&describe(&before));
-    fx.retype(&find('c').message, "new subject");
+    // The message field's first row: in cells each line of a message is a row of its own.
+    fx.retype("third", "new subject");
     let after = Edit::Quick(Quick::Reword {
         commit: oid('c'),
         message: "new subject".into(),
@@ -899,7 +900,7 @@ fn the_shown_confirmation_is_the_edit_enter_returns() {
         author: ada(),
     });
     fx.assert_shows(&describe(&keep));
-    fx.click("now");
+    fx.click("( ) now");
     let now = Edit::Quick(Quick::Author {
         commit: oid('c'),
         author: Author {
