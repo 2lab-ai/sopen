@@ -1017,7 +1017,7 @@ fn no_confirmation_runs_at_once() {
         quiet,
     ));
     let fx = with_dialog(d, quiet);
-    fx.assert_shows("Prune");
+    fx.assert_shows("[ ] Prune");
     fx.assert_shows("git checkout fetch");
     // Check out (detached) with "Don't ask again in this window" chosen earlier runs at once.
     let bar = Target::Commit {
@@ -1126,7 +1126,7 @@ fn a_restore_never_writes_over_anything_unless_chosen() {
     let mut fx = with_dialog(d, fake);
     fx.assert_shows("moved since (now cccccccc)");
     fx.assert_shows("occupied: left as it is unless replace is chosen");
-    fx.click("replace");
+    fx.click("[ ] replace");
     let Some(Action::Restore {
         entries: planned, ..
     }) = asked().last().cloned()

@@ -1130,7 +1130,7 @@ fn g_s6_take_theirs_then_restore_with_replace() {
         "{:#?}",
         g.texts()
     );
-    g.click("replace");
+    g.click("[ ] replace");
     g.until_quiet("the replace's reads");
     g.run();
     assert_eq!(std::fs::read(g.repo.top.join("c.txt")).unwrap(), hand);

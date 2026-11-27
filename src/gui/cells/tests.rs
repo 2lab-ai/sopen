@@ -1041,3 +1041,28 @@ fn the_skins_colours_in_a_256_colour_terminal() {
         assert!(index256(c) >= 16, "{c:?}");
     }
 }
+
+/// `OnScreen` gives what the screen shows: the painting of the last pass that reached it — kept
+/// through a pass that did not, and nothing after a printed pass that painted nothing.
+#[test]
+fn on_screen_is_the_last_painting_that_reached_the_screen() {
+    let ctx = egui::Context::default();
+    let mut screen = OnScreen::default();
+    assert_eq!(screen.start(&ctx), None, "nothing painted yet");
+    screen.painted(1);
+    assert_eq!(screen.start(&ctx), Some(&1), "a window shows every pass");
+    screen.painted(2);
+    set_presented(&ctx, false);
+    assert_eq!(screen.start(&ctx), Some(&1), "2 never reached the screen");
+    screen.painted(3);
+    assert_eq!(screen.start(&ctx), Some(&1), "nor 3");
+    screen.painted(4);
+    set_presented(&ctx, true);
+    assert_eq!(screen.start(&ctx), Some(&4));
+    assert_eq!(
+        screen.start(&ctx),
+        None,
+        "a printed pass that painted nothing"
+    );
+    assert!(presented(&ctx));
+}
