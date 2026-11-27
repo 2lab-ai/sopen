@@ -497,9 +497,16 @@ fn without_the_sandboxs_tools_there_is_no_engine() {
     );
     // A probe that does not end is given up on, on time.
     let stuck = temp.path().join("stuck-bwrap");
-    std::fs::write(&stuck, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::write(
+        &stuck,
+        "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nexec sleep 30\n",
+    )
+    .unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Run once now (`warm` ends it at once): a just-written stand-in can be "busy" for a moment
+    // on Linux (testutil), and the probe would fail to start it.
+    crate::testutil::run_fresh(std::process::Command::new(&stuck).arg("warm"));
     let at = Instant::now();
     let why = sandbox_runs(stuck.to_str().unwrap(), Duration::from_millis(300)).unwrap_err();
     assert!(why.ends_with("did not end within 300ms"), "{why}");

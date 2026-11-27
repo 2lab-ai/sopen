@@ -1358,12 +1358,16 @@ pub(crate) mod fixture {
     /// The real thing (Linux only: macOS starts a script that is still open for writing): a
     /// stand-in in `git`'s place whose write descriptor is still open — as a child another test
     /// thread forked holds it until its exec — is busy; the fixture's command runs once the
-    /// descriptor is closed.
+    /// descriptor is closed. The descriptor is closed only after the fixture's start was refused
+    /// ([`crate::testutil::busy_refusals`]; 5 s at most, so a fixture that never retries still
+    /// ends), never on a timer: a stall of this thread cannot let a start that does not retry
+    /// pass.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_stand_in_git_still_open_for_writing_runs_once_it_is_closed() {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
         let Some(git) = git() else {
             return;
         };
@@ -1374,13 +1378,22 @@ pub(crate) mod fixture {
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let err = Command::new(&wrapper).output().unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ExecutableFileBusy, "{err}");
-        repo.git = wrapper;
-        let closer = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            drop(file);
+        repo.git = wrapper.clone();
+        let refused = || crate::testutil::busy_refusals(&wrapper);
+        let top = std::thread::scope(|s| {
+            s.spawn(move || {
+                let until = Instant::now() + Duration::from_secs(5);
+                while refused() == 0 && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                drop(file);
+            });
+            repo.run(&["rev-parse", "--show-toplevel"])
         });
-        let top = repo.run(&["rev-parse", "--show-toplevel"]);
-        closer.join().unwrap();
+        assert!(
+            refused() >= 1,
+            "the fixture's start was refused, then retried"
+        );
         assert_eq!(top.trim(), repo.top());
     }
 }

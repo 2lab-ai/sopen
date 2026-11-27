@@ -1485,9 +1485,10 @@ fn the_planner_takes_its_keys_first_and_the_banner_keys_wait() {
         &editor,
         &format!("sed -i.bak 's/^pick {}/edit {}/' \"$1\"", &b[..7], &b[..7]),
     );
-    // Run once now (no file: sed only fails): a just-written script can be "busy" for a moment
-    // on Linux (testutil), and git would fail to start it as the sequence editor.
-    crate::testutil::run_fresh(&mut std::process::Command::new(&editor));
+    // Run once now (no file: sed only fails; in the test's own folder whatever it does): a
+    // just-written script can be "busy" for a moment on Linux (testutil), and git would fail to
+    // start it as the sequence editor.
+    crate::testutil::run_fresh(std::process::Command::new(&editor).current_dir(stopped.tmp.path()));
     let out = std::process::Command::new(&stopped.git)
         .current_dir(&stopped.top)
         .envs(fixture::env(&stopped.home()))
