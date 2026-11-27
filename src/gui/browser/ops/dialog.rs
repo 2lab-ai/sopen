@@ -201,6 +201,9 @@ enum Work {
     Cut,
     /// Glyphs a message field's galley is laid with.
     Glyphs,
+    /// Bytes of a message field's text compared to know its kept rows are still its own (the
+    /// tests bound these themselves: a few times the text a pass).
+    Checked,
     /// A list's rows measured.
     Measured,
     /// A list's rows drawn.
@@ -227,6 +230,7 @@ pub(crate) mod work {
     pub struct Done {
         pub cut: usize,
         pub glyphs: usize,
+        pub checked: usize,
         pub measured: usize,
         pub drawn: usize,
     }
@@ -241,7 +245,8 @@ pub(crate) mod work {
         DONE.with(|d| d.replace(Done::default()))
     }
 
-    /// The most of any one kind until the next [`take`] (`None`: no bound).
+    /// The most of any one kind but the bytes compared until the next [`take`] (`None`: no
+    /// bound).
     pub fn budget(most: Option<usize>) {
         BUDGET.with(|b| b.set(most));
     }
@@ -251,13 +256,15 @@ pub(crate) mod work {
         let c = match kind {
             super::Work::Cut => &mut done.cut,
             super::Work::Glyphs => &mut done.glyphs,
+            super::Work::Checked => &mut done.checked,
             super::Work::Measured => &mut done.measured,
             super::Work::Drawn => &mut done.drawn,
         };
         *c += n;
         let now = *c;
         DONE.with(|d| d.set(done));
-        if let Some(most) = BUDGET.with(Cell::get) {
+        let bounded = !matches!(kind, super::Work::Checked);
+        if let (Some(most), true) = (BUDGET.with(Cell::get), bounded) {
             assert!(now <= most, "over the work budget of {most}: {done:?}");
         }
     }
@@ -749,6 +756,12 @@ impl Shown {
         self.clicked.contains(&id)
     }
 
+    /// How many times `id` acted this pass (the tests: two presses in one pass are two).
+    #[cfg(test)]
+    pub fn clicks(&self, id: egui::Id) -> usize {
+        self.clicked.iter().filter(|c| **c == id).count()
+    }
+
     /// The rows of the list `id` chosen this pass, in order: a click on one, or Space or Enter
     /// on its bar — each the row the bar was on then.
     #[cfg_attr(not(test), allow(dead_code))] // X4-menu uses it; the tests till then.
@@ -1128,6 +1141,13 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
         Placed::Check(_, _, id) if !named(*id) => Some(*id),
         _ => None,
     });
+    // The check boxes `by_id` names: the kit's presses are theirs; the others keep egui's click.
+    let named_checks: Vec<egui::Id> = (layout.placed.iter())
+        .filter_map(|p| match p {
+            Placed::Check(_, _, id) if named(*id) => Some(*id),
+            _ => None,
+        })
+        .collect();
     // A pass that began on a field or a message field: that field read all of it, the presses
     // after a Tab too, so no control the Tab reaches takes them again.
     let began = ctx.memory(|m| m.focused());
@@ -1205,12 +1225,13 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                         let Some(cells) = visible(cells) else {
                             continue;
                         };
-                        // The first check box `Inputs::check` holds: egui's click, as the list's
-                        // dialogs have it; the others the kit's presses, as a choice's.
+                        // A check box `by_id` names: the kit's presses, as a choice's; the others
+                        // (the first, which `Inputs::check` holds) egui's click, as the list's
+                        // dialogs have it.
                         let rect = grid.rect(cells);
-                        let times = match Some(*id) == first_check {
-                            true => usize::from(ui.interact(rect, *id, Sense::click()).clicked()),
-                            false => acts(ui, rect, *id, after_tab),
+                        let times = match named_checks.contains(id) {
+                            true => acts(ui, rect, *id, after_tab),
+                            false => usize::from(ui.interact(rect, *id, Sense::click()).clicked()),
                         };
                         for _ in 0..times {
                             clicked.push(*id);
@@ -1430,14 +1451,14 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
 
 /// What a message field keeps between passes: the first row it shows, how many rows its text
 /// takes, its caret's row and cell as egui's galley puts it (while it has the keyboard), the
-/// caret's character and the text's hash and length when last seen — a change scrolls to the
-/// caret — and the pass it was last laid in.
+/// caret's character and the revision of its rows ([`Laid`]) when last seen — a change, in the
+/// text or the room, scrolls to the caret — and the pass it was last laid in.
 #[derive(Debug, Clone, Copy, Default)]
 struct MessageView {
     top: usize,
     rows: usize,
     caret: Option<(usize, usize)>,
-    seen: Option<(usize, u64, usize)>,
+    seen: Option<(usize, u64)>,
     laid: Option<u64>,
 }
 
@@ -1517,9 +1538,11 @@ pub fn message(ui: &mut egui::Ui, grid: &Grid, at: Cells, id: egui::Id, text: &m
         let cell = |v: f32, size: f32| (v / size).round().max(0.0) as usize;
         (cell(p.min.y, CELL.y), cell(p.min.x, CELL.x))
     });
-    // The text as last laid: its hash and length (no second pass over it).
-    let (hash, len, _) = laid(&ctx, id, text, room).key;
-    let seen = (out.cursor_range).map(|r| (r.primary.index.0, hash, len));
+    // The rows as the engine last laid them, this pass (no second look at the text).
+    let rev = ctx
+        .data(|d| d.get_temp::<Laid>(laid_id(id)))
+        .map_or(0, |l| l.rev);
+    let seen = (out.cursor_range).map(|r| (r.primary.index.0, rev));
     if let (Some((row, _)), true) = (view.caret, seen != view.seen) {
         if row < view.top {
             view.top = row;
@@ -1537,6 +1560,9 @@ pub fn message(ui: &mut egui::Ui, grid: &Grid, at: Cells, id: egui::Id, text: &m
 #[derive(Debug, Clone)]
 struct TextRow {
     bytes: std::ops::Range<usize>,
+    /// Where the glyphs that stand on the field's cells end: the blanks hung past them are
+    /// never drawn, so a row's cells are drawn from its first bytes alone.
+    ink: usize,
     first: usize,
     newline: bool,
 }
@@ -1544,8 +1570,9 @@ struct TextRow {
 /// The rows a message field lays `text` in, `room` cells wide: each of its lines broken by cells
 /// as [`wrap`] breaks a text — after its last blank that fits, else after its last whole glyph —
 /// with nothing dropped: the blanks at a break end the row above, past `room` if they must (no
-/// cell shows them there), so every character is on a row. One pass over the text, each line's
-/// glyphs held only while it is cut.
+/// cell shows them there), so every character is on a row; each row says where the glyphs on
+/// the field's `room + 1` cells end. One pass over the text, each line's glyphs held only while
+/// it is cut.
 fn cut_rows(text: &str, room: usize) -> Vec<TextRow> {
     let room = room.max(1);
     let mut out = vec![];
@@ -1562,8 +1589,11 @@ fn cut_rows(text: &str, room: usize) -> Vec<TextRow> {
         count(Work::Cut, all.len());
         let mut start = 0;
         loop {
-            let (mut end, mut after_blank, mut used) = (start, None, 0);
+            let (mut end, mut after_blank, mut used, mut ink) = (start, None, 0, None);
             while let Some(&(_, _, w, blank)) = all.get(end) {
+                if ink.is_none() && used + w > room + 1 {
+                    ink = Some(end);
+                }
                 if blank {
                     (end, used) = (end + 1, used + w);
                     after_blank = Some(end);
@@ -1585,8 +1615,10 @@ fn cut_rows(text: &str, room: usize) -> Vec<TextRow> {
             let byte_at = |i: usize| all.get(i).map_or(line.len(), |g| g.0);
             let char_at = |i: usize| all.get(i).map_or(chars, |g| g.1);
             let last = end >= all.len();
+            let ink = ink.map_or(end, |i| i.min(end));
             out.push(TextRow {
                 bytes: at + byte_at(start)..at + byte_at(end),
+                ink: at + byte_at(ink),
                 first: before + char_at(start),
                 newline: last && lines.peek().is_some(),
             });
@@ -1600,14 +1632,16 @@ fn cut_rows(text: &str, room: usize) -> Vec<TextRow> {
     out
 }
 
-/// The glyphs of `row` of `text`: each grapheme, the characters before it in the text, its cell
-/// in the row and its cells.
+/// The glyphs of `row` of `text` — all of them, or (`drawn`) those on the field's cells: each
+/// grapheme, the characters before it in the text, its cell in the row and its cells.
 fn row_glyphs<'a>(
     text: &'a str,
     row: &TextRow,
+    drawn: bool,
 ) -> impl Iterator<Item = (&'a str, usize, usize, usize)> + 'a {
     let (mut chars, mut x) = (row.first, 0);
-    text[row.bytes.clone()].graphemes(true).map(move |g| {
+    let end = if drawn { row.ink } else { row.bytes.end };
+    text[row.bytes.start..end].graphemes(true).map(move |g| {
         count(Work::Cut, 1);
         let (w, glyph) = (cells::width(g), (g, chars, x, cells::width(g)));
         (chars, x) = (chars + g.chars().count(), x + w);
@@ -1616,11 +1650,14 @@ fn row_glyphs<'a>(
 }
 
 /// A message field's text as last laid on cells, kept by its field while its text and room stay:
-/// the text's hash and length and the room, its rows, and the galley egui's engine reads (laid
-/// the first time it is wanted).
+/// the text itself (its identity, compared byte for byte), the room, a revision counted up each
+/// time it is laid again, its rows, and the galley egui's engine reads (laid the first time it
+/// is wanted).
 #[derive(Clone)]
 struct Laid {
-    key: (u64, usize, usize),
+    text: Arc<str>,
+    room: usize,
+    rev: u64,
     rows: Arc<Vec<TextRow>>,
     galley: Option<Arc<egui::Galley>>,
 }
@@ -1630,15 +1667,21 @@ fn laid_id(field: egui::Id) -> egui::Id {
 }
 
 /// The rows of `text` for the message field `id`, `room` cells wide: the ones it keeps while
-/// they are this text's at this room, else cut again ([`cut_rows`]) and kept.
+/// they are this very text's at this room — the kept text compared with it byte for byte, never
+/// by a hash two texts can share — else cut again ([`cut_rows`]) and kept.
 fn laid(ctx: &egui::Context, id: egui::Id, text: &str, room: usize) -> Laid {
-    let key = (egui::epaint::util::hash(text), text.len(), room);
     let kept: Option<Laid> = ctx.data(|d| d.get_temp(laid_id(id)));
-    if let Some(kept) = kept.filter(|l| l.key == key) {
-        return kept;
+    let rev = kept.as_ref().map_or(0, |k| k.rev + 1);
+    if let Some(kept) = kept.filter(|k| k.room == room && k.text.len() == text.len()) {
+        count(Work::Checked, text.len());
+        if *kept.text == *text {
+            return kept;
+        }
     }
     let fresh = Laid {
-        key,
+        text: Arc::from(text),
+        room,
+        rev,
         rows: Arc::new(cut_rows(text, room)),
         galley: None,
     };
@@ -1676,7 +1719,7 @@ fn message_galley(ui: &egui::Ui, id: egui::Id, text: &str, room: usize) -> Arc<e
     let mut right = 0.0f32;
     for (k, r) in kept.rows.iter().enumerate() {
         let mut row = template.clone();
-        for (g, _, x, w) in row_glyphs(text, r) {
+        for (g, _, x, w) in row_glyphs(text, r, false) {
             for (c, chr) in g.chars().enumerate() {
                 let mut glyph = glyph0;
                 (glyph.chr, glyph.first_vertex) = (chr, 0);
@@ -1740,7 +1783,7 @@ pub fn message_cells(
     let kept = laid(ctx, id, text, room_of(at));
     for (k, row) in kept.rows.iter().enumerate().skip(view.top).take(shown) {
         let y = at.y + (k - view.top) as u16;
-        for (g, first, x, w) in row_glyphs(text, row) {
+        for (g, first, x, w) in row_glyphs(text, row, true) {
             if w == 0 || x + w > width {
                 continue;
             }

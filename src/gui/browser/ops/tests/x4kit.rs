@@ -50,6 +50,10 @@ struct Host {
     left: Vec<String>,
     /// The first row a report's rows that scroll show.
     report_top: usize,
+    /// The clicks of a check box no input holds (`spare`).
+    spare_clicks: usize,
+    /// The keys the dialog left pressed in each pass's input.
+    left_keys: Vec<Key>,
 }
 
 impl Host {
@@ -77,6 +81,8 @@ impl Host {
             hidden: false,
             left: vec![],
             report_top: 0,
+            spare_clicks: 0,
+            left_keys: vec![],
         }
     }
 
@@ -142,9 +148,21 @@ impl Window for Host {
             by_id,
         };
         let shown = dialog::show(&ctx, id("dialog"), &layout, inputs);
-        self.clicked
-            .extend(clickable().into_iter().filter(|c| shown.clicked(*c)));
+        for c in clickable() {
+            self.clicked.extend(std::iter::repeat_n(c, shown.clicks(c)));
+        }
         self.chosen.extend(shown.chosen(id("list")));
+        self.spare_clicks += shown.clicks(id("spare"));
+        self.left_keys.extend(ctx.input(|i| {
+            (i.events.iter())
+                .filter_map(|e| match e {
+                    Event::Key {
+                        key, pressed: true, ..
+                    } => Some(*key),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        }));
         self.controls = shown.controls;
         self.modal = shown.modal.response.rect;
         self.left.extend(ctx.input(|i| {
@@ -749,12 +767,13 @@ fn x4kit_space_then_tab_turns_the_check_box_that_had_the_keyboard() {
     assert_eq!((h.on, h.also), (true, true));
     assert_eq!(focused(&drv), Some(id("ok")));
     assert_eq!(h.take_clicked(), vec![id("also")], "Run is not clicked");
-    // Space, Space in one pass: twice.
+    // Space, Space in one pass: twice, each recorded.
     focus(&mut drv, &mut h, id("on"));
     let space = || down(Key::Space, Modifiers::NONE);
     drv.frame(&mut h, vec![space(), space()], Modifiers::NONE);
     drv.idle(&mut h, 1);
     assert_eq!((h.on, h.also), (true, true));
+    assert_eq!(h.take_clicked(), vec![id("on"), id("on")]);
     // A click still turns it.
     let l = boxed(&drv, "Checks");
     let on = place(&l, "[X] Sign off");
@@ -1068,6 +1087,28 @@ fn x4kit_the_scroll_bars_of_a_message_and_a_list_take_clicks() {
     same_in_a_terminal(&drv);
 }
 
+/// A check box `by_id` does not name, after the first (which `Inputs::check` holds), keeps
+/// egui's click: Space on it is not taken out of the pass, and egui clicks it once.
+#[test]
+fn x4kit_an_unnamed_second_check_box_keeps_egui_s_click() {
+    let parts = vec![check("Sign off", "on"), check("Spare", "spare"), buttons()];
+    let mut h = Host::new("Checks", 40, parts);
+    h.legacy = true;
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut h, 2);
+    focus(&mut drv, &mut h, id("spare"));
+    let space = || down(Key::Space, Modifiers::NONE);
+    drv.frame(&mut h, vec![space(), space()], Modifiers::NONE);
+    drv.idle(&mut h, 1);
+    assert_eq!(h.spare_clicks, 1, "egui's click, once a pass");
+    assert_eq!(
+        h.left_keys,
+        vec![Key::Space, Key::Space],
+        "left in the pass"
+    );
+    assert!(!h.on);
+}
+
 /// A selection in a message field — over every row (Ctrl/⌘+A), or a part of one row (Shift+→)
 /// — shows in the bar's colours where it is, and the field goes on editing: typing replaces it.
 #[test]
@@ -1107,9 +1148,11 @@ fn x4kit_a_long_message_costs_its_rows_not_its_length_a_pass() {
     h.message = "word ".repeat(40_960);
     let len = h.message.len();
     let mut drv = Driver::new(640.0, 400.0);
-    work::take();
-    work::budget(Some(3 * len));
-    drv.idle(&mut h, 2);
+    for _ in 0..2 {
+        work::take();
+        work::budget(Some(3 * len));
+        drv.idle(&mut h, 1);
+    }
     let idle = |drv: &mut Driver, h: &mut Host| {
         work::take();
         work::budget(Some(200));
@@ -1121,8 +1164,11 @@ fn x4kit_a_long_message_costs_its_rows_not_its_length_a_pass() {
     idle(&mut drv, &mut h);
     focus(&mut drv, &mut h, id("message"));
     idle(&mut drv, &mut h);
-    work::budget(Some(3 * len));
+    work::take();
+    work::budget(None);
     drv.key(&mut h, Key::ArrowDown, Modifiers::COMMAND);
+    work::take();
+    work::budget(Some(3 * len));
     drv.frame(&mut h, vec![Event::Text("!".into())], Modifiers::NONE);
     let done = work::take();
     assert!(done.glyphs <= 2 * len && done.cut <= 3 * len, "{done:?}");
@@ -1168,6 +1214,100 @@ fn x4kit_the_wheel_over_a_message_leaves_the_reports_rows() {
     drv.wheel(&mut h, at_cell(step0.x + 2, step0.y), -1.0);
     assert_eq!(h.report_top, 3);
     assert_eq!(place(&boxed(&drv, "Report"), "line 3").y, line0.y);
+}
+
+/// Two texts of one length, one after the other in the same field at the same room, are each
+/// cut as they are: the field keeps the rows of the text it laid, and knows them by that text,
+/// byte for byte — the second's rows are its own, its words where they wrap and no row cut
+/// inside a character (a key of hash and length alone would hand the first text's rows on).
+#[test]
+fn x4kit_a_text_of_the_same_length_is_cut_anew() {
+    let mut h = Host::new("M", 0, vec![message("", 3)]);
+    let mut drv = Driver::new(640.0, 400.0);
+    let shown = |drv: &Driver| -> Vec<String> {
+        let l = boxed(drv, "M");
+        let a = l.buf.area;
+        (a.y + 2..a.y + 5)
+            .map(|y| row(&l, y).trim_matches(['║', ' ']).to_string())
+            .collect()
+    };
+    h.message = "aaaaa bbbbb cc".into();
+    drv.idle(&mut h, 2);
+    assert_eq!(shown(&drv), ["aaaaa bbbbb", "cc", ""]);
+    h.message = "cc bbbbb aaaaa".into();
+    drv.idle(&mut h, 1);
+    assert_eq!(shown(&drv), ["cc bbbbb", "aaaaa", ""]);
+    // The first text's break would fall inside the second's 가.
+    h.message = "aaaaa bbbbb 가".into();
+    drv.idle(&mut h, 1);
+    h.message = "aaaaaaaaaa 가b".into();
+    drv.idle(&mut h, 1);
+    assert_eq!(shown(&drv), ["aaaaaaaaaa", "가b", ""]);
+    focus(&mut drv, &mut h, id("message"));
+    drv.frame(&mut h, vec![Event::Text("!".into())], Modifiers::NONE);
+    drv.idle(&mut h, 1);
+    assert_eq!(h.message, "!aaaaaaaaaa 가b");
+    same_in_a_terminal(&drv);
+}
+
+/// A run of 200 KB of blanks in a narrow field hangs on one row: a pass without input draws the
+/// cells the field has, not the run, and reads the text only to know its rows are still its
+/// own (a few times a pass, byte for byte).
+#[test]
+fn x4kit_a_long_run_of_blanks_costs_the_field_not_the_run_a_pass() {
+    let mut h = Host::new("Blanks", 16, vec![message("", 3)]);
+    h.message = format!("start{}end", " ".repeat(204_800));
+    let len = h.message.len();
+    let mut drv = Driver::new(640.0, 400.0);
+    for _ in 0..2 {
+        work::take();
+        work::budget(Some(4 * len));
+        drv.idle(&mut h, 1);
+    }
+    focus(&mut drv, &mut h, id("message"));
+    for _ in 0..2 {
+        work::take();
+        work::budget(Some(3 * len));
+        drv.idle(&mut h, 1);
+        let done = work::take();
+        work::budget(None);
+        assert_eq!(done.glyphs, 0, "{done:?}");
+        assert!(done.cut <= 3 * 16, "{done:?}");
+        assert!(done.checked <= 3 * len, "{done:?}");
+    }
+    let l = boxed(&drv, "Blanks");
+    let all = rows(&l).join("\n");
+    assert!(all.contains("start") && all.contains("end"), "{all}");
+    assert_eq!(place(&l, "end").y, place(&l, "start").y + 1);
+}
+
+/// The field narrowed under a still caret (the window made narrower): its text wraps again, and
+/// the rows it shows follow the caret's row, which moved down.
+#[test]
+fn x4kit_a_narrower_field_keeps_its_caret_in_view() {
+    let mut h = Host::new("Narrow", 60, vec![message("", 3)]);
+    h.message = "word ".repeat(60).trim_end().to_string();
+    let mut drv = Driver::new(640.0, 400.0);
+    drv.idle(&mut h, 2);
+    focus(&mut drv, &mut h, id("message"));
+    drv.key(&mut h, Key::ArrowDown, Modifiers::COMMAND);
+    let caret = |drv: &Driver| boxed(drv, "Narrow").caret;
+    let wide = caret(&drv).expect("the caret in view");
+    drv.resize(400.0, 400.0);
+    drv.idle(&mut h, 2);
+    let narrow = caret(&drv).expect("the caret still in view");
+    assert_ne!(narrow, wide, "the rows wrapped again");
+    let l = boxed(&drv, "Narrow");
+    let state = egui::text_edit::TextEditState::load(&drv.ctx, id("message")).unwrap();
+    let at = state.cursor.char_range().unwrap().primary.index.0;
+    assert_eq!(at, h.message.chars().count(), "the caret did not move");
+    assert_eq!(
+        symbol_at(&l, narrow.x - 4, narrow.y),
+        "w",
+        "{:#?}",
+        rows(&l)
+    );
+    same_in_a_terminal(&drv);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1333,7 +1473,7 @@ fn x4kit_the_lists_first_arrow_after_tab_is_its_own() {
 
 /// A list of 20,000 rows (the branch chooser's): a pass without input, and one that moves the
 /// bar, measures none of its rows and draws only the rows it shows; its part is the same rows,
-/// shared, pass after pass (nothing copies them).
+/// shared, pass after pass: no pass keeps them, and `Rows` is not `Clone`.
 #[test]
 fn x4kit_a_long_list_costs_its_view_not_its_length_a_pass() {
     let names: Vec<String> = (0..20_000).map(|k| format!("branch-{k}")).collect();
