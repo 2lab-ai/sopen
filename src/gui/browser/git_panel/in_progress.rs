@@ -12,14 +12,15 @@
 //! dialog (`ActionDialog::confirm`); a step the state does not offer gives
 //! [`Pressed::NotOffered`], the status row's words, and does nothing (Skip in a merge).
 
+use super::graph_view::printable;
 use crate::git::actions::{Action, Banner, Proceed};
 use crate::git::model::Oid;
 use crate::git::model::{InProgress, Status};
 use crate::git::rebase::Edit;
 use crate::gui::browser::keys::{self, Mods};
-use crate::gui::cells::{Buffer, Cells, Grid};
-use crate::gui::chrome::{self, PALETTE};
-use eframe::egui::{self, Key, Pos2, Rect, Vec2};
+use crate::gui::cells::{self, Buffer, Cells, Grid, Pen};
+use crate::gui::chrome::PALETTE;
+use eframe::egui::{self, Key, Sense};
 
 /// What the banner shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,53 +123,87 @@ pub fn keys(ctx: &egui::Context, banner: &BannerView) -> Option<Pressed> {
     })
 }
 
-/// Whether [`draw`] and [`draw_stop`] paint the banner's cells (10 §17, X4-graph's seam): not yet
-/// — egui draws it at `grid.rect(cells)` and the panel leaves those cells to `term::compose` (a
-/// hand-off box in a terminal) until X4-pane makes it `true`.
-pub(super) const PAINTS_CELLS: bool = false;
+/// Whether [`draw`] and [`draw_stop`] paint the banner's cells (10 §17, X4-graph's seam): they do
+/// (X4-pane), so the panel leaves none of them to egui.
+pub(super) const PAINTS_CELLS: bool = true;
 
-/// The banner at cells `cells` of `grid` (the panel's top rows, [`BannerView::rows`] of them):
-/// its lines in the warning colour, the offered steps as buttons at the right of the first row —
-/// a click is the step's key. `buf` is the panel's buffer, for the banner's cells once it paints
-/// them ([`PAINTS_CELLS`]).
+/// The banner at cells `area` of `grid` (the panel's top rows, [`BannerView::rows`] of them),
+/// written into `buf`, the panel's buffer (10 §4, X4-pane): its lines in the warning colour, the
+/// offered steps as `[ Continue ]`-style buttons at the right of the first row ([`lay`]) — a
+/// click is the step's key.
 pub fn draw(
     ui: &mut egui::Ui,
     grid: &Grid,
-    cells: Cells,
-    _buf: &mut Buffer,
+    area: Cells,
+    buf: &mut Buffer,
     banner: &BannerView,
 ) -> Option<Pressed> {
-    let rect = grid.rect(cells);
-    let ctx = ui.ctx().clone();
-    let font = chrome::mono(ui);
-    let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-    let row_h = text_h.ceil();
-    let painter = ui.painter_at(rect);
-    // The buttons, right to left from the first row's end.
-    let mut right = rect.right();
-    let mut pressed = None;
-    for &p in banner.offers.iter().rev() {
-        let w = cw * (word(p).chars().count() + 2) as f32;
-        let at = Rect::from_min_size(Pos2::new(right - w, rect.top()), Vec2::new(w, row_h));
-        let button = ui
-            .put(at, egui::Button::new(word(p)))
-            .on_hover_text(key_text(p));
-        if button.clicked() {
-            pressed = Some(banner.press(p));
-        }
-        right -= w + cw;
+    let words: Vec<&str> = banner.offers.iter().map(|&p| word(p)).collect();
+    let k = lay(ui, grid, area, buf, &banner.lines, &words)?;
+    Some(banner.press(banner.offers[k]))
+}
+
+/// The banner's `lines` at cells `area` of `grid`, written into `buf`: a line a row in the warning
+/// colour on the panel's back, cut by cells (`…`); `buttons` as `[ word ]` at the right of the
+/// first row, right-aligned, in the dialog's colours as the hex view's buttons outside a dialog
+/// (10 §6) — never focused, the banner's keys being Cmd/Ctrl+Shift's — a blank cell of the panel's
+/// back apart and from the state: a dialog's buttons need two (§6: each its own text, on the
+/// dialog's own colour), these stand apart in their colour with one, which leaves an edit stop's
+/// `stopped to edit` beside its four buttons on a 1000-point window's side (61 cells; its commit
+/// id cut there, shown on HEAD's row of the graph). The buttons
+/// come first, as egui's did: each that fits whole is laid, from the right, those that do not
+/// going from the left (Amend first), and the state is cut to what is left before them. Each is
+/// an `interact` rect at its cells; the one clicked, by its place in `buttons`. The buttons have
+/// no hover (a cell has no place for it): the status row names their keys while the banner shows
+/// (`GitView::status_line`).
+fn lay(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    area: Cells,
+    buf: &mut Buffer,
+    lines: &[String],
+    buttons: &[&str],
+) -> Option<usize> {
+    let p = PALETTE;
+    let warn = Pen::new(p.warn, p.back);
+    cells::fill(buf, area, warn);
+    if area.height == 0 {
+        return None;
     }
-    for (k, line) in banner.lines.iter().enumerate() {
-        let y = rect.top() + row_h * k as f32;
-        let end = if k == 0 { right } else { rect.right() };
-        let shown = chrome::fit_start(&ctx, line, &font, (end - rect.left()).max(0.0));
-        painter.text(
-            Pos2::new(rect.left(), y),
-            egui::Align2::LEFT_TOP,
-            shown,
-            font.clone(),
-            PALETTE.warn,
-        );
+    let width = usize::from(area.width);
+    // Cell `c` of the banner's row, on the grid (every `c` here is below `width`).
+    let x = |c: usize| area.x.saturating_add(u16::try_from(c).unwrap_or(u16::MAX));
+    // The buttons, right to left from the first row's end: where each starts.
+    let mut laid: Vec<(usize, usize)> = Vec::new();
+    let mut right = width;
+    for (k, label) in buttons.iter().enumerate().rev() {
+        let w = cells::width(label) + 4;
+        let gap = usize::from(!laid.is_empty());
+        let Some(at) = right.checked_sub(gap + w) else {
+            break;
+        };
+        laid.push((k, at));
+        right = at;
+    }
+    let state_end = laid.last().map_or(width, |&(_, at)| at.saturating_sub(1));
+    let mut pressed = None;
+    let button = Pen::new(p.dialog_text, p.dialog_back);
+    for &(k, at) in &laid {
+        let label = format!("[ {} ]", buttons[k]);
+        let w = cells::width(&label);
+        cells::put(buf, x(at), area.y, &label, w, button);
+        let id = ui.scope_id().with(("sopen-git-banner", buttons[k]));
+        let rect = grid.rect(Cells::new(x(at), area.y, w as u16, 1));
+        if ui.interact(rect, id, Sense::click()).clicked() {
+            pressed = Some(k);
+        }
+    }
+    for (y, (k, line)) in (area.top()..area.bottom()).zip(lines.iter().enumerate()) {
+        let room = if k == 0 { state_end } else { width };
+        if room > 0 {
+            let shown = cells::fit_start(&printable(line), room);
+            cells::put(buf, area.x, y, &shown, room, warn);
+        }
     }
     pressed
 }
@@ -345,60 +380,24 @@ pub fn stop_keys(
     })
 }
 
-/// The banner of an edit stop at cells `cells` of `grid`, as [`draw`] draws a banner, with Amend
+/// The banner of an edit stop at cells `area` of `grid`, as [`draw`] draws a banner, with Amend
 /// and Split before S3-B's steps at the right of its first row (03 §8.5's order: Amend, Split,
 /// Continue, Abort); a click is the step's key.
 pub fn draw_stop(
     ui: &mut egui::Ui,
     grid: &Grid,
-    cells: Cells,
-    _buf: &mut Buffer,
+    area: Cells,
+    buf: &mut Buffer,
     banner: &BannerView,
     stop: &EditStop,
 ) -> Option<StopEnd> {
-    let rect = grid.rect(cells);
-    let ctx = ui.ctx().clone();
-    let font = chrome::mono(ui);
-    let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-    let row_h = text_h.ceil();
-    let painter = ui.painter_at(rect);
-    // The buttons, right to left from the first row's end: S3-B's steps, then Split and Amend.
-    let buttons = banner
-        .offers
-        .iter()
-        .rev()
-        .map(|&p| (word(p), key_text(p), Err(p)))
-        .chain(
-            stop.offers()
-                .into_iter()
-                .rev()
-                .map(|s| (stop_word(s), stop_key_text(s), Ok(s))),
-        );
-    let mut right = rect.right();
-    let mut pressed = None;
-    for (word, key, step) in buttons {
-        let w = cw * (word.chars().count() + 2) as f32;
-        let at = Rect::from_min_size(Pos2::new(right - w, rect.top()), Vec2::new(w, row_h));
-        let button = ui.put(at, egui::Button::new(word)).on_hover_text(key);
-        if button.clicked() {
-            pressed = Some(match step {
-                Ok(s) => StopEnd::Stop(stop.press(s)),
-                Err(p) => StopEnd::Banner(banner.press(p)),
-            });
-        }
-        right -= w + cw;
-    }
-    for (k, line) in banner.lines.iter().enumerate() {
-        let y = rect.top() + row_h * k as f32;
-        let end = if k == 0 { right } else { rect.right() };
-        let shown = chrome::fit_start(&ctx, line, &font, (end - rect.left()).max(0.0));
-        painter.text(
-            Pos2::new(rect.left(), y),
-            egui::Align2::LEFT_TOP,
-            shown,
-            font.clone(),
-            PALETTE.warn,
-        );
-    }
-    pressed
+    let steps = stop.offers();
+    let words: Vec<&str> = (steps.iter().map(|&s| stop_word(s)))
+        .chain(banner.offers.iter().map(|&p| word(p)))
+        .collect();
+    let k = lay(ui, grid, area, buf, &banner.lines, &words)?;
+    Some(match steps.get(k) {
+        Some(&s) => StopEnd::Stop(stop.press(s)),
+        None => StopEnd::Banner(banner.press(banner.offers[k - steps.len()])),
+    })
 }

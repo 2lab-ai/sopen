@@ -8,14 +8,22 @@
 //! follows the graph's bar; Esc again closes it (03 §6.1). Its reads are the integration's: the
 //! pane shows `reading…` until [`super::GitView::set_details`] hands over the details of exactly
 //! the subject it shows (a result for another is dropped).
+//!
+//! The pane is cells (10 §4, X4-pane): each line a row of the panel's buffer, every width a count
+//! of cells (unicode-width) — the message wrapped by cells at a blank ([`Pane::wrap`],
+//! `dialog::wrap`'s rule), its tabs at every eighth cell — so the window and the terminal show
+//! the same cells. In an ambiguous-wide terminal (10 §10, T38) the pane's own `√` and a rename's
+//! `→` are §10's stand-ins, at the source; paths and messages are content and stay as written.
 
 use super::graph_view::{date_text, printable};
 use super::{Scroll, Subject};
 use crate::git::model::Oid;
-use crate::gui::cells::{Buffer, Cells, Grid};
+use crate::gui::cells::{self, Buffer, Cells, Grid, Pen};
 use crate::gui::chrome;
 use crate::gui::chrome::git::{self as look, LOOK};
-use eframe::egui::{self, Pos2, Rect, Sense, Vec2};
+use crate::gui::term;
+use eframe::egui::{self, Color32, Sense};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// What a details read found (03 §6.1), for [`super::GitView::set_details`]. The field names are
 /// S2-B's `CommitDetails` and `ChangedFile`'s, so S2-F maps one to the other field by field.
@@ -340,21 +348,20 @@ impl Pane {
         self.lines = lines;
     }
 
-    /// The message's lines wrapped to `chars` cells of `font` (03 §6.1: the whole message,
-    /// scrollable), once a width: the bar stays on its file row.
-    pub fn wrap(&mut self, ctx: &egui::Context, font: &egui::FontId, cw: f32, chars: usize) {
+    /// The message's lines wrapped to `chars` cells (03 §6.1: the whole message, scrollable),
+    /// once a width: the bar stays on its file row.
+    pub fn wrap(&mut self, chars: usize) {
         if self.wrapped_for == Some(chars) {
             return;
         }
         let spot = self.spot();
         self.build();
-        let width = cw * chars.max(1) as f32;
         let mut wrapped = Vec::with_capacity(self.lines.len());
         let mut origin = Vec::with_capacity(self.lines.len());
         for (k, line) in std::mem::take(&mut self.lines).into_iter().enumerate() {
             match line {
                 Line::Text(s) => {
-                    for row in wrap_line(ctx, font, &s, width) {
+                    for row in wrap_line(&s, chars) {
                         wrapped.push(Line::Text(row));
                         origin.push(k);
                     }
@@ -383,41 +390,60 @@ impl Pane {
     }
 }
 
-/// Whether [`draw`] paints the pane's cells (10 §17, X4-graph's seam): not yet — egui draws it at
-/// `grid.rect(cells)`, its scroll bar on the border cell right of them, and the panel leaves
-/// those cells to `term::compose` (a hand-off box in a terminal) until X4-pane makes it `true`.
-pub(super) const PAINTS_CELLS: bool = false;
+/// Whether [`draw`] paints the pane's cells (10 §17, X4-graph's seam): it does (X4-pane), so the
+/// panel leaves none of them to egui.
+pub(super) const PAINTS_CELLS: bool = true;
 
-/// The pane at cells `cells` of `grid` (the panel hands it the rows under the graph's rule), the
-/// scroll bar on the right border beside it; `viewed` says which files were opened (`√`), `active`
-/// whether the pane's bar is the active one. `buf` is the panel's buffer, for the pane's cells
-/// once it paints them ([`PAINTS_CELLS`]). A click puts the pane's bar on a line and gives it the
-/// keyboard; returns the line clicked and whether twice.
+/// One of the pane's own glyphs as this pass's screen shows it: in a terminal that draws a glyph
+/// of ambiguous width in two cells (`wide`), 10 §10's stand-in (`term::narrow`: `√` `.`, `→`
+/// `>`), put here where the glyph is known to be the pane's, never a path's (T38).
+fn own(glyph: char, wide: bool) -> String {
+    let mut utf8 = [0u8; 4];
+    let s: &str = glyph.encode_utf8(&mut utf8);
+    match term::narrow(s).filter(|_| wide) {
+        Some(stand_in) => stand_in.to_string(),
+        None => s.to_string(),
+    }
+}
+
+/// Between a rename's old and new path (`old → new`, 03 §6.1).
+const RENAMED: char = '→';
+
+/// The pane at cells `area` of `grid` (the panel hands it the rows under the graph's rule),
+/// written into `buf`, the panel's buffer (10 §4, X4-pane): a line a row — a summary field's name
+/// dim at its first cell and its value at the fourteenth, a group's head dim, a file's `√` (or an
+/// untracked folder's `►`), its change letter, its path (a rename `old → new`) cut from its start
+/// so that its end shows, and `+adds -dels` at the right; the message's lines as [`Pane::wrap`]
+/// wrapped them — every text cut by cells, never half a wide glyph. The pane's bar (while the
+/// keyboard is the pane's) in the active bar's colours when `active`, else the idle bar's; the
+/// scroll bar on the border right of `area`, as the graph's. `viewed` says which files were
+/// opened (`√`). The wheel scrolls the lines by cells; each line is an `interact` rect at its
+/// cells: returns the line clicked, and whether the click is the second of a double click on it
+/// (the browser's `second_click`: egui alone misses a double click right after a click on another
+/// line).
 pub(super) fn draw(
     ui: &mut egui::Ui,
     grid: &Grid,
-    cells: Cells,
-    _buf: &mut Buffer,
+    area: Cells,
+    buf: &mut Buffer,
     pane: &mut Pane,
     viewed: &dyn Fn(&FileRow) -> bool,
     active: bool,
 ) -> Option<(usize, bool)> {
-    let area = grid.rect(cells);
     let ctx = ui.ctx().clone();
-    let font = chrome::mono(ui);
-    let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-    let row_h = text_h.ceil();
-    let visible = ((area.height() / row_h).floor() as usize).max(1);
-    let chars = (area.width() / cw).floor().max(0.0) as usize;
-    pane.wrap(&ctx, &font, cw, chars);
+    let p = chrome::PALETTE;
+    let wide = cells::ambiguous_wide(&ctx);
+    let chars = usize::from(area.width);
+    let visible = usize::from(area.height).max(1);
+    pane.wrap(chars);
     let len = pane.lines.len();
-    if ui.rect_contains_pointer(area) {
+    if super::super::pointer_on_pane(ui, grid.rect(area)) {
         let lines: f32 = ctx.input(|i| {
             i.events
                 .iter()
                 .map(|e| match e {
                     egui::Event::MouseWheel { unit, delta, .. } => match unit {
-                        egui::MouseWheelUnit::Point => -delta.y / row_h,
+                        egui::MouseWheelUnit::Point => -delta.y / chrome::CELL.y,
                         _ => -delta.y * 3.0,
                     },
                     _ => 0.0,
@@ -429,112 +455,158 @@ pub(super) fn draw(
     }
     pane.scroll.settle(visible, len);
     let range = pane.scroll.range(len);
-    let painter = ui.painter_at(area);
-    let x = |cell: usize| area.left() + cw * cell as f32;
+    let shown = range.start..range.end.min(range.start + usize::from(area.height));
+    // Cell `c` of the pane, on the grid (every `c` here is below `chars`).
+    let x = |c: usize| area.x.saturating_add(u16::try_from(c).unwrap_or(u16::MAX));
+    let pane = &*pane;
     let mut clicked = None;
     for (k, line) in pane
         .lines
         .iter()
         .enumerate()
-        .skip(range.start)
-        .take(range.len())
+        .skip(shown.start)
+        .take(shown.len())
     {
-        let y = area.top() + row_h * (k - range.start) as f32;
-        let row = Rect::from_min_size(Pos2::new(area.left(), y), Vec2::new(area.width(), row_h));
+        let y = area.y + (k - shown.start) as u16;
+        let row = Cells::new(area.x, y, area.width, 1);
         let on_bar = pane.keyboard && k == pane.scroll.bar;
-        // Everything of the line is painted inside it.
-        let painter = painter.with_clip_rect(row.intersect(area));
-        if on_bar {
-            chrome::bar(&painter, row, active);
-        }
-        let paint = |c| if on_bar && active { LOOK.on_bar } else { c };
-        let text = |cell: usize, s: &str, c| {
-            let room = cw * chars.saturating_sub(cell) as f32;
-            let shown = chrome::fit_start(&ctx, &printable(s), &font, room);
-            painter.text(
-                Pos2::new(x(cell), y),
-                egui::Align2::LEFT_TOP,
-                shown,
-                font.clone(),
-                paint(c),
-            );
+        let back = match (on_bar, active) {
+            (false, _) => p.back,
+            (true, true) => p.bar,
+            (true, false) => p.bar_idle,
+        };
+        let pen = |c: Color32| Pen::new(if on_bar && active { LOOK.on_bar } else { c }, back);
+        cells::fill(buf, row, pen(LOOK.text));
+        // `s` from cell `at`, cut by cells to the pane's end.
+        let text = |buf: &mut Buffer, at: usize, s: &str, c: Color32| {
+            let room = chars.saturating_sub(at);
+            if room > 0 {
+                cells::put(buf, x(at), y, &fitted(s, room), room, pen(c));
+            }
         };
         match line {
             Line::Field { name, value } => {
-                text(0, name, LOOK.dim);
-                text(VALUE, value, LOOK.text);
+                text(buf, 0, name, LOOK.dim);
+                text(buf, VALUE, value, LOOK.text);
             }
             Line::Parent { first, oid } => {
                 if *first {
-                    text(0, "Parents", LOOK.dim);
+                    text(buf, 0, "Parents", LOOK.dim);
                 }
-                text(VALUE, oid.as_str(), LOOK.text);
+                text(buf, VALUE, oid.as_str(), LOOK.text);
             }
-            Line::Text(s) => text(0, s, LOOK.text),
+            Line::Text(s) => text(buf, 0, s, LOOK.text),
             Line::Blank => {}
-            Line::Head(h) => text(0, h, LOOK.dim),
-            Line::Reading => text(0, "reading…", LOOK.dim),
-            Line::Error(e) => text(0, e, LOOK.error),
+            Line::Head(h) => text(buf, 0, h, LOOK.dim),
+            Line::Reading => text(buf, 0, "reading…", LOOK.dim),
+            Line::Error(e) => text(buf, 0, e, LOOK.error),
             Line::File { group, file } => {
                 let Some((_, f)) = pane.file(*group, *file) else {
                     continue;
                 };
-                if f.is_folder() {
-                    text(0, &look::FOLDER.to_string(), LOOK.text);
+                // The first cell: an untracked folder's `►`, a text; or the viewed mark `√`,
+                // which keeps its colour on the bar as the graph's lanes and labels keep theirs.
+                let mark = if f.is_folder() {
+                    Some((look::FOLDER.to_string(), pen(LOOK.text)))
                 } else if viewed(f) {
-                    text(0, &look::VIEWED.to_string(), LOOK.viewed);
+                    Some((own(look::VIEWED, wide), Pen::new(LOOK.viewed, back)))
+                } else {
+                    None
+                };
+                if let (Some((mark, pen)), true) = (mark, chars > 0) {
+                    cells::put(buf, x(0), y, &mark, 1, pen);
                 }
-                text(2, &f.letter.to_string(), LOOK.text);
-                let counts = f.lines.map(|(a, d)| format!("+{a} -{d}"));
-                let counts_w = counts.as_ref().map_or(0, |c| c.chars().count() + 1);
-                let room = cw * chars.saturating_sub(4 + counts_w) as f32;
-                let path = chrome::fit_left(&ctx, &printable(&f.shown()), &font, room);
-                painter.text(
-                    Pos2::new(x(4), y),
-                    egui::Align2::LEFT_TOP,
-                    path,
-                    font.clone(),
-                    paint(LOOK.text),
-                );
-                if let Some(counts) = counts {
-                    painter.text(
-                        Pos2::new(area.right(), y),
-                        egui::Align2::RIGHT_TOP,
-                        counts,
-                        font.clone(),
-                        paint(LOOK.text),
-                    );
-                }
+                file_row(buf, x, y, chars, f, wide, &pen);
             }
         }
         let resp = ui.interact(
-            row,
+            grid.rect(row),
             ui.scope_id().with(("sopen-git-pane", k)),
             Sense::click(),
         );
-        if resp.double_clicked() {
-            clicked = Some((k, true));
-        } else if resp.clicked() {
-            clicked = Some((k, false));
+        if resp.clicked() {
+            // The line by what the pane shows: another subject's line `k` starts no pair.
+            let pair = egui::Id::unique(("sopen-git-pane-line", &pane.subject, k));
+            clicked = Some((k, super::super::second_click(&resp, pair)));
         }
     }
+    // The scroll bar on the border, beside the pane's rows.
     let max_top = len.saturating_sub(visible);
-    let column = Rect::from_min_max(
-        Pos2::new(area.right(), area.top()),
-        Pos2::new(area.right() + chrome::CELL.x, area.bottom()),
-    );
-    chrome::scroll_bar(
-        &ui.painter_at(column),
-        column,
-        (max_top > 0).then(|| pane.scroll.top as f32 / max_top as f32),
-    );
+    let at = (max_top > 0).then(|| pane.scroll.top as f32 / max_top as f32);
+    if area.height > 0 {
+        cells::scroll_bar(buf, area.right(), area.y, area.height, at);
+    }
     clicked
 }
 
-/// One message line as the pane's lines of `width` points: tabs to the next multiple of eight
-/// cells, other control characters escaped, then wrapped as egui wraps it (at word boundaries; a
-/// word longer than the line is broken).
-fn wrap_line(ctx: &egui::Context, font: &egui::FontId, line: &str, width: f32) -> Vec<String> {
+/// `s` as it fits in `room` cells, its control characters escaped (`printable`): whole, or its
+/// longest start before `…` (`cells::fit_start`). Only its start up to the first glyph past the
+/// room is escaped and measured, so a pass costs the room, never the whole of a long value (`In`
+/// naming every branch and tag that holds the commit).
+pub(super) fn fitted(s: &str, room: usize) -> String {
+    let mut used = 0;
+    let mut end = s.len();
+    for (i, g) in s.grapheme_indices(true) {
+        walked();
+        used += cells::width(&printable(g));
+        if used > room {
+            end = i + g.len();
+            break;
+        }
+    }
+    cells::fit_start(&printable(&s[..end]), room)
+}
+
+/// The rest of a file's row at row `y` of a pane `chars` cells wide (`x` its cells on the grid),
+/// after its first cell's mark: the change letter at the third cell, the path at the fifth cut
+/// from its start (`…`, a path keeps its end), and `+adds -dels` ending at the pane's last cell,
+/// a blank between it and the path, where they fit; each in `pen`'s colours. In an
+/// ambiguous-wide terminal (`wide`) the rename's `→` is §10's stand-in (T38); the paths are
+/// content.
+fn file_row(
+    buf: &mut Buffer,
+    x: impl Fn(usize) -> u16,
+    y: u16,
+    chars: usize,
+    f: &FileRow,
+    wide: bool,
+    pen: &dyn Fn(Color32) -> Pen,
+) {
+    if chars > 2 {
+        cells::put(buf, x(2), y, &f.letter.to_string(), 1, pen(LOOK.text));
+    }
+    let counts = f.lines.map(|(a, d)| format!("+{a} -{d}"));
+    let counts_w = counts.as_ref().map_or(0, |c| cells::width(c));
+    // The counts only where the letter and a blank stand before them.
+    let counts = counts.filter(|_| chars >= 4 + counts_w);
+    let room = match counts {
+        Some(_) => chars.saturating_sub(4 + counts_w + 1),
+        None => chars.saturating_sub(4),
+    };
+    if room > 0 {
+        let shown = match &f.old_path {
+            Some(old) => format!("{old} {} {}", own(RENAMED, wide), f.path),
+            None => f.path.clone(),
+        };
+        let shown = cells::fit_left(&printable(&shown), room);
+        cells::put(buf, x(4), y, &shown, room, pen(LOOK.text));
+    }
+    if let Some(counts) = counts {
+        cells::put(
+            buf,
+            x(chars - counts_w),
+            y,
+            &counts,
+            counts_w,
+            pen(LOOK.text),
+        );
+    }
+}
+
+/// One message line as the pane's rows of `chars` cells: tabs to the next multiple of eight
+/// cells, counted as the row shows them (a wide glyph two, an escaped control character its
+/// escape's length), other control characters escaped, then wrapped by cells ([`wrap_cells`]).
+fn wrap_line(line: &str, chars: usize) -> Vec<String> {
     let mut expanded = String::with_capacity(line.len());
     // The column, counted as the line is read (not measured again per tab).
     let mut column = 0;
@@ -543,22 +615,79 @@ fn wrap_line(ctx: &egui::Context, font: &egui::FontId, line: &str, width: f32) -
             let n = 8 - column % 8;
             expanded.extend(std::iter::repeat_n(' ', n));
             column += n;
+        } else if c.is_control() {
+            let at = expanded.len();
+            expanded.extend(c.escape_default());
+            column += expanded.len() - at;
         } else {
             expanded.push(c);
-            column += 1;
+            let mut utf8 = [0u8; 4];
+            column += cells::width(c.encode_utf8(&mut utf8));
         }
     }
-    let text = printable(&expanded).into_owned();
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-    let galley = ctx.fonts_mut(|f| f.layout(text, font.clone(), LOOK.text, width));
-    galley
-        .rows
-        .iter()
-        .map(|row| {
-            let s: String = row.row.glyphs.iter().map(|g| g.chr).collect();
-            s.trim_end().to_string()
-        })
+    wrap_cells(&expanded, chars)
+        .into_iter()
+        .map(|row| row.trim_end().to_string())
         .collect()
+}
+
+/// `text` in rows of at most `room` cells as `dialog::wrap` breaks it — whole when it fits; else
+/// at its last blank that fits (the blank dropped), a word longer than the row after its last
+/// whole glyph, a glyph wider than the row alone on a row of its own; after a break, blanks alone
+/// make no row — in one walk over the text: `dialog::wrap` measures what is left at each row,
+/// which a message of a mebibyte on one line (03 §6.1's bound) makes quadratic.
+pub(super) fn wrap_cells(text: &str, room: usize) -> Vec<String> {
+    let room = room.max(1);
+    // `text[start..]` is blank (or empty) once `start` is past its last glyph that is not.
+    let end = text.trim_end().len();
+    let mut rows = vec![];
+    let mut start = 0;
+    while rows.is_empty() || start < end {
+        let rest = &text[start..];
+        let (mut used, mut cut, mut blank, mut over) = (0, 0, None, false);
+        for (i, g) in rest.grapheme_indices(true) {
+            walked();
+            let w = cells::width(g);
+            if g == " " && i > 0 {
+                blank = Some(i);
+            }
+            if used + w > room {
+                over = true;
+                break;
+            }
+            used += w;
+            cut = i + g.len();
+        }
+        if !over {
+            break;
+        }
+        let (row, next) = match blank {
+            Some(b) if b <= cut => (&rest[..b], b + 1),
+            // A glyph wider than the row alone: it goes on a row of its own, cut there.
+            _ if cut == 0 => {
+                let first = rest.graphemes(true).next().map_or(rest.len(), str::len);
+                (&rest[..first], first)
+            }
+            _ => (&rest[..cut], cut),
+        };
+        rows.push(row.to_string());
+        start += next;
+    }
+    if start < end || rows.is_empty() {
+        rows.push(text[start..].to_string());
+    }
+    rows
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The graphemes [`wrap_cells`] and [`fitted`] have measured on this thread: their work,
+    /// which the tests bound by the text's length and by the room.
+    pub(super) static WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts a grapheme measured ([`WALKED`], in the tests only).
+fn walked() {
+    #[cfg(test)]
+    WALKED.with(|c| c.set(c.get() + 1));
 }
