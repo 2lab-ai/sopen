@@ -1486,6 +1486,208 @@ fn frame_cost_with_find_at_1000_by_700() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// What the terminal printed (`cells::presented`, `cells::OnScreen`): the search runs only what
+// the owner saw.
+
+/// A terminal that sends its bursts of events back to back — each event waiting while the next is
+/// unread, so the backend prints only the last pass of a burst — one burst once the backend has
+/// asked three times since the last (its pass done and printed), then ends the run (as
+/// X4-dialogs' `Bursts`). Before each burst it notes how many searches the host had asked for.
+struct Bursts {
+    bursts: std::collections::VecDeque<Vec<crossterm::event::Event>>,
+    now: std::collections::VecDeque<crossterm::event::Event>,
+    asked: usize,
+    searches: std::rc::Rc<std::cell::Cell<usize>>,
+    sent_at: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+}
+
+impl crate::gui::term::Tty for Bursts {
+    fn raw(&mut self, _on: bool) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn size(&mut self) -> std::io::Result<(u16, u16)> {
+        Ok((100, 30))
+    }
+    fn probe(&mut self) -> crate::gui::term::Probed {
+        crate::gui::term::Probed {
+            kitty: false,
+            ambiguous: false,
+        }
+    }
+    fn drop_input(&mut self) {}
+    fn next(
+        &mut self,
+        _wait: std::time::Duration,
+    ) -> std::io::Result<Option<crossterm::event::Event>> {
+        if let Some(ev) = self.now.pop_front() {
+            return Ok(Some(ev));
+        }
+        self.asked += 1;
+        assert!(self.asked < 20_000, "the script ran out without an end");
+        if self.asked >= 3 {
+            if let Some(burst) = self.bursts.pop_front() {
+                self.sent_at.borrow_mut().push(self.searches.get());
+                self.asked = 0;
+                self.now.extend(burst);
+                return Ok(self.now.pop_front());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        Ok(None)
+    }
+    fn pending(&mut self) -> std::io::Result<bool> {
+        Ok(!self.now.is_empty())
+    }
+    fn stopped(&self) -> Option<i32> {
+        (self.bursts.is_empty() && self.now.is_empty() && self.asked >= 3).then_some(libc::SIGTERM)
+    }
+}
+
+/// The git panel's host in the terminal, saying how many searches it has asked for.
+struct InTerminal {
+    host: Host,
+    searches: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl Window for InTerminal {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        self.host.ui(ui);
+        let n = (self.host.actions.iter())
+            .filter(|a| matches!(a, GitAction::Search(_)))
+            .count();
+        self.searches.set(n);
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// The history search, opened on the Hangul fixture, run in a 100×30 terminal through `bursts`
+/// (after two of a focus report each, so the box is laid out and printed): the searches it asked
+/// for, and how many it had when each burst was sent.
+fn search_in_terminal(bursts: Vec<Vec<crossterm::event::Event>>) -> (Vec<SearchQuery>, Vec<usize>) {
+    use crossterm::event::Event as CEvent;
+    let searches = std::rc::Rc::new(std::cell::Cell::new(0));
+    let sent_at = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut all = vec![vec![CEvent::FocusGained], vec![CEvent::FocusGained]];
+    all.extend(bursts);
+    let tty = Bursts {
+        bursts: all.into(),
+        now: Default::default(),
+        asked: 0,
+        searches: searches.clone(),
+        sent_at: sent_at.clone(),
+    };
+    let ctx = egui::Context::default();
+    chrome::install(&ctx);
+    let mut b = crate::gui::term::Backend::new(tty, std::io::sink(), ctx, true);
+    let mut view = hangul_view();
+    view.run(Command::HistorySearch);
+    let mut win = InTerminal {
+        host: Host {
+            view,
+            active: true,
+            actions: Vec::new(),
+            rect: Rect::NOTHING,
+            under: Vec::new(),
+            side: None,
+        },
+        searches,
+    };
+    let mut no_switch =
+        |_: &mut crate::gui::term::Backend<Bursts, std::io::Sink>| panic!("no switch in this test");
+    let end = b.run(&mut win, &mut no_switch).expect("the run");
+    assert_eq!(end, crate::gui::term::End::Signal(libc::SIGTERM));
+    let asked = (win.host.actions.into_iter())
+        .filter_map(|a| match a {
+            GitAction::Search(q) => Some(q),
+            _ => None,
+        })
+        .collect();
+    let sent_at = sent_at.borrow().clone();
+    (asked, sent_at)
+}
+
+/// A key as the terminal reads it.
+fn key_event(code: crossterm::event::KeyCode) -> crossterm::event::Event {
+    use crossterm::event::{Event as CEvent, KeyEvent, KeyModifiers};
+    CEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+/// The terminal prints no pass while input waits, and the search runs only what it printed
+/// (`cells::OnScreen`): a letter and Enter read in one burst — the letter's pass never printed —
+/// search nothing; the next Enter, the letter printed by then, searches it.
+#[test]
+fn a_letter_and_enter_in_one_burst_search_nothing() {
+    use crossterm::event::KeyCode;
+    let (asked, sent_at) = search_in_terminal(vec![
+        vec![key_event(KeyCode::Char('o')), key_event(KeyCode::Enter)],
+        vec![key_event(KeyCode::Enter)],
+    ]);
+    assert_eq!(
+        sent_at,
+        [0, 0, 0, 0],
+        "nothing searched before the last Enter"
+    );
+    let wanted = SearchQuery {
+        message: "o".into(),
+        ..Default::default()
+    };
+    assert_eq!(asked, [wanted]);
+}
+
+/// The letter printed, then Enter in a burst of its own: it searches the letter.
+#[test]
+fn a_printed_letter_then_enter_searches() {
+    use crossterm::event::KeyCode;
+    let (asked, sent_at) = search_in_terminal(vec![
+        vec![key_event(KeyCode::Char('o'))],
+        vec![key_event(KeyCode::Enter)],
+    ]);
+    assert_eq!(sent_at, [0, 0, 0, 0]);
+    let wanted = SearchQuery {
+        message: "o".into(),
+        ..Default::default()
+    };
+    assert_eq!(asked, [wanted]);
+}
+
+/// A click on `[ Search ]` whose press and release the terminal reads together — the press's pass
+/// never printed, changing nothing on screen — searches what shows.
+#[test]
+fn a_click_on_search_read_in_one_burst_searches_what_shows() {
+    use crossterm::event::MouseEventKind as M;
+    use crossterm::event::{Event as CEvent, KeyCode, KeyModifiers, MouseButton, MouseEvent};
+    // Where `[ Search ]` stands on a 100×30 grid, as the window lays the same box.
+    let mut fx = with_search(800.0, 480.0);
+    fx.typed("o");
+    let (x, y) = search_at(&fx, "[ Search ]");
+    let mouse = |kind| {
+        CEvent::Mouse(MouseEvent {
+            kind,
+            column: x + 2,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    let (asked, sent_at) = search_in_terminal(vec![
+        vec![key_event(KeyCode::Char('o'))],
+        vec![
+            mouse(M::Moved),
+            mouse(M::Down(MouseButton::Left)),
+            mouse(M::Up(MouseButton::Left)),
+        ],
+    ]);
+    assert_eq!(sent_at, [0, 0, 0, 0], "the click's burst searched");
+    let wanted = SearchQuery {
+        message: "o".into(),
+        ..Default::default()
+    };
+    assert_eq!(asked, [wanted]);
+}
+
+// ---------------------------------------------------------------------------------------------
 // TS-4 (10 §14): Find and the history search, the same cells in both backends.
 
 mod ts4 {

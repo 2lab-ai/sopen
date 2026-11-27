@@ -448,9 +448,10 @@ pub(super) enum SearchEnd {
 /// Shift+Enter or an Alt+Enter too, as the egui dialog's did — but each Enter of a pass goes to
 /// what has the keyboard at that point (on Cancel it cancels), and one egui cannot follow there is
 /// dropped, a Space too ([`take_enters`]). Only what the screen showed runs: an Enter or a Search
-/// runs the query the pass before painted, unchanged in this one — not in the pass that lays the
-/// box out unseen, nor the first one seen — else the note says the search changed and the next
-/// Enter runs it. An empty query is refused there (`type what to search for`), and a query with a
+/// runs the query the last pass that reached the screen painted (`cells::OnScreen`: the terminal
+/// prints no pass while input waits), unchanged in this one — not in the pass that lays the box
+/// out unseen, nor the first one seen — else the note says the search changed and the next Enter
+/// runs it. An empty query is refused there (`type what to search for`), and a query with a
 /// control that is not on the grid and holds something (the box taller than it, a field of no
 /// cells; a field's text, Match case on) is never run: the box says so first ([`TOO_SMALL`]) and
 /// its Search is off (review round 1, fix-check). Esc, Cancel or a click
@@ -462,8 +463,9 @@ pub(super) struct SearchDialog {
     pub query: SearchQuery,
     /// What the note row says.
     note: Note,
-    /// The query the last pass painted where it could be seen (`None` until one has).
-    shown: Option<SearchQuery>,
+    /// The query the last pass that reached the screen painted where it could be seen (`None`
+    /// until one has: egui's sizing pass paints nothing).
+    screen: cells::OnScreen<SearchQuery>,
     /// The last pass laid out no cells for a control that holds something (a field's text, Match
     /// case on): [`TOO_SMALL`], Search off.
     off_grid: bool,
@@ -624,9 +626,8 @@ impl SearchDialog {
         }
         let layout = self.layout(grid);
         let before = self.query.clone();
-        // presented: once main has X4-dialogs' `cells::presented`, a pass the terminal did not
-        // print is not seen either — `self.shown.take().filter(|_| cells::presented(ctx))`.
-        let seen = self.shown.take();
+        // What the owner saw: the query of the last pass that reached the screen.
+        let seen = self.screen.start(ctx).cloned();
         let q = &mut self.query;
         let texts = [
             &mut q.message,
@@ -648,8 +649,11 @@ impl SearchDialog {
         };
         let pass = kit::show(ctx, search_id(), &layout, inputs);
         let now = ctx.memory(|m| m.focused());
-        // What this pass painted, where it could be seen: the next pass's Enter runs it.
-        self.shown = (!unseen).then(|| self.query.clone());
+        // What this pass painted, where it could be seen: the next pass's Enter runs it, if this
+        // pass reaches the screen.
+        if !unseen {
+            self.screen.painted(self.query.clone());
+        }
         // A control that holds something other than its default with no cells this pass
         // (`Shown::controls` lists the laid ones) — a field with text, Match case on: never run,
         // the box saying so from the next pass (fix-check: Match case below the grid's foot was
