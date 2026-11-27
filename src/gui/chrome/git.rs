@@ -26,6 +26,32 @@ pub const UNCOMMITTED: char = '○';
 /// Where lanes beyond the Graph column's third of the panel are cut (03 §4.2).
 pub const CUT: char = '»';
 
+/// The uncommitted row's dotted line to HEAD's row, a cell a row, in the dim colour (03 §4.4):
+/// code page 437 has no dashed box line, and `:` stays one cell in an ambiguous-wide terminal,
+/// apart from the solid line's stand-in `|` (10 §10).
+pub const DOTTED: char = ':';
+
+/// A lane's box line in a cell, by the sides its lines leave the cell's middle to (10 §6): `│`
+/// and `─` straight, `┌ ┐ └ ┘` a corner, `├ ┤ ┬ ┴` where lines join, `┼` where a lane change
+/// crosses a line passing by; a blank for none. Code page 437 has these, and no rounded corner
+/// (`╭ ╮ ╰ ╯`).
+pub fn line(up: bool, down: bool, left: bool, right: bool) -> char {
+    match (up, down, left, right) {
+        (false, false, false, false) => ' ',
+        (_, _, false, false) => '│',
+        (false, false, _, _) => '─',
+        (true, false, true, false) => '┘',
+        (true, false, false, true) => '└',
+        (false, true, true, false) => '┐',
+        (false, true, false, true) => '┌',
+        (true, true, false, true) => '├',
+        (true, true, true, false) => '┤',
+        (false, true, true, true) => '┬',
+        (true, false, true, true) => '┴',
+        (true, true, true, true) => '┼',
+    }
+}
+
 /// Before the checked-out branch's name (`►main`).
 pub const CURRENT: char = '►';
 
