@@ -61,9 +61,12 @@ const BREW_BIN_DIRS: &str =
 
 /// The desktop session's variables a window needs, imported from the systemd user manager when
 /// an ssh session on Linux has no display — with the desktop's name (KDE Plasma: sopen brings the
-/// editor's window forward, [`crate::raise`]).
+/// editor's window forward, [`crate::raise`]) and the session's own, KDE_SESSION_VERSION among
+/// them: `xdg-open`, an address's opener, picks `kde-open` by it, and without it falls back to
+/// `kfmclient`, missing on Plasma 6, and reports success having opened nothing.
 const SESSION_ENV: &str = "DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR \
-     DBUS_SESSION_BUS_ADDRESS XDG_SESSION_TYPE XDG_CURRENT_DESKTOP";
+     DBUS_SESSION_BUS_ADDRESS XDG_SESSION_TYPE XDG_CURRENT_DESKTOP \
+     KDE_SESSION_VERSION KDE_FULL_SESSION XDG_SESSION_DESKTOP DESKTOP_SESSION";
 
 /// `[user@]host` split at the last `@`, as ssh does.
 fn split_user(host: &str) -> (Option<&str>, &str) {
@@ -2099,6 +2102,29 @@ mod tests {
             assert!(script.contains(place), "{place}");
         }
         assert!(!script.contains("eval"), "{script}");
+        // The desktop session's names imported on Linux, each a whole word of the loop: the
+        // display's, and the session's own (`xdg-open` picks `kde-open` by KDE_SESSION_VERSION;
+        // without it, `kfmclient`, missing on Plasma 6, and a success that opened nothing).
+        let keys = script
+            .split_once("for key in ")
+            .and_then(|(_, rest)| rest.split_once("; do"))
+            .map(|(keys, _)| keys.split_whitespace().collect::<Vec<_>>())
+            .unwrap_or_else(|| panic!("no session import in {script}"));
+        for name in [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_SESSION_TYPE",
+            "XDG_CURRENT_DESKTOP",
+            "KDE_SESSION_VERSION",
+            "KDE_FULL_SESSION",
+            "XDG_SESSION_DESKTOP",
+            "DESKTOP_SESSION",
+        ] {
+            assert!(keys.contains(&name), "{name} not in {keys:?}");
+        }
     }
 
     /// X2-switch: HOST's half of the switch is `--gui --state-stdin -- FOLDER` after the script's
@@ -3413,7 +3439,7 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
     }
 
     /// The variables a run on HOST depends on; the fake sopen prints each.
-    const SEEN: [&str; 12] = [
+    const SEEN: [&str; 16] = [
         "SOPEN_STATE",
         "SOPEN_LOG",
         "SOPEN_TARGET_BIN",
@@ -3424,6 +3450,10 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
         "DBUS_SESSION_BUS_ADDRESS",
         "XDG_SESSION_TYPE",
         "XDG_CURRENT_DESKTOP",
+        "KDE_SESSION_VERSION",
+        "KDE_FULL_SESSION",
+        "XDG_SESSION_DESKTOP",
+        "DESKTOP_SESSION",
         "EVIL",
         "PATH",
     ];
@@ -3847,6 +3877,12 @@ tcp4       0      0  127.0.0.1.1234         *.*                    LISTEN       
                 ("XDG_RUNTIME_DIR", "/run/user/1"),
                 ("XDG_SESSION_TYPE", hostile.as_str()),
                 ("XDG_CURRENT_DESKTOP", "KDE"),
+                // A Plasma 6 session's own: `xdg-open` (an address's opener) picks `kde-open` by
+                // KDE_SESSION_VERSION.
+                ("KDE_SESSION_VERSION", "6"),
+                ("KDE_FULL_SESSION", "true"),
+                ("XDG_SESSION_DESKTOP", "KDE"),
+                ("DESKTOP_SESSION", "plasma"),
             ];
             let mut session = format!("EVIL=$(: > {marker})\nPATH=/nowhere\nNOT_DISPLAY=:3\n");
             for (key, val) in imported {
