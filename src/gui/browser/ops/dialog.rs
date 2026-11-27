@@ -20,10 +20,23 @@
 //! The shadow's cells are black: 10 §6 has them show the cells under them in dark grey, which
 //! needs the layers below, and the window keeps none outside the tests (cells.rs's recording) —
 //! black is the same in both backends.
+//!
+//! The parts the git panel's dialogs need (X4-kit, 10 §17): a row of choices — one of several,
+//! `(•) word`, or any of several, `[X] word` — wrapped by cells, each choice a control of its
+//! own; a message field of several rows ([`message`], [`message_cells`]), its text wrapped by
+//! cells, Shift+Enter its new line and a plain Enter the dialog's; a list with a bar, its rows'
+//! keys at the right, scrolled with the bar; and several fields and check boxes in one dialog,
+//! Tab going through every control in the order of the parts. Their state is the caller's,
+//! given by the id of each part ([`Inputs::by_id`], [`Input`]). A chosen choice reads as its
+//! mark, never as a colour: the bar's colours are the focus's (10 §6), so the two never look
+//! alike, and `SOPEN_CELLS`' text rows say which is chosen; `•` is of ambiguous width, so an
+//! ambiguous-wide terminal gets §10's `.` there, at the source (T38).
 
+use crate::gui::browser::keys::Mods;
 use crate::gui::cells::{self, Buffer, Cells, Grid, Pen, Position};
 use crate::gui::chrome::{self, cga, CELL};
-use eframe::egui::{self, Color32, Sense};
+use eframe::egui::{self, Color32, Key, Sense};
+use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// The colour a text of a dialog is in.
@@ -94,6 +107,68 @@ pub enum Part {
         most: u16,
         top: usize,
     },
+    /// A row of choices after `label` (empty: none), two blank cells apart and wrapped by cells
+    /// under the first: one of several (`(•) word`, its [`Input::One`]) or, `many`, any of
+    /// several (`[X] word`, its [`Input::Any`]). Each choice is a control of its own
+    /// ([`choice_id`]): a click, or Space or Enter while it has the keyboard, chooses it — or
+    /// turns it on or off — once a press.
+    #[cfg_attr(not(test), allow(dead_code))] // X4-dialogs uses it; the tests till then.
+    Choices {
+        label: String,
+        id: egui::Id,
+        choices: Vec<String>,
+        many: bool,
+    },
+    /// A message field ([`Input::Text`]): `label` on a row of its own (empty: none), then `rows`
+    /// rows of black cells, its text wrapped by cells; past them it scrolls with the caret,
+    /// ↑ ░ ↓ on the box's right border. Shift+Enter is a new line; a plain Enter is never
+    /// typed, it is the dialog's — which takes it with exactly no modifiers (`keys::take`'s
+    /// `Mods::None`): egui's `consume_key(Modifiers::NONE, …)` would take Shift+Enter too.
+    #[cfg_attr(not(test), allow(dead_code))] // X4-dialogs uses it; the tests till then.
+    Message {
+        label: String,
+        id: egui::Id,
+        rows: u16,
+    },
+    /// A list with a bar ([`Input::List`]): at most `most` rows on screen, each its label at the
+    /// left and its key at the right, a blank cell at either end; one control. ↑ ↓ PgUp PgDn
+    /// Home End move the bar while it has the keyboard, the rows it shows following the bar;
+    /// a click on a row, or Space or Enter, chooses the bar's row ([`Shown::chosen`]).
+    #[cfg_attr(not(test), allow(dead_code))] // X4-menu uses it; the tests till then.
+    List {
+        rows: Vec<Row>,
+        id: egui::Id,
+        most: u16,
+    },
+}
+
+/// A row of a [`Part::List`]: its label, and its key at the right (empty: none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    pub label: String,
+    pub key: String,
+}
+
+impl Row {
+    #[cfg_attr(not(test), allow(dead_code))] // X4-menu uses it; the tests till then.
+    pub fn new(label: &str, key: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            key: key.to_string(),
+        }
+    }
+}
+
+/// Where a list stands: the row its bar is on and the first row it shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Bar {
+    pub at: usize,
+    pub top: usize,
+}
+
+/// The id of choice `k` of the row of choices `row` (its focus and its click).
+pub fn choice_id(row: egui::Id, k: usize) -> egui::Id {
+    row.with(("sopen-choice", k))
 }
 
 /// A part at its cells.
@@ -108,6 +183,20 @@ enum Placed {
         cells: Cells,
         rows: Vec<(String, Pen)>,
         top: usize,
+    },
+    /// Choice `k` of the row of choices `row`: its cells and its word.
+    Choice {
+        cells: Cells,
+        word: String,
+        row: egui::Id,
+        k: usize,
+        many: bool,
+    },
+    Message(Cells, egui::Id),
+    List {
+        cells: Cells,
+        rows: Vec<Row>,
+        id: egui::Id,
     },
 }
 
@@ -178,11 +267,59 @@ fn wants(part: &Part) -> usize {
             each + 2 * all.len().saturating_sub(1)
         }
         Part::Scroll { rows, .. } => rows.iter().map(|(t, _)| w(t)).max().unwrap_or(0),
+        Part::Choices { label, choices, .. } => {
+            let each: usize = choices.iter().map(|c| w(c) + 4).sum();
+            lead(label) + each + 2 * choices.len().saturating_sub(1)
+        }
+        Part::Message { label, .. } => w(label).max(FIELD),
+        Part::List { rows, .. } => rows.iter().map(row_wants).max().unwrap_or(0),
     }
 }
 
 /// The fewest cells a field has.
 const FIELD: usize = 12;
+
+/// The cells a row of choices' label takes before its first choice: the label and a blank.
+fn lead(label: &str) -> usize {
+    match cells::width(label) {
+        0 => 0,
+        w => w + 1,
+    }
+}
+
+/// How many cells a list's row wants: a blank, its label, two blanks and its key, a blank.
+fn row_wants(row: &Row) -> usize {
+    let w = cells::width;
+    match w(&row.key) {
+        0 => w(&row.label) + 2,
+        key => w(&row.label) + 2 + key + 2,
+    }
+}
+
+/// Where each choice of a row after `label` stands in a dialog `width` cells wide: its row, its
+/// first cell and its cells (`(•) ` and its word). Two blank cells apart; one that does not fit
+/// in what is left of a row starts the next, under the first choice — or at the row's start,
+/// where the label leaves no room there for the widest. A choice wider than a row is cut.
+fn choice_places(label: &str, choices: &[String], width: usize) -> Vec<(usize, usize, usize)> {
+    let lead = lead(label);
+    let wants = |c: &String| cells::width(c) + 4;
+    let widest = choices.iter().map(wants).max().unwrap_or(0);
+    let under = if lead + widest <= width { lead } else { 0 };
+    let (mut row, mut x) = (0, lead);
+    let mut out = vec![];
+    for c in choices {
+        let w = wants(c);
+        // Something stands before it in its row (the label, a choice): it may go to the next.
+        let taken = if row == 0 { x > 0 } else { x > under };
+        if x + w > width && taken {
+            row += 1;
+            x = under;
+        }
+        out.push((row, x, w.min(width.saturating_sub(x))));
+        x += w + 2;
+    }
+    out
+}
 
 /// `row` cut to end in "…" within `room` cells: a text with rows below it that do not fit.
 fn cut_short(row: &str, room: usize) -> String {
@@ -267,21 +404,50 @@ pub fn layout(grid: Grid, title: &str, nominal: usize, parts: &[Part]) -> Layout
         })
         .unwrap_or(0);
     let mut shown = scrolled.len().min(most);
+    let places: Vec<Vec<(usize, usize, usize)>> = (parts.iter())
+        .map(|part| match part {
+            Part::Choices { label, choices, .. } => choice_places(label, choices, width),
+            _ => vec![],
+        })
+        .collect();
+    // The rows each list and message field shows; they give way with the rows that scroll.
+    let mut give: Vec<usize> = (parts.iter())
+        .map(|part| match part {
+            Part::List { rows, most, .. } => rows.len().min(usize::from(*most)).max(1),
+            Part::Message { rows, .. } => usize::from(*rows).max(1),
+            _ => 0,
+        })
+        .collect();
     let fixed = |texts: &[Vec<String>]| -> usize {
-        (parts.iter().zip(texts))
-            .map(|(part, rows)| match part {
+        (parts.iter().zip(texts).zip(&places))
+            .map(|((part, rows), places)| match part {
                 Part::Text(..) | Part::Held(..) => rows.len(),
-                Part::Scroll { .. } => 0,
+                Part::Scroll { .. } | Part::List { .. } => 0,
+                Part::Message { label, .. } => usize::from(!label.is_empty()),
+                Part::Choices { .. } => places.last().map_or(1, |p| p.0 + 1),
                 _ => 1,
             })
             .sum()
     };
     // The box is its rows, two border rows and two margin rows; its shadow one more.
     let fits = usize::from(grid.rows).saturating_sub(5);
-    while fixed(&texts) + shown > fits && shown > 1 {
-        shown -= 1;
+    // The rows that scroll, a list's and a message field's give way first, the most first,
+    // down to one each.
+    loop {
+        if fixed(&texts) + shown + give.iter().sum::<usize>() <= fits {
+            break;
+        }
+        let big = (0..give.len())
+            .filter(|&i| give[i] > 1)
+            .max_by_key(|&i| give[i]);
+        match big {
+            Some(i) if give[i] > shown || shown <= 1 => give[i] -= 1,
+            _ if shown > 1 => shown -= 1,
+            _ => break,
+        }
     }
-    while fixed(&texts) + shown > fits {
+    let shown_with = |shown: usize| shown + give.iter().sum::<usize>();
+    while fixed(&texts) + shown_with(shown) > fits {
         let Some(tallest) = (texts.iter_mut())
             .filter(|rows| rows.len() > 1)
             .max_by_key(|rows| rows.len())
@@ -293,12 +459,16 @@ pub fn layout(grid: Grid, title: &str, nominal: usize, parts: &[Part]) -> Layout
             *last = cut_short(last, width);
         }
     }
-    let inside = fixed(&texts) + shown;
+    let inside = fixed(&texts) + shown_with(shown);
     let frame = centred(grid, width as u16 + 4, inside as u16 + 4);
     let (x0, mut y) = (frame.x + 2, frame.y + 2);
     let width = width as u16;
     let mut placed = vec![];
-    for (part, rows) in parts.iter().zip(texts) {
+    let label_at = |placed: &mut Vec<Placed>, y: u16, label: &str| {
+        let label = cells::fit_start(label, usize::from(width));
+        placed.push(Placed::Text(Position::new(x0, y), label, Ink::Text.pen()));
+    };
+    for (i, (part, rows)) in parts.iter().zip(texts).enumerate() {
         match part {
             Part::Text(_, ink) | Part::Held(_, ink, _) => {
                 if let Part::Held(_, _, id) = part {
@@ -353,6 +523,48 @@ pub fn layout(grid: Grid, title: &str, nominal: usize, parts: &[Part]) -> Layout
                 y += shown as u16;
                 continue;
             }
+            Part::Choices {
+                label,
+                id,
+                choices,
+                many,
+            } => {
+                if !label.is_empty() {
+                    label_at(&mut placed, y, label);
+                }
+                for (k, (word, &(row, x, w))) in choices.iter().zip(&places[i]).enumerate() {
+                    placed.push(Placed::Choice {
+                        cells: Cells::new(x0 + x as u16, y + row as u16, w as u16, 1),
+                        word: word.clone(),
+                        row: *id,
+                        k,
+                        many: *many,
+                    });
+                }
+                y += places[i].last().map_or(1, |p| p.0 as u16 + 1);
+                continue;
+            }
+            Part::Message { label, id, .. } => {
+                if !label.is_empty() {
+                    label_at(&mut placed, y, label);
+                    y += 1;
+                }
+                placed.push(Placed::Message(
+                    Cells::new(x0, y, width, give[i] as u16),
+                    *id,
+                ));
+                y += give[i] as u16;
+                continue;
+            }
+            Part::List { rows, id, .. } => {
+                placed.push(Placed::List {
+                    cells: Cells::new(x0, y, width, give[i] as u16),
+                    rows: rows.clone(),
+                    id: *id,
+                });
+                y += give[i] as u16;
+                continue;
+            }
         }
         y += 1;
     }
@@ -382,26 +594,76 @@ impl Layout {
 }
 
 /// What a dialog's controls hold while it is shown: its field's text, its check box, the first
-/// row its rows that scroll show.
+/// row its rows that scroll show — and every other control's, by the id of its part.
 #[derive(Default)]
 pub struct Inputs<'a> {
+    /// The first field's text, unless [`Inputs::by_id`] names it.
     pub field: Option<&'a mut String>,
+    /// The first check box, unless [`Inputs::by_id`] names it.
     pub check: Option<&'a mut bool>,
     pub top: Option<&'a mut usize>,
+    /// Each control's state by the id of its part: several fields and check boxes in one
+    /// dialog, its rows of choices, its message fields and its lists (X4-kit).
+    pub by_id: Vec<(egui::Id, Input<'a>)>,
+}
+
+/// A control's state while its dialog is shown ([`Inputs::by_id`]).
+#[cfg_attr(not(test), allow(dead_code))] // X4-dialogs uses it; the tests till then.
+pub enum Input<'a> {
+    /// A field's or a message field's text.
+    Text(&'a mut String),
+    /// A check box.
+    Check(&'a mut bool),
+    /// A row of one of several: the chosen choice, if one is.
+    One(&'a mut Option<usize>),
+    /// A row of any of several: each choice on or off.
+    Any(&'a mut [bool]),
+    /// A list: where it stands.
+    List(&'a mut Bar),
+}
+
+/// The text `by_id` gives the part `id`.
+fn text_of<'b>(by_id: &'b mut [(egui::Id, Input<'_>)], id: egui::Id) -> Option<&'b mut String> {
+    match by_id.iter_mut().find(|(k, _)| *k == id) {
+        Some((_, Input::Text(text))) => Some(&mut **text),
+        _ => None,
+    }
+}
+
+/// The check box `by_id` gives the part `id`.
+fn check_of<'b>(by_id: &'b mut [(egui::Id, Input<'_>)], id: egui::Id) -> Option<&'b mut bool> {
+    match by_id.iter_mut().find(|(k, _)| *k == id) {
+        Some((_, Input::Check(on))) => Some(&mut **on),
+        _ => None,
+    }
 }
 
 /// What a pass of a dialog did.
 pub struct Shown {
     pub modal: egui::ModalResponse<()>,
-    /// The buttons and the check box clicked — Enter or Space on the focused one too.
+    /// The buttons and the check box clicked — Enter or Space on the focused one too; each
+    /// choice chosen, each list a row of which was.
     clicked: Vec<egui::Id>,
-    /// Its controls (the field, the check box, the buttons): the ones that may hold the focus.
+    /// Each list's rows chosen, in order.
+    chosen: Vec<(egui::Id, usize)>,
+    /// Its controls (the fields, the check boxes, the choices, the message fields, the lists,
+    /// the buttons): the ones that may hold the focus.
     pub controls: Vec<egui::Id>,
 }
 
 impl Shown {
     pub fn clicked(&self, id: egui::Id) -> bool {
         self.clicked.contains(&id)
+    }
+
+    /// The rows of the list `id` chosen this pass, in order: a click on one, or Space or Enter
+    /// on its bar — each the row the bar was on then.
+    #[cfg_attr(not(test), allow(dead_code))] // X4-menu uses it; the tests till then.
+    pub fn chosen(&self, id: egui::Id) -> Vec<usize> {
+        (self.chosen.iter())
+            .filter(|(list, _)| *list == id)
+            .map(|&(_, row)| row)
+            .collect()
     }
 }
 
@@ -516,17 +778,247 @@ fn scroll_bar_input(
     first.min(max_top)
 }
 
+/// The keys a list takes while it has the keyboard.
+const LIST_KEYS: [Key; 8] = [
+    Key::ArrowUp,
+    Key::ArrowDown,
+    Key::PageUp,
+    Key::PageDown,
+    Key::Home,
+    Key::End,
+    Key::Space,
+    Key::Enter,
+];
+
+/// The presses of `wanted` (with no modifiers) before the pass's first Tab — or, `after`, after
+/// it — taken out of its input, in order; a Space's text with it (egui-winit sends the key and
+/// its text in one pass), so no field the keyboard reaches in the pass types it.
+fn take_presses(ctx: &egui::Context, wanted: &[Key], after: bool) -> Vec<Key> {
+    ctx.input_mut(|i| {
+        let (mut out, mut tab, mut typed) = (vec![], false, false);
+        i.events.retain(|e| match (e, std::mem::take(&mut typed)) {
+            (egui::Event::Text(text), true) if text == " " => false,
+            (e, _) => match e {
+                egui::Event::Key {
+                    key: Key::Tab,
+                    pressed: true,
+                    ..
+                } => {
+                    tab = true;
+                    true
+                }
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if tab == after && wanted.contains(key) && Mods::None.matches(*modifiers) => {
+                    out.push(*key);
+                    typed = *key == Key::Space;
+                    false
+                }
+                _ => true,
+            },
+        });
+        out
+    })
+}
+
+/// Whether the pass has a Tab pressed.
+fn tab_pressed(ctx: &egui::Context) -> bool {
+    ctx.input(|i| {
+        (i.events.iter()).any(|e| {
+            matches!(
+                e,
+                egui::Event::Key {
+                    key: Key::Tab,
+                    pressed: true,
+                    ..
+                }
+            )
+        })
+    })
+}
+
+/// The presses of `wanted` this pass that are the control `id`'s, in order, and its egui
+/// interaction (`interact`, which moves the keyboard on a Tab): while it has the keyboard as its
+/// turn comes, those before the pass's first Tab; once that Tab gives it the keyboard, those
+/// after. Taken out of the input before egui's own Space and Enter click could see them (one
+/// flag a pass, whatever their order and number), so a click the pass reports is the pointer's.
+fn presses(
+    ctx: &egui::Context,
+    id: egui::Id,
+    wanted: &[Key],
+    interact: impl FnOnce() -> egui::Response,
+) -> (Vec<Key>, egui::Response) {
+    let had = ctx.memory(|m| m.has_focus(id));
+    let mut keys = if had {
+        take_presses(ctx, wanted, false)
+    } else {
+        vec![]
+    };
+    let response = interact();
+    if !had && ctx.memory(|m| m.has_focus(id)) {
+        keys.extend(take_presses(ctx, wanted, true));
+    }
+    (keys, response)
+}
+
+/// The text `by_id` gives the part `id`, to read.
+fn text_value<'b>(by_id: &'b [(egui::Id, Input<'_>)], id: egui::Id) -> Option<&'b str> {
+    match by_id.iter().find(|(k, _)| *k == id) {
+        Some((_, Input::Text(text))) => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+/// The check box `by_id` gives the part `id`, to read.
+fn check_value(by_id: &[(egui::Id, Input<'_>)], id: egui::Id) -> Option<bool> {
+    match by_id.iter().find(|(k, _)| *k == id) {
+        Some((_, Input::Check(on))) => Some(**on),
+        _ => None,
+    }
+}
+
+/// The list's rows at `cells` of `buf`, from the bar's `top`: a blank, the label, the key at the
+/// right and a blank; the bar's row in the bar's colours; ↑ ░ ↓ in column `border` beside them
+/// when there are more.
+fn list_cells(buf: &mut Buffer, cells: Cells, rows: &[Row], bar: Bar, border: u16) {
+    let p = chrome::PALETTE;
+    let width = usize::from(cells.width);
+    let shown = usize::from(cells.height);
+    for (k, row) in rows.iter().enumerate().skip(bar.top).take(shown) {
+        let y = cells.y + (k - bar.top) as u16;
+        let pen = match k == bar.at {
+            true => Pen::new(p.bar_text, p.bar),
+            false => Ink::Text.pen(),
+        };
+        cells::fill(buf, Cells::new(cells.x, y, cells.width, 1), pen);
+        let key = cells::width(&row.key);
+        let room = match key {
+            0 => width.saturating_sub(2),
+            _ => width.saturating_sub(key + 4),
+        };
+        let label = cells::fit_start(&row.label, room);
+        cells::put(buf, cells.x + 1, y, &label, room, pen);
+        if key > 0 && key + 2 <= width {
+            cells::put_right(buf, cells.right() - 1, y, &row.key, pen);
+        }
+    }
+    let max_top = rows.len().saturating_sub(shown);
+    if max_top > 0 {
+        let at = bar.top as f32 / max_top as f32;
+        cells::scroll_bar(buf, border, cells.y, cells.height, Some(at));
+    }
+}
+
+/// One pass of the list `list` of `n` rows at cells `at.0` of `grid`, where it stands `bar`: its
+/// keys while it has the keyboard ([`presses`]; a page its rows less one, as the tree's), a click
+/// on a row, the wheel over it and its scroll bar at `at.1` (ids under the dialog's `salt`), the
+/// rows it shows following the bar when the bar moved. The rows chosen, in order.
+fn list_pass(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    at: (Cells, Cells),
+    list: egui::Id,
+    n: usize,
+    bar: &mut Bar,
+    salt: egui::Id,
+) -> Vec<usize> {
+    let ctx = ui.ctx().clone();
+    let (cells, column) = at;
+    let shown = usize::from(cells.height);
+    let rect = grid.rect(cells);
+    // While it has the keyboard, its arrows are its own: egui moves the focus by them otherwise.
+    let arrows = egui::EventFilter {
+        vertical_arrows: true,
+        ..Default::default()
+    };
+    ctx.memory_mut(|m| m.set_focus_lock_filter(list, arrows));
+    let interact = || ui.interact(rect, list, Sense::click());
+    let (keys, response) = presses(&ctx, list, &LIST_KEYS, interact);
+    let (last, page) = (n.saturating_sub(1), shown.saturating_sub(1).max(1));
+    bar.at = bar.at.min(last);
+    let (mut chosen, mut moved, mut arrow) = (vec![], false, false);
+    for key in keys {
+        let to = match key {
+            Key::ArrowUp => bar.at.saturating_sub(1),
+            Key::ArrowDown => (bar.at + 1).min(last),
+            Key::PageUp => bar.at.saturating_sub(page),
+            Key::PageDown => (bar.at + page).min(last),
+            Key::Home => 0,
+            Key::End => last,
+            // Space, Enter.
+            _ => {
+                if n > 0 {
+                    chosen.push(bar.at);
+                }
+                continue;
+            }
+        };
+        arrow |= matches!(key, Key::ArrowUp | Key::ArrowDown);
+        (bar.at, moved) = (to, true);
+    }
+    if response.clicked_by(egui::PointerButton::Primary) {
+        let row = (response.interact_pointer_pos())
+            .map(|p| ((p.y - rect.top()) / CELL.y).floor().max(0.0) as usize);
+        if let Some(k) = row.map(|r| bar.top + r).filter(|k| *k < n) {
+            (bar.at, moved) = (k, true);
+            chosen.push(k);
+        }
+        response.request_focus();
+    }
+    // egui read this pass's arrow as a move of the focus before the list could keep it (its
+    // first pass with the keyboard): no move. A Tab's is egui's.
+    if arrow && !tab_pressed(&ctx) {
+        ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+    }
+    let max_top = n.saturating_sub(shown);
+    if moved && bar.at < bar.top {
+        bar.top = bar.at;
+    } else if moved && bar.at >= bar.top + shown {
+        bar.top = bar.at + 1 - shown;
+    }
+    if ui.rect_contains_pointer(rect) {
+        let moved = (bar.top as f32 + wheel_rows(&ctx)).round();
+        bar.top = moved.clamp(0.0, max_top as f32) as usize;
+    }
+    if max_top > 0 {
+        bar.top = scroll_bar_input(ui, grid, column, salt.with(list), bar.top, max_top);
+    }
+    bar.top = bar.top.min(max_top);
+    chosen
+}
+
 /// Shows `layout` as a modal `id` at its cells for one pass: one buffer of cells — the shadow,
 /// the frame, the texts — and each control an egui interaction at its cells, in the order of the
-/// parts (Tab's order); the field's engine at its cells; the wheel over the box and the scroll
-/// bar ([`scroll_bar_input`]) scroll its rows.
+/// parts (Tab's order); the fields' engines at their cells; the wheel over the box and the scroll
+/// bar ([`scroll_bar_input`]) scroll its rows — over a list or a message field, those.
 /// Painted once every control has had its say, so the focus it shows is this pass's.
 pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) -> Shown {
     let Inputs {
         mut field,
         mut check,
         mut top,
+        mut by_id,
     } = inputs;
+    // The first field and check box `by_id` does not name take `field` and `check`.
+    let named = |id: egui::Id| by_id.iter().any(|(k, _)| *k == id);
+    let first_field = (layout.placed.iter()).find_map(|p| match p {
+        Placed::Field(_, id) if !named(*id) => Some(*id),
+        _ => None,
+    });
+    let first_check = (layout.placed.iter()).find_map(|p| match p {
+        Placed::Check(_, _, id) if !named(*id) => Some(*id),
+        _ => None,
+    });
+    // The lists' and message fields' cells: the wheel over them is theirs.
+    let own_wheel: Vec<Cells> = (layout.placed.iter())
+        .filter_map(|p| match p {
+            Placed::Message(cells, _) | Placed::List { cells, .. } => Some(*cells),
+            _ => None,
+        })
+        .collect();
     let grid = layout.grid;
     // The box, cut to the grid: on a grid too small for it, nothing of it stands outside.
     let body = grid.rect(layout.frame.intersection(grid.all()));
@@ -536,6 +1028,7 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
         .fade_in(false)
         .constrain(false);
     let mut clicked = vec![];
+    let mut chosen = vec![];
     let mut controls = vec![];
     let modal = egui::Modal::new(id)
         .area(area)
@@ -548,7 +1041,11 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
             let mut buf = Buffer::empty(area.intersection(grid.all()));
             shadow(&mut buf, frame_cells);
             frame(&mut buf, frame_cells, &layout.title);
-            let mut field_at = None;
+            // The box's right border: a list's or a message field's scroll bar stands there.
+            let border = frame_cells.right() - 1;
+            let mut fields_at = vec![];
+            let mut messages_at = vec![];
+            let mut lists_at = vec![];
             // A control's cells on the grid: one with none there (a grid smaller than the dialog)
             // is not there to click, nor its field to hold the keyboard.
             let visible = |c: &Cells| Some(c.intersection(grid.all())).filter(|v| !v.is_empty());
@@ -571,10 +1068,14 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                         }
                     }
                     Placed::Field(cells, id) => {
-                        if let (Some(text), Some(cells)) = (field.as_deref_mut(), visible(cells)) {
+                        let text = match Some(*id) == first_field {
+                            true => field.as_deref_mut(),
+                            false => text_of(&mut by_id, *id),
+                        };
+                        if let (Some(text), Some(cells)) = (text, visible(cells)) {
                             self::field(ui, &grid, cells, *id, text, |e| e);
                             controls.push(*id);
-                            field_at = Some((cells, *id));
+                            fields_at.push((cells, *id));
                         }
                     }
                     Placed::Check(cells, _, id) => {
@@ -583,7 +1084,11 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                         };
                         if ui.interact(grid.rect(cells), *id, Sense::click()).clicked() {
                             clicked.push(*id);
-                            if let Some(on) = check.as_deref_mut() {
+                            let on = match Some(*id) == first_check {
+                                true => check.as_deref_mut(),
+                                false => check_of(&mut by_id, *id),
+                            };
+                            if let Some(on) = on {
                                 *on = !*on;
                             }
                         }
@@ -600,6 +1105,85 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                         controls.push(b.id);
                     }
                     Placed::Scroll { .. } => {}
+                    Placed::Choice {
+                        cells,
+                        row,
+                        k,
+                        many,
+                        ..
+                    } => {
+                        let Some(cells) = visible(cells) else {
+                            continue;
+                        };
+                        let cid = choice_id(*row, *k);
+                        let rect = grid.rect(cells);
+                        let keys = [Key::Space, Key::Enter];
+                        let (keys, response) =
+                            presses(ctx, cid, &keys, || ui.interact(rect, cid, Sense::click()));
+                        let mut times = keys.len();
+                        if response.clicked_by(egui::PointerButton::Primary) {
+                            times += 1;
+                            response.request_focus();
+                        }
+                        for _ in 0..times {
+                            clicked.push(cid);
+                            match by_id.iter_mut().find(|(i, _)| i == row) {
+                                Some((_, Input::One(which))) if !*many => **which = Some(*k),
+                                Some((_, Input::Any(on))) if *many => {
+                                    if let Some(on) = on.get_mut(*k) {
+                                        *on = !*on;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        controls.push(cid);
+                    }
+                    Placed::Message(cells, mid) => {
+                        let (Some(text), Some(cells)) = (text_of(&mut by_id, *mid), visible(cells))
+                        else {
+                            continue;
+                        };
+                        message(ui, &grid, cells, *mid, text);
+                        let mut view = MessageView::load(ctx, *mid);
+                        let max_top = view.rows.saturating_sub(usize::from(cells.height));
+                        if ui.rect_contains_pointer(grid.rect(cells)) {
+                            let moved = (view.top as f32 + wheel_rows(ctx)).round();
+                            view.top = moved.clamp(0.0, max_top as f32) as usize;
+                        }
+                        if max_top > 0 {
+                            let bar = Cells::new(border, cells.y, 1, cells.height);
+                            let first = view.top;
+                            view.top =
+                                scroll_bar_input(ui, &grid, bar, id.with(*mid), first, max_top);
+                        }
+                        view.top = view.top.min(max_top);
+                        view.store(ctx, *mid);
+                        controls.push(*mid);
+                        messages_at.push((cells, *mid));
+                    }
+                    Placed::List {
+                        cells,
+                        rows,
+                        id: list,
+                    } => {
+                        let Some(cells) = visible(cells) else {
+                            continue;
+                        };
+                        let mut own = Bar::default();
+                        let bar = match by_id.iter_mut().find(|(k, _)| k == list) {
+                            Some((_, Input::List(bar))) => &mut **bar,
+                            _ => &mut own,
+                        };
+                        let column = Cells::new(border, cells.y, 1, cells.height);
+                        let at = (cells, column);
+                        for row in list_pass(ui, &grid, at, *list, rows.len(), bar, id) {
+                            chosen.push((*list, row));
+                            clicked.push(*list);
+                        }
+                        controls.push(*list);
+                        lists_at.push((cells, rows, *bar));
+                    }
                 }
             }
             // What the controls show, now that the focus is this pass's.
@@ -607,7 +1191,11 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
             for placed in &layout.placed {
                 match placed {
                     Placed::Check(cells, label, id) => {
-                        let on = check.as_deref().copied().unwrap_or(false);
+                        let on = match Some(*id) == first_check {
+                            true => check.as_deref().copied(),
+                            false => check_value(&by_id, *id),
+                        };
+                        let on = on.unwrap_or(false);
                         let shown = format!("[{}] {label}", if on { "X" } else { " " });
                         let pen = control_pen(&ctx, *id, true);
                         cells::put(&mut buf, cells.x, cells.y, &shown, cells.width.into(), pen);
@@ -624,7 +1212,9 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                     } => {
                         let max_top = rows.len().saturating_sub(usize::from(cells.height));
                         let mut first = top.as_deref().copied().unwrap_or(*laid).min(max_top);
-                        if ui.rect_contains_pointer(body) {
+                        let theirs =
+                            (own_wheel.iter()).any(|c| ui.rect_contains_pointer(grid.rect(*c)));
+                        if ui.rect_contains_pointer(body) && !theirs {
                             let moved = (first as f32 + wheel_rows(&ctx)).round();
                             first = moved.clamp(0.0, max_top as f32) as usize;
                         }
@@ -647,16 +1237,63 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                             cells::scroll_bar(&mut buf, x, cells.y, cells.height, Some(at));
                         }
                     }
+                    Placed::Choice {
+                        cells,
+                        word,
+                        row,
+                        k,
+                        many,
+                    } => {
+                        let on = match by_id.iter().find(|(i, _)| i == row) {
+                            Some((_, Input::One(which))) => **which == Some(*k),
+                            Some((_, Input::Any(on))) => on.get(*k).copied().unwrap_or(false),
+                            _ => false,
+                        };
+                        // `•` is of ambiguous width: §10's `.` where a terminal draws it in two.
+                        let dot = if cells::ambiguous_wide(&ctx) {
+                            "."
+                        } else {
+                            "•"
+                        };
+                        let shown = match (*many, on) {
+                            (true, true) => format!("[X] {word}"),
+                            (true, false) => format!("[ ] {word}"),
+                            (false, true) => format!("({dot}) {word}"),
+                            (false, false) => format!("( ) {word}"),
+                        };
+                        let pen = control_pen(&ctx, choice_id(*row, *k), true);
+                        cells::put(&mut buf, cells.x, cells.y, &shown, cells.width.into(), pen);
+                    }
                     _ => {}
                 }
             }
-            let caret = match (field_at, field.as_deref()) {
-                (Some((cells, id)), Some(text)) => {
-                    let focused = ctx.memory(|m| m.has_focus(id));
-                    field_cells(&ctx, &mut buf, cells, id, text, focused)
+            for (cells, rows, bar) in lists_at {
+                list_cells(&mut buf, cells, rows, bar, border);
+            }
+            let mut caret = None;
+            for (cells, fid) in fields_at {
+                let text = match Some(fid) == first_field {
+                    true => field.as_deref().map(String::as_str),
+                    false => text_value(&by_id, fid),
+                };
+                if let Some(text) = text {
+                    let focused = ctx.memory(|m| m.has_focus(fid));
+                    caret = field_cells(&ctx, &mut buf, cells, fid, text, focused).or(caret);
                 }
-                _ => None,
-            };
+            }
+            for (cells, mid) in messages_at {
+                let Some(text) = text_value(&by_id, mid) else {
+                    continue;
+                };
+                let focused = ctx.memory(|m| m.has_focus(mid));
+                caret = message_cells(&ctx, &mut buf, cells, mid, text, focused).or(caret);
+                let view = MessageView::load(&ctx, mid);
+                let max_top = view.rows.saturating_sub(usize::from(cells.height));
+                if max_top > 0 {
+                    let at = view.top as f32 / max_top as f32;
+                    cells::scroll_bar(&mut buf, border, cells.y, cells.height, Some(at));
+                }
+            }
             let painter = ctx.layer_painter(ui.layer_id());
             let painter = painter.with_clip_rect(grid.rect(grid.all()));
             cells::paint(&painter, grid.origin, &buf, caret);
@@ -664,8 +1301,278 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
     Shown {
         modal,
         clicked,
+        chosen,
         controls,
     }
+}
+
+/// What a message field keeps between passes: the first row it shows, how many rows its text
+/// takes, its caret's row and cell as egui's galley puts it (while it has the keyboard), the
+/// caret's character and the text's length when last seen — a change scrolls to the caret —
+/// and the pass it was last laid in.
+#[derive(Debug, Clone, Copy, Default)]
+struct MessageView {
+    top: usize,
+    rows: usize,
+    caret: Option<(usize, usize)>,
+    seen: Option<(usize, usize)>,
+    laid: Option<u64>,
+}
+
+impl MessageView {
+    fn id(field: egui::Id) -> egui::Id {
+        field.with("sopen-message-view")
+    }
+
+    fn load(ctx: &egui::Context, field: egui::Id) -> Self {
+        ctx.data(|d| d.get_temp(Self::id(field)))
+            .unwrap_or_default()
+    }
+
+    fn store(self, ctx: &egui::Context, field: egui::Id) {
+        ctx.data_mut(|d| d.insert_temp(Self::id(field), self));
+    }
+}
+
+/// The cells a message field at `at` lays its text in a row: a cell fewer than it has, so the
+/// caret after a full row is still on it.
+fn room_of(at: Cells) -> usize {
+    usize::from(at.width).saturating_sub(1).max(1)
+}
+
+/// A message field's engine: egui's multi-line `TextEdit` for `text` at cells `at` of `grid`, as
+/// [`field`] is a one-line field's — painting nothing while it edits, selects, takes the
+/// clipboard and IME; Shift+Enter its new line, a plain Enter never typed, Tab moving on. Its
+/// galley is laid on the cells ([`message_galley`]): each row of the text at a row of cells,
+/// every character at its cell. It is laid as many rows higher as the field has scrolled, under
+/// a clip of the field's cells, so a click on a row the field shows lands on that row and one
+/// outside the field never reaches it. When its caret moves or its text changes, the rows it
+/// shows follow the caret. A field not laid in the pass before — a dialog opened again under
+/// the same id too — starts afresh: at its top, its caret at its start (egui's would be at its
+/// end), nothing to undo from before, as an editor opens a file; a caller that wants another
+/// caret sets it once the field has been laid.
+pub fn message(ui: &mut egui::Ui, grid: &Grid, at: Cells, id: egui::Id, text: &mut String) {
+    let ctx = ui.ctx().clone();
+    let room = room_of(at);
+    let shown = usize::from(at.height).max(1);
+    let mut view = MessageView::load(&ctx, id);
+    let now = ctx.cumulative_pass_nr();
+    if view.laid.is_none_or(|pass| pass + 1 < now) {
+        view = MessageView::default();
+        egui::text_edit::TextEditState::default().store(&ctx, id);
+    }
+    view.laid = Some(now);
+    let field = grid.rect(at);
+    let above = view.top as f32 * CELL.y;
+    let tall = (view.rows.max(shown) as f32 * CELL.y).max(field.height() + above);
+    let rect = egui::Rect::from_min_size(
+        field.min - egui::vec2(0.0, above),
+        egui::vec2(field.width(), tall),
+    );
+    let mut engine = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    engine.shrink_clip_rect(field);
+    engine.set_opacity(0.0);
+    let inside = egui::Frame::NONE.inner_margin(egui::Margin {
+        right: CELL.x as i8,
+        ..egui::Margin::ZERO
+    });
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
+        message_galley(ui, buf.as_str(), room)
+    };
+    let shift_enter = egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter);
+    let out = egui::TextEdit::multiline(text)
+        .id(id)
+        .frame(inside)
+        .desired_width(rect.width())
+        .desired_rows(shown)
+        .cursor_at_end(false)
+        .return_key(shift_enter)
+        .layouter(&mut layouter)
+        .show(&mut engine);
+    view.rows = out.galley.rows.len();
+    view.caret = out.cursor_range.map(|r| {
+        let p = out.galley.pos_from_cursor(r.primary);
+        let cell = |v: f32, size: f32| (v / size).round().max(0.0) as usize;
+        (cell(p.min.y, CELL.y), cell(p.min.x, CELL.x))
+    });
+    let seen = (out.cursor_range).map(|r| (r.primary.index.0, text.chars().count()));
+    if let (Some((row, _)), true) = (view.caret, seen != view.seen) {
+        if row < view.top {
+            view.top = row;
+        } else if row >= view.top + shown {
+            view.top = row + 1 - shown;
+        }
+    }
+    view.seen = seen;
+    view.top = view.top.min(view.rows.saturating_sub(shown));
+    view.store(&ctx, id);
+}
+
+/// A row of a message field's text: the line it is in, its characters in that line, its glyphs
+/// (the grapheme, the characters before it in the text, its cell in the row, its cells) and
+/// whether a `\n` ends it.
+struct TextRow<'a> {
+    line: usize,
+    chars: std::ops::Range<usize>,
+    glyphs: Vec<(&'a str, usize, usize, usize)>,
+    newline: bool,
+}
+
+/// The rows a message field lays `text` in, `room` cells wide: each of its lines broken by cells
+/// as [`wrap`] breaks a text — after its last blank that fits, else after its last whole glyph —
+/// with nothing dropped: the blanks at a break end the row above, past `room` if they must (no
+/// cell shows them there), so every character is on a row.
+fn message_rows(text: &str, room: usize) -> Vec<TextRow<'_>> {
+    let room = room.max(1);
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out = vec![];
+    let mut before = 0;
+    for (n, line) in lines.iter().enumerate() {
+        let all = glyphs(line);
+        let count = line.chars().count();
+        let mut start = 0;
+        loop {
+            let x0 = all.get(start).map_or(0, |g| g.2);
+            let (mut end, mut after_blank) = (start, None);
+            while let Some(&(g, _, x, w)) = all.get(end) {
+                if g == " " {
+                    end += 1;
+                    after_blank = Some(end);
+                    continue;
+                }
+                if x + w - x0 > room {
+                    break;
+                }
+                end += 1;
+            }
+            if end < all.len() {
+                end = match after_blank {
+                    Some(b) => b,
+                    // A glyph wider than the row: on a row of its own.
+                    None if end == start => start + 1,
+                    None => end,
+                };
+            }
+            let char_at = |i: usize| all.get(i).map_or(count, |g| g.1);
+            let last = end >= all.len();
+            out.push(TextRow {
+                line: n,
+                chars: char_at(start)..char_at(end),
+                glyphs: (all[start..end].iter())
+                    .map(|&(g, c, x, w)| (g, before + c, x - x0, w))
+                    .collect(),
+                newline: last && n + 1 < lines.len(),
+            });
+            if last {
+                break;
+            }
+            start = end;
+        }
+        before += count + 1;
+    }
+    out
+}
+
+/// `text` laid for a message field `room` cells wide: egui's galley of its lines, unwrapped, cut
+/// into [`message_rows`]' rows, each a row of cells, every character at its cell as [`on_cells`]
+/// places a field's. Only egui's interaction reads it — the engine paints nothing. A galley that
+/// is not a row a line and a glyph a character is left as egui laid it.
+fn message_galley(ui: &egui::Ui, text: &str, room: usize) -> Arc<egui::Galley> {
+    let font = egui::FontSelection::Default.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::simple(text.to_string(), font, cga::WHITE, f32::INFINITY);
+    job.keep_trailing_whitespace = true;
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let lines: Vec<usize> = text.split('\n').map(|l| l.chars().count()).collect();
+    let fits = galley.rows.len() == lines.len()
+        && (galley.rows.iter().zip(&lines)).all(|(r, n)| r.row.glyphs.len() == *n);
+    if !fits {
+        return galley;
+    }
+    let mut laid = (*galley).clone();
+    let mut placed = vec![];
+    let mut right = 0.0f32;
+    for (k, r) in message_rows(text, room).iter().enumerate() {
+        let line = &galley.rows[r.line];
+        let mut row = (*line.row).clone();
+        row.visuals = Default::default();
+        let mut source = line.row.glyphs[r.chars.clone()].iter();
+        row.glyphs.clear();
+        for &(g, _, x, w) in &r.glyphs {
+            for (c, _) in g.chars().enumerate() {
+                let Some(glyph) = source.next() else {
+                    break;
+                };
+                let mut glyph = *glyph;
+                (glyph.pos.x, glyph.advance_width) = match c {
+                    0 => (x as f32 * CELL.x, w as f32 * CELL.x),
+                    _ => ((x + w) as f32 * CELL.x, 0.0),
+                };
+                row.glyphs.push(glyph);
+            }
+        }
+        row.size = egui::vec2(row.glyphs.last().map_or(0.0, |g| g.max_x()), CELL.y);
+        right = right.max(row.size.x);
+        placed.push(egui::epaint::text::PlacedRow {
+            pos: egui::pos2(0.0, k as f32 * CELL.y),
+            row: Arc::new(row),
+            ends_with_newline: r.newline,
+        });
+    }
+    laid.rect = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(right, placed.len() as f32 * CELL.y),
+    );
+    laid.mesh_bounds = laid.rect;
+    (laid.num_vertices, laid.num_indices) = (0, 0);
+    laid.rows = placed;
+    Arc::new(laid)
+}
+
+/// The message field at cells `at` of `buf`, as its engine `id` holds `text`: black cells, the
+/// rows it shows of the text in white ([`message_rows`], from the first it keeps), the selection
+/// in the bar's colours while `focused`; while `focused`, the caret's cell when its row shows.
+pub fn message_cells(
+    ctx: &egui::Context,
+    buf: &mut Buffer,
+    at: Cells,
+    id: egui::Id,
+    text: &str,
+    focused: bool,
+) -> Option<Position> {
+    let p = chrome::PALETTE;
+    let plain = Pen::new(p.field_text, cga::BLACK);
+    let marked = Pen::new(p.bar_text, p.bar);
+    cells::fill(buf, at, plain);
+    let view = MessageView::load(ctx, id);
+    let range = (egui::text_edit::TextEditState::load(ctx, id))
+        .and_then(|s| s.cursor.char_range())
+        .map(|r| (r.primary.index.0, r.secondary.index.0));
+    let (lo, hi) = match range {
+        Some((a, b)) if focused => (a.min(b), a.max(b)),
+        _ => (0, 0),
+    };
+    let (width, shown) = (usize::from(at.width), usize::from(at.height));
+    let rows = message_rows(text, room_of(at));
+    for (k, row) in rows.iter().enumerate().skip(view.top).take(shown) {
+        let y = at.y + (k - view.top) as u16;
+        for &(g, first, x, w) in &row.glyphs {
+            if w == 0 || x + w > width {
+                continue;
+            }
+            let pen = if first >= lo && first < hi {
+                marked
+            } else {
+                plain
+            };
+            cells::put(buf, at.x + x as u16, y, g, w, pen);
+        }
+    }
+    let (row, col) = view.caret.filter(|_| focused)?;
+    let on = row >= view.top && row < view.top + shown;
+    on.then(|| {
+        let col = col.min(width.saturating_sub(1));
+        Position::new(at.x + col as u16, at.y + (row - view.top) as u16)
+    })
 }
 
 /// The field's engine: egui's `TextEdit` for `text`, `tweak`ed, at cells `at` of `grid`, in a ui
