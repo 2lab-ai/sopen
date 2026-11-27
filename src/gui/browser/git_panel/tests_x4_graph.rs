@@ -1041,13 +1041,14 @@ fn boxes(fx: &Fx) -> Vec<Cells> {
         .collect()
 }
 
-/// R1 MUST 1: the log, the Backups list and the planner draw their egui scroll bar inside their
-/// own cells, so the frame's right border stays the panel's on every body row (`║` in the window
-/// and the terminal), and the box a terminal shows is exactly their cells: the heads' row and the
-/// body. The details pane, whose scroll bar egui draws on the border, takes the border cell too.
+/// R1 MUST 1: the log and the Backups list draw their egui scroll bar inside their own cells,
+/// so the frame's right border stays the panel's on every body row (`║` in the window and the
+/// terminal), and the box a terminal shows is exactly their cells: the heads' row and the body.
+/// The details pane, whose scroll bar egui draws on the border, takes the border cell too. (The
+/// planner is cells since X4-planner: `tests_x4_planner.rs`.)
 #[test]
 fn the_log_backups_and_planner_leave_the_frames_right_border() {
-    for open in ["log", "backups", "planner"] {
+    for open in ["log", "backups"] {
         let mut fx = Fx::new(1000.0, 500.0, fixture_view());
         let v = fx.view_mut();
         match open {
@@ -1057,11 +1058,7 @@ fn the_log_backups_and_planner_leave_the_frames_right_border() {
                 "",
                 0,
             )]),
-            "backups" => v.open_backups(super::tests_s3::records()),
-            _ => {
-                v.set_repo(super::tests_s4::repo());
-                v.open_planner(super::tests_s4::model());
-            }
+            _ => v.open_backups(super::tests_s3::records()),
         }
         fx.idle();
         fx.idle();
