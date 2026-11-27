@@ -2192,6 +2192,7 @@ mod tests {
 
     mod s6;
     mod x1b;
+    mod x4kit;
 
     use super::*;
     use crate::fileops::Item;
