@@ -410,8 +410,9 @@ fn a_narrow_row_gives_up_the_word_then_the_toggle() {
 
 /// Two panels side by side in one `ui` (a pin beside another repository's panel): each Find's
 /// field and toggle are its own — a click on the left toggle turns the left panel's case only,
-/// then one on the right the right's (with one id the click went to the panel laid last) — and
-/// each field shows its own text.
+/// then one on the right the right's (with one id the click went to the panel laid last) — each
+/// field shows its own text, and each keeps its own caret as the keyboard goes from one to the
+/// other (with one field id the right would type at the left's caret).
 #[test]
 fn two_panels_finds_are_their_own() {
     let mut drv = Driver::new(1000.0, 500.0);
@@ -437,11 +438,36 @@ fn two_panels_finds_are_their_own() {
     assert_eq!(shows(left).0, "x", "{}", shows(left).1);
     assert_eq!(shows(right).0, "y", "{}", shows(right).1);
     assert!(shows(left).1.contains("[X] Aa") && shows(right).1.contains("[X] Aa"));
+    // Each field's caret is its own (review round 1): the left's moved, the right's at its end;
+    // with one id for both the right would type where the left's caret stands.
+    for (view, text) in pair.views.iter_mut().zip(["abcd", "wxyz"]) {
+        let find = view.find.as_mut().unwrap();
+        (find.text, find.fresh) = (text.into(), true);
+    }
+    pair.actives = [true, false];
+    drv.idle(&mut pair, 1);
+    for _ in 0..3 {
+        drv.key(&mut pair, Key::ArrowLeft, Modifiers::NONE);
+    }
+    pair.actives = [false, true];
+    drv.idle(&mut pair, 2);
+    drv.frame(&mut pair, vec![Event::Text("!".into())], Modifiers::NONE);
+    pair.actives = [true, false];
+    drv.idle(&mut pair, 2);
+    drv.frame(&mut pair, vec![Event::Text("?".into())], Modifiers::NONE);
+    drv.idle(&mut pair, 1);
+    let texts = pair
+        .views
+        .each_ref()
+        .map(|v| v.find_text().map(str::to_string));
+    assert_eq!(texts, [Some("a?bcd".into()), Some("wxyz!".into())]);
 }
 
-/// Two git panels side by side, as the browser lays a pin beside another repository's panel.
+/// Two git panels side by side, as the browser lays a pin beside another repository's panel, each
+/// active or not (the one with the keyboard).
 struct Pair {
     views: [GitView; 2],
+    actives: [bool; 2],
     grid: Grid,
 }
 
@@ -449,6 +475,7 @@ impl Pair {
     fn new() -> Self {
         Pair {
             views: [fixture_view(), fixture_view()],
+            actives: [true, true],
             grid: Grid::over(Rect::NOTHING),
         }
     }
@@ -461,8 +488,8 @@ impl Window for Pair {
             .show(ui, |ui| {
                 self.grid = Grid::over(ui.max_rect());
                 let sides = cells::halves(self.grid.all());
-                for (view, side) in self.views.iter_mut().zip(sides) {
-                    draw(ui, &self.grid, side, view, true, &[]);
+                for ((view, side), active) in self.views.iter_mut().zip(sides).zip(self.actives) {
+                    draw(ui, &self.grid, side, view, active, &[]);
                 }
             });
     }
@@ -473,7 +500,7 @@ impl Window for Pair {
 }
 
 /// A panel too short for its parts runs Find's field on no cells, in a child `ui` of its own: its
-/// id is the panel's column, not that `ui`'s scope, so its caret and text stay as they were
+/// id is the panel's own key, not that `ui`'s scope, so its caret and text stay as they were
 /// across the resize — a letter typed there lands where the caret was — and the field comes back
 /// with them.
 #[test]
@@ -850,6 +877,512 @@ fn a_search_from_the_dialog_shows_its_results_in_cells() {
     assert!(boxes(&fx).is_empty());
     fx.press(Key::Escape);
     assert_eq!(fx.bar(), RowKey::Commit(oid(5)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1.
+
+/// Only the active panel's Find types (MUST 1): two panels side by side, both with Find open, the
+/// left with the keyboard — a letter typed lands in the left's field alone, and only the left
+/// shows a caret (one cursor in a terminal); an inactive panel's field gives the keyboard up.
+#[test]
+fn only_the_active_panels_find_types() {
+    let mut drv = Driver::new(1000.0, 500.0);
+    let mut pair = Pair::new();
+    pair.actives = [true, false];
+    drv.idle(&mut pair, 1);
+    pair.views[0].run(Command::FindWith('x'));
+    pair.views[1].run(Command::FindWith('y'));
+    drv.idle(&mut pair, 2);
+    drv.frame(&mut pair, vec![Event::Text("z".into())], Modifiers::NONE);
+    drv.idle(&mut pair, 1);
+    let texts = pair
+        .views
+        .each_ref()
+        .map(|v| v.find_text().map(str::to_string));
+    assert_eq!(texts, [Some("xz".into()), Some("y".into())]);
+    let [left, right] = cells::halves(pair.grid.all());
+    let carets = [left, right].map(|side| layer_over(&drv.ctx, side).caret);
+    assert!(carets[0].is_some() && carets[1].is_none(), "{carets:?}");
+    // The keyboard goes to the other side: its Find takes the typing, the left's none.
+    pair.actives = [false, true];
+    drv.idle(&mut pair, 2);
+    drv.frame(&mut pair, vec![Event::Text("w".into())], Modifiers::NONE);
+    drv.idle(&mut pair, 1);
+    let texts = pair
+        .views
+        .each_ref()
+        .map(|v| v.find_text().map(str::to_string));
+    assert_eq!(texts, [Some("xz".into()), Some("yw".into())]);
+    // The keyboard elsewhere (the list's): neither Find keeps it, neither types.
+    pair.actives = [false, false];
+    drv.idle(&mut pair, 2);
+    assert_eq!(drv.ctx.memory(|m| m.focused()), None, "given up");
+    drv.frame(&mut pair, vec![Event::Text("q".into())], Modifiers::NONE);
+    drv.idle(&mut pair, 1);
+    let texts = pair
+        .views
+        .each_ref()
+        .map(|v| v.find_text().map(str::to_string));
+    assert_eq!(
+        texts,
+        [Some("xz".into()), Some("yw".into())],
+        "nobody typed"
+    );
+}
+
+/// Find's field is the panel's own whatever column it stands in (MUST 2): with the caret between
+/// two letters, the panel's column moves (the right side as the window's width changes) and a
+/// letter typed lands at the caret; an input method's composition goes on across the move.
+#[test]
+fn finds_field_keeps_its_state_when_its_column_moves() {
+    let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+    fx.host.side = Some(Cells::new(40, 0, 60, grid_of(&fx).rows));
+    fx.idle();
+    fx.typed("ab");
+    fx.press(Key::ArrowLeft);
+    fx.drv
+        .frame(&mut fx.host, vec![preedit("하")], Modifiers::NONE);
+    assert_eq!(fx.view().find_text(), Some("a하b"));
+    fx.host.side = Some(Cells::new(43, 0, 60, grid_of(&fx).rows));
+    fx.idle();
+    let events = vec![preedit("한"), Event::Ime(ImeEvent::Commit("한".into()))];
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    fx.idle();
+    assert_eq!(
+        fx.view().find_text(),
+        Some("a한b"),
+        "the composition went on"
+    );
+    fx.typed("x");
+    assert_eq!(fx.view().find_text(), Some("a한xb"), "typed at the caret");
+}
+
+/// A blank typed after a Shift+Tab in the same pass, in a field, stays typed (MUST 3): the field
+/// read the whole pass, and the kit keeps the control the keyboard goes to from taking it.
+#[test]
+fn a_blank_after_a_shift_tab_in_a_field_is_typed() {
+    let mut fx = with_search(1000.0, 500.0);
+    fx.press(Key::Tab);
+    assert_eq!(
+        fx.drv.ctx.memory(|m| m.focused()),
+        Some(find::search_field_id(1)),
+        "on Author"
+    );
+    let mut events = key_events(Key::Tab, Modifiers::SHIFT);
+    events.push(Event::Text("a".into()));
+    events.extend(space_events());
+    events.push(Event::Text("b".into()));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    fx.idle();
+    assert_eq!(query(&fx).author, "a b");
+}
+
+/// A field that is not on screen is never searched (MUST 4): on a grid too short for the box, a
+/// filled Until below its foot keeps Search off and says so at the box's top; Enter searches
+/// nothing. A taller grid searches it.
+#[test]
+fn a_field_off_the_grid_is_never_searched() {
+    let mut fx = with_search(1000.0, 16.0 + 7.0 * 16.0);
+    fx.view_mut().search_dialog.as_mut().unwrap().query.until = "2026-11-01".into();
+    fx.typed("one");
+    fx.idle();
+    let asked = fx.press(Key::Enter);
+    assert!(asked.is_empty(), "{asked:?}");
+    assert!(fx.view().search_dialog.is_some());
+    let (x, y) = search_at(&fx, find::TOO_SMALL);
+    assert_eq!(
+        cell(&search_layer(&fx), x, y).fg,
+        Some(PALETTE.dialog_error)
+    );
+    assert!(
+        !search_rows(&fx).iter().any(|r| r.contains("Until")),
+        "Until is off the grid: {:#?}",
+        search_rows(&fx)
+    );
+    // Taller: every field on screen, the search runs.
+    fx.drv.resize(1000.0, 500.0);
+    fx.idle();
+    fx.idle();
+    let asked = fx.press(Key::Enter);
+    let wanted = SearchQuery {
+        message: "one".into(),
+        until: "2026-11-01".into(),
+        ..Default::default()
+    };
+    assert_eq!(asked, [GitAction::Search(wanted)]);
+}
+
+/// Two moves of the keyboard in one pass (MUST 5): egui moves it once, so an Enter or a Space
+/// after the second is dropped — `[Tab, Tab, Enter]` from Match case neither searches nor
+/// cancels.
+#[test]
+fn presses_after_a_second_move_in_one_pass_are_dropped() {
+    let mut fx = with_search(1000.0, 500.0);
+    fx.typed("one");
+    for _ in 0..6 {
+        fx.press(Key::Tab);
+    }
+    assert_eq!(
+        fx.drv.ctx.memory(|m| m.focused()),
+        Some(find::match_case_id()),
+        "on Match case"
+    );
+    for last in [Key::Enter, Key::Space] {
+        let mut events = key_events(Key::Tab, Modifiers::NONE);
+        events.extend(key_events(Key::Tab, Modifiers::NONE));
+        events.extend(key_events(last, Modifiers::NONE));
+        fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+        fx.idle();
+        assert!(fx.take().is_empty(), "{last:?}: nothing pressed");
+        assert!(fx.view().search_dialog.is_some(), "{last:?}: not cancelled");
+        assert!(!query(&fx).case);
+        fx.drv
+            .ctx
+            .memory_mut(|m| m.request_focus(find::match_case_id()));
+        fx.idle();
+    }
+}
+
+/// Find's Enter acts after what the pass typed before it (item 6): `[merge, Enter]` in one pass
+/// goes to the first match of `merge`, then the next; Shift+Enter after typing, the previous.
+#[test]
+fn finds_enter_acts_after_what_was_typed() {
+    let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+    fx.key(Key::F, Modifiers::COMMAND);
+    let mut events = vec![Event::Text("merge".into())];
+    events.extend(key_events(Key::Enter, Modifiers::NONE));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    assert_eq!(fx.view().find_text(), Some("merge"));
+    assert_eq!(
+        fx.bar(),
+        RowKey::Commit(oid(7)),
+        "the first match, then the next"
+    );
+    fx.idle();
+    assert!(fx.shows("2 of 3"));
+    // Shift+Enter after typing: the previous.
+    let mut events = vec![Event::Text("".into())];
+    events.extend(key_events(Key::Enter, Modifiers::SHIFT));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    assert_eq!(fx.bar(), RowKey::Commit(oid(9)));
+    fx.press(Key::Escape);
+    // Find closed, `[m, Enter]`: the m opens it, the bar jumps to its first match, then the next.
+    fx.press(Key::Home);
+    let mut events = vec![Event::Text("m".into())];
+    events.extend(key_events(Key::Enter, Modifiers::NONE));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    assert_eq!(fx.view().find_text(), Some("m"));
+    // The first match of `m` is the merge (9), the next the octopus merge (7).
+    assert_eq!(
+        fx.bar(),
+        RowKey::Commit(oid(7)),
+        "the match after the first"
+    );
+}
+
+/// Find's keys are the keyboard's only (round 1): with a dialog of the panel's up — the history
+/// search over an open Find — Enter searches and Esc cancels the dialog, Find's bar staying; and
+/// an inactive panel's open Find never steps on the pass's Enter.
+#[test]
+fn finds_keys_are_the_keyboards_only() {
+    let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+    fx.typed("x");
+    let bar = fx.view().bar_place().0;
+    fx.view_mut().run(Command::HistorySearch);
+    fx.idle();
+    fx.idle();
+    fx.typed("one");
+    let asked = fx.press(Key::Enter);
+    assert!(
+        matches!(&asked[..], [GitAction::Search(q)] if q.message == "one"),
+        "{asked:?}"
+    );
+    assert_eq!(fx.view().bar_place().0, bar, "Find did not step");
+    let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+    fx.typed("x");
+    fx.view_mut().run(Command::HistorySearch);
+    fx.idle();
+    fx.idle();
+    fx.press(Key::Escape);
+    assert!(
+        fx.view().search_dialog.is_none(),
+        "Esc cancelled the dialog"
+    );
+    assert_eq!(fx.view().find_text(), Some("x"), "and left Find open");
+    // Two panels, both Finds on `m`: the Enter steps the active one's alone.
+    let mut drv = Driver::new(1000.0, 500.0);
+    let mut pair = Pair::new();
+    pair.actives = [true, false];
+    drv.idle(&mut pair, 1);
+    for view in &mut pair.views {
+        view.run(Command::FindWith('m'));
+    }
+    drv.idle(&mut pair, 2);
+    let bars = |pair: &Pair| pair.views.each_ref().map(|v| v.bar_place().0);
+    let before = bars(&pair);
+    assert_eq!(before[0], before[1], "both on the first match");
+    drv.frame(
+        &mut pair,
+        key_events(Key::Enter, Modifiers::NONE),
+        Modifiers::NONE,
+    );
+    drv.idle(&mut pair, 1);
+    let after = bars(&pair);
+    assert!(after[0] > before[0], "the active one stepped: {after:?}");
+    assert_eq!(after[1], before[1], "the inactive one did not");
+}
+
+/// Find's Esc acts after what the pass typed before it (item 6): `[x, Esc]` — Find open, then
+/// closed — types the x (or opens Find with it), the bar jumping to its first match, then closes
+/// Find, never opening it again with the x, and that pass's cells show the heads; a Down after
+/// the Esc moves the bar; `[Esc, y]` closes it, then the y opens it anew.
+#[test]
+fn an_esc_after_typing_closes_find_for_good() {
+    let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+    for open in [true, false] {
+        fx.press(Key::Home);
+        if open {
+            fx.key(Key::F, Modifiers::COMMAND);
+        }
+        let mut events = vec![Event::Text("x".into())];
+        events.extend(key_events(Key::Escape, Modifiers::NONE));
+        fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+        assert_eq!(fx.view().find_text(), None, "open {open}: closed");
+        let bar = fx.view().bar_place().0;
+        assert_eq!(
+            fx.view().line(bar).unwrap().subject,
+            "Octopus merge of x and y",
+            "open {open}: the x's first match"
+        );
+        let l = panel(&fx);
+        assert!(
+            line(&l, HEAD).contains("Description"),
+            "open {open}, in that pass: {}",
+            line(&l, HEAD)
+        );
+        assert_eq!(l.caret, None);
+    }
+    // `[x, Esc, ↓]`: what comes after the Esc is the graph's — the bar a row below the match.
+    fx.press(Key::Home);
+    fx.key(Key::F, Modifiers::COMMAND);
+    let mut events = vec![Event::Text("x".into())];
+    events.extend(key_events(Key::Escape, Modifiers::NONE));
+    events.extend(key_events(Key::ArrowDown, Modifiers::NONE));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    assert_eq!(fx.view().find_text(), None);
+    let octopus = index_of(&fx, "Octopus merge of x and y");
+    assert_eq!(
+        fx.view().bar_place().0,
+        octopus + 1,
+        "the Down after the Esc"
+    );
+    // `[Esc, y]` with Find open: closed, then opened again by the y.
+    fx.typed("w");
+    let mut events = key_events(Key::Escape, Modifiers::NONE);
+    events.push(Event::Text("y".into()));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    assert_eq!(fx.view().find_text(), Some("y"));
+}
+
+/// A key the graph takes takes its text with it (item 7): with Find closed, Space then a letter
+/// in one pass marks the bar's row and opens Find with the letter alone.
+#[test]
+fn a_space_the_graph_takes_never_reaches_find() {
+    let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+    let mut events = space_events();
+    events.push(Event::Text("a".into()));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    fx.idle();
+    assert_eq!(fx.view().find_text(), Some("a"));
+    assert_eq!(fx.view().marks.len(), 1, "the row marked");
+}
+
+/// The log and the Backups list close Find (item 8), as the filters and the planner do: Enter and
+/// Esc are theirs then.
+#[test]
+fn the_log_and_the_backups_list_close_find() {
+    for open in ["log", "backups"] {
+        let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+        fx.typed("x");
+        let v = fx.view_mut();
+        match open {
+            "log" => v.open_log(vec![super::tests_s3::entry(
+                "git fetch",
+                crate::git::runner::Ending::Exit(0),
+                "",
+                0,
+            )]),
+            _ => v.open_backups(super::tests_s3::records()),
+        }
+        fx.idle();
+        assert_eq!(fx.view().find_text(), None, "{open}");
+        fx.press(Key::Escape);
+        let closed = match open {
+            "log" => fx.view().log_newest().is_none(),
+            _ => fx.view().backups().is_none(),
+        };
+        assert!(closed, "{open}: Esc is its");
+    }
+}
+
+/// On a grid too narrow for the labels at one width (SHOULD 9) the fields follow their own
+/// labels, so each keeps cells and takes the typing.
+#[test]
+fn a_narrow_search_keeps_its_fields() {
+    let mut fx = with_search(30.0 * 8.0, 500.0);
+    fx.typed("abc");
+    let (x, y) = search_at(&fx, "Message");
+    assert_eq!(query(&fx).message, "abc");
+    let l = search_layer(&fx);
+    assert_eq!(text(&l, y, x + 8, x + 11), "abc", "{:#?}", search_rows(&fx));
+    assert_eq!(cell(&l, x + 8, y).bg, Some(cga::BLACK));
+}
+
+/// The note row's change asks for a pass (SHOULD 10), so the note shows without waiting for input.
+#[test]
+fn a_changed_note_asks_for_a_pass() {
+    // The passes' repaints asked from `find.rs`: egui says, a pass later, who asked (its file).
+    let from_find = |fx: &Fx| {
+        (fx.drv.ctx.repaint_causes().iter()).any(|c| c.file.ends_with("git_panel/find.rs"))
+    };
+    let mut fx = with_search(1000.0, 500.0);
+    for _ in 0..7 {
+        fx.press(Key::Tab);
+    }
+    fx.idle();
+    fx.idle();
+    assert!(!from_find(&fx), "the control: nothing asked");
+    // Space on Search with nothing typed: the note says so, and asks for the pass that shows it.
+    fx.drv.frame(&mut fx.host, space_events(), Modifiers::NONE);
+    fx.idle();
+    assert!(fx.shows("type what to search for"));
+    assert!(
+        from_find(&fx),
+        "the note's change: {:?}",
+        fx.drv.ctx.repaint_causes()
+    );
+}
+
+/// Shift+Enter and Alt+Enter search as Enter does, as the egui dialog's did (SHOULD 11);
+/// Cmd/Ctrl+Enter does not.
+#[test]
+fn shift_and_alt_enter_search() {
+    for (mods, searches) in [
+        (Modifiers::SHIFT, true),
+        (Modifiers::ALT, true),
+        (Modifiers::COMMAND, false),
+    ] {
+        let mut fx = with_search(1000.0, 500.0);
+        fx.typed("one");
+        let asked = fx.key(Key::Enter, mods);
+        assert_eq!(!asked.is_empty(), searches, "{mods:?}: {asked:?}");
+    }
+}
+
+/// Find's field at no, one and three cells (SHOULD 12): it never panics, typing lands, and the
+/// caret stays in its cells.
+#[test]
+fn finds_field_on_tiny_rows() {
+    for inside in [0u16, 1, 3] {
+        let placed = find::Placed::of(Cells::new(5, 1, inside, 1));
+        assert_eq!(placed.field, Cells::new(5, 1, inside, 1), "{inside}");
+        assert!(placed.word.is_none() && placed.toggle.is_none());
+        if inside == 0 {
+            continue;
+        }
+        let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+        let side = Cells::new(40, 0, inside + 2, grid_of(&fx).rows);
+        fx.host.side = Some(side);
+        fx.idle();
+        fx.typed("가나다");
+        assert_eq!(fx.view().find_text(), Some("가나다"), "{inside}");
+        let l = layer_over(&fx.drv.ctx, side);
+        assert_eq!(
+            l.caret,
+            Some(Position::new(41 + inside - 1, HEAD)),
+            "{inside}"
+        );
+        assert_eq!(
+            cell(&l, side.right() - 1, HEAD).symbol,
+            "║",
+            "{inside}: the frame stays"
+        );
+    }
+}
+
+/// A long mixed query (SHOULD 12): 500 characters, Hangul and Latin, the field showing the end
+/// with the caret on its last cell, never half a wide glyph at its left edge; Home shows the
+/// start, the caret on the first cell.
+#[test]
+fn a_long_mixed_query_scrolls_by_whole_glyphs() {
+    let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+    let query: String = "가a".repeat(250);
+    fx.key(Key::F, Modifiers::COMMAND);
+    fx.typed(&query);
+    assert_eq!(fx.view().find_text(), Some(query.as_str()));
+    let g = grid_of(&fx);
+    let end = g.cols - 1 - 7;
+    let l = panel(&fx);
+    let caret = l.caret.expect("a caret");
+    assert!(caret.x >= end - 2 && caret.x < end, "{caret:?}");
+    let first = cell(&l, 6, HEAD);
+    assert_ne!(first.symbol, "", "never a wide glyph's second half first");
+    let shown = text(&l, HEAD, 6, end);
+    assert!(query.contains(shown.trim()), "{shown:?}");
+    fx.press(Key::Home);
+    let l = panel(&fx);
+    assert_eq!(l.caret, Some(Position::new(6, HEAD)));
+    assert!(text(&l, HEAD, 6, end).starts_with("가a가a"));
+}
+
+/// The panel's release frame cost at 1000×700 with Find open on a Hangul word — 3,000 commits on
+/// one line, Hangul subjects and authors, a match every third row — run alone: `cargo test
+/// --release --lib -- --ignored --exact
+/// gui::browser::git_panel::tests_x4_find::frame_cost_with_find_at_1000_by_700 --nocapture`.
+/// Printed, no budget set. It builds against main's code as it is, for the comparison.
+#[test]
+#[ignore]
+fn frame_cost_with_find_at_1000_by_700() {
+    use crate::git::graph::RowStream;
+    use crate::git::model::{CommitRow, Oid};
+    use std::time::Instant;
+    let id = |k: u32| Oid::parse(&format!("{k:040x}")).unwrap();
+    let n = 3_000u32;
+    let commits: Vec<CommitRow> = (1..=n)
+        .rev()
+        .map(|k| CommitRow {
+            oid: id(k),
+            parents: if k > 1 { vec![id(k - 1)] } else { vec![] },
+            author_name: if k % 2 == 0 { "김철수" } else { "Ann" }.into(),
+            author_email: "dev@example.com".into(),
+            author_time: 1_790_000_000 + i64::from(k) * 600,
+            commit_time: 1_790_000_000 + i64::from(k) * 600,
+            subject: match k % 3 {
+                0 => format!("한글 제목 {k}: 검색되는 줄"),
+                _ => format!("commit {k}: an English subject"),
+            },
+        })
+        .collect();
+    let mut stream = RowStream::new(Some(id(n)), false, Vec::new(), false);
+    let mut view = GitView::new("box:/srv/repo");
+    view.set_refs(Vec::new(), HeadRef::Branch("refs/heads/main".into()));
+    view.set_rows(stream.page(commits), false, 0);
+    view.set_paging(Paging::AllLoaded);
+    let mut fx = Fx::new(1000.0, 700.0, view);
+    fx.key(Key::F, Modifiers::COMMAND);
+    fx.typed("한글 제목");
+    assert_eq!(fx.view().find_text(), Some("한글 제목"));
+    fx.drv.idle(&mut fx.host, 20);
+    let frames = 400;
+    let started = Instant::now();
+    for _ in 0..frames {
+        fx.drv.frame(&mut fx.host, Vec::new(), Modifiers::NONE);
+    }
+    println!(
+        "the git panel's frame with Find open at 1000x700: {:?}",
+        started.elapsed() / frames
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
