@@ -202,6 +202,20 @@ The formula also installs the model `sopen stems` uses (67 MB) and
 [`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES). `just build` runs `cargo build --release --locked`;
 the default build downloads sherpa-onnx and checks it (`SHERPA_ONNX_LIB_DIR` for offline builds).
 
+Pick a channel and update, through brew:
+
+```sh
+sopen channel           # channel: preview (via brew)
+sopen channel stable    # installs 2lab-ai/tap/sopen, removes sopen-preview — once stable has a release
+sopen channel preview   # and back
+sopen update            # brew upgrade on this channel: sopen-preview 2026.11.27.0138 → 2026.11.28.0101
+```
+
+The stable channel has no release yet, so for now `sopen channel stable` says so and changes
+nothing. Windows already open keep the old version until they are reopened. A sopen built from
+source is not brew's and does not update itself this way. A file named `channel` or `update` is
+`./channel`. Details: [spec §4b](.prd/01-spec.md#4b-release-channel-and-update-a18-msg-25).
+
 ## Requirements
 
 - Media: `ffmpeg` and `ffprobe` (the formula installs them).
