@@ -75,7 +75,8 @@ jobs:
             os: ubuntu-22.04-arm
             name: sopen-linux-aarch64
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Hosted runners' speed varies more than twofold from hour to hour (ci.yml's note).
+    timeout-minutes: 60
     env:
       # `sopen --version` = `sopen <ver> (<channel> <sha12>)` (src/lib.rs version_text).
       # SOPEN_BUILD_ID is a revision (first 12 chars kept), so it gets the commit
