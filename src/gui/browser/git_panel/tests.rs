@@ -22,6 +22,8 @@ pub(super) struct Host {
     pub(super) rect: Rect,
     /// Cells a dialog of the list's covers, as the browser hands them to the panel.
     pub(super) under: Vec<crate::gui::cells::Cells>,
+    /// The panel's side of the grid (`None`: all of it, as wide).
+    pub(super) side: Option<crate::gui::cells::Cells>,
 }
 
 impl Window for Host {
@@ -33,12 +35,12 @@ impl Window for Host {
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 let grid = crate::gui::cells::Grid::over(ui.max_rect());
-                let rect = grid.rect(grid.all());
-                self.rect = rect;
+                let side = self.side.unwrap_or(grid.all());
+                self.rect = grid.rect(side);
                 self.actions.extend(draw(
                     ui,
                     &grid,
-                    grid.all(),
+                    side,
                     &mut self.view,
                     self.active,
                     &self.under,
@@ -67,6 +69,7 @@ impl Fx {
                 actions: Vec::new(),
                 rect: Rect::NOTHING,
                 under: Vec::new(),
+                side: None,
             },
         };
         fx.idle();

@@ -515,6 +515,11 @@ fn x4_graph_the_tree_and_the_preview_blank_a_git_panels_dialog() {
         "{:?}",
         cells_in(&g.fx, gr.rect(covered))
     );
+    // The panel's own covers are never handed back to it (round 2): it blanks them as its pass
+    // leaves them.
+    let i = g.b().git.panel(&g.top()).expect("the panel");
+    assert_eq!(g.b().git_covered(&gr, None), [covered]);
+    assert!(g.b().git_covered(&gr, Some(i)).is_empty());
     g.panel_mut().view.test_covers.clear();
     g.key(Key::F10);
     g.settle();

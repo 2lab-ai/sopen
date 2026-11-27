@@ -2378,7 +2378,7 @@ impl Browser {
     fn tree_ui(&mut self, ui: &mut egui::Ui, grid: &Grid, side: cells::Cells) {
         let mut under = self.ops.covered(grid);
         // A pinned git panel stands beside the tree (02 §3.1): its dialogs' cells too (X4-graph).
-        under.extend(self.git_covered(grid));
+        under.extend(self.git_covered(grid, None));
         let Some(t) = self.tree.as_mut() else {
             return;
         };
@@ -2701,7 +2701,7 @@ impl Browser {
                 Some(view::Content::Preview(_)) => {
                     // The cells under a dialog of the list's or of the git panel's (X4-graph).
                     let mut under = self.ops.covered(&grid);
-                    under.extend(self.git_covered(&grid));
+                    under.extend(self.git_covered(&grid, None));
                     self.preview.ui(ui, &grid, side, &under);
                     // 09 §4: the engine refused the preview's page — the preview shows the
                     // source now, and page files open as their source in this window.

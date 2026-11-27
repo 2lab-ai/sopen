@@ -186,7 +186,7 @@ impl Browser {
         // cells under it blank first (cells.rs, one buffer over another), so a wide glyph half
         // under its edge goes as a terminal erases it.
         for under in (self.ops.covered(grid).into_iter())
-            .chain(self.git_covered(grid))
+            .chain(self.git_covered(grid, None))
             .chain(help::covered(&ctx, grid))
         {
             cells::fill(&mut buf, under, body);

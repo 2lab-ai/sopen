@@ -205,7 +205,10 @@ fn lossy(r: &RefLabel) -> bool {
 /// out, however long the ref's name.
 pub(super) fn capped(text: &str, room: usize) -> Cow<'_, str> {
     match text.char_indices().nth(room + 1) {
-        Some((at, _)) => Cow::Owned(text[..at].to_string()),
+        Some((at, _)) => {
+            copied(at);
+            Cow::Owned(text[..at].to_string())
+        }
         None => Cow::Borrowed(text),
     }
 }
@@ -414,8 +417,8 @@ pub(super) fn label_text(label: &Label, room: usize, wide: bool) -> String {
 
 #[cfg(test)]
 thread_local! {
-    /// The bytes [`label_text`] has copied on this thread: its work, which the tests bound by the
-    /// room a label has, however long its name.
+    /// The bytes [`label_text`] has copied on this thread, [`capped`]'s cut among them: its work,
+    /// which the tests bound by the room a label has, however long its name.
     pub(super) static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 

@@ -784,28 +784,109 @@ fn a_part_egui_draws_is_a_box_inside_the_frame() {
     );
 }
 
+/// The grid of a `w`×`h` window of the test host: its central area, above the F-key row.
+fn window_grid(w: f32, h: f32) -> Grid {
+    Grid::over(egui::Rect::from_min_size(
+        Pos2::ZERO,
+        Vec2::new(w, h - 16.0),
+    ))
+}
+
+/// What the last pass of the panel at `side` shows outside it, in the grid's rows: every
+/// rectangle painted (not wholly transparent: the host's central panel is one) and text seen left
+/// of the side, where nothing else stands in this host.
+fn strays(fx: &Fx, g: &Grid, side: Cells) -> Vec<String> {
+    let left = g.rect(Cells::new(0, 0, side.x, g.rows));
+    let mut out: Vec<String> = (fx.drv.rects().into_iter())
+        .filter(|(r, c, w)| r.intersect(left).area() > 0.0 && (c.a() > 0 || *w > 0.0))
+        .map(|(r, c, _)| format!("rect {r:?} {c:?}"))
+        .collect();
+    out.extend(
+        (fx.drv.texts_starting_with("").into_iter())
+            .filter(|(r, _)| r.intersect(left).area() > 0.0)
+            .map(|(r, t)| format!("text {t:?} at {r:?}")),
+    );
+    out
+}
+
 /// A panel too small for its parts — the heads' row, the rule and the foot under the banner —
-/// draws its frame alone, never past its cells, whatever is open; at a few rows more every part
-/// has its cells again.
+/// draws its frame alone, never past its cells, whatever is open: on the right side, nothing of
+/// it is seen left of the side, nor does a click there reach it (review round 2: the short
+/// branch's egui parts stood outside its cells); at a few rows more every part has its cells.
 #[test]
 fn a_panel_too_small_for_its_parts_draws_its_frame() {
-    for (w, h) in [(8.0, 16.0), (48.0, 64.0), (200.0, 96.0), (200.0, 160.0)] {
+    for (w, h) in [(96.0, 16.0), (200.0, 64.0), (400.0, 96.0), (400.0, 160.0)] {
         let mut view = fixture_view();
         view.banner = Some(in_progress::BannerView::new("rebase in progress", vec![]));
         let mut fx = Fx::new(w, h + 16.0, view);
+        let g = window_grid(w, h + 16.0);
+        let [_, side] = cells::halves(g.all());
+        fx.host.side = Some(side);
+        fx.idle();
         fx.press(Key::Enter);
         fx.typed("x");
         fx.idle();
-        let g = grid_of(&fx);
-        let l = panel(&fx);
-        assert_eq!(l.buf.area, g.all(), "{w}x{h}");
-        let room = g.rows.saturating_sub(2) >= 4;
+        let l = cells::layers(&fx.drv.ctx)
+            .into_iter()
+            .find(|l| l.buf.area == side)
+            .expect("the panel's cells over its side");
+        assert_eq!(l.origin, g.origin, "{w}x{h}");
+        let room = side.height.saturating_sub(2) >= 4;
         assert_eq!(
             fx.view().geometry().is_some(),
             room,
             "{w}x{h}: {:?}",
             fx.view().geometry()
         );
+        assert_eq!(strays(&fx, &g, side), Vec::<String>::new(), "{w}x{h}");
+        let case = fx.view().find.as_ref().map(|f| f.case);
+        fx.take();
+        for y in 0..g.rows {
+            for x in 0..side.x {
+                let p = g.rect(Cells::new(x, y, 1, 1)).center();
+                fx.drv.frame(
+                    &mut fx.host,
+                    click_events(p, PointerButton::Primary),
+                    Modifiers::NONE,
+                );
+            }
+        }
+        fx.idle();
+        assert!(
+            fx.take().is_empty(),
+            "{w}x{h}: a click outside asked something"
+        );
+        assert_eq!(
+            fx.view().find.as_ref().map(|f| f.case),
+            case,
+            "{w}x{h}: the Aa toggle"
+        );
+    }
+}
+
+/// Review round 2: in a panel too short for its parts, the Backups list's buttons — Restore,
+/// Show, Delete, which egui lays at its foot — are not laid on the frame's title row: a click
+/// there asks nothing and the list stays open.
+#[test]
+fn a_short_panels_title_row_is_not_the_backups_buttons() {
+    let mut fx = Fx::new(1000.0, 80.0, fixture_view());
+    fx.view_mut().set_repo(super::tests_s3::repo());
+    fx.view_mut().open_backups(super::tests_s3::records());
+    fx.idle();
+    fx.idle();
+    assert_eq!(grid_of(&fx).rows, 4);
+    fx.take();
+    for x in [3, 12, 18] {
+        let p = centre(&fx, x, 0);
+        fx.drv.frame(
+            &mut fx.host,
+            click_events(p, PointerButton::Primary),
+            Modifiers::NONE,
+        );
+        fx.idle();
+        assert!(fx.take().is_empty(), "cell ({x}, 0) asked something");
+        assert!(fx.view().backups().is_some(), "the list stays open");
+        assert!(!fx.view().dialog_up(), "no dialog from cell ({x}, 0)");
     }
 }
 
@@ -912,6 +993,7 @@ mod ts4 {
             actions: Vec::new(),
             rect: Rect::NOTHING,
             under: Vec::new(),
+            side: None,
         }
     }
 

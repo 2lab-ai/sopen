@@ -2345,9 +2345,10 @@ impl Browser {
         }
         let active = self.git.focus && side == 1 - self.active && self.viewer.is_none();
         // Under the list's dialogs, and under the other git panel's when two repositories' panels
-        // stand side by side (a pin and the other side's own; its own covers twice is harmless).
+        // stand side by side (a pin and the other side's own) — never its own, which it takes
+        // after this pass's dialogs have opened or closed (`GitView::covered`).
         let mut under = self.ops.covered(grid);
-        under.extend(self.git_covered(grid));
+        under.extend(self.git_covered(grid, Some(i)));
         let view = &mut self.git.panels[i].view;
         let mut actions = git_panel::draw(ui, grid, cells, view, active, &under);
         if self.ops.holds_keyboard() || self.tree.is_some() {
@@ -2359,8 +2360,9 @@ impl Browser {
 
     /// The cells of `grid` (the panels' grid) that the dialogs of the git panels on screen cover
     /// (`GitView::covered`), for the other side's list, preview or tree to blank before it is
-    /// painted (10 §17, X4-graph), as it blanks those under the list's dialogs.
-    pub(super) fn git_covered(&self, grid: &Grid) -> Vec<cells::Cells> {
+    /// painted (10 §17, X4-graph), as it blanks those under the list's dialogs — all of them but
+    /// panel `except`'s (a panel blanks its own as its pass leaves them).
+    pub(super) fn git_covered(&self, grid: &Grid, except: Option<usize>) -> Vec<cells::Cells> {
         let Some(shown) = &self.shown else {
             return Vec::new();
         };
@@ -2373,6 +2375,7 @@ impl Browser {
         tops.dedup();
         (tops.into_iter())
             .filter_map(|top| self.git.panel(top))
+            .filter(|&i| Some(i) != except)
             .flat_map(|i| self.git.panels[i].view.covered(grid))
             .collect()
     }

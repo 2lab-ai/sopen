@@ -2958,8 +2958,14 @@ pub fn draw(
     } else {
         // No room for the parts: those that hold the keyboard still run, at no cells — the
         // planner's keys and its dialogs, the log's entry shown whole, Find's field and its bar —
-        // so no key or typing goes nowhere (review round 1).
+        // so no key or typing goes nowhere (review round 1); the Backups list reads no key of
+        // its own (`keys` → `run_list`) and is not drawn. They run in a child clipped to no
+        // cells, so nothing of them is painted or takes a click outside the panel's (round 2):
+        // the keyboard is by id, and the dialogs are areas of their own.
         let none = Cells::new(inner.x, inner.y, 0, 0);
+        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(grid.rect(none)));
+        ui.set_clip_rect(grid.rect(none));
+        let ui = &mut ui;
         if view.planner.is_some() {
             let pane_active = active && !view.other_dialog_up();
             let end = view.planner.as_mut().and_then(|p| {
@@ -2968,10 +2974,7 @@ pub fn draw(
             asked.extend(view.planner_end(end));
         } else if let Some(log) = &mut view.log {
             log_view::draw(ui, grid, none, &mut buf, log, active && !dialog);
-        } else if let Some(list) = &mut view.backups {
-            let end = backups::draw(ui, grid, none, &mut buf, list, active && !dialog);
-            let end = end.filter(|_| !dialog);
-            asked.extend(view.backups_end(end));
+        } else if view.backups.is_some() {
         } else if let Some(find) = view.find.as_mut().filter(|_| view.search.is_none()) {
             caret = find::field(ui, grid, none, &mut buf, find, !dialog);
             if view.refresh_find() {
