@@ -645,41 +645,22 @@ impl TreeSide {
     /// Nothing is on its way that a receipt waits for: the rows are on screen, 05 §5 has run to
     /// its end (or the tree has said why it has none), no link is being resolved. Listings
     /// further away and scans go on (`~/Library` and tag rows never get counts) — unless `whole`
-    /// (a `SOPEN_CELLS` run, X4-tree): then also every row's sizes are final ([`still_counting`]),
-    /// so the receipt holds no moving mark; `SOPEN_WATCHDOG` caps that wait.
+    /// (a `SOPEN_CELLS` run, X4-tree): then also no request of the tree is on its way
+    /// ([`crate::tree::Tree::in_flight`]: the listings of the screen and of a screen above and
+    /// below it, whose sums an open folder on screen shows, the filesystems' figures, the scans),
+    /// so the receipt holds final sizes and no moving mark; a request reported not answering is
+    /// left out — it may never answer — and its row is taken saying so. `SOPEN_WATCHDOG` caps
+    /// the wait.
     fn settled(&self, whole: bool) -> bool {
         match &self.model {
             TreeModel::Connecting(_) => false,
             TreeModel::Open(model) => {
                 self.target.is_none()
                     && (model.error().is_some()
-                        || model.built()
-                            && self.told.is_some()
-                            && !(whole && still_counting(model, self.told)))
+                        || model.built() && self.told.is_some() && !(whole && model.in_flight()))
             }
         }
     }
-}
-
-/// Whether a row of the tree is still being counted: a deep scan runs on it (its moving mark,
-/// 05 §6.3), or a folder on screen (`told`: what the model was last told of it) has neither its
-/// counts nor a tag yet — its listing is on its way, and its scan may follow it (phase 3 sizes a
-/// row once it is listed, so "no row scanning" alone can hold while one is still to start). A
-/// row the rules never list unasked (05 §4 H3: `~/Library`, `~/.Trash`, which on macOS are hidden
-/// and so grouped unless their row is opened) reads the same: such a run ends at its watchdog.
-/// Read from the model as it is now — it has been told the screen since the rows were mapped.
-fn still_counting(
-    model: &crate::tree::Tree,
-    told: Option<(usize, usize, Option<crate::tree::RowId>)>,
-) -> bool {
-    use crate::tree::{RowKind, Size};
-    let rows = model.rows();
-    let scanning = (rows.iter()).any(|r| matches!(r.info.size, Size::Bytes { scanning: true, .. }));
-    let (top, height) = told.map_or((0, 0), |(top, height, _)| (top, height));
-    let unread = (rows.iter().skip(top).take(height)).any(|r| {
-        r.kind == RowKind::Folder && r.info.dirs.is_none() && !matches!(r.info.size, Size::Tag(_))
-    });
-    scanning || unread
 }
 
 /// The rows the tree has room for beyond the list's: it has no column heads, rule or foot (its

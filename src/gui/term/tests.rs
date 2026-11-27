@@ -1670,6 +1670,44 @@ fn the_mode_button_switches_from_the_terminal_and_back_from_the_window() {
     assert_eq!(vt.part(0, 85, 90), "[GUI]", "{}", vt.row(0));
 }
 
+/// Review round 1 of X4-tree: the receipt leaves the clock out with the mode button
+/// (`chrome::mode_clock_rect`), but only `[GUI]` is the switch — clicks on the blank before it,
+/// on the clock's `│` and digits and on the row's last cell switch nothing; then a click on
+/// `[GUI]` does.
+#[test]
+fn a_click_on_the_clock_is_no_switch_and_one_on_the_mode_button_is() {
+    let fx = fixture(0);
+    let (mut b, tape, bytes) = backend(&fx, 100, 30, false);
+    // `[GUI]` at 85–89, a blank, `│` at 91, the clock at 92–98, a blank at 99.
+    let mut events = vec![];
+    for column in [90, 91, 92, 95, 98, 99] {
+        events.extend(click(column, 0));
+    }
+    events.extend(click(87, 0));
+    events.push(ctrl_q());
+    tape.0.borrow_mut().events.extend(events);
+    let switched = std::rc::Rc::new(std::cell::Cell::new(0));
+    let clicks_left = tape.clone();
+    let seen = switched.clone();
+    let mut switch = move |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> {
+        // At most `[GUI]`'s release and Ctrl+Q are left when the switch is asked for: had a
+        // click on the clock switched, `[GUI]`'s press would be left too.
+        let left = clicks_left.0.borrow().events.len();
+        assert!(
+            left <= 2,
+            "a click before [GUI]'s switched: {left} events left"
+        );
+        seen.set(seen.get() + 1);
+        Ok(None)
+    };
+    let mut win = Shared(fx.b.clone());
+    assert_eq!(b.run(&mut win, &mut switch).unwrap(), End::Closed);
+    assert_eq!(switched.get(), 1, "only the click on [GUI] is the switch");
+    let vt = bytes.last_screen(100, 30);
+    assert_eq!(vt.part(0, 85, 90), "[GUI]", "{}", vt.row(0));
+    assert_eq!(vt.part(0, 91, 92), "│", "{}", vt.row(0));
+}
+
 // ---------------------------------------------------------------------------------------------
 // The key help, and what the terminal cannot show yet (10 §11, T17).
 

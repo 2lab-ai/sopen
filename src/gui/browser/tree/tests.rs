@@ -941,6 +941,30 @@ fn a_click_moves_the_bar_and_a_double_click_goes_to() {
     assert!(fx.find("/").is_none(), "scrolled off");
 }
 
+/// Review round 1 (S4): a wheel in points (a trackpad's) scrolls by cells as the list's does —
+/// 32 points two rows — and two in one pass add up; the bar stays.
+#[test]
+fn a_wheel_in_points_scrolls_by_cells() {
+    let mut fx = Fx::new(1000.0, TreeView::new("box:/", long(200), 0));
+    let middle = fx.on_screen(10, 10, 1).center();
+    fx.drv.move_to(&mut fx.host, middle);
+    let wheel = || Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -32.0),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
+        modifiers: Modifiers::NONE,
+    };
+    fx.drv.frame(&mut fx.host, vec![wheel()], Modifiers::NONE);
+    fx.idle();
+    assert_eq!((fx.host.view.top, fx.host.view.bar), (2, 0));
+    fx.drv
+        .frame(&mut fx.host, vec![wheel(), wheel()], Modifiers::NONE);
+    fx.idle();
+    assert_eq!((fx.host.view.top, fx.host.view.bar), (6, 0));
+    assert_eq!(fx.find("f005"), Some((4, 0)));
+}
+
 /// Every glyph of the tree is a VGA font glyph, one cell wide (05:82–83).
 #[test]
 fn the_glyphs_are_one_cell_of_the_vga_font() {
@@ -1506,7 +1530,9 @@ mod model_rows {
 // TS-4 (10 §14): the tree in both backends; the receipt's wait for final sizes (X4-tree).
 
 mod ts4 {
-    use super::super::super::{parse_keys, Browser, Start, TreeConnect, TreeModel};
+    use super::super::super::{
+        parse_keys, Browser, Start, TreeConnect, TreeModel, TREE_ROWS_OVER_LIST,
+    };
     use super::*;
     use crate::gui::term::{self, Backend, End, Probed, Receipt, Tty};
     use crate::remote::treefs::{Budget, Disk, FsStat, Listing, Live, Mounts, Resolved};
@@ -1778,17 +1804,7 @@ mod ts4 {
         whole: bool,
         keys: &str,
     ) -> (Browser, TreePool) {
-        let mut b = Browser::new(Start {
-            fs: Box::new(LocalFs::new()),
-            connect: Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)),
-            label: None,
-            destination: None,
-            abs: h.root.clone(),
-            cache: h.cache.clone(),
-            state_dir: h.cache.with_file_name("state"),
-            launch: Arc::new(|abs: &str, _| Ok(format!("opened {abs}"))),
-            git: None,
-        });
+        let mut b = Browser::new(start(h));
         let pool = Pool::new(Timing::default());
         let p = pool.clone();
         let connect: TreeConnect =
@@ -1798,6 +1814,21 @@ mod ts4 {
         b.bar_first = Some("notes.txt".into());
         b.script = parse_keys(keys).unwrap().into();
         (b, TreePool(pool))
+    }
+
+    /// A browser's start on `h`, on this machine.
+    fn start(h: &Home) -> Start {
+        Start {
+            fs: Box::new(LocalFs::new()),
+            connect: Arc::new(|| Ok(Box::new(LocalFs::new()) as Box<dyn RemoteFs + Send>)),
+            label: None,
+            destination: None,
+            abs: h.root.clone(),
+            cache: h.cache.clone(),
+            state_dir: h.cache.with_file_name("state"),
+            launch: Arc::new(|abs: &str, _| Ok(format!("opened {abs}"))),
+            git: None,
+        }
     }
 
     fn real(h: &Home) -> Arc<dyn Disk> {
@@ -1867,9 +1898,30 @@ mod ts4 {
         for mark in SCAN_MARKS {
             assert!(!project.contains(&format!("7.0K {mark}")), "{project}");
         }
-        let title = terminal.lines().nth(1).unwrap_or_default();
-        assert!(!title.contains("[GUI]") && !title.contains("am") && !title.contains("pm"));
-        assert!(title.ends_with("      "), "blank to its end: {title:?}");
+        // The title row (ASCII and `…`: a character a cell) blank in the columns
+        // `mode_clock_rect` names, the window's as the terminal's lays it, to the row's end.
+        let title: Vec<char> = terminal
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .chars()
+            .collect();
+        let blank = chrome::mode_clock_rect(&drv.ctx).expect("the title row's");
+        let (from, to) = (
+            (blank.left() / CELL.x) as usize,
+            (blank.right() / CELL.x) as usize,
+        );
+        assert_eq!((to, title.len()), (usize::from(cols), usize::from(cols)));
+        assert!(
+            to - from >= 14,
+            "the button's place and the clock: {from}..{to}"
+        );
+        let masked: String = title[from..to].iter().collect();
+        assert!(masked.trim().is_empty(), "blank: {masked:?}");
+        assert!(
+            title[..from].iter().any(|c| *c != ' '),
+            "the place before it"
+        );
         assert_eq!(terminal, in_window, "the same bytes");
     }
 
@@ -1930,7 +1982,7 @@ mod ts4 {
 
     /// X4-tree: "no row is scanning" alone holds while a row on screen waits for its listing —
     /// phase 3 starts a scan only once its row is listed (`tree/scan.rs` `scannable`) — so a
-    /// `SOPEN_CELLS` run also waits for every row on screen to have its counts or a tag. Here
+    /// `SOPEN_CELLS` run waits until the tree has no request on its way (`Tree::in_flight`). Here
     /// `프로젝트` is opened once the tree has settled (as `SOPEN_KEYS`' `F10,…,Right` would), and
     /// the listing of its `c` is held: nothing scans, the tree is built, and only that row waits.
     #[test]
@@ -1973,6 +2025,158 @@ mod ts4 {
         }
         disk.release();
         drv.until(&mut b, 30, |b| b.ready());
+    }
+
+    /// Review round 1 (MUST): phase 2 also lists a screen below the screen (`tree/scan.rs`
+    /// `window`), and an open folder never scanned shows the sum of its subfolders' listings
+    /// (`tree/mod.rs` `total`), so a listing below the last row still changes a size on screen.
+    /// `zz` opens by itself at the end of 05 §5 — the build does not wait for its subfolders, a
+    /// level below its own (`tree/scan.rs` `build`) — on the screen's second-last row, its `c`
+    /// below the screen, `c`'s listing held: a `SOPEN_CELLS` run waits for it (no request on its
+    /// way), and `zz`'s size then counts `c`'s file.
+    #[test]
+    fn a_cells_run_waits_for_a_listing_below_the_screen() {
+        let h = home();
+        let held = format!("{}/zz/c", h.root);
+        let disk = HoldDisk::new(&h.root, std::slice::from_ref(&held), false);
+        let (mut b, _p) = browser(&h, disk.clone(), "x4-tree-below", true, "");
+        let mut drv = Driver::new(1000.0, 700.0);
+        drv.until(&mut b, 30, |b| b.ready());
+        // The tree's height: the list's rows and its heads, rule and foot. Before `zz`, by name:
+        // `~`, `a/b/c`, the `f…` leaves made here, `link` (the Hangul folders and the hidden row
+        // come after it) — so the leaves put `zz` on the screen's second-last row.
+        let height = b.visible + TREE_ROWS_OVER_LIST;
+        let before = 3;
+        for k in 0..height - 2 - before {
+            std::fs::create_dir(format!("{}/f{k:02}", h.root)).unwrap();
+        }
+        for (d, n) in [("a", 100), ("b", 200), ("c", 5000)] {
+            std::fs::create_dir_all(format!("{}/zz/{d}", h.root)).unwrap();
+            std::fs::write(format!("{}/zz/{d}/x", h.root), vec![b'x'; n]).unwrap();
+        }
+        drv.key(&mut b, Key::F10, Modifiers::NONE);
+        let zz_size = |b: &mut Browser| {
+            let rows = model(b).rows();
+            let zz = rows.iter().find(|r| r.name == "zz" && r.depth == 1)?;
+            match zz.info.size {
+                crate::tree::Size::Bytes { bytes, more, .. } => Some((bytes, more)),
+                _ => None,
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            drv.idle(&mut b, 1);
+            let built = b.tree.as_ref().is_some_and(|t| {
+                matches!(&t.model, TreeModel::Open(m) if m.built()) && t.told.is_some()
+            });
+            if built {
+                let rows = model(&mut b).rows();
+                let listed = |name: &str| {
+                    (rows.iter()).any(|r| r.depth == 2 && r.name == name && r.info.dirs.is_some())
+                };
+                if listed("a") && listed("b") && !scanning(&b) {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "zz opened and its a and b listed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let t = b.tree.as_ref().unwrap();
+        let at = |name: &str, depth: usize| {
+            (t.view.rows.iter())
+                .position(|r| r.name == name && r.depth == depth)
+                .unwrap_or_else(|| panic!("{name} is drawn"))
+        };
+        let (top, shown) = (t.view.top, t.view.height());
+        assert_eq!((top, shown), (0, height), "the screen");
+        assert!(at("zz", 1) < shown, "zz on screen at {}", at("zz", 1));
+        assert!(at("c", 2) >= shown, "c below the screen at {}", at("c", 2));
+        assert!(t.settled(false), "settled as any other run would be");
+        let (early, _) = zz_size(&mut b).expect("zz's size");
+        for _ in 0..10 {
+            drv.idle(&mut b, 1);
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(!b.ready(), "c's listing is on its way");
+        }
+        disk.release();
+        drv.until(&mut b, 30, |b| b.ready());
+        assert_eq!(
+            zz_size(&mut b),
+            Some((5300, false)),
+            "c counted, from {early}"
+        );
+    }
+
+    /// Review round 1 (S2): a dialog of the list's up while the tree is open (F7's, here): the
+    /// tree's cells under it (`Ops::covered`, as `tree_ui` hands them) are blanks in the body's
+    /// colours, in the tree's own layer.
+    #[test]
+    fn a_list_dialog_over_the_tree_blanks_the_trees_cells() {
+        let h = home();
+        let (mut b, _p) = browser(&h, real(&h), "x4-tree-dialog", false, "F10");
+        let mut drv = Driver::new(1000.0, 700.0);
+        drv.until(&mut b, 30, |b| b.ready());
+        let side = b.tree.as_ref().expect("the tree is open").side;
+        assert_eq!(side, 0);
+        assert!(b.ops.open_make_folder(&b.panels[side], None).is_none());
+        drv.idle(&mut b, 3);
+        let layers = cells::layers(&drv.ctx);
+        let tree = (layers.iter())
+            .find(|l| {
+                let a = l.buf.area;
+                a.x == 0 && l.buf[(a.x, a.y)].symbol() == "╔"
+            })
+            .expect("the tree's layer, double-lined");
+        let other = (layers.iter())
+            .find(|l| l.origin == tree.origin && l.buf.area.x == tree.buf.area.width)
+            .expect("the other side's layer");
+        let grid = Grid {
+            origin: tree.origin,
+            cols: other.buf.area.x + other.buf.area.width,
+            rows: tree.buf.area.height,
+        };
+        let covered = b.ops.covered(&grid);
+        let a = tree.buf.area;
+        let seen = tree.seen();
+        let mut checked = 0;
+        for r in covered.iter().map(|r| r.intersection(a)) {
+            for y in r.top()..r.bottom() {
+                for x in r.left()..r.right() {
+                    let c = &seen[usize::from(y - a.y)][usize::from(x - a.x)];
+                    let body = (Some(PALETTE.text), Some(PALETTE.back));
+                    assert_eq!(
+                        (c.symbol.as_str(), c.fg, c.bg),
+                        (" ", body.0, body.1),
+                        "({x},{y})"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "the dialog stands over the tree: {covered:?}");
+    }
+
+    /// Review round 1 (S3): `open_on` tells the browser a `SOPEN_CELLS` run (`whole_sizes`) —
+    /// the terminal's, the window's and HOST's switched window's alike — and no other run.
+    #[test]
+    fn open_on_tells_the_browser_a_cells_run() {
+        let h = home();
+        for (cells, want) in [(Some(h.cache.join("cells.txt")), true), (None, false)] {
+            let hooks = crate::gui::Hooks {
+                cells,
+                ..Default::default()
+            };
+            let mut seen = None;
+            super::super::super::open_on(start(&h), &hooks, |_, b| {
+                seen = Some(b.whole_sizes);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, Some(want));
+        }
     }
 
     /// X4-tree, AGENTS.md: a `SOPEN_CELLS` run whose tree never settles — a scan that never

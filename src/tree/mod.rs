@@ -452,6 +452,22 @@ impl Tree {
         }
     }
 
+    /// A request of the tree is on its way — a listing (of the screen's rows, of a screen above
+    /// and below them, of the path), a filesystem's figure, a scan — other than those reported not
+    /// answering: while none is, nothing the tree shows changes until the owner acts or another
+    /// row comes on screen (a `SOPEN_CELLS` receipt waits for that, X4-tree). One reported not
+    /// answering is left out, since it may never answer — locally its call is abandoned (05
+    /// §6.2), remotely it waits out its request timeout — and its row says `not answering`
+    /// meanwhile; phase 1's requests count until they answer.
+    pub fn in_flight(&self) -> bool {
+        self.asks.values().any(|&what| match what {
+            For::List(i) => !self.nodes[i].not_answering,
+            For::Statvfs(i) => !self.nodes[i].fs_late,
+            For::Scan(i) => !self.nodes[i].deep.not_answering,
+            For::Folder | For::Home | For::Mounts | For::MacFence(_) | For::Target => true,
+        })
+    }
+
     /// Phase 1 is done: the rows exist.
     pub fn ready(&self) -> bool {
         matches!(self.stage, Stage::Building(_) | Stage::Done)
