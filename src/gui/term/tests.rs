@@ -2593,7 +2593,9 @@ fn a_repaint_asked_for_ages_away_is_no_deadline() {
 
 /// The terminal's input on a pty this test owns: quiet, then ready with a key, then — the
 /// terminal's side closed, as a hang-up — an error at once, never a wait or a spin (crossterm's
-/// own reader loops on a hung-up terminal's empty reads without returning).
+/// own reader loops on a hung-up terminal's empty reads without returning). At once is under
+/// half the wait, a minute: waiting it out takes the whole minute; the slack is for a child of
+/// another test that still holds the master for a while (below).
 #[test]
 fn a_terminal_that_hung_up_is_an_error_at_once() {
     let (mut master, mut slave) = (-1, -1);
@@ -2608,6 +2610,15 @@ fn a_terminal_that_hung_up_is_an_error_at_once() {
         )
     };
     assert_eq!(made, 0, "openpty");
+    for fd in [master, slave] {
+        // Close-on-exec: a child another test thread spawns from here on does not inherit it.
+        // One that held the master would hold the hang-up off until it exits (the 1 s watchdog
+        // child of `a_window_receipt_that_stalls_after_its_dump_ends_at_the_deadline`); one
+        // spawned during `openpty` itself still can: the bound allows for one that exits within
+        // half the wait.
+        // SAFETY: fcntl on a descriptor openpty just returned.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
     let quiet = wait_input(slave, Duration::from_millis(50)).unwrap();
     assert_eq!(quiet, Input::Quiet);
     // SAFETY: writes from a live buffer to the master this test opened (a line: the pty reads
@@ -2622,8 +2633,10 @@ fn a_terminal_that_hung_up_is_an_error_at_once() {
     unsafe { libc::read(slave, byte.as_mut_ptr().cast(), byte.len()) };
     // SAFETY: closes the master this test opened: the terminal's side is gone.
     unsafe { libc::close(master) };
+    let wait = Duration::from_secs(60);
     let at = Instant::now();
-    let gone = wait_input(slave, Duration::from_secs(5));
+    let gone = wait_input(slave, wait);
+    let took = at.elapsed();
     // SAFETY: closes the slave this test opened.
     unsafe { libc::close(slave) };
     assert!(
@@ -2631,11 +2644,7 @@ fn a_terminal_that_hung_up_is_an_error_at_once() {
             .is_err_and(|e| e.kind() == io::ErrorKind::BrokenPipe),
         "{gone:?}"
     );
-    assert!(
-        at.elapsed() < Duration::from_secs(1),
-        "at once: {:?}",
-        at.elapsed()
-    );
+    assert!(took < wait / 2, "at once: {took:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
