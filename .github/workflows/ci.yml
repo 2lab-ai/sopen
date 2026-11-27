@@ -24,7 +24,8 @@ jobs:
         # macOS first because aarch64-apple-darwin is the platform that ships first.
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # The same suite has taken from 8 to 21 minutes on macos-latest in one day; 30 cut it off.
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
