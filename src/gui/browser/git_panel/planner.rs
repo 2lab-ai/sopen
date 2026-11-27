@@ -808,6 +808,16 @@ fn inner_id(kind: &str) -> egui::Id {
     egui::Id::unique(("sopen-git-planner", kind))
 }
 
+/// The message dialog's field: one id for every row's.
+fn message_field_id() -> egui::Id {
+    inner_id("message").with("field")
+}
+
+/// The author dialog's field `n` (the name, the email, the author date): one id for every row's.
+fn author_field_id(n: usize) -> egui::Id {
+    inner_id("author").with(("field", n))
+}
+
 /// The first line of `text`, at most `n` characters, control characters shown.
 fn first_line(text: &str, n: usize) -> String {
     let line = text.lines().next().unwrap_or("");
@@ -1137,10 +1147,36 @@ impl PlannerView {
                 }
             }
             if self.inner.is_some() {
+                self.carets_at_the_end(ctx);
                 return None;
             }
         }
         None
+    }
+
+    /// A dialog of the pane's has just opened: each of its fields' carets at the end of its
+    /// text, as egui puts a field's caret the first time — it keeps a field's caret between
+    /// dialogs, and every row's dialog has the same field ids, so the caret left in one row's
+    /// message would stand in the middle of the next row's.
+    fn carets_at_the_end(&self, ctx: &egui::Context) {
+        let fields = match &self.inner {
+            Some(Inner::Message { text, .. }) => vec![(message_field_id(), text)],
+            Some(Inner::Author { form, .. }) => {
+                let texts = [&form.name, &form.email, &form.date];
+                (0..)
+                    .zip(texts)
+                    .map(|(n, t)| (author_field_id(n), t))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        for (id, text) in fields {
+            let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+            let end = egui::text::CCursor::new(text.chars().count());
+            let at = egui::text::CCursorRange::one(end);
+            state.cursor.set_char_range(Some(at));
+            state.store(ctx, id);
+        }
     }
 
     /// The dialog over the pane, one pass, on `grid` (the panels', where it stands once it is in
@@ -1164,7 +1200,7 @@ impl PlannerView {
                 if take(Key::Escape) {
                     return None;
                 }
-                let id = inner_id("message").with("field");
+                let id = message_field_id();
                 type_into(ctx, id);
                 let at = enter(ctx);
                 if is(at, cancel_button) {
@@ -1219,7 +1255,7 @@ impl PlannerView {
                 if take(Key::Escape) {
                     return None;
                 }
-                let id = |n: usize| inner_id("author").with(("field", n));
+                let id = author_field_id;
                 type_into(ctx, id(0));
                 let at = enter(ctx);
                 if is(at, cancel_button) {

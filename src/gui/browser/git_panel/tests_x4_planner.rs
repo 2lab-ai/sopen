@@ -755,22 +755,28 @@ fn text_typed_after_a_key_that_opens_a_dialog_reaches_it() {
             "split {split}"
         );
     }
-    for events in [
-        vec![Event::Text("a".into()), Event::Text("x".into())],
-        vec![Event::Text("ax".into())],
+    // The rest of a text put back where it stood, before what came after it; a dialog-opening
+    // letter after a Hangul one, and Hangul after it (`char_indices` on a multi-byte boundary).
+    let text_event = |t: &str| Event::Text(t.into());
+    for (events, name) in [
+        (vec![text_event("a"), text_event("x")], "Ann Leex"),
+        (vec![text_event("ax")], "Ann Leex"),
+        (vec![text_event("ax"), text_event("y")], "Ann Leexy"),
+        (vec![text_event("a한x")], "Ann Lee한x"),
+        (vec![text_event("한ax")], "Ann Leex"),
     ] {
         let mut fx = with_planner(1000.0, 500.0, plain(6));
         fx.drv.frame(&mut fx.host, events.clone(), Modifiers::NONE);
         fx.idle();
         assert!(pane(&fx).dialog_up(), "{events:?}: the author dialog");
-        assert!(shown(&fx, "Ann Leex"), "{events:?}: {:#?}", fx.drv.texts());
+        assert!(shown(&fx, name), "{events:?}: {:#?}", fx.drv.texts());
         fx.press(Key::Enter);
         assert!(!pane(&fx).dialog_up(), "{events:?}");
         let author = pane(&fx).model().rows[0]
             .author
             .as_ref()
             .map(|a| a.name.clone());
-        assert_eq!(author.as_deref(), Some("Ann Leex"), "{events:?}");
+        assert_eq!(author.as_deref(), Some(name), "{events:?}");
         assert_eq!(
             text(&fx, 2, MARK_AT, MARK_AT + 1),
             "A",
@@ -851,6 +857,118 @@ fn a_button_stands_only_where_it_fits_whole() {
     fx.drv.frame(&mut fx.host, click_events(p), Modifiers::NONE);
     fx.idle();
     assert!(pane(&fx).dialog_up(), "the control: Run…");
+}
+
+/// A button that fits exactly is drawn and pressed: in a pane of 19 cells `[ Close ]` ends on
+/// the pane's last cell, and a click on it closes the planner (nothing changed).
+#[test]
+fn a_button_that_fits_exactly_stands() {
+    let mut fx = with_planner(21.0 * 8.0, 500.0, plain(6));
+    let y = 26;
+    assert_eq!(at(&fx, y, "[ Close ]"), Some(11), "{:?}", line(&fx, y));
+    assert_eq!(cell(&fx, 20, y).symbol, "║", "the frame right after it");
+    let p = centre(&fx, 15, y);
+    fx.drv.frame(&mut fx.host, click_events(p), Modifiers::NONE);
+    fx.idle();
+    assert!(fx.view().planner_model().is_none(), "closed");
+}
+
+/// Enter, a typed `x` and Enter in one pass on a reword row: the message dialog opens, takes the
+/// second Enter as its own and its field the `x` in the same pass, so the message kept is the
+/// commit's with the `x` after it.
+#[test]
+fn enter_text_and_enter_in_one_pass_keep_the_text() {
+    let message = format!(
+        "{}\n\nbody of 7\n",
+        "커밋 7: 한글 제목과 an English subject"
+    );
+    let mut fx = with_planner(1000.0, 500.0, plain(6));
+    fx.typed("r");
+    let mut events = key_events(Key::Enter, Modifiers::NONE);
+    events.push(Event::Text("x".into()));
+    events.extend(key_events(Key::Enter, Modifiers::NONE));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    fx.idle();
+    assert!(!pane(&fx).dialog_up(), "kept and closed");
+    let kept = pane(&fx).model().rows[0].message.clone();
+    assert_eq!(kept, Some(format!("{message}x")));
+}
+
+/// As built until X4-planner2's dialogs read presses in the pass's order: the egui dialog takes
+/// its own Enter and Esc before its field reads the pass's text, so text typed after them in the
+/// same pass is read as typed before them — Enter, Enter and `d`: the `d` in the message kept;
+/// Enter, Esc and `d`: nothing kept, the `d` dropped; `a`, Enter and `d`: the author `Ann Leed`.
+#[test]
+fn the_egui_dialogs_take_their_enter_and_esc_before_the_passs_text() {
+    let message = format!(
+        "{}\n\nbody of 7\n",
+        "커밋 7: 한글 제목과 an English subject"
+    );
+    let pass = |fx: &mut Fx, events: Vec<Event>| {
+        fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+        fx.idle();
+    };
+    let keyed = |key: Key| key_events(key, Modifiers::NONE);
+    for (second, kept) in [
+        (Key::Enter, Some(format!("{message}d"))),
+        (Key::Escape, None),
+    ] {
+        let mut fx = with_planner(1000.0, 500.0, plain(6));
+        fx.typed("r");
+        let mut events = keyed(Key::Enter);
+        events.extend(keyed(second));
+        events.push(Event::Text("d".into()));
+        pass(&mut fx, events);
+        assert!(!pane(&fx).dialog_up(), "{second:?}");
+        assert_eq!(pane(&fx).model().rows[0].message, kept, "{second:?}");
+        assert_eq!(
+            verb_of(&fx, 0),
+            Verb::Reword,
+            "{second:?}: the d set no verb"
+        );
+    }
+    let mut fx = with_planner(1000.0, 500.0, plain(6));
+    let mut events = vec![Event::Text("a".into())];
+    events.extend(keyed(Key::Enter));
+    events.push(Event::Text("d".into()));
+    pass(&mut fx, events);
+    assert!(!pane(&fx).dialog_up());
+    let author = pane(&fx).model().rows[0]
+        .author
+        .as_ref()
+        .map(|a| a.name.clone());
+    assert_eq!(author.as_deref(), Some("Ann Leed"));
+}
+
+/// A dialog of the pane's opens with each field's caret at the end of its text, whatever caret
+/// the same field had in the row edited before (egui keeps it by the field's id, one for every
+/// row): the caret moved to the top of one row's message, that message kept, then on the next
+/// row's a typed `x` goes at its end.
+#[test]
+fn a_dialog_opens_with_its_carets_at_the_end() {
+    let message = |k: u32| format!("커밋 {k}: 한글 제목과 an English subject\n\nbody of {k}\n");
+    let mut fx = with_planner(1000.0, 500.0, plain(6));
+    fx.typed("r");
+    fx.press(Key::Enter);
+    assert!(pane(&fx).dialog_up());
+    for _ in 0..4 {
+        fx.press(Key::ArrowUp);
+    }
+    fx.press(Key::Enter);
+    assert!(!pane(&fx).dialog_up());
+    assert_eq!(
+        pane(&fx).model().rows[0].message,
+        Some(message(7)),
+        "kept as it was"
+    );
+    fx.press(Key::ArrowDown);
+    fx.typed("r");
+    fx.press(Key::Enter);
+    assert!(pane(&fx).dialog_up(), "row 1's message");
+    fx.typed("x");
+    fx.press(Key::Enter);
+    let kept = pane(&fx).model().rows[1].message.clone();
+    assert_eq!(kept, Some(format!("{}x", message(6))));
 }
 
 /// A focused button is in the bar's colours (10 §6): Tab moves egui's focus through the pane's
