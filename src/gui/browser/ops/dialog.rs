@@ -114,7 +114,6 @@ pub enum Part {
     /// several (`[X] word`, its [`Input::Any`]). Each choice is a control of its own
     /// ([`choice_id`]): a click, or Space or Enter while it has the keyboard, chooses it — or
     /// turns it on or off — once a press.
-    #[cfg_attr(not(test), allow(dead_code))] // X4-dialogs uses it; the tests till then.
     Choices {
         label: String,
         id: egui::Id,
@@ -126,7 +125,6 @@ pub enum Part {
     /// ↑ ░ ↓ on the box's right border. Shift+Enter is a new line; a plain Enter is never
     /// typed, it is the dialog's — which takes it with exactly no modifiers (`keys::take`'s
     /// `Mods::None`): egui's `consume_key(Modifiers::NONE, …)` would take Shift+Enter too.
-    #[cfg_attr(not(test), allow(dead_code))] // X4-dialogs uses it; the tests till then.
     Message {
         label: String,
         id: egui::Id,
@@ -686,6 +684,12 @@ impl Layout {
         [self.frame, right, under]
     }
 
+    /// Whether the box stands whole on its grid: one whose parts that never give way (choices,
+    /// fields, buttons) are more than the grid holds stands past its foot (X4-dialogs).
+    pub fn fits(&self) -> bool {
+        self.frame.intersection(self.grid.all()) == self.frame
+    }
+
     /// The box and its shadow, cut to the grid.
     pub fn covers(&self) -> Vec<Cells> {
         let all = self.grid.all();
@@ -710,7 +714,7 @@ pub struct Inputs<'a> {
 }
 
 /// A control's state while its dialog is shown ([`Inputs::by_id`]).
-#[cfg_attr(not(test), allow(dead_code))] // X4-dialogs uses it; the tests till then.
+#[cfg_attr(not(test), allow(dead_code))] // X4-menu uses `List`; the tests till then.
 pub enum Input<'a> {
     /// A field's or a message field's text.
     Text(&'a mut String),
