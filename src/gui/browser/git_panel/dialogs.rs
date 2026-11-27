@@ -30,10 +30,11 @@
 //!   text field, or on nothing; Enter runs (03 §8.1), but each Enter of a pass goes to what has
 //!   the keyboard at that point — before the pass's first Tab what had it then, after it what the
 //!   Tab gave it to — so Enter on a focused button is that button's press, and one after a
-//!   Shift+Tab or an arrow that moves the keyboard (egui moves it later) is dropped; only the plan
-//!   on screen runs: a pass that changed it shows the new one and its Run or Enter is dropped,
-//!   [`CHANGED`] saying so. Space is the kit's, once a press in the pass's order; Esc, Cancel or
-//!   a click outside cancels, and a pass that both cancels and runs cancels.
+//!   Shift+Tab or an arrow that moves the keyboard (egui moves it later) is dropped, a Space too;
+//!   only what the screen showed runs: a Run or an Enter runs when what would run is what the
+//!   pass before painted, else it is dropped and [`CHANGED`] says so. Space is the kit's, once a
+//!   press in the pass's order; Esc, Cancel or a click outside cancels, and a pass that both
+//!   cancels and runs cancels.
 
 use super::menu::{self, Target};
 use crate::git::actions::{
@@ -673,9 +674,25 @@ pub struct ActionDialog {
     plan_first: Option<egui::Id>,
     /// In cells: the first of the plan's rows shown.
     plan_top: usize,
-    /// In cells: a Run or an Enter came in a pass that changed the plan, and was not acted on —
-    /// the hint says the plan changed and Enter runs it.
+    /// In cells: a Run or an Enter came when what would run was not what the screen showed, and
+    /// was not acted on — the hint says the plan changed and Enter runs it.
     changed: bool,
+    /// In cells: what the last pass painted, which the owner saw when they pressed this pass's
+    /// keys — `None` until a pass has painted where it can be seen (egui lays a new modal out
+    /// unseen the first time).
+    on_screen: Option<OnScreen>,
+    /// In cells: a pass has laid the box out (the next one paints where it can be seen).
+    laid_once: bool,
+}
+
+/// What a pass of an action's dialog in cells painted: the draft, its plan's rows and whether its
+/// Run was on. A Run or an Enter runs only what the screen showed: the last pass's, equal to what
+/// would run at this pass's end.
+#[derive(Debug, Clone, PartialEq)]
+struct OnScreen {
+    draft: Action,
+    plan: Vec<PlanRow>,
+    runs: bool,
 }
 
 fn dialog_id() -> egui::Id {
@@ -835,6 +852,8 @@ impl ActionDialog {
             plan_first: None,
             plan_top: 0,
             changed: false,
+            on_screen: None,
+            laid_once: false,
         }))
     }
 
@@ -1110,11 +1129,21 @@ impl ActionDialog {
             buttons.push(Button::new(PLAN_FIRST, plan_first_id()));
         }
         parts.push(Part::Buttons(buttons));
-        parts.push(match self.changed {
+        // Said only while what shows can run.
+        parts.push(match self.changed && fits && self.ready() {
             true => Part::Text(CHANGED.to_string(), Ink::Text),
             false => Part::Text(HINT.to_string(), Ink::Weak),
         });
         kit::layout(grid, &title, NOMINAL, &parts)
+    }
+
+    /// What a pass paints as the dialog stands now, the box `fits` its grid or not.
+    fn painted(&self, fits: bool) -> OnScreen {
+        OnScreen {
+            draft: self.form.draft.clone(),
+            plan: self.plan_lines(),
+            runs: fits && self.ready(),
+        }
     }
 
     /// One pass in cells (see the module's notes).
@@ -1131,8 +1160,11 @@ impl ActionDialog {
             .any(|n| began == Some(field_id(n)));
         let enters = take_enters(ctx, began.is_some() && !in_field);
         let (layout, fits) = self.layout(grid, &controls);
-        // What the screen shows this pass: only this draft, its Run on, may run.
-        let (shown, runs) = (self.form.draft.clone(), fits && self.ready());
+        // What the owner saw (the last pass's painting), and what this pass paints.
+        let seen = self.on_screen.take();
+        if std::mem::replace(&mut self.laid_once, true) {
+            self.on_screen = Some(self.painted(fits));
+        }
         // The form's first text field takes the keyboard when it shows anew, or while nothing
         // has it.
         let typing = (controls.iter()).any(|c| c.text_field() == Some(0));
@@ -1175,14 +1207,18 @@ impl ActionDialog {
         if !ran {
             return None;
         }
-        // Only the plan the screen showed runs: a pass that changed it shows the new one, and
-        // its Run or Enter waits for the next (round 1).
-        if self.form.draft != shown {
-            self.changed = true;
+        // Only what the screen showed runs: what would run now — this pass's options, a refresh's
+        // plan, reads that came — is what the last pass painted, its Run on; else the screen shows
+        // it now and the next Run or Enter runs it.
+        let wide = cells::ambiguous_wide(ctx);
+        let (_, fits_now) = self.layout(grid, &self::controls(&self.form, wide));
+        let end = self.painted(fits_now);
+        if seen.as_ref() != Some(&end) {
+            self.changed |= seen.is_some();
             ctx.request_repaint();
             return None;
         }
-        if runs && self.ready() {
+        if end.runs {
             let dont_ask_again =
                 self.form.dont_ask && matches!(self.form.draft, Action::Checkout { .. });
             return Some(DialogEnd::Run {
@@ -1289,7 +1325,8 @@ pub(super) fn plan_part(rows: Vec<PlanRow>, grid: Grid, width: usize, top: usize
 /// has the keyboard then. egui moves the keyboard for a Shift+Tab only on the next pass and for an
 /// arrow at the pass's end, where an Enter after it in the pass cannot follow: in a pass with one,
 /// an Enter after a move is taken and dropped, and the owner presses it again on what now shows
-/// the keyboard (round 1).
+/// the keyboard (round 1) — a Space too, with its text, which a button or a choice the keyboard is
+/// leaving would take (fix-check).
 fn take_enters(ctx: &egui::Context, arrows_move: bool) -> Vec<bool> {
     let arrow = |key: &Key| {
         matches!(
@@ -1316,20 +1353,36 @@ fn take_enters(ctx: &egui::Context, arrows_move: bool) -> Vec<bool> {
     };
     ctx.input_mut(|i| {
         let later = i.events.iter().any(|e| moves(e) == Some(true));
-        let (mut moved, mut out) = (false, Vec::new());
-        i.events.retain(|e| match e {
-            egui::Event::Key {
-                key: Key::Enter,
-                pressed: true,
-                modifiers,
-                ..
-            } if Mods::None.matches(*modifiers) => {
+        let (mut moved, mut out, mut typed) = (false, Vec::new(), false);
+        i.events.retain(|e| match (e, std::mem::take(&mut typed)) {
+            (egui::Event::Text(text), true) if text == " " => false,
+            (
+                egui::Event::Key {
+                    key: Key::Enter,
+                    pressed: true,
+                    modifiers,
+                    ..
+                },
+                _,
+            ) if Mods::None.matches(*modifiers) => {
                 if !(moved && later) {
                     out.push(moved);
                 }
                 false
             }
-            e => {
+            (
+                egui::Event::Key {
+                    key: Key::Space,
+                    pressed: true,
+                    modifiers,
+                    ..
+                },
+                _,
+            ) if moved && later && Mods::None.matches(*modifiers) => {
+                typed = true;
+                false
+            }
+            (e, _) => {
                 moved |= moves(e).is_some();
                 true
             }

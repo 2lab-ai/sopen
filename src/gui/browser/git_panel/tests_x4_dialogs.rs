@@ -11,8 +11,8 @@ use super::dialogs::{self, ActionDialog, DialogEnd, Opened, Planner, Prefill};
 use super::menu::Target;
 use super::tests_s3::repo;
 use crate::git::actions::{
-    Action, ActionId, ConfigScope, Confirmation, Overwrite, Plan, Proceed, PushOptions, Refused,
-    Remote, RemoteChange, Repo, Step,
+    Action, ActionId, ConfigScope, Confirmation, Need, Overwrite, Plan, Proceed, PushOptions,
+    Refused, Remote, RemoteChange, Repo, Step,
 };
 use crate::git::backup::{RestoreEntry, RestoreHow, Subject, Value};
 use crate::git::model::{
@@ -268,6 +268,15 @@ impl Fx {
     fn frame(&mut self, events: Vec<Event>) {
         self.drv.frame(&mut self.host, events, Modifiers::NONE);
         self.idle(1);
+    }
+
+    /// One pass with `events` and no other: what the owner saw is the pass before.
+    fn raw(&mut self, events: Vec<Event>) {
+        self.drv.frame(&mut self.host, events, Modifiers::NONE);
+    }
+
+    fn dialog_mut(&mut self) -> &mut ActionDialog {
+        self.host.dialog.as_mut().expect("still open")
     }
 
     fn press(&mut self, key: Key) {
@@ -657,8 +666,8 @@ fn literal(action: &Action, repo: &Repo) -> Result<Plan, Refused> {
 }
 
 /// Only the plan on screen runs: Space on Fetch's "Prune" and Enter in one pass change the plan,
-/// so nothing runs — the plan now shows the prune and the hint says it changed — and the next
-/// Enter runs it with the prune; a click on Run runs the plan shown.
+/// so nothing runs — the plan now shows the prune and the hint says it changed — and a click on
+/// Run then runs it with the prune.
 #[test]
 fn x4d_a_pass_that_changes_the_plan_does_not_run() {
     let d = open(A::Fetch, Target::Repository, &dirty(), literal);
@@ -678,7 +687,7 @@ fn x4d_a_pass_that_changes_the_plan_does_not_run() {
     );
     assert!(all.contains(dialogs::CHANGED), "{all}");
     assert_eq!(pen_of(&l, dialogs::CHANGED), text_pen());
-    fx.press(Key::Enter);
+    fx.click("[ Run ]");
     assert_eq!(
         fx.host.ends,
         [DialogEnd::Run {
@@ -688,6 +697,173 @@ fn x4d_a_pass_that_changes_the_plan_does_not_run() {
             },
             dont_ask_again: false
         }]
+    );
+}
+
+/// The read a plan waits for (a stand-in of `git::actions::needs`' words).
+fn ls_files() -> Need {
+    Need(vec!["ls-files".into(), "--others".into()])
+}
+
+/// A planner whose plan names the untracked files it reads, refused until that read is in, as the
+/// real one waits for its reads (`not read yet`).
+fn reads(action: &Action, repo: &Repo) -> Result<Plan, Refused> {
+    let read = repo
+        .seen
+        .get(&ls_files())
+        .map(|o| String::from_utf8_lossy(o).to_string());
+    let Some(read) = read else {
+        return Err(Refused("not read yet: git ls-files --others".into()));
+    };
+    let mut p = fake(action, repo)?;
+    if let Some(c) = &mut p.confirm {
+        c.changes = vec![format!("removes {}", read.trim())];
+    }
+    Ok(p)
+}
+
+fn with_read(files: &str) -> Repo {
+    let mut r = dirty();
+    r.seen.put(ls_files(), files.as_bytes().to_vec());
+    r
+}
+
+/// Fix-check: what runs is what the last pass painted — the frame the owner saw — never only this
+/// pass's layout. Each in raw passes, none between: a refresh in the pass of an Enter (its plan
+/// another), reads landing in it (the frame before said `not read yet`, Run off), an option in one
+/// pass and Enter in the next (that frame painted the old plan beside the new `[X]`), and Enter in
+/// the dialog's first passes (nothing of it seen) — each runs nothing, and the next Enter runs
+/// what shows then.
+fn ran(fx: &Fx) -> bool {
+    matches!(&fx.host.ends[..], [DialogEnd::Run { .. }])
+}
+
+#[test]
+fn x4d_only_what_the_last_pass_painted_runs_a_refresh_in_the_pass() {
+    // A refresh with another plan, in the pass of the Enter.
+    let d = open(A::Clean, Target::Uncommitted, &with_read("a.txt"), reads);
+    let mut fx = Fx::new(d, reads, 100, 30);
+    assert!(rows(&fx.boxed("Fake clean"))
+        .join("\n")
+        .contains("removes a.txt"));
+    fx.dialog_mut().set_repo(with_read("a.txt b.txt"));
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(fx.host.ends.is_empty(), "refresh: {:?}", fx.host.ends);
+    assert!(rows(&fx.boxed("Fake clean"))
+        .join("\n")
+        .contains("removes a.txt b.txt"));
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(ran(&fx), "the plan shown: {:?}", fx.host.ends);
+}
+
+#[test]
+fn x4d_only_what_the_last_pass_painted_runs_reads_landing_in_the_pass() {
+    // Reads landing in the pass of the Enter: the frame before showed the refusal, Run off.
+    let d = open(A::Clean, Target::Uncommitted, &dirty(), reads);
+    let mut fx = Fx::new(d, reads, 100, 30);
+    let l = fx.boxed("Remove untracked files");
+    assert_eq!(pen_of(&l, "[ Run ]"), weak_pen());
+    fx.dialog_mut().set_repo(with_read("a.txt"));
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(fx.host.ends.is_empty(), "reads: {:?}", fx.host.ends);
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(ran(&fx), "{:?}", fx.host.ends);
+}
+
+#[test]
+fn x4d_only_what_the_last_pass_painted_runs_an_option_then_enter() {
+    // An option in one pass, Enter in the next.
+    let d = open(A::Fetch, Target::Repository, &dirty(), literal);
+    let mut fx = Fx::new(d, literal, 100, 30);
+    fx.focus(choice_id(dialogs::row_id(0), 0));
+    fx.raw(space());
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(
+        fx.host.ends.is_empty(),
+        "the frame showed the old plan: {:?}",
+        fx.host.ends
+    );
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(
+        matches!(
+            &fx.host.ends[..],
+            [DialogEnd::Run {
+                action: Action::Fetch { prune: true, .. },
+                ..
+            }]
+        ),
+        "{:?}",
+        fx.host.ends
+    );
+}
+
+#[test]
+fn x4d_only_what_the_last_pass_painted_runs_not_in_the_first_passes() {
+    // Enter in the dialog's first passes: the first lays it out unseen, so the second's keys were
+    // pressed with nothing of it on screen.
+    let stash = Target::Stash(stash_row());
+    let mut fx = Fx {
+        drv: Driver::new(800.0, 480.0),
+        host: Host {
+            dialog: Some(open(A::StashDrop, stash, &repo(), fake)),
+            planner: fake,
+            ends: Vec::new(),
+            covers: Vec::new(),
+        },
+    };
+    fx.raw(vec![down(Key::Enter)]);
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(fx.host.ends.is_empty(), "first passes: {:?}", fx.host.ends);
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(ran(&fx), "{:?}", fx.host.ends);
+}
+
+/// `the plan changed` is said only while what shows can run: once the plan is refused again the
+/// hint is the plain one.
+#[test]
+fn x4d_the_changed_hint_shows_only_while_run_is_on() {
+    let d = open(A::Clean, Target::Uncommitted, &with_read("a.txt"), reads);
+    let mut fx = Fx::new(d, reads, 100, 30);
+    fx.dialog_mut().set_repo(with_read("a.txt b.txt"));
+    fx.raw(vec![down(Key::Enter)]);
+    fx.idle(1);
+    let shown = rows(&fx.boxed("Fake clean")).join("\n");
+    assert!(shown.contains(dialogs::CHANGED), "{shown}");
+    fx.dialog_mut().set_repo(dirty());
+    fx.idle(2);
+    let shown = rows(&fx.boxed("Remove untracked files")).join("\n");
+    assert!(shown.contains("not read yet"), "{shown}");
+    assert!(!shown.contains(dialogs::CHANGED), "{shown}");
+    assert!(shown.contains("Enter runs · Esc cancels"), "{shown}");
+}
+
+/// Fix-check: a Space after an arrow that moves the keyboard in the same pass presses nothing —
+/// egui moves the keyboard at the pass's end, so the button or choice it leaves never takes it:
+/// `[→, Space]` on a focused `[ Run ]` runs nothing and leaves the keyboard on Cancel; `[↑, Space]`
+/// on Run, a choice above it, turns nothing.
+#[test]
+fn x4d_a_space_after_an_arrow_presses_nothing() {
+    let stash = Target::Stash(stash_row());
+    let d = open(A::StashDrop, stash, &repo(), fake);
+    let mut fx = Fx::new(d, fake, 100, 30);
+    fx.focus(dialogs::run_id());
+    let mut events = vec![down(Key::ArrowRight)];
+    events.extend(space());
+    fx.frame(events);
+    assert!(fx.host.ends.is_empty(), "{:?}", fx.host.ends);
+    assert_eq!(fx.focused(), Some(dialogs::cancel_id()));
+
+    let d = open(A::Clean, Target::Uncommitted, &dirty(), fake);
+    let mut fx = Fx::new(d, fake, 100, 30);
+    fx.focus(dialogs::run_id());
+    let mut events = vec![down(Key::ArrowUp)];
+    events.extend(space());
+    fx.frame(events);
+    assert!(fx.host.ends.is_empty(), "{:?}", fx.host.ends);
+    assert_eq!(
+        fx.draft(),
+        Action::Clean { folders: true },
+        "turned nothing"
     );
 }
 
