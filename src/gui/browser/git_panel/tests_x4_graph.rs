@@ -771,7 +771,11 @@ fn every_part_of_the_panel_is_cells_with_no_box() {
     assert!(fx.view().find_text().is_some());
     let rows = u16::try_from(fx.view().banner.as_ref().unwrap().rows()).unwrap();
     let boxes: Vec<Cells> = compose(&fx).into_iter().filter(|r| r.y < g.rows).collect();
-    assert_eq!(boxes, Vec::<Cells>::new(), "the banner and Find's row are cells");
+    assert_eq!(
+        boxes,
+        Vec::<Cells>::new(),
+        "the banner and Find's row are cells"
+    );
     assert!(line(&fx, 1).contains("rebase in progress"), "the banner");
     assert!(
         line(&fx, rows + 2).contains("Uncommitted changes (2)"),
