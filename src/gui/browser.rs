@@ -154,6 +154,7 @@ pub(crate) fn open_on(
     };
     let mut browser = Browser::new(start);
     browser.scripted(&hooks.state);
+    browser.whole_sizes = hooks.cells.is_some();
     browser.script = script.into();
     let leftover = browser.leftover.clone();
     let run = run(&title, browser);
@@ -643,16 +644,42 @@ enum TreeModel {
 impl TreeSide {
     /// Nothing is on its way that a receipt waits for: the rows are on screen, 05 §5 has run to
     /// its end (or the tree has said why it has none), no link is being resolved. Listings
-    /// further away and scans go on (`~/Library` and tag rows never get counts).
-    fn settled(&self) -> bool {
+    /// further away and scans go on (`~/Library` and tag rows never get counts) — unless `whole`
+    /// (a `SOPEN_CELLS` run, X4-tree): then also every row's sizes are final ([`still_counting`]),
+    /// so the receipt holds no moving mark; `SOPEN_WATCHDOG` caps that wait.
+    fn settled(&self, whole: bool) -> bool {
         match &self.model {
             TreeModel::Connecting(_) => false,
             TreeModel::Open(model) => {
                 self.target.is_none()
-                    && (model.error().is_some() || model.built() && self.told.is_some())
+                    && (model.error().is_some()
+                        || model.built()
+                            && self.told.is_some()
+                            && !(whole && still_counting(model, self.told)))
             }
         }
     }
+}
+
+/// Whether a row of the tree is still being counted: a deep scan runs on it (its moving mark,
+/// 05 §6.3), or a folder on screen (`told`: what the model was last told of it) has neither its
+/// counts nor a tag yet — its listing is on its way, and its scan may follow it (phase 3 sizes a
+/// row once it is listed, so "no row scanning" alone can hold while one is still to start). A
+/// row the rules never list unasked (05 §4 H3: `~/Library`, `~/.Trash`, which on macOS are hidden
+/// and so grouped unless their row is opened) reads the same: such a run ends at its watchdog.
+/// Read from the model as it is now — it has been told the screen since the rows were mapped.
+fn still_counting(
+    model: &crate::tree::Tree,
+    told: Option<(usize, usize, Option<crate::tree::RowId>)>,
+) -> bool {
+    use crate::tree::{RowKind, Size};
+    let rows = model.rows();
+    let scanning = (rows.iter()).any(|r| matches!(r.info.size, Size::Bytes { scanning: true, .. }));
+    let (top, height) = told.map_or((0, 0), |(top, height, _)| (top, height));
+    let unread = (rows.iter().skip(top).take(height)).any(|r| {
+        r.kind == RowKind::Folder && r.info.dirs.is_none() && !matches!(r.info.size, Size::Tag(_))
+    });
+    scanning || unread
 }
 
 /// The rows the tree has room for beyond the list's: it has no column heads, rule or foot (its
@@ -930,6 +957,9 @@ pub(crate) struct Browser {
     script_gap: u8,
     /// The directory tree, while it is open (F10, 05).
     tree: Option<TreeSide>,
+    /// A `SOPEN_CELLS` run (X4-tree): the tree settles once every row's sizes are final, so its
+    /// receipt holds them and no moving mark ([`TreeSide::settled`]).
+    whole_sizes: bool,
     /// Makes the tree's worker (05 §6.4).
     tree_connect: TreeConnect,
     /// The tree's host as its per-process cache knows it: empty on this machine, else `label`.
@@ -1092,6 +1122,7 @@ impl Browser {
             script: VecDeque::new(),
             script_gap: 0,
             tree: None,
+            whole_sizes: false,
             tree_connect,
             tree_host,
             git,
@@ -2357,14 +2388,17 @@ impl Browser {
         }
     }
 
-    /// The tree's side: the view drawn (its clicks carried out), then the model told what is on
-    /// screen when that changed — phase 2 lists around it, phase 3 sizes on it (05 §6.3). Called
-    /// only while the tree is open ([`Browser::panels_ui`] lists the side otherwise).
-    fn tree_ui(&mut self, ui: &mut egui::Ui, rect: Rect) {
+    /// The tree's side at cells `side` of `grid`: the view drawn in cells — those under a dialog
+    /// of the list's and under the key help blanked first (10 §4, X4-tree) — its clicks carried
+    /// out, then the model told what is on screen when that changed — phase 2 lists around it,
+    /// phase 3 sizes on it (05 §6.3). Called only while the tree is open
+    /// ([`Browser::panels_ui`] lists the side otherwise).
+    fn tree_ui(&mut self, ui: &mut egui::Ui, grid: &Grid, side: cells::Cells) {
+        let under = self.ops.covered(grid);
         let Some(t) = self.tree.as_mut() else {
             return;
         };
-        let mut actions = tree::draw(ui, rect, &mut t.view, true);
+        let mut actions = tree::draw(ui, grid, side, &mut t.view, true, &under);
         if self.ops.holds_keyboard() {
             // A file operation's dialog is the owner's now, as in the list.
             actions.clear();
@@ -2690,7 +2724,7 @@ impl Browser {
                         self.page_failed = Some(why);
                     }
                 }
-                Some(view::Content::Tree) if self.tree.is_some() => self.tree_ui(ui, rect),
+                Some(view::Content::Tree) if self.tree.is_some() => self.tree_ui(ui, &grid, side),
                 Some(view::Content::Git(top)) => self.git_ui(ui, i, rect, &top),
                 _ => self.panel_cells(ui, i, &grid, side),
             }
@@ -2816,7 +2850,7 @@ impl Browser {
             && (!self.ops.busy() || self.ops.waiting().is_some())
             // The delete dialog is settled once it says where things go.
             && !self.ops.checking_trash()
-            && self.tree.as_ref().is_none_or(TreeSide::settled)
+            && (self.tree.as_ref()).is_none_or(|t| t.settled(self.whole_sizes))
             && self.git.settled(
                 &self.panels[self.active].dir,
                 self.shown.as_ref().map_or(&[], |s| s.as_slice()),
@@ -3271,7 +3305,10 @@ impl Window for Browser {
             || self.preview.busy()
             || self.ops.busy()
             || self.trash_wait.is_some()
-            || self.tree.as_ref().is_some_and(|t| !t.settled())
+            || self
+                .tree
+                .as_ref()
+                .is_some_and(|t| !t.settled(self.whole_sizes))
             || self.git.busy();
         if working {
             ctx.request_repaint_after(Duration::from_millis(100));

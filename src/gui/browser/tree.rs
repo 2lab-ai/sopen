@@ -1,7 +1,8 @@
 //! The directory tree as a side's content (05 §1, §3, §6.1): in place of the active panel's list
 //! (02 §3.1 O4), its rows, the bar, the keys of the tree's context ([`super::keys`]) and its F-key
 //! row (`1Help` and `10Tree`), drawn in the look of [`crate::gui::chrome::tree`] from the model of
-//! [`crate::tree`].
+//! [`crate::tree`] — in cells (10 §4, X4-tree), so the window and the terminal show the same
+//! cells: every width a count of cells (unicode-width), a Hangul name two cells a glyph.
 //!
 //! It draws from an input of its own, not from the model: a [`TreeView`] holding one [`TreeRow`]
 //! per drawn row, the bar and the status row's words. The integration (S5-C) builds the rows from
@@ -11,11 +12,12 @@
 //! integration: it maps [`crate::tree::Row`]s to [`TreeRow`]s every pass.
 
 use super::keys::{self, Command, Context, Mods, Step, Trigger};
+use crate::gui::cells::{self, Buffer, Cells, Grid, Pen};
 use crate::gui::chrome::tree::{self as look, LOOK};
 use crate::gui::chrome::{self, FKey};
-use crate::gui::Status;
+use crate::gui::{help, Status};
 use crate::tree as model;
-use eframe::egui::{self, Color32, Pos2, Rect, Sense, Vec2};
+use eframe::egui::{self, Color32, Sense};
 use std::time::Duration;
 
 /// What the tree hands the browser when it is done (02 §7, 05 §1).
@@ -517,19 +519,44 @@ fn info_pieces(row: &TreeRow, info: Color32) -> [Option<(String, Color32)>; 3] {
     ]
 }
 
-/// The tree in `rect` (05 §1, §3, §6.1): its frame titled with the root, a row a cell tall each —
-/// the glyph, the name two cells deeper a level, the info line's columns at the right — the bar,
-/// and the scroll bar on the right border. A click puts the bar on a row, a double click is Enter
-/// there and the wheel scrolls the rows, as in the list; what they ask of the model is returned.
-pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut TreeView, active: bool) -> Vec<TreeAction> {
+/// One of the tree's own glyphs as this pass's screen shows it: in a terminal that draws a glyph
+/// of ambiguous width in two cells (`wide`), 10 §10's stand-in — `▼` `v`, `→` `>`, `·` and `•`
+/// `.` — put here, where the glyph is known to be the tree's: the printer could not tell it from
+/// a letter of a folder's name (10 §10, as built; T38). `►` and `∙` are one cell everywhere.
+fn glyph(c: char, wide: bool) -> String {
+    let mut utf8 = [0u8; 4];
+    let s: &str = c.encode_utf8(&mut utf8);
+    match crate::gui::term::narrow(s).filter(|_| wide) {
+        Some(stand_in) => stand_in.to_string(),
+        None => s.to_string(),
+    }
+}
+
+/// The tree at cells `side` of `grid` (05 §1, §3, §6.1), written into a buffer of the side's cells
+/// and painted by [`cells::paint`]: its frame titled with the root, a row a cell tall each — the
+/// glyph, the name two cells deeper a level and cut by cells (a wide glyph never split), the info
+/// line's columns right-aligned at the right, the scan's mark in the last cell — the bar, and the
+/// scroll bar on the right border. The cells `under` a dialog of the list's, and under the key
+/// help, are blanked first (cells.rs: one buffer over another). A click puts the bar on a row, a
+/// double click is Enter there and the wheel scrolls the rows, as in the list (`list_cells.rs`):
+/// each row an `interact` rect at its cells; what they ask of the model is returned.
+pub fn draw(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    side: Cells,
+    view: &mut TreeView,
+    active: bool,
+    under: &[Cells],
+) -> Vec<TreeAction> {
     let ctx = ui.ctx().clone();
+    let p = chrome::PALETTE;
+    let rect = grid.rect(side);
     let painter = ui.painter_at(rect);
-    let inner = chrome::panel_frame(&painter, rect, &view.title, active);
-    let font = chrome::mono(ui);
-    let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-    // Rows touch, a cell apart, as on a text screen.
-    let row_h = text_h.ceil();
-    let visible = ((inner.height() / row_h).floor() as usize).max(1);
+    let mut buf = Buffer::empty(side);
+    let inner = cells::frame(&mut buf, side, &view.title, active);
+    // The side's body under its cells, as the list fills its own.
+    painter.rect_filled(rect, 0.0, p.back);
+    let visible = usize::from(inner.height).max(1);
     // The wheel scrolls the rows (the bar stays where it is).
     if super::pointer_on_pane(ui, rect) {
         let lines: f32 = ctx.input(|i| {
@@ -537,7 +564,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut TreeView, active: bool) ->
                 .iter()
                 .map(|e| match e {
                     egui::Event::MouseWheel { unit, delta, .. } => match unit {
-                        egui::MouseWheelUnit::Point => -delta.y / row_h,
+                        egui::MouseWheelUnit::Point => -delta.y / chrome::CELL.y,
                         _ => -delta.y * 3.0,
                     },
                     _ => 0.0,
@@ -548,28 +575,32 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut TreeView, active: bool) ->
         view.top = (view.top as f32 + lines).round().clamp(0.0, max_top as f32) as usize;
     }
     view.settle(visible);
-    let chars = (inner.width() / cw).floor().max(0.0) as isize;
+    let chars = inner.width as isize;
     let counted = chars >= COUNTED as isize;
-    let x = |cells: isize| inner.left() + cw * cells as f32;
+    // Cell `c` of the room inside the frame, on the grid; `None` left of it.
+    let x = |c: isize| u16::try_from(c).ok().map(|c| inner.x.saturating_add(c));
+    let wide = cells::ambiguous_wide(&ctx);
     let now = ctx.input(|i| i.time);
     let step = (now / look::SCAN_STEP).floor();
     let mark = look::SCAN_MARKS[step as usize % look::SCAN_MARKS.len()];
     let mut scanning = false;
     let mut clicked = None;
     for (k, at) in (view.top..view.rows.len()).take(visible).enumerate() {
-        let row = &view.rows[at];
-        let y = inner.top() + row_h * k as f32;
-        let row_rect =
-            Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(inner.width(), row_h));
-        let on_bar = at == view.bar;
-        if on_bar {
-            chrome::bar(&painter, row_rect, active);
+        if k >= usize::from(inner.height) {
+            break;
         }
-        let paint = |c: Color32| if on_bar && active { LOOK.on_bar } else { c };
-        let dim = row.hidden || matches!(row.kind, RowKind::Hidden(_));
-        let text = |cell: isize, align: egui::Align2, s: &str, c: Color32| {
-            painter.text(Pos2::new(x(cell), y), align, s, font.clone(), paint(c));
+        let row = &view.rows[at];
+        let y = inner.y + k as u16;
+        let row_cells = Cells::new(inner.x, y, inner.width, 1);
+        let on_bar = at == view.bar;
+        let back = match (on_bar, active) {
+            (false, _) => p.back,
+            (true, true) => p.bar,
+            (true, false) => p.bar_idle,
         };
+        cells::fill(&mut buf, row_cells, Pen::new(p.text, back));
+        let pen = |c: Color32| Pen::new(if on_bar && active { LOOK.on_bar } else { c }, back);
+        let dim = row.hidden || matches!(row.kind, RowKind::Hidden(_));
         // The info line, from the right: each piece right-aligned in its column, a wider one
         // moving the pieces to its left.
         let [dirs, files, size] = info_pieces(row, if dim { LOOK.hidden } else { LOOK.info });
@@ -579,62 +610,51 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut TreeView, active: bool) ->
         for (width, piece) in slots.into_iter().take(if counted { 3 } else { 1 }) {
             let mut left = edge - width;
             if let Some((s, c)) = piece {
-                left = left.min(edge - s.chars().count() as isize);
-                text(edge, egui::Align2::RIGHT_TOP, &s, c);
+                let w = cells::width(&s) as isize;
+                left = left.min(edge - w);
+                if let (Some(end), true) = (x(edge), edge - w >= 0) {
+                    cells::put_right(&mut buf, end, y, &s, pen(c));
+                }
             }
             info_left = left;
             edge = left - GAP;
         }
         if row.info.scanning {
             scanning = true;
-            text(
-                chars - 1,
-                egui::Align2::LEFT_TOP,
-                &mark.to_string(),
-                LOOK.mark,
-            );
+            if let Some(at) = x(chars - 1) {
+                cells::put(&mut buf, at, y, &glyph(mark, wide), 1, pen(LOOK.mark));
+            }
         }
         // The glyph and the name, a blank cell before the info line at least; a row deeper
         // than the side has room for sits at the deepest indent that leaves its name its cells.
         let name_end = info_left - 1;
         let depth = isize::try_from(row.depth).unwrap_or(isize::MAX);
         let indent = depth.saturating_mul(2).min((name_end - 2 - NAME).max(0));
-        let name_color = if dim { LOOK.hidden } else { LOOK.name };
-        let clip = Rect::from_min_max(
-            Pos2::new(x(indent).min(x(name_end)), y),
-            Pos2::new(x(name_end), y + row_h),
-        );
+        let name_pen = pen(if dim { LOOK.hidden } else { LOOK.name });
         let (name, name_at) = match row.kind {
             RowKind::Hidden(n) => {
                 let s = if n == 1 { "" } else { "s" };
-                (format!("{} {n} hidden folder{s}", look::HIDDEN), indent)
+                let dot = glyph(look::HIDDEN, wide);
+                (format!("{dot} {n} hidden folder{s}"), indent)
             }
             _ => (row.name.clone(), indent + 2),
         };
-        let glyph = match (row.kind, row.fold) {
+        let mark_of = match (row.kind, row.fold) {
             (RowKind::Link, _) => Some(look::LINK),
             (RowKind::Hidden(_), _) | (_, Fold::Leaf) => None,
             (_, Fold::Open | Fold::AutoOpened) => Some(look::OPEN),
             (_, Fold::Closed) => Some(look::CLOSED),
         };
-        let room = (x(name_end) - x(name_at)).max(0.0);
-        let shown = chrome::fit_start(&ctx, &name, &font, room);
-        let clipped = painter.with_clip_rect(clip.intersect(rect));
-        for (cell, s) in glyph
-            .map(|g| (indent, g.to_string()))
-            .into_iter()
-            .chain([(name_at, shown)])
-        {
-            clipped.text(
-                Pos2::new(x(cell), y),
-                egui::Align2::LEFT_TOP,
-                s,
-                font.clone(),
-                paint(name_color),
-            );
+        if let (Some(g), Some(at)) = (mark_of, x(indent).filter(|_| indent < name_end)) {
+            cells::put(&mut buf, at, y, &glyph(g, wide), 1, name_pen);
+        }
+        let room = usize::try_from(name_end - name_at).unwrap_or(0);
+        if let (Some(at), true) = (x(name_at), room > 0) {
+            let shown = cells::fit_start(&name, room);
+            cells::put(&mut buf, at, y, &shown, room, name_pen);
         }
         let resp = ui.interact(
-            row_rect,
+            grid.rect(row_cells),
             ui.scope_id().with(("sopen-tree", at)),
             Sense::click(),
         );
@@ -646,15 +666,17 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &mut TreeView, active: bool) ->
     }
     // The scroll bar on the right border, beside the rows.
     let max_top = view.rows.len().saturating_sub(visible);
-    let column = Rect::from_min_max(
-        Pos2::new(inner.right(), inner.top()),
-        Pos2::new(inner.right() + chrome::CELL.x, inner.bottom()),
-    );
-    chrome::scroll_bar(
-        &painter,
-        column,
-        (max_top > 0).then(|| view.top as f32 / max_top as f32),
-    );
+    let at = (max_top > 0).then(|| view.top as f32 / max_top as f32);
+    if inner.height > 0 {
+        cells::scroll_bar(&mut buf, inner.right(), inner.y, inner.height, at);
+    }
+    // A dialog or the key help over the tree: the cells under it blank first, so a wide glyph
+    // half under its edge goes as a terminal erases it.
+    let body = Pen::new(p.text, p.back);
+    for r in under.iter().copied().chain(help::covered(&ctx, grid)) {
+        cells::fill(&mut buf, r, body);
+    }
+    cells::paint(&painter, grid.origin, &buf, None);
     if scanning {
         // The mark's next step.
         let next = (step + 1.0) * look::SCAN_STEP - now;
