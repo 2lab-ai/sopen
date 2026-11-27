@@ -696,8 +696,10 @@ non-interactive ssh session on macOS has no Homebrew on PATH, and sopen finds ff
 its own directory first on PATH (brew's ffmpeg sits next to brew's sopen) and Homebrew's bin directories that exist
 appended after the session's own entries. On Linux an ssh session has no display, so when neither DISPLAY nor
 WAYLAND_DISPLAY is set the desktop session's DISPLAY, WAYLAND_DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR,
-DBUS_SESSION_BUS_ADDRESS, XDG_SESSION_TYPE and XDG_CURRENT_DESKTOP (§3: KDE Plasma) are taken from
-`systemctl --user show-environment` — exported by name,
+DBUS_SESSION_BUS_ADDRESS, XDG_SESSION_TYPE and XDG_CURRENT_DESKTOP (§3: KDE Plasma), and KDE_SESSION_VERSION,
+KDE_FULL_SESSION, XDG_SESSION_DESKTOP and DESKTOP_SESSION (an address's `xdg-open` picks `kde-open` by
+KDE_SESSION_VERSION; without it, it falls back to `kfmclient`, missing on Plasma 6, and reports success having
+opened nothing) are taken from `systemctl --user show-environment` — exported by name,
 never evaluated. If that gives none, the first Wayland socket in `/run/user/<uid>` is used, else X display `:0` when
 it exists. HOST's sopen runs as a foreground child of the script, which catches INT, TERM and HUP (sopen itself
 keeps their default handling), so a sopen stopped by a signal comes back as an exit code rather than as a lost
