@@ -575,12 +575,18 @@ one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it has one (Linux
   `document.write` would, the document still the scheme's at its address. A scheme response cannot
   redirect: the page server's heads are 200, 206, 403, 404 and 416 only. **Behind all of it**, the
   commit is checked (`gtk::Home`): a main-frame document committed outside the view's scope is
-  never copied to the screen — the last picture of the view's own stays — and is stopped: the view's
-  page loaded back the first time per load sopen asked for (the view's load, a user's reload), only
-  stopped and said after that, so a page that leaves at every load cannot loop; Cmd/Ctrl+R then
-  loads the view's own page, not the outside one. No input of the tests reached it; with the
-  `about:` refusal taken away by a test hook, a page whose script leaves at every load was sent home
-  once and then stopped, its red on screen throughout (and once more after a reload).
+  stopped — the view's page loaded back the first time per load sopen asked for (the view's load,
+  a user's reload), only stopped and said after that, so a page that leaves at every load cannot
+  loop; Cmd/Ctrl+R then loads the view's own page, not the outside one. Nothing is copied to the
+  screen while such a document is committed, nor after a document of the view's own commits again
+  until the web view draws again (a damage after that commit; a resize or a show alone redraws the
+  surface, which still holds the outside document's last frame) or 150 ms after the load's
+  end — the screen keeps the last picture of the view's own. No input of the tests reached it; with
+  the `about:` refusal taken away by a test hook, a page whose script leaves at every load was sent
+  home once and then stopped, and after a Cmd/Ctrl+R the same again, every picture copied after the
+  page's first being the page's red (five runs; without the redraw wait an outside `about:blank`
+  frame reached the screen after the page came back). An address window whose page leaves for
+  `about:blank` at every load (no hook) does the same.
 - **Only through the view's policy.** WebKit's ways of following a link outside the view's own
   navigation policy are closed on macOS: the link preview (off, §3.2) and the context menu's Open
   … in New Window (gone, §3.2); its Open Link is a click like any other (refused out of the
@@ -801,10 +807,14 @@ within 2 s, else 1 with `… ended while ssh stayed for the browser's connection
   <shown>: port 9 is one WebKit never connects to (a restricted port) — Cmd/Ctrl+R tries again`; after
   that load's own failure a document outside is only stopped; a navigation away from a page on
   screen is sent home once per load sopen asked for (the view's load, an address again, a user's
-  reload), then only stopped and said; a failure after the page was reached never silences the
-  check, and an outside document is never copied to the screen (`gtk::Home`, round 1). An
-  authentication request's line is not said over by WebKit's own failure of the same load (none
-  followed one in the measured cases, HTTP Basic and a client certificate).
+  reload), then only stopped and said; a failure of the page's own (one of its reads, its own
+  reload) never silences the check — a user's Cmd/Ctrl+R that fails with the old page on screen is
+  a load sopen asked for, so that page's next document outside is only stopped (never copied, not
+  said) until a page of the view's commits again; nothing of an outside document reaches the
+  screen, nor its last frame after the view's own page commits again until the web view draws
+  again (`gtk::Home`, rounds 1–2, §3.4). WebKit's own failure after an authentication request's
+  line would say over it — none followed one in the measured cases (HTTP Basic, a client
+  certificate).
 - **Open**: Cmd/Ctrl+R while the page holds the keyboard on macOS reaches the page, not sopen: R is
   not among §2.4's always-sopen keys (`route`, `mod.rs`). Esc takes the keyboard back first.
 

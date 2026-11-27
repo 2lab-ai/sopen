@@ -1563,6 +1563,7 @@ fn wv_b_a_document_outside_the_scheme_is_sent_home_once() {
         "red",
         "the outside document never reaches the screen"
     );
+    only_red_after_red(&shown.view.posted(), "sent home, then stopped");
     // A user's reload: the check starts over.
     shown.seen.clear();
     shown.view.reload();
@@ -1580,10 +1581,63 @@ fn wv_b_a_document_outside_the_scheme_is_sent_home_once() {
     );
     assert_eq!(outs(&shown.seen), 2, "no loop: {:?}", shown.seen);
     assert_eq!(shown.colour(50.0, 50.0), "red");
+    only_red_after_red(&shown.view.posted(), "stopped, then Cmd/Ctrl+R");
     assert!(
         !shown.seen.contains(&Event::Document("about:blank".into())),
         "never said as the document: {:?}",
         shown.seen
+    );
+}
+
+/// The same in an address window, no hook needed: a page whose script leaves for `about:blank`
+/// at every load is sent home once, then stopped; Cmd/Ctrl+R starts over; no picture but the
+/// page's reaches the screen.
+#[test]
+fn wv_b_an_address_window_leaving_for_about_blank_never_shows_it() {
+    let Some((_turn, engine)) =
+        turn("wv_b_an_address_window_leaving_for_about_blank_never_shows_it")
+    else {
+        return;
+    };
+    let server = Http::serving(|_, _| {
+        "<!doctype html><style>body{margin:0;background:#f00}</style>\
+         <script>setTimeout(() => { location = 'about:blank' }, 300)</script>"
+            .to_string()
+    });
+    let origin = format!("http://127.0.0.1:{}", server.port);
+    let mut shown = Shown::address(&engine, &origin);
+    shown.place(100.0, 100.0, 1.0);
+    shown.view.load(&format!("{origin}/"));
+    let out = Event::Refused {
+        target: "about:blank".to_string(),
+        clicked: false,
+    };
+    let outs = |e: &[Event]| e.iter().filter(|e| **e == out).count();
+    shown.until("sent home, then stopped", 10.0, |e| outs(e) >= 2);
+    std::thread::sleep(Duration::from_millis(1500));
+    shown.drain();
+    assert_eq!(outs(&shown.seen), 2, "no loop: {:?}", shown.seen);
+    only_red_after_red(&shown.view.posted(), "address: sent home, then stopped");
+    shown.seen.clear();
+    shown.view.reload();
+    shown.until("after Cmd/Ctrl+R: home, then stopped", 10.0, |e| {
+        outs(e) >= 2
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    shown.drain();
+    assert_eq!(outs(&shown.seen), 2, "no loop: {:?}", shown.seen);
+    only_red_after_red(&shown.view.posted(), "address: stopped, then Cmd/Ctrl+R");
+}
+
+/// Every picture posted after the first red one is red: nothing else reached the screen.
+fn only_red_after_red(posted: &[egui::Color32], what: &str) {
+    let names: Vec<&str> = posted.iter().map(|c| colour_of(*c)).collect();
+    let first = names.iter().position(|c| *c == "red");
+    println!("{what}: posted {names:?}");
+    let first = first.unwrap_or_else(|| panic!("{what}: never red: {names:?}"));
+    assert!(
+        names[first..].iter().all(|c| *c == "red"),
+        "{what}: a picture not the page's reached the screen: {names:?}"
     );
 }
 
@@ -1639,8 +1693,9 @@ fn the_commit_check_fails_once_and_sends_home_once() {
         Out::Home,
         "a new load asked: home once again"
     );
-    // A failure that is not the asked load's (a later read, a reload while the server is down)
-    // never silences the check; a page reached clears it.
+    // A failure that is not a load sopen asked for (one of the page's reads, its own reload)
+    // never silences the check; a page reached clears it. (A user's reload is one sopen asked
+    // for: the engine test below drives it through the real reload command.)
     let mut home = Home::default();
     home.asked();
     home.reached();
@@ -1659,20 +1714,6 @@ fn the_commit_check_fails_once_and_sends_home_once() {
         home.commit_out(),
         Out::Home,
         "a failure after the page was reached: home"
-    );
-    // A user's reload is a load sopen asked for: the check starts over.
-    let mut home = Home::default();
-    home.asked();
-    home.reached();
-    assert_eq!(home.commit_out(), Out::Home);
-    home.reached();
-    assert_eq!(home.commit_out(), Out::Stop);
-    home.asked();
-    home.reached();
-    assert_eq!(
-        home.commit_out(),
-        Out::Home,
-        "after a reload: home once again"
     );
     // What the line shows of the address is redacted where it is made.
     let why = not_reached(None, "http://user:pw@127.0.0.1:8080/x?token=SECRET");

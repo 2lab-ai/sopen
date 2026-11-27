@@ -64,11 +64,13 @@
 //!   view's `data:` or `blob:` document, an address window's other origin. An address window's
 //!   frames load as in a browser; a click out and a new window out are refused at the policy.
 //!   Behind both, the commit is checked ([`Home`]): a main-frame document committed outside the
-//!   scope is never copied to the screen (the last picture of the view's own stays) and is
-//!   stopped — as the asked load's failure when it never reached its page (a restricted port),
-//!   quietly after that load's own failure, with the view's page loaded back ([`send_home`]) for
-//!   a navigation away once per load sopen asked for, and only said after that. A load sopen asks for outside the scope is
-//!   refused before WebKit sees it. A response the engine cannot show is refused, never
+//!   scope is stopped — as the asked load's failure when it never reached its page (a
+//!   restricted port), quietly after that load's own failure, with the view's page loaded back
+//!   ([`send_home`]) for a navigation away once per load sopen asked for, and only said after
+//!   that — and nothing is copied to the screen while it is committed, nor after a document of
+//!   the view's own commits again until the web view draws again (the surface still holds the
+//!   outside document's last frame) or the load's end. A load sopen asks for outside the scope
+//!   is refused before WebKit sees it. A response the engine cannot show is refused, never
 //!   downloaded, and a download that starts anyway is cancelled.
 
 mod api;
@@ -564,12 +566,14 @@ struct Gview {
     home: Option<String>,
     /// Where that load stands, for the commit's check ([`Home`]).
     homing: Home,
-    /// The document committed is outside the view's scope: nothing of it is copied to the
-    /// screen, which keeps the last picture of the view's own.
+    /// The document committed is outside the view's scope: nothing is copied to the screen,
+    /// which keeps the last picture of the view's own.
     outside: bool,
-    /// An authentication request said this load's failure: WebKit's own failure after it is not
-    /// said over it.
-    asked_auth: bool,
+    /// A document of the view's own committed after an outside one: nothing is copied until the
+    /// web view draws again (a damage after that commit; never a size or a show alone, which
+    /// redraw what the surface holds — the outside document's last frame), or until the load's
+    /// end and [`FINISH_WAIT`] after it.
+    redraw: bool,
     /// The load waiting for the filter.
     pending: Option<String>,
     scale: f32,
@@ -896,7 +900,7 @@ unsafe fn open(api: &'static Api, open: Open) {
             home: None,
             homing: Home::default(),
             outside: false,
-            asked_auth: false,
+            redraw: false,
             pending: None,
             scale: 1.0,
             shown: true,
@@ -1686,7 +1690,6 @@ unsafe extern "C" fn on_load_changed(web: P, event: c_int, data: P) {
             with_view(key, |v| {
                 v.failed = false;
                 v.finishing = false;
-                v.asked_auth = false;
                 v.events.send(Event::Loading);
             });
         }
@@ -1695,6 +1698,11 @@ unsafe extern "C" fn on_load_changed(web: P, event: c_int, data: P) {
             let url = unsafe { text((api.webkit_web_view_get_uri)(web)) };
             let out = with_view(key, |v| {
                 if !commit_out(&v.scope, &url) {
+                    if v.outside {
+                        // What the surface holds is the outside document's: never copied.
+                        v.redraw = true;
+                        v.damaged = false;
+                    }
                     v.outside = false;
                     v.homing.reached();
                     v.events.send(Event::Document(v.scope.document(&url)));
@@ -1784,9 +1792,11 @@ impl Home {
         self.failed = false;
     }
 
-    /// A load failed (WebKit said why): only the load sopen asked for, before it reached its
-    /// page, counts — a later failure (a read of the page's, a reload while the server is down)
-    /// never silences the check.
+    /// A load failed (WebKit said why): only a load sopen asked for, before it reached its page,
+    /// counts — a failure of the page's own (one of its reads, its own reload) never silences
+    /// the check. A user's Cmd/Ctrl+R is a load sopen asked for: when it fails with the old page
+    /// still on screen, that page's next document outside is only stopped (never copied, not
+    /// said) until a page of the view's commits again.
     pub(super) fn failed(&mut self) {
         self.failed |= self.asked;
     }
@@ -1913,6 +1923,8 @@ unsafe extern "C" fn finish_late(data: P) -> GBoolean {
         if v.finishing {
             v.finish_on_copy = true;
             v.damaged = true;
+            // The backstop: no view stays without its picture for want of a draw.
+            v.redraw = false;
         }
     });
     0
@@ -1935,11 +1947,8 @@ unsafe extern "C" fn on_load_failed(
             v.homing.failed();
             v.failed = true;
             v.finishing = false;
-            // An authentication request said why already (its line names what was asked).
-            if !v.asked_auth {
-                v.events
-                    .send(Event::Failed(format!("{message} ({domain} {code})")));
-            }
+            v.events
+                .send(Event::Failed(format!("{message} ({domain} {code})")));
         });
     }
     // WebKit's own error page is not shown: the row says why.
@@ -2088,6 +2097,9 @@ unsafe fn header(headers: P, name: &str) -> Option<String> {
 
 unsafe extern "C" fn on_damage(_widget: P, _event: P, data: P) -> GBoolean {
     with_view(key_of(data), |v| {
+        if !v.outside {
+            v.redraw = false;
+        }
         v.damaged = true;
         if v.finishing {
             v.finish_on_copy = true;
@@ -2114,10 +2126,7 @@ unsafe extern "C" fn on_authenticate(_web: P, request: P, data: P) -> GBoolean {
         (api.webkit_authentication_request_cancel)(request);
         scheme
     };
-    with_view(key_of(data), |v| {
-        v.asked_auth = true;
-        v.events.send(Event::Failed(asks(scheme)));
-    });
+    with_view(key_of(data), |v| v.events.send(Event::Failed(asks(scheme))));
     1
 }
 
@@ -2640,6 +2649,10 @@ struct SharedState {
     seq: u64,
     /// The window the view is painted in: woken at every new picture.
     ctx: Option<egui::Context>,
+    /// The colour at (50, 50) of every picture posted, in order (the tests' record of what
+    /// reached the screen).
+    #[cfg(test)]
+    posted: Vec<egui::Color32>,
 }
 
 #[derive(Clone)]
@@ -2656,6 +2669,10 @@ impl Shared {
 
     fn post(&self, image: egui::ColorImage, scale: f32) {
         let mut state = self.lock();
+        #[cfg(test)]
+        if image.size[0] > 50 && image.size[1] > 50 {
+            state.posted.push(image[(50, 50)]);
+        }
         state.picture = Some(Picture {
             image: Arc::new(image),
             scale,
@@ -2675,7 +2692,7 @@ unsafe fn copy_damaged(api: &Api) {
     let todo: Vec<(u64, P, Arc<Shared>, f32, bool)> = with(|gtk| {
         gtk.views
             .values_mut()
-            .filter(|v| v.damaged && v.shown && !v.outside)
+            .filter(|v| v.damaged && v.shown && !v.outside && !v.redraw)
             .map(|v| {
                 v.damaged = false;
                 let finish = std::mem::take(&mut v.finish_on_copy);
@@ -3237,6 +3254,11 @@ impl GtkView {
     fn picture(&self) -> Option<(Arc<egui::ColorImage>, f32)> {
         let state = self.shared.lock();
         state.picture.as_ref().map(|p| (p.image.clone(), p.scale))
+    }
+
+    /// The colour at (50, 50) of every picture posted so far, in order.
+    fn posted(&self) -> Vec<egui::Color32> {
+        self.shared.lock().posted.clone()
     }
 
     /// The pictures copied so far.
