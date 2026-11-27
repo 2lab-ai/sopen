@@ -1160,6 +1160,11 @@ const DRAIN: Duration = Duration::from_secs(2);
 /// Runs `command` (its stdout and stdin as they are) with its stderr copied to `copy` as it
 /// comes, keeping the tail to name its last line when it fails. `shown` is how the failure
 /// names it. The command's exit is waited for on its own; its stderr only for `drain` more.
+///
+/// Reading and copying are two threads: the reader keeps each chunk in the tail and hands it to
+/// the copier through an unbounded queue, so a copy that blocks (a paused terminal) or crawls
+/// never stops the reading — the failure keeps its last line even when it comes in a later write
+/// than the one the copy is stuck on.
 fn run_passing_stderr(
     mut command: Command,
     shown: String,
@@ -1176,42 +1181,56 @@ fn run_passing_stderr(
         .spawn()
         .map_err(|e| fail(format!("could not start it: {e}"), None))?;
     let tail = Arc::new(Mutex::new(Vec::new()));
-    let (ended, read_to_end) = mpsc::channel::<()>();
-    if let Some(mut pipe) = child.stderr.take() {
-        let tail = Arc::clone(&tail);
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match pipe.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        // Kept first: a copy that blocks (a paused terminal) past the drain
-                        // must not cost the failure its last line.
-                        {
-                            let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
-                            tail.extend_from_slice(&buf[..n]);
-                            if tail.len() > STDERR_TAIL {
-                                let excess = tail.len() - STDERR_TAIL;
-                                tail.drain(..excess);
+    let (chunks, to_copy) = mpsc::channel::<Vec<u8>>();
+    let (read_all, read_to_end) = mpsc::channel::<()>();
+    let (copied_all, copied_to_end) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // A standard error whose reader is gone loses the copy, not the run.
+        for chunk in to_copy {
+            let _ = copy.write_all(&chunk);
+            let _ = copy.flush();
+        }
+        let _ = copied_all.send(());
+    });
+    match child.stderr.take() {
+        Some(mut pipe) => {
+            let tail = Arc::clone(&tail);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match pipe.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            {
+                                let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+                                tail.extend_from_slice(&buf[..n]);
+                                if tail.len() > STDERR_TAIL {
+                                    let excess = tail.len() - STDERR_TAIL;
+                                    tail.drain(..excess);
+                                }
                             }
+                            let _ = chunks.send(buf[..n].to_vec());
                         }
-                        // A standard error whose reader is gone loses the copy, not the run.
-                        let _ = copy.write_all(&buf[..n]);
-                        let _ = copy.flush();
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
                 }
-            }
-            let _ = ended.send(());
-        });
+                // `chunks` goes with this thread: the copier ends once it has copied the rest.
+                let _ = read_all.send(());
+            });
+        }
+        None => drop((chunks, read_all)),
     }
     let status = child
         .wait()
         .map_err(|e| fail(format!("could not wait for it: {e}"), None))?;
-    // Its own output is read by now or within the bound; a pipe still open past it is left to
-    // the reader thread, which ends with the pipe.
-    let _ = read_to_end.recv_timeout(drain);
+    // What it wrote is read and copied by now or within the bound — copied too, so its lines
+    // come before the next of sopen's own. A pipe still open past it, or a copy still stuck, is
+    // left to its thread, which ends with it.
+    let deadline = std::time::Instant::now() + drain;
+    let left = || deadline.saturating_duration_since(std::time::Instant::now());
+    let _ = read_to_end.recv_timeout(left());
+    let _ = copied_to_end.recv_timeout(left());
     if status.success() {
         return Ok(());
     }

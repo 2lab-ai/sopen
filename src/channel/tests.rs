@@ -807,8 +807,9 @@ fn a_child_left_holding_stderr_does_not_hold_the_command() {
     assert_eq!(failed.last_line.as_deref(), Some("b: boom"));
 }
 
-/// A standard error that blocks (a paused terminal) holds the copy, never the failing line:
-/// each chunk is kept before it is passed on.
+/// A standard error that blocks (a paused terminal) holds the copy, never the reading: the
+/// failing line is kept even when it comes in a later write than the one the copy is stuck on
+/// (two writes, apart, as macOS CI delivered one `printf` of two lines).
 #[test]
 fn a_stderr_that_blocks_keeps_the_last_line() {
     /// Every write waits until the test lets go (its sender dropped), then fails.
@@ -825,7 +826,7 @@ fn a_stderr_that_blocks_keeps_the_last_line() {
     let (release, blocked) = std::sync::mpsc::channel::<()>();
     let started = Instant::now();
     let failed = run_passing_stderr(
-        sh("printf 'a\\nb: boom\\n' >&2; exit 3"),
+        sh("printf 'a\\n' >&2; sleep 0.2; printf 'b: boom\\n' >&2; exit 3"),
         "sh".into(),
         Box::new(Blocking(Mutex::new(blocked))),
         DRAIN,
