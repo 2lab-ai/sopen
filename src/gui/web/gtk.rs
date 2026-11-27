@@ -559,6 +559,8 @@ struct Gview {
     ruled: bool,
     /// The view's own page: the last load asked of it, loaded back by the commit's check.
     home: Option<String>,
+    /// Where that load stands, for the commit's check ([`Home`]).
+    homing: Home,
     /// The load waiting for the filter.
     pending: Option<String>,
     scale: f32,
@@ -682,7 +684,10 @@ unsafe fn handle(api: &'static Api, cmd: Cmd) {
         match cmd {
             Cmd::Open(open) => self::open(api, *open),
             Cmd::Close(key) => close(api, key),
-            Cmd::Load(key, url) => load(api, key, url),
+            Cmd::Load(key, url) => {
+                with_view(key, |v| v.homing.asked());
+                load(api, key, url)
+            }
             Cmd::Reload(key) => {
                 let web = with_view(key, |v| v.pending.is_none().then_some(v.web)).flatten();
                 if let Some(web) = web {
@@ -864,6 +869,7 @@ unsafe fn open(api: &'static Api, open: Open) {
             needs_rules,
             ruled: false,
             home: None,
+            homing: Home::default(),
             pending: None,
             scale: 1.0,
             shown: true,
@@ -1660,16 +1666,17 @@ unsafe extern "C" fn on_load_changed(web: P, event: c_int, data: P) {
             // SAFETY: the view's URL, on the GTK thread.
             let url = unsafe { text((api.webkit_web_view_get_uri)(web)) };
             let out = with_view(key, |v| {
-                let out = commit_out(&v.scope, &url);
-                if !out {
+                if !commit_out(&v.scope, &url) {
+                    v.homing.reached();
                     v.events.send(Event::Document(v.scope.document(&url)));
+                    return None;
                 }
-                out
+                Some(v.homing.commit_out())
             })
-            .unwrap_or(false);
-            if out {
+            .flatten();
+            if let Some(out) = out {
                 // SAFETY: on the GTK thread.
-                unsafe { send_home(api, key, web, &url) };
+                unsafe { committed_out(api, key, web, &url, out) };
             }
         }
         api::WEBKIT_LOAD_FINISHED => {
@@ -1702,10 +1709,126 @@ unsafe extern "C" fn on_load_changed(web: P, event: c_int, data: P) {
     }
 }
 
-/// A main-frame document committed outside the view's scope — one the policy and the main
-/// resource's hold both missed: none is known (every input of the tests is held before), so this
-/// is defence in depth. Stopped, said, and the view's own page loaded back (from an idle, outside
-/// the emission).
+/// What the commit's check does with a main-frame document committed outside the view's scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Out {
+    /// The load sopen asked for never reached its page — WebKit showed `about:blank` instead,
+    /// with no failure of its own (measured: a port WebKit refuses): that load failed, said so.
+    Failed,
+    /// A navigation away the policy and the main resource's hold missed: the view's page loaded
+    /// back ([`send_home`]), once per load sopen asked for.
+    Home,
+    /// Again after that: stopped and said, not loaded back (a home that leaves again would loop).
+    Stop,
+    /// The load had failed already (its line said): only stopped.
+    Quiet,
+}
+
+/// Where the last load sopen asked of a view stands, for the commit's check. Pure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Home {
+    /// Asked, and no document of it in the view's scope yet.
+    asked: bool,
+    /// It failed (WebKit's own failure).
+    failed: bool,
+    /// The view was sent home since it was asked.
+    sent: bool,
+}
+
+impl Home {
+    /// sopen asked for a load (not the check's own load back).
+    pub(super) fn asked(&mut self) {
+        *self = Home {
+            asked: true,
+            ..Home::default()
+        };
+    }
+
+    /// A document in the view's scope committed.
+    pub(super) fn reached(&mut self) {
+        self.asked = false;
+    }
+
+    /// The load failed (WebKit said why).
+    pub(super) fn failed(&mut self) {
+        self.failed = true;
+    }
+
+    /// A document outside the view's scope committed: what to do.
+    pub(super) fn commit_out(&mut self) -> Out {
+        if self.failed {
+            return Out::Quiet;
+        }
+        if self.asked {
+            self.asked = false;
+            self.failed = true;
+            return Out::Failed;
+        }
+        if self.sent {
+            return Out::Stop;
+        }
+        self.sent = true;
+        Out::Home
+    }
+}
+
+/// The ports WebKit never connects to: the Fetch standard's bad ports, every one measured on
+/// WebKitGTK 2.52.6 (an address on each committed `about:blank` and failed nothing; 2, 8, 10, 24,
+/// 80, 443, 631, 3000, 5000, 5432, 6001, 6670, 8000, 8080 were tried and connected).
+pub(super) const RESTRICTED_PORTS: [u16; 83] = [
+    0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101,
+    102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427,
+    465, 512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990,
+    993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667,
+    6668, 6669, 6679, 6697, 10080,
+];
+
+/// Why the load of `asked` showed `shown` instead (the line's reason, [`Out::Failed`]): its port
+/// when WebKit refuses it, else what it showed.
+pub(super) fn not_reached(asked: Option<&str>, shown: &str) -> String {
+    let port = asked.and_then(origin).and_then(|o| o.port);
+    match port {
+        Some(port) if RESTRICTED_PORTS.contains(&port) => {
+            format!("port {port} is one WebKit never connects to (a restricted port)")
+        }
+        _ => format!("WebKit showed {shown} instead of the page"),
+    }
+}
+
+/// A main-frame document committed at `url` outside view `key`'s scope, as [`Out`] says.
+///
+/// SAFETY: on the GTK thread; `web` is view `key`'s.
+unsafe fn committed_out(api: &Api, key: u64, web: P, url: &str, out: Out) {
+    if out == Out::Home {
+        // SAFETY: as the caller says.
+        unsafe { send_home(api, key, web, url) };
+        return;
+    }
+    crate::debug!(
+        "page view: a document outside the view committed: {} ({out:?})",
+        crate::url::redacted(url)
+    );
+    // SAFETY: the view's own load.
+    unsafe { (api.webkit_web_view_stop_loading)(web) };
+    with_view(key, |v| match out {
+        Out::Failed => {
+            v.failed = true;
+            v.finishing = false;
+            let why = not_reached(v.home.as_deref(), url);
+            v.events.send(Event::Failed(why));
+        }
+        Out::Stop => v.events.send(Event::Refused {
+            target: url.to_string(),
+            clicked: false,
+        }),
+        Out::Quiet | Out::Home => {}
+    });
+}
+
+/// A main-frame document committed outside the view's scope that the policy and the main
+/// resource's hold both missed — after the view's page had been on screen ([`Out::Home`]): none
+/// is known, so this is defence in depth. Stopped, said, and the view's own page loaded back
+/// (from an idle, outside the emission), once per load sopen asked for.
 ///
 /// SAFETY: on the GTK thread; `web` is view `key`'s.
 unsafe fn send_home(api: &Api, key: u64, web: P, url: &str) {
@@ -1769,6 +1892,7 @@ unsafe extern "C" fn on_load_failed(
     let (domain, code, message) = unsafe { error_parts(api, error) };
     if !cancelled(&domain, code) {
         with_view(key_of(data), |v| {
+            v.homing.failed();
             v.failed = true;
             v.finishing = false;
             v.events
@@ -1938,15 +2062,30 @@ unsafe extern "C" fn on_download(_context: P, download: P, _data: P) {
 }
 
 unsafe extern "C" fn on_authenticate(_web: P, request: P, data: P) -> GBoolean {
-    if let Some(api) = loaded() {
-        // SAFETY: the request WebKit gave, answered once.
-        unsafe { (api.webkit_authentication_request_cancel)(request) };
-    }
-    with_view(key_of(data), |v| {
-        let line = "the page asks for a login: refused".to_string();
-        v.events.send(Event::Failed(line));
-    });
+    let Some(api) = loaded() else {
+        return 1;
+    };
+    // SAFETY: the request WebKit gave: its scheme read, then answered once.
+    let scheme = unsafe {
+        let scheme = (api.webkit_authentication_request_get_scheme)(request);
+        (api.webkit_authentication_request_cancel)(request);
+        scheme
+    };
+    with_view(key_of(data), |v| v.events.send(Event::Failed(asks(scheme))));
     1
+}
+
+/// The failure an authentication request says (never answered: a page view gives no login and
+/// no certificate), WebKit's scheme as its code, so the address window tells them apart: 7 and 9
+/// a client certificate (measured: a TLS server asking for one is 7), 8 the server's trust,
+/// anything else a login (measured: HTTP Basic is 2).
+pub(super) fn asks(scheme: c_int) -> String {
+    let what = match scheme {
+        7 | 9 => "a client certificate",
+        8 => "its certificate to be trusted",
+        _ => "a login",
+    };
+    format!("the page asks for {what}, which is refused (WebKitAuthenticationScheme {scheme})")
 }
 
 /// A `<select>`'s popup: none is shown (it would be a window of GTK's own); the menu is closed

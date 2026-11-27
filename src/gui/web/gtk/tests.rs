@@ -1579,6 +1579,167 @@ fn the_sandbox_off_variable_refuses_the_engine() {
     }
 }
 
+/// The commit's check: a load sopen asked for that shows a document out of the view's scope
+/// before any of its own failed (WebKit's `about:blank` for a refused port); after a load failed,
+/// a document out is only stopped; a navigation away from a page on screen is sent home once per
+/// load sopen asked for, then only stopped — never a loop.
+#[test]
+fn the_commit_check_fails_once_and_sends_home_once() {
+    let mut home = Home::default();
+    home.asked();
+    assert_eq!(home.commit_out(), Out::Failed, "never reached its page");
+    assert_eq!(home.commit_out(), Out::Quiet, "after that, only stopped");
+    home.asked();
+    home.failed();
+    assert_eq!(
+        home.commit_out(),
+        Out::Quiet,
+        "WebKit's failure said it already"
+    );
+    home.asked();
+    home.reached();
+    assert_eq!(
+        home.commit_out(),
+        Out::Home,
+        "away from a page on screen: home"
+    );
+    home.reached();
+    assert_eq!(
+        home.commit_out(),
+        Out::Stop,
+        "away again: stopped, not loaded back"
+    );
+    assert_eq!(home.commit_out(), Out::Stop);
+    home.asked();
+    home.reached();
+    assert_eq!(
+        home.commit_out(),
+        Out::Home,
+        "a new load asked: home once again"
+    );
+    // The reason a load that never reached its page gives.
+    assert_eq!(
+        not_reached(Some("http://127.0.0.1:9/"), "about:blank"),
+        "port 9 is one WebKit never connects to (a restricted port)"
+    );
+    assert_eq!(
+        not_reached(Some("http://user:pw@127.0.0.1:6000/x?t=1"), "about:blank"),
+        "port 6000 is one WebKit never connects to (a restricted port)"
+    );
+    assert_eq!(
+        not_reached(Some("http://127.0.0.1:8080/"), "about:blank"),
+        "WebKit showed about:blank instead of the page"
+    );
+    assert_eq!(
+        not_reached(None, "data:x"),
+        "WebKit showed data:x instead of the page"
+    );
+    // An authentication request, as the address window reads it.
+    use crate::gui::web::address::{failure, Failure};
+    for (scheme, kind) in [
+        (2, Failure::Login),
+        (1, Failure::Login),
+        (6, Failure::Login),
+        (100, Failure::Login),
+        (7, Failure::ClientCertificate),
+        (9, Failure::ClientCertificate),
+        (8, Failure::Untrusted),
+    ] {
+        assert_eq!(failure(&asks(scheme)), kind, "{}", asks(scheme));
+    }
+}
+
+/// §7 on Linux: an address on one of WebKit's restricted ports (9, the discard port) fails once,
+/// said as its failure line's text; WebKit commits `about:blank` after refusing it, which is not
+/// sent home again and again — at most two loads in two seconds.
+#[test]
+fn wv_b_a_restricted_port_fails_once() {
+    let Some((_turn, engine)) = turn("wv_b_a_restricted_port_fails_once") else {
+        return;
+    };
+    let before = COMMITS_SENT_HOME.load(Ordering::SeqCst);
+    let mut shown = Shown::address(&engine, "http://127.0.0.1:9");
+    shown.place(300.0, 200.0, 1.0);
+    shown.view.load("http://127.0.0.1:9/");
+    std::thread::sleep(Duration::from_secs(2));
+    shown.drain();
+    let sent = COMMITS_SENT_HOME.load(Ordering::SeqCst) - before;
+    let loads = shown.seen.iter().filter(|e| **e == Event::Loading).count();
+    let failed: Vec<&String> = shown
+        .seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::Failed(why) => Some(why),
+            _ => None,
+        })
+        .collect();
+    let said: Vec<&Event> = shown.seen.iter().take(12).collect();
+    println!("restricted port: {loads} loads, {sent} sent home, failed {failed:?}; said {said:?}");
+    assert!(loads <= 2, "{loads} loads: {said:?}");
+    assert!(sent <= 1, "{sent} sent home");
+    assert_eq!(failed.len(), 1, "one failure: {said:?}");
+    assert!(
+        !shown
+            .seen
+            .iter()
+            .any(|e| matches!(e, Event::Refused { .. })),
+        "the failure is not hidden by a refusal: {said:?}"
+    );
+    assert_eq!(
+        failed[0], "port 9 is one WebKit never connects to (a restricted port)",
+        "WebKit says nothing of it: the engine names the port"
+    );
+}
+
+/// §7 on Linux: a page asking for an HTTP login (Basic) is answered with none and said once, as a
+/// login the address window names.
+#[test]
+fn wv_b_a_login_is_said_as_one() {
+    let Some((_turn, engine)) = turn("wv_b_a_login_is_said_as_one") else {
+        return;
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "<title>login</title>login please";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"sopen\"\r\n\
+                 Content-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n\
+                 {body}",
+                body.len()
+            );
+        }
+    });
+    let origin = format!("http://127.0.0.1:{port}");
+    let mut shown = Shown::address(&engine, &origin);
+    shown.place(300.0, 200.0, 1.0);
+    shown.view.load(&format!("{origin}/"));
+    shown.until("the login said", 10.0, |e| {
+        e.iter().any(|e| matches!(e, Event::Failed(_)))
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    shown.drain();
+    println!("login: said {:?}", shown.seen);
+    let failed: Vec<&String> = shown
+        .seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::Failed(why) => Some(why),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failed, [&asks(2)], "{:?}", shown.seen);
+    use crate::gui::web::address::{failure, Failure};
+    assert_eq!(failure(failed[0]), Failure::Login);
+}
+
 /// §2.3, §3.2: a context whose sandbox reads back off is refused — the view says why and loads
 /// nothing (the tests' hook skips the request); the next view, asked as always, is sandboxed and
 /// loads.

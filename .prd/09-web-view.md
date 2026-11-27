@@ -777,7 +777,26 @@ within 2 s, else 1 with `… ended while ssh stayed for the browser's connection
   <code>)`): -1201…-1204 the certificate line, -1205 and -1206 the client-certificate line, -1012 and
   -1013 and a 401 or 407 with nothing to show the login line; anything else `cannot load …`.
   **Open**: a 401 whose body the engine shows is shown as the page — `Event` carries no status, so
-  the login line needs the engine to say it (WV-A's file); WebKitGTK's errors are WV-B's to map.
+  the login line needs the engine to say it (WV-A's file).
+- **WebKitGTK's failures** (fix/wv-linux-failures, measured under a private compositor): both
+  engines end a failure with `(<domain> <code>)`, and `address::failure` reads Linux's too — GLib's
+  `g-tls-error-quark` 2 (a bad certificate: a self-signed server gave `Unacceptable TLS certificate
+  (g-tls-error-quark 2)`) the certificate line, 5 (a certificate required) the client-certificate
+  line; an authentication request, which WebKitGTK asks through its `authenticate` signal and the
+  engine answers with none, is said with WebKit's scheme as the code (`… (WebKitAuthenticationScheme
+  <n>)`, `gtk::asks`): 7 and 9 (measured: a TLS server asking for a client certificate is 7, its own
+  certificate ignored for the measurement) the client-certificate line, 8 the certificate line, any
+  other (measured: HTTP Basic is 2) the login line; anything else (`Could not connect to 127.0.0.1:
+  Connection refused (g-io-error-quark 39)`) `cannot load …`. **A restricted port**: WebKitGTK says
+  nothing of one — it commits `about:blank` and fails nothing (measured on all 83 of the Fetch
+  standard's bad ports, 0 and 9 and 6000 among them; 2, 8, 80, 443, 3000, 8080 and others connect) —
+  and the commit's check sent that view home again and again (1,691 times in 2 s). Now a load sopen
+  asked for that shows a document outside its scope before reaching its page has failed: stopped,
+  never sent home, said once — `port <n> is one WebKit never connects to (a restricted port)`, or
+  `WebKit showed <address> instead of the page` for any other port — so the window says `cannot load
+  <shown>: port 9 is one WebKit never connects to (a restricted port) — Cmd/Ctrl+R tries again`; after
+  a load failed a document outside is only stopped; a navigation away from a page on screen is sent
+  home once per load sopen asked for, then only stopped and said (`gtk::Home`).
 - **Open**: Cmd/Ctrl+R while the page holds the keyboard on macOS reaches the page, not sopen: R is
   not among §2.4's always-sopen keys (`route`, `mod.rs`). Esc takes the keyboard back first.
 
