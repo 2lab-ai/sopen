@@ -1846,3 +1846,94 @@ fn undo_takes_the_newest_stamp_whatever_order_the_runs_end_in() {
         g.texts()
     );
 }
+
+/// One git dialog at a time across two panels (X4-menu round 1): `a`'s panel pinned on the
+/// right, the right list in `b` and active, so `b`'s own panel stands on the left (02 §3.1 O6)
+/// with the keyboard in it. F10 opens `b`'s menu; a click on the right half under its box moves
+/// the keyboard nowhere; a right click in `a`'s rows opens no menu there; Enter runs `b`'s item.
+#[test]
+fn x4_menu_one_dialog_at_a_time_across_two_panels() {
+    let git = git_or_skip!();
+    let b = Repo::new(&git);
+    b.write("b.txt", "b\n");
+    b.commit("only in b");
+    let mut g = Gx::new(small(&git));
+    g.wait_for_the_panel();
+    g.cmd(Key::G);
+    g.settle();
+    let (a_top, b_top) = (g.top(), b.top().to_string());
+    g.fx.b.list(Some(1), b_top.clone(), None, None);
+    g.fx.b.active = 1;
+    let both = [
+        view::Content::Git(b_top.clone()),
+        view::Content::Git(a_top.clone()),
+    ];
+    g.until("the two panels with their rows", |br| {
+        br.shown.as_ref() == Some(&both)
+            && [&a_top, &b_top].iter().all(|top| {
+                br.git
+                    .panel(top)
+                    .is_some_and(|i| !br.git.panels[i].view.rows().is_empty())
+            })
+    });
+    g.settle();
+    g.fx.b.git.focus = true;
+    g.settle();
+    let (ia, ib) = (
+        g.b().git.panel(&a_top).expect("a's panel"),
+        g.b().git.panel(&b_top).expect("b's panel"),
+    );
+    assert_eq!(g.b().git_focused(), Some(ib), "the keyboard in b's panel");
+    assert_eq!(g.shown(), both);
+    g.key(Key::F10);
+    g.idle(2);
+    assert!(g.b().git.panels[ib].view.dialog_up(), "b's menu");
+    // A click on the right half, inside b's box (its margin under the last line).
+    let gr = Grid::over(Rect::from_min_max(
+        Pos2::new(0.0, 16.0),
+        Pos2::new(1000.0, 700.0 - 32.0),
+    ));
+    let frame = g.b().git.panels[ib].view.covered(&gr)[0];
+    let right_half = cells::halves(gr.all())[1];
+    let x = frame.right().saturating_sub(4).max(right_half.x);
+    let at = gr
+        .rect(cells::Cells::new(x, frame.bottom() - 2, 1, 1))
+        .center();
+    g.fx.drv.click(&mut g.fx.b, at);
+    g.idle(2);
+    assert_eq!(
+        g.b().git_focused(),
+        Some(ib),
+        "no keyboard move under b's box"
+    );
+    assert!(g.b().git.panels[ib].view.dialog_up(), "b's menu stays");
+    // A right click on a's rows, on the right: no menu there.
+    let row = (g.fx.drv.texts_starting_with("third").into_iter())
+        .find(|(r, _)| r.left() >= 500.0)
+        .expect("a's row on the right")
+        .0;
+    let p = row.center();
+    let events = [true, false].map(|pressed| egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Secondary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    });
+    let mut all = vec![egui::Event::PointerMoved(p)];
+    all.extend(events);
+    g.fx.drv.frame(&mut g.fx.b, all, Modifiers::NONE);
+    g.idle(2);
+    assert!(
+        !g.b().git.panels[ia].view.dialog_up(),
+        "no menu in a's panel"
+    );
+    assert_eq!(g.b().git_focused(), Some(ib));
+    // Enter runs b's item, its first: Tag… on b's commit.
+    g.key(Key::Enter);
+    g.idle(2);
+    assert_eq!(
+        g.b().git.panels[ib].view.draft().map(Action::id),
+        Some(ActionId::Tag)
+    );
+    assert!(g.b().git.panels[ia].view.draft().is_none());
+}

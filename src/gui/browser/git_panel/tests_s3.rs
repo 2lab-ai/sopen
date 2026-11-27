@@ -709,7 +709,9 @@ fn the_menu_draws_in_the_dialog_look_and_its_keys_choose() {
     fx.idle();
     fx.assert_shows("Fetch all remotes…");
     fx.assert_shows("Ctrl/⌘+Shift+R");
+    // Its last line is the panel over both sides (X4-menu round 1, T17); Undo above it.
     fx.press(Key::End);
+    fx.press(Key::ArrowUp);
     fx.press(Key::Enter);
     assert_eq!(
         fx.host.menu_ends,

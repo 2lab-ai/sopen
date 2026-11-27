@@ -817,7 +817,9 @@ fn the_commit_menu_draws_its_history_row_and_gives_the_choice() {
         !fx.shows("Reword…"),
         "the repository's menu has no history row"
     );
+    // Its last line is the panel over both sides (X4-menu round 1, T17); Undo above it.
     fx.press(Key::End);
+    fx.press(Key::ArrowUp);
     fx.press(Key::Enter);
     assert_eq!(
         fx.host.menu_ends,

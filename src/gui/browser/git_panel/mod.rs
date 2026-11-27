@@ -438,6 +438,9 @@ pub struct GitView {
     unasked: bool,
     /// The menu of the object under the bar, with a commit's history row (S4).
     menu: Option<menu::HistoryMenu>,
+    /// Another panel's dialog is up (two repositories' panels side by side): this one opens none
+    /// and takes no click until it closes, one dialog at a time (X4-menu round 1).
+    dialog_elsewhere: bool,
     dialog: Option<Box<dialogs::ActionDialog>>,
     /// The plan the dialog showed for the action it returned: what runs (S3-A: its backup
     /// verifies the values the owner confirmed).
@@ -536,6 +539,7 @@ impl GitView {
             undo: None,
             unasked: false,
             menu: None,
+            dialog_elsewhere: false,
             dialog: None,
             confirmed: None,
             result: None,
@@ -862,6 +866,9 @@ impl GitView {
     pub fn status_line(&self) -> Status {
         if let Some(menu) = &self.menu {
             return Status::info(menu_hint(menu));
+        }
+        if self.filters_dialog.is_some() {
+            return Status::info(filters::HINT);
         }
         if let Some(said) = self.said.as_ref().or(self.status.as_ref()) {
             return said.clone();
@@ -1313,6 +1320,11 @@ impl GitView {
             return Some(GitAction::MoreRows);
         }
         None
+    }
+
+    /// Whether another panel's dialog is up: the integration says so before each pass.
+    pub fn set_dialog_elsewhere(&mut self, up: bool) {
+        self.dialog_elsewhere = up;
     }
 
     /// A dialog is up — the filters', history search's, S3's menu, action dialog, result, "Stop
@@ -2129,10 +2141,15 @@ impl GitView {
             ctx.copy_text(text);
         }
         if let Some(menu) = &mut self.menu {
-            return match menu.ui(ctx, grid) {
+            let mut asked = match menu.ui(ctx, grid) {
                 Some(menu::HistoryMenuEnd::Menu(menu::MenuEnd::Chose { id, target })) => {
                     self.menu = None;
                     self.act(id, target)
+                }
+                // A key line of the repository's menu (10 T17): as its key runs it.
+                Some(menu::HistoryMenuEnd::Menu(menu::MenuEnd::Key(command))) => {
+                    self.menu = None;
+                    self.run(command)
                 }
                 Some(menu::HistoryMenuEnd::Menu(menu::MenuEnd::Cancel)) => {
                     self.menu = None;
@@ -2144,6 +2161,12 @@ impl GitView {
                 }
                 None => Vec::new(),
             };
+            // The dialog a choice opened, in the same pass: the menu handed it what the pass held
+            // after the choosing Enter, typed text in its place (X4-menu).
+            if self.menu.is_none() && (self.quick.is_some() || self.dialog.is_some()) {
+                asked.extend(self.modals(ctx, grid));
+            }
+            return asked;
         }
         if let Some(quick) = &mut self.quick {
             return match quick.ui(ctx, grid, planner::PLAN) {
@@ -2821,7 +2844,9 @@ pub fn draw(
     let layout = Layout::of(inner, banner_rows, view.pane.is_some() && !listing);
     let pane_keyboard = view.pane.as_ref().is_some_and(|p| p.keyboard);
     let list_active = active && !pane_keyboard && !view.dialog_up();
-    let dialog = view.dialog_up();
+    // A dialog of this panel's, or of another panel's beside it: no click or right click here
+    // opens one or acts (one dialog at a time, X4-menu round 1).
+    let dialog = view.dialog_up() || view.dialog_elsewhere;
     // The cells egui draws (the parts not in cells yet), and Find's caret.
     let mut eguis: Vec<Cells> = Vec::new();
     let mut caret = None;

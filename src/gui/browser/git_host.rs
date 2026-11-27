@@ -1816,6 +1816,10 @@ impl Browser {
         let Some(i) = self.git_focused() else {
             return;
         };
+        // Another panel's dialog is up: it has the keyboard (one dialog at a time, X4-menu).
+        if self.git_dialog_up(Some(i)) {
+            return;
+        }
         // A key of the owner's: what was said before is old news.
         let pressed = ctx.input(|inp| {
             inp.events.iter().any(|e| {
@@ -2336,7 +2340,15 @@ impl Browser {
                     .interact_pos()
                     .is_some_and(|pos| on_pane(rect, pos))
         });
-        if pressed && !self.ops.holds_keyboard() && self.tree.is_none() && self.listing.is_empty() {
+        // One dialog at a time (X4-menu round 1): while a git panel's dialog is up — its box may
+        // lie over the other panel's half — a press moves the keyboard nowhere.
+        let held = self.git_dialog_up(None);
+        if pressed
+            && !held
+            && !self.ops.holds_keyboard()
+            && self.tree.is_none()
+            && self.listing.is_empty()
+        {
             if side != 1 - self.active {
                 // The other side's list had the keyboard: it is the origin list now.
                 self.active = 1 - side;
@@ -2349,7 +2361,10 @@ impl Browser {
         // after this pass's dialogs have opened or closed (`GitView::covered`).
         let mut under = self.ops.covered(grid);
         under.extend(self.git_covered(grid, Some(i)));
+        let elsewhere = self.git_dialog_up(Some(i));
         let view = &mut self.git.panels[i].view;
+        // Another panel's dialog up: this one opens none and takes no click.
+        view.set_dialog_elsewhere(elsewhere);
         let mut actions = git_panel::draw(ui, grid, cells, view, active, &under);
         if self.ops.holds_keyboard() || self.tree.is_some() {
             actions.clear();
@@ -2363,6 +2378,14 @@ impl Browser {
     /// painted (10 §17, X4-graph), as it blanks those under the list's dialogs — all of them but
     /// panel `except`'s (a panel blanks its own as its pass leaves them).
     pub(super) fn git_covered(&self, grid: &Grid, except: Option<usize>) -> Vec<cells::Cells> {
+        (self.git_shown().into_iter())
+            .filter(|&i| Some(i) != except)
+            .flat_map(|i| self.git.panels[i].view.covered(grid))
+            .collect()
+    }
+
+    /// The git panels on screen, by index.
+    fn git_shown(&self) -> Vec<usize> {
         let Some(shown) = &self.shown else {
             return Vec::new();
         };
@@ -2375,9 +2398,15 @@ impl Browser {
         tops.dedup();
         (tops.into_iter())
             .filter_map(|top| self.git.panel(top))
-            .filter(|&i| Some(i) != except)
-            .flat_map(|i| self.git.panels[i].view.covered(grid))
             .collect()
+    }
+
+    /// Whether a dialog of a git panel on screen is up (`GitView::dialog_up`: a menu, the
+    /// filters, an action's dialog, the log's entry, …), panel `except`'s left out.
+    pub(super) fn git_dialog_up(&self, except: Option<usize>) -> bool {
+        (self.git_shown().into_iter())
+            .filter(|&i| Some(i) != except)
+            .any(|i| self.git.panels[i].view.dialog_up())
     }
 }
 

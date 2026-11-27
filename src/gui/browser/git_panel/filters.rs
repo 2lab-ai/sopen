@@ -58,8 +58,9 @@ pub struct Filters {
     pub reflog: bool,
 }
 
-/// The Branches filter.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The Branches filter. Its copies and comparisons count the names they walk in a test build
+/// ([`copied`]): the dialog's pass may walk none of them (X4-menu round 1, 20,000 branches).
+#[derive(Debug, Default, Eq)]
 pub enum BranchChoice {
     /// Every branch (the default).
     #[default]
@@ -67,6 +68,51 @@ pub enum BranchChoice {
     /// Only these branches, by refname (`refs/heads/main`, `refs/remotes/origin/main`); none
     /// chosen leaves no ref: `no refs chosen` (03 §4.1).
     Only(BTreeSet<String>),
+}
+
+impl Clone for BranchChoice {
+    fn clone(&self) -> Self {
+        match self {
+            BranchChoice::All => BranchChoice::All,
+            BranchChoice::Only(chosen) => {
+                walked(chosen.len());
+                BranchChoice::Only(chosen.clone())
+            }
+        }
+    }
+}
+
+impl PartialEq for BranchChoice {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (BranchChoice::All, BranchChoice::All) => true,
+            (BranchChoice::Only(a), BranchChoice::Only(b)) => {
+                walked(a.len().min(b.len()));
+                a == b
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn walked(_: usize) {}
+
+#[cfg(test)]
+fn walked(n: usize) {
+    COPIED.with(|c| c.set(c.get() + n));
+}
+
+#[cfg(test)]
+thread_local! {
+    static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The branch names copied or compared since the last call (a test's bound on a pass).
+#[cfg(test)]
+pub(super) fn copied() -> usize {
+    COPIED.with(|c| c.replace(0))
 }
 
 /// The log's order (03 §4.1): S2-B's `history::Order`, variant for variant.
@@ -238,9 +284,13 @@ pub(super) struct Dialog {
     /// The `made` of the rows the last pass painted and where it painted the box (none before
     /// the first pass).
     painted: Option<(u64, Vec<Cells>)>,
-    /// The filters the last pass painted, where it changed none of them (a pass that changes one
-    /// paints the choices as it leaves them and the list's marks as they were).
-    painted_filters: Option<Filters>,
+    /// Bumped whenever a filter changes: which filters these are, compared in place of the
+    /// filters themselves (a copy of 20,000 chosen branches a pass would not be bounded).
+    revision: u64,
+    /// The `revision` the last pass painted, where it changed none of them (a pass that changes
+    /// one paints the choices as it leaves them and the list's marks as they were); a pass that
+    /// changes one keeps the record before it, so an Enter right after says the filters changed.
+    painted_filters: Option<u64>,
     /// An Enter or `[ Apply ]` came while the filters on screen were not the ones it would apply.
     changed: bool,
     /// The dialog's controls, as the last pass laid them (the ones that may hold the keyboard).
@@ -292,8 +342,8 @@ const BRANCH_ROWS: u16 = 8;
 /// widest text, at most 76).
 const NOMINAL: usize = 60;
 
-/// What the dialog says Enter and Esc do.
-const HINT: &str = "Space turns on or off · Enter applies · Esc cancels";
+/// What the dialog says Enter and Esc do — on the status row too while it is open.
+pub(super) const HINT: &str = "Space turns on or off · Enter applies · Esc cancels";
 
 /// The hint once an Enter or `[ Apply ]` came while the filters on screen were not the ones it
 /// would apply: only what showed is applied.
@@ -301,10 +351,13 @@ pub(super) const CHANGED: &str = "the filters changed — Enter applies them · 
 
 /// The pass's presses of Enter with no modifiers, taken out of its input in order, each saying
 /// whether it came after the pass's first move of the keyboard (a Tab) — and the Enters and
-/// Spaces after a move egui makes only after the pass (a Shift+Tab; an arrow on a choice or a
-/// button, and ← → on the list), dropped with a Space's text: they would reach the control the
-/// keyboard is leaving. `began`: what had the keyboard as the pass began (in the field arrows
-/// are its caret's; the list keeps ↑ ↓).
+/// Spaces where egui cannot follow the owner's moves, dropped with a Space's text: after a move
+/// egui makes only after the pass (a Shift+Tab; an arrow on a choice or a button, and ← → on the
+/// list) they would reach the control the keyboard is leaving, and after a second move in the
+/// pass the control egui stops on (it moves the keyboard once a pass, the last direction). A
+/// Space is dropped so only when the pass did not begin in the field, which typed it. `began`:
+/// what had the keyboard as the pass began (in the field arrows are its caret's; the list keeps
+/// ↑ ↓). X4-dialogs' rules, in the same shape (`dialogs::take_enters`).
 fn take_enters(ctx: &egui::Context, began: Option<egui::Id>) -> Vec<bool> {
     let (field, list) = (began == Some(typed_id()), began == Some(list_id()));
     // Whether a key moves the keyboard as egui reads it (`None`: not), and whether egui makes that
@@ -330,7 +383,9 @@ fn take_enters(ctx: &egui::Context, began: Option<egui::Id>) -> Vec<bool> {
     };
     ctx.input_mut(|i| {
         let later = i.events.iter().any(|e| moves(e) == Some(true));
-        let (mut moved, mut out, mut typed) = (false, Vec::new(), false);
+        let (mut moved, mut out, mut typed) = (0usize, Vec::new(), false);
+        // A press here goes where egui cannot follow the owner's moves.
+        let lost = |moved: usize| moved >= 2 || (moved == 1 && later);
         i.events.retain(|e| match (e, std::mem::take(&mut typed)) {
             (egui::Event::Text(text), true) if text == " " => false,
             (
@@ -342,8 +397,8 @@ fn take_enters(ctx: &egui::Context, began: Option<egui::Id>) -> Vec<bool> {
                 },
                 _,
             ) if Mods::None.matches(*modifiers) => {
-                if !(moved && later) {
-                    out.push(moved);
+                if !lost(moved) {
+                    out.push(moved > 0);
                 }
                 false
             }
@@ -355,17 +410,41 @@ fn take_enters(ctx: &egui::Context, began: Option<egui::Id>) -> Vec<bool> {
                     ..
                 },
                 _,
-            ) if moved && later && Mods::None.matches(*modifiers) => {
+            ) if !field && lost(moved) && Mods::None.matches(*modifiers) => {
                 typed = true;
                 false
             }
             (e, _) => {
-                moved |= moves(e).is_some();
+                moved += usize::from(moves(e).is_some());
                 true
             }
         });
         out
     })
+}
+
+/// The pass's plain Enter and Space presses, and a Space's text, taken out of its input: the pass
+/// that closes the dialog leaves none for what is under it.
+fn drop_presses(ctx: &egui::Context) {
+    ctx.input_mut(|i| {
+        let mut typed = false;
+        i.events.retain(|e| match (e, std::mem::take(&mut typed)) {
+            (egui::Event::Text(text), true) if text == " " => false,
+            (
+                egui::Event::Key {
+                    key: key @ (Key::Enter | Key::Space),
+                    pressed: true,
+                    modifiers,
+                    ..
+                },
+                _,
+            ) if Mods::None.matches(*modifiers) => {
+                typed = *key == Key::Space;
+                false
+            }
+            _ => true,
+        });
+    });
 }
 
 /// The pass's plain Space presses no control took, and their text, taken out of its input: the
@@ -426,6 +505,7 @@ impl Dialog {
             bar: Bar::default(),
             made: 0,
             painted: None,
+            revision: 0,
             painted_filters: None,
             changed: false,
             controls: Vec::new(),
@@ -467,14 +547,15 @@ impl Dialog {
 
     /// Toggles one branch: from every branch, all but it; else in or out of the chosen.
     fn toggle_branch(&mut self, refname: &str) {
-        let mut chosen = match &self.filters.branches {
-            BranchChoice::All => self.branches.iter().cloned().collect(),
-            BranchChoice::Only(chosen) => chosen.clone(),
-        };
-        if !chosen.remove(refname) {
-            chosen.insert(refname.to_string());
+        if self.filters.branches == BranchChoice::All {
+            let every = self.branches.iter().cloned().collect();
+            self.filters.branches = BranchChoice::Only(every);
         }
-        self.filters.branches = BranchChoice::Only(chosen);
+        if let BranchChoice::Only(chosen) = &mut self.filters.branches {
+            if !chosen.remove(refname) {
+                chosen.insert(refname.to_string());
+            }
+        }
     }
 
     /// Whether "All branches" shows chosen: every branch, and no reflog (which shows every branch
@@ -538,6 +619,7 @@ impl Dialog {
             escape = true;
         }
         if escape {
+            drop_presses(ctx);
             return Some(DialogEnd::Cancel);
         }
         let began = ctx.memory(|m| m.focused());
@@ -546,7 +628,7 @@ impl Dialog {
         if !began.is_some_and(|id| self.controls.contains(&id)) {
             ctx.memory_mut(|m| m.request_focus(typed_id()));
         }
-        let laid_filters = self.filters.clone();
+        let laid_revision = self.revision;
         let laid_all = self.all();
         let laid = self.layout(grid);
         let f = &self.filters;
@@ -579,37 +661,49 @@ impl Dialog {
         // finds its row by where it stands now, and a box laid elsewhere (fewer or more rows, the
         // grid resized) has another row there.
         let at = (self.made, laid.covers());
+        // presented: once `cells::presented(ctx)` lands (X4-dialogs), the record counts only a
+        // pass that reached the screen.
         let seen_rows = self.painted.replace(at.clone()) == Some(at);
+        // Whether the branches' marks change: the Branches filter or Reflog commits.
+        let mut marks = false;
         if seen_rows {
             for k in shown.chosen(list_id()) {
                 if let Some(refname) = self.shown.get(k).map(|&b| self.branches[b].clone()) {
                     self.toggle_branch(&refname);
+                    marks = true;
                 }
             }
         }
-        // The choices, as their presses left them.
+        // The choices, as their presses left them; each change a revision.
         if all[0] != laid_all {
             self.filters.branches = match laid_all {
                 true => BranchChoice::Only(BTreeSet::new()),
                 false => BranchChoice::All,
             };
+            marks = true;
         }
+        let mut changed = marks;
         for (remote, on) in self.remotes.iter().zip(remotes) {
-            match on {
+            changed |= match on {
                 true => self.filters.hidden_remotes.remove(remote),
                 false => self.filters.hidden_remotes.insert(remote.clone()),
             };
         }
         let f = &mut self.filters;
+        let was = [f.tags, f.stashes, f.first_parent, f.reflog];
+        marks |= was[3] != shows[3];
+        changed |= was != shows;
         [f.tags, f.stashes, f.first_parent, f.reflog] = shows;
         if let Some(order) = order.and_then(|k| ORDERS.get(k)) {
+            changed |= f.order != *order;
             f.order = *order;
+        }
+        if changed {
+            self.revision += 1;
         }
         // The rows anew where the typed text changed what they show (the bar on the first) or a
         // branch's mark changed.
         let narrowed = self.narrow();
-        let marks = (self.filters.branches != laid_filters.branches)
-            || (self.filters.reflog != laid_filters.reflog);
         if narrowed || marks {
             self.rows = self.branch_rows();
         }
@@ -628,8 +722,12 @@ impl Dialog {
         if cancel {
             return Some(DialogEnd::Cancel);
         }
-        let unchanged = self.filters == laid_filters;
-        let seen = std::mem::replace(&mut self.painted_filters, unchanged.then_some(laid_filters));
+        let unchanged = self.revision == laid_revision;
+        // presented: as the list's record above.
+        let seen = self.painted_filters;
+        if unchanged {
+            self.painted_filters = Some(laid_revision);
+        }
         if !unchanged || narrowed {
             ctx.request_repaint();
         }
@@ -638,7 +736,7 @@ impl Dialog {
         }
         // Only what the screen showed is applied: the filters the pass before painted, which this
         // pass left as they were.
-        if seen.as_ref() == Some(&self.filters) {
+        if seen == Some(self.revision) {
             return Some(DialogEnd::Apply(self.filters.clone()));
         }
         self.changed |= seen.is_some();

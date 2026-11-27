@@ -1520,6 +1520,9 @@ fn remotes_by_their_whole_names_and_only_their_own_head() {
     let [GitAction::FiltersChanged(f)] = &asked[..] else {
         panic!("{asked:?}");
     };
+    // The remote clicked is the one turned off, by its whole name (X4-menu round 1).
+    let team_up = std::collections::BTreeSet::from(["team/up".to_string()]);
+    assert_eq!(f.hidden_remotes, team_up);
     assert_eq!(
         names(f.revisions(&r, &remotes)),
         [
@@ -1570,14 +1573,25 @@ fn the_branch_chooser_draws_only_its_visible_rows() {
         .ctx
         .viewport(|v| v.prev_pass.widgets.layers().map(|(_, w)| w.len()).sum());
     assert!(widgets < 400, "{widgets} widgets laid out");
-    work::take();
-    fx.idle();
-    let done = work::take();
-    assert_eq!(done.measured, 0, "{done:?}");
-    assert!(done.drawn <= 8, "{done:?}");
     fx.typed("b1999");
     fx.idle();
     assert!(fx.shows("[X] b19995") && !fx.shows("[X] b00001"));
+    // One branch off: the filter holds the other 20,004 by name (X4-menu round 1), and a pass that
+    // changes nothing copies, compares, measures none of them and draws the rows it shows.
+    fx.drv.click_text_on_top(&mut fx.host, "[X] b19995");
+    fx.idle();
+    assert!(fx.shows("[ ] b19995"));
+    filters::copied();
+    work::take();
+    fx.idle();
+    let done = work::take();
+    assert_eq!(
+        filters::copied(),
+        0,
+        "branch names copied or compared in a pass"
+    );
+    assert_eq!(done.measured, 0, "{done:?}");
+    assert!(done.drawn <= 8, "{done:?}");
 }
 
 /// Item 6: a message line longer than the pane wraps into lines of the pane, all of it readable.

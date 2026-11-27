@@ -696,40 +696,45 @@ fn a_click_right_after_typing_turns_nothing_unseen() {
     );
 }
 
-/// A box laid elsewhere than the pass before painted it takes no click in that pass: typing
-/// leaves one branch, the box is four rows shorter and re-centred, and a click where `up/main`
-/// stood — now on `[X] Tags` — turns nothing (egui gives it to the control that stood there).
+/// A box laid elsewhere than the pass before painted it takes no click on the list in that pass.
+/// Typing `up` leaves one branch and the box is four rows shorter, re-centred: a click where
+/// `feature` stood — egui gives it to the list, which stood there — would be the list's first row
+/// now, `up/main`, and turns nothing. With the same rows, a window resized under the pointer: the
+/// click where `main` stood would be another branch, and turns nothing.
 #[test]
 fn a_box_laid_elsewhere_takes_no_click_in_that_pass() {
     let mut fx = filters_open(fixture_view());
     let before = filters_covers(&fx);
-    let p = place_of(&layer_over(&fx.drv, &before), "[X] up/main");
+    let p = place_of(&layer_over(&fx.drv, &before), "[X] feature");
     pass(&mut fx, vec![Event::Text("up".into())]);
     pass(&mut fx, click_events(p, PointerButton::Primary));
     fx.idle();
     let now = filters_covers(&fx);
     assert_eq!(now[0].height + 4, before[0].height, "four rows fewer");
-    let l = layer_over(&fx.drv, &now);
-    let tags = grid_of(&fx)
-        .at(place_of(&l, "[X] Tags"))
-        .expect("on the grid");
-    assert_eq!(
-        grid_of(&fx).at(p).map(|c| c.y),
-        Some(tags.y),
-        "the old place is Tags' row"
-    );
     let rows = filters_rows(&fx);
-    row_with(&rows, "[X] Tags");
     row_with(&rows, "[X] up/main");
     assert!(
         fx.view().filters_dialog.is_some(),
         "no click outside it either"
     );
-    fx.drv.click_text_on_top(&mut fx.host, "[X] Tags");
     assert!(
-        !applied(&mut fx).tags,
-        "a click on the box on screen turns it"
+        fx.press(Key::Enter).is_empty(),
+        "nothing turned: nothing to reload"
     );
+    assert!(fx.view().filters_dialog.is_none() && fx.view().filters().is_default());
+    // The rows unchanged, the box elsewhere: the window two rows shorter.
+    let mut fx = filters_open(fixture_view());
+    let before = filters_covers(&fx);
+    let p = place_of(&layer_over(&fx.drv, &before), "[X] main");
+    fx.drv.resize(1000.0, 600.0 - 2.0 * 16.0);
+    pass(&mut fx, click_events(p, PointerButton::Primary));
+    fx.idle();
+    assert_ne!(filters_covers(&fx), before, "the box moved");
+    assert!(
+        fx.press(Key::Enter).is_empty(),
+        "nothing turned: nothing to reload"
+    );
+    assert!(fx.view().filters_dialog.is_none() && fx.view().filters().is_default());
 }
 
 /// Type-to-filter and Enter in one pass: the filters the screen showed are applied — the typed
@@ -859,6 +864,420 @@ fn space_on_a_focused_button_presses_it() {
             "{button}: {asked:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round 1.
+
+/// A dialog alone over the window — the menu or the filters — and what each pass left in its
+/// input after the dialog's pass: whatever is under it would read those.
+struct Alone {
+    menu: Option<menu::Menu>,
+    filters: Option<filters::Dialog>,
+    ends: Vec<String>,
+    left: Vec<Vec<Event>>,
+}
+
+impl Alone {
+    fn menu(target: Target) -> Alone {
+        Alone {
+            menu: Some(menu::Menu::new(target, &super::tests_s3::repo())),
+            filters: None,
+            ends: Vec::new(),
+            left: Vec::new(),
+        }
+    }
+
+    fn filters() -> Alone {
+        let refs = super::tests::refs();
+        Alone {
+            menu: None,
+            filters: Some(filters::Dialog::new(&Filters::default(), &refs, &[])),
+            ends: Vec::new(),
+            left: Vec::new(),
+        }
+    }
+}
+
+impl crate::gui::Window for Alone {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let grid = kit::grid(&ctx);
+        if let Some(m) = &mut self.menu {
+            if let Some(end) = m.ui(&ctx, grid) {
+                self.ends.push(format!("{end:?}"));
+                self.menu = None;
+            }
+        }
+        if let Some(d) = &mut self.filters {
+            if let Some(end) = d.ui(&ctx, grid) {
+                self.ends.push(format!("{end:?}"));
+                self.filters = None;
+            }
+        }
+        self.left.push(ctx.input(|i| i.events.clone()));
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// The presses and texts `events` hold, in order: `Enter`, `Space`, `text:fix`.
+fn presses(events: &[Event]) -> Vec<String> {
+    (events.iter())
+        .filter_map(|e| match e {
+            Event::Key {
+                key, pressed: true, ..
+            } => Some(format!("{key:?}")),
+            Event::Text(t) => Some(format!("text:{t}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One pass of `host` with `events`, after two passes that show it: what it left.
+fn left_after(host: &mut Alone, drv: &mut Driver, events: Vec<Event>) -> Vec<String> {
+    drv.frame(host, events, Modifiers::NONE);
+    presses(host.left.last().expect("a pass"))
+}
+
+/// The pass that closes the menu or the filters leaves no Enter and no Space (with its text) for
+/// what is under it: Esc and Enter, F10 and Space in one pass.
+#[test]
+fn the_closing_pass_leaves_no_enter_or_space() {
+    let space = || {
+        let mut e = key_events(Key::Space, Modifiers::NONE);
+        e.insert(1, Event::Text(" ".into()));
+        e
+    };
+    for (close, then) in [(Key::Escape, Key::Enter), (Key::F10, Key::Space)] {
+        let mut events = key_events(close, Modifiers::NONE);
+        events.extend(match then {
+            Key::Space => space(),
+            _ => key_events(then, Modifiers::NONE),
+        });
+        let mut drv = Driver::new(1200.0, 900.0);
+        let mut host = Alone::menu(Target::Repository);
+        drv.idle(&mut host, 2);
+        let left = left_after(&mut host, &mut drv, events.clone());
+        assert_eq!(host.ends, ["Cancel"], "{close:?}");
+        assert!(left.is_empty(), "the menu's {close:?} pass left {left:?}");
+        if close == Key::Escape {
+            let mut host = Alone::filters();
+            let mut drv = Driver::new(1200.0, 900.0);
+            drv.idle(&mut host, 2);
+            let left = left_after(&mut host, &mut drv, events);
+            assert_eq!(host.ends, ["Cancel"]);
+            assert!(left.is_empty(), "the filters' Esc pass left {left:?}");
+        }
+    }
+    // Nothing under the menu acted: in the panel, Esc and Enter close it and open no details.
+    let mut fx = panel();
+    fx.press(Key::ArrowDown);
+    fx.press(Key::F10);
+    let mut events = key_events(Key::Escape, Modifiers::NONE);
+    events.extend(key_events(Key::Enter, Modifiers::NONE));
+    let asked = pass(&mut fx, events);
+    fx.idle();
+    assert!(
+        fx.view().menu.is_none() && !fx.view().details_open(),
+        "{asked:?}"
+    );
+}
+
+/// The Enters the list does not take (after a Tab in the pass) are taken out of the pass, not
+/// left for what is under the menu.
+#[test]
+fn an_enter_after_a_tab_is_not_left_in_the_pass() {
+    let mut drv = Driver::new(1200.0, 900.0);
+    let mut host = Alone::menu(Target::Repository);
+    drv.idle(&mut host, 2);
+    let mut events = key_events(Key::Tab, Modifiers::NONE);
+    events.extend(key_events(Key::Enter, Modifiers::NONE));
+    let left = left_after(&mut host, &mut drv, events);
+    assert!(host.ends.is_empty(), "{:?}", host.ends);
+    assert!(!left.iter().any(|k| k == "Enter"), "{left:?}");
+}
+
+/// What the pass holds after the Enter that chooses a line is the dialog's that line opens: the
+/// menu hands it on in its order — no Enter, which would run a dialog never shown — and lets the
+/// keyboard go; the dialog shows in that same pass, and an Esc there closes it.
+#[test]
+fn the_rest_of_the_choosing_pass_goes_to_the_dialog_it_opens() {
+    let mut drv = Driver::new(1200.0, 900.0);
+    let mut host = Alone::menu(Target::Repository);
+    drv.idle(&mut host, 2);
+    let mut events = key_events(Key::Enter, Modifiers::NONE);
+    events.push(Event::Text("fix".into()));
+    events.extend(key_events(Key::Space, Modifiers::NONE));
+    events.insert(4, Event::Text(" ".into()));
+    events.push(Event::Text("it".into()));
+    events.extend(key_events(Key::Enter, Modifiers::NONE));
+    let left = left_after(&mut host, &mut drv, events);
+    assert_eq!(host.ends.len(), 1, "chose: {:?}", host.ends);
+    assert_eq!(left, ["text:fix", "Space", "text: ", "text:it"], "in order");
+    let list = egui::Id::unique("sopen-git-menu").with("list");
+    assert!(
+        !drv.ctx.memory(|m| m.has_focus(list)),
+        "the keyboard let go"
+    );
+    // In the panel: an Esc after the Enter that chose Tag… is the Tag dialog's, run in that pass:
+    // it closes the dialog, nothing run.
+    let mut fx = panel();
+    fx.press(Key::ArrowDown);
+    fx.press(Key::F10);
+    let mut events = key_events(Key::Enter, Modifiers::NONE);
+    events.extend(key_events(Key::Escape, Modifiers::NONE));
+    pass(&mut fx, events);
+    assert!(
+        fx.view().menu.is_none() && fx.view().draft().is_none(),
+        "opened, then closed"
+    );
+}
+
+/// A right click in a panel beside another panel's open dialog opens nothing and moves no bar
+/// (one dialog at a time): the integration says the other's is up.
+#[test]
+fn a_panel_beside_an_open_dialog_opens_none() {
+    let mut fx = panel();
+    fx.view_mut().set_dialog_elsewhere(true);
+    fx.idle();
+    let g = fx.view().geometry().expect("the graph drawn");
+    let p = centre(&fx, 60, g.row(3).expect("row 3").y);
+    let asked = pass(&mut fx, click_events(p, PointerButton::Secondary));
+    fx.idle();
+    assert!(fx.view().menu.is_none(), "{asked:?}");
+    assert_eq!(fx.view().bar_place().0, 0, "the bar stays");
+    // The other's closed: the right click opens this one's menu.
+    fx.view_mut().set_dialog_elsewhere(false);
+    fx.idle();
+    pass(&mut fx, click_events(p, PointerButton::Secondary));
+    fx.idle();
+    assert!(fx.view().menu.is_some());
+}
+
+/// The S3 repository in an in-progress state, its status entries `entries`.
+fn in_state(state: crate::git::model::InProgress) -> crate::git::actions::Repo {
+    let mut r = super::tests_s3::repo();
+    r.in_progress = state;
+    r
+}
+
+/// The panel on `repo`, the repository's menu open through `Repository…`.
+fn repository_menu(repo: &crate::git::actions::Repo) -> Fx {
+    let mut fx = Fx::new(1000.0, 700.0, fixture_view());
+    fx.view_mut().set_repo(repo.clone());
+    fx.idle();
+    fx.press(Key::F10);
+    fx.press(Key::End);
+    fx.press(Key::Enter);
+    fx.idle();
+    fx
+}
+
+/// A state of the repository's, its name and the key lines its menu holds (label, key letter).
+type Case = (
+    &'static str,
+    crate::git::model::InProgress,
+    &'static [(&'static str, char)],
+);
+
+/// T17: a terminal without the kitty protocol loses the Shift of the Cmd/Ctrl+Shift chords
+/// (10 §9), so the repository's menu holds each of the panel's: the banner's steps the state
+/// offers, an edit stop's Amend and Split, bisect's Reset, the panel over both sides — each with
+/// its key at the right, each running what its key runs. A rebase stopped to edit, a merge with
+/// a conflict, a cherry-pick, a bisect.
+#[test]
+fn the_repositorys_menu_holds_every_cmd_shift_action() {
+    use crate::git::model::{InProgress, Operation, OperationHead, RebaseProgress};
+    use crate::git::rebase::Edit;
+    let a = "a".repeat(40);
+    let stop = InProgress {
+        operation: Some(Operation::Rebase),
+        rebase: Some(RebaseProgress {
+            msgnum: Some("2".into()),
+            end: Some("4".into()),
+            head_name: Some("refs/heads/main".into()),
+            onto: Some("b".repeat(40)),
+            stopped_sha: Some(a.clone()),
+            done_last: Some(format!("edit {a} third")),
+        }),
+        ..InProgress::default()
+    };
+    let merge = InProgress {
+        operation: Some(Operation::Merge),
+        head: Some(OperationHead {
+            commit: "b".repeat(40),
+            merge_msg: Some("Merge branch 'feature'".into()),
+        }),
+        ..InProgress::default()
+    };
+    let pick = InProgress {
+        operation: Some(Operation::CherryPick),
+        head: Some(OperationHead {
+            commit: "b".repeat(40),
+            merge_msg: None,
+        }),
+        ..InProgress::default()
+    };
+    let bisect = InProgress {
+        bisect: true,
+        ..InProgress::default()
+    };
+    let cmd_shift = Mods::CommandShift.prefix();
+    let wide = "The git panel over both sides, and back";
+    let cases: [Case; 4] = [
+        (
+            "edit stop",
+            stop,
+            &[
+                ("Continue", 'C'),
+                ("Abort", 'A'),
+                ("Amend the stopped commit…", 'M'),
+                ("Split the stopped commit…", 'P'),
+            ],
+        ),
+        ("merge", merge, &[("Continue", 'C'), ("Abort", 'A')]),
+        (
+            "cherry-pick",
+            pick,
+            &[("Continue", 'C'), ("Skip", 'S'), ("Abort", 'A')],
+        ),
+        ("bisect", bisect, &[("Reset (bisect)", 'B')]),
+    ];
+    for (name, state, steps) in cases {
+        let repo = in_state(state);
+        let fx = repository_menu(&repo);
+        let rows = menu_rows(&fx);
+        // Its key lines first, in their keys' order, each with its key at the right.
+        for (k, (label, key)) in steps.iter().enumerate() {
+            let row = &rows[2 + k];
+            assert!(row.starts_with(&format!("║  {label}")), "{name}: {rows:#?}");
+            assert!(
+                row.ends_with(&format!(" {cmd_shift}{key}  ║")),
+                "{name}: {rows:#?}"
+            );
+        }
+        assert!(
+            row_with(&rows, wide).ends_with(&format!(" {cmd_shift}G  ║")),
+            "{name}: {rows:#?}"
+        );
+        assert!(row_with(&rows, "Fetch all remotes…").contains("Ctrl/⌘+Shift+R"));
+        // Each as its key runs it: the same dialog, the same draft.
+        for &(label, key) in steps.iter() {
+            let mut by_menu = repository_menu(&repo);
+            by_menu.drv.click_text_on_top(&mut by_menu.host, label);
+            let menu_asked = by_menu.take();
+            let mut by_key = Fx::new(1000.0, 700.0, fixture_view());
+            by_key.view_mut().set_repo(repo.clone());
+            by_key.idle();
+            let letter = Key::from_name(&key.to_string()).expect("a letter");
+            let key_asked = by_key.key(letter, Modifiers::COMMAND | Modifiers::SHIFT);
+            let seen = |fx: &Fx| (fx.view().draft().cloned(), fx.view().edit_draft());
+            assert_eq!(seen(&by_menu), seen(&by_key), "{name}: {label}");
+            assert_eq!(menu_asked, key_asked, "{name}: {label}");
+            assert!(
+                seen(&by_menu) != (None, None) || !menu_asked.is_empty(),
+                "{name}: {label} opened its dialog or asked its reads"
+            );
+        }
+    }
+    // The stop's Split is `Edit::SplitStop` of the stopped commit, not the history row's split.
+    let fx = {
+        let mut fx = repository_menu(&in_state(InProgress {
+            operation: Some(Operation::Rebase),
+            rebase: Some(RebaseProgress {
+                stopped_sha: Some(a.clone()),
+                done_last: Some(format!("edit {a} third")),
+                ..RebaseProgress::default()
+            }),
+            ..InProgress::default()
+        }));
+        fx.drv
+            .click_text_on_top(&mut fx.host, "Split the stopped commit…");
+        fx
+    };
+    assert!(
+        matches!(fx.view().edit_draft(), Some(Edit::SplitStop { .. })),
+        "{:?}",
+        fx.view().edit_draft()
+    );
+    // The panel over both sides, as Cmd/Ctrl+Shift+G.
+    let mut fx = repository_menu(&super::tests_s3::repo());
+    fx.drv.click_text_on_top(&mut fx.host, wide);
+    assert_eq!(fx.take(), [GitAction::Wide]);
+}
+
+/// An Enter in the pass right after a choice was turned — no pass between to show it — applies
+/// nothing and says the filters changed; the next Enter applies them.
+#[test]
+fn an_enter_right_after_a_change_says_the_filters_changed() {
+    let mut fx = filters_open(fixture_view());
+    let covers = filters_covers(&fx);
+    let p = place_of(&layer_over(&fx.drv, &covers), "[X] Tags");
+    pass(&mut fx, click_events(p, PointerButton::Primary));
+    let asked = pass(&mut fx, key_events(Key::Enter, Modifiers::NONE));
+    assert!(
+        asked.is_empty() && fx.view().filters_dialog.is_some(),
+        "{asked:?}"
+    );
+    fx.idle();
+    row_with(&filters_rows(&fx), filters::CHANGED);
+    assert!(!applied(&mut fx).tags);
+}
+
+/// egui moves the keyboard once a pass: after a second move in a pass, an Enter goes nowhere
+/// the owner meant, and is dropped. A Space after a late move is dropped only when the pass did
+/// not begin in the field — the field typed it.
+#[test]
+fn a_second_move_drops_the_enter_and_the_field_keeps_its_space() {
+    let mut fx = filters_open(fixture_view());
+    let mut events = key_events(Key::Tab, Modifiers::NONE);
+    events.extend(key_events(Key::Tab, Modifiers::NONE));
+    events.extend(key_events(Key::Enter, Modifiers::NONE));
+    let asked = pass(&mut fx, events);
+    fx.idle();
+    assert!(asked.is_empty(), "{asked:?}");
+    assert!(fx.view().filters_dialog.is_some(), "the Enter was dropped");
+    // In the field: Shift+Tab, a, Space, b — the field types `a b`.
+    let mut fx = filters_open(fixture_view());
+    let mut events = key_events(Key::Tab, Modifiers::SHIFT);
+    events.push(Event::Text("a".into()));
+    let mut space = key_events(Key::Space, Modifiers::NONE);
+    space.insert(1, Event::Text(" ".into()));
+    events.extend(space);
+    events.push(Event::Text("b".into()));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    fx.idle();
+    row_with(&filters_rows(&fx), "Type to filter a b");
+}
+
+/// The filters' buttons take the kit's presses: Space then Tab on `[ Apply ]` applies — egui's
+/// own click would let the Tab hand the Space to `[ Cancel ]`.
+#[test]
+fn space_then_tab_on_apply_applies() {
+    let mut fx = filters_open(fixture_view());
+    fx.drv.click_text_on_top(&mut fx.host, "[X] Tags");
+    fx.drv
+        .ctx
+        .memory_mut(|m| m.request_focus(filters_id("apply")));
+    fx.idle();
+    let mut events = key_events(Key::Space, Modifiers::NONE);
+    events.insert(1, Event::Text(" ".into()));
+    events.extend(key_events(Key::Tab, Modifiers::NONE));
+    let asked = pass(&mut fx, events);
+    assert!(
+        matches!(&asked[..], [GitAction::FiltersChanged(f)] if !f.tags),
+        "{asked:?}"
+    );
+}
+
+/// While the filters are open the status row says their keys, not the panel's.
+#[test]
+fn the_status_row_says_the_filters_keys() {
+    let fx = filters_open(fixture_view());
+    assert_eq!(fx.view().status_line().text, filters::HINT);
 }
 
 // ---------------------------------------------------------------------------------------------
