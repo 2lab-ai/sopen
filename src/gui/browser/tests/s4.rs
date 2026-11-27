@@ -882,7 +882,7 @@ fn g_h3_root_split_refused_and_edit_then_amend() {
     g.until_quiet("Amend's prefill");
     assert_eq!(g.dialog_id(), Some(ActionId::Amend));
     // The message field takes the typing once it shows (the dialog's own focus rule).
-    g.click("edit it");
+    g.click("( ) edit it");
     g.idle(2);
     g.replace_typed("both, amended");
     g.idle(2);

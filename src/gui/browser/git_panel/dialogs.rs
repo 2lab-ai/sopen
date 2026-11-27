@@ -20,6 +20,17 @@
 //!   `<what was done> · backup <stamp> · Cmd/Ctrl+Z undoes` (§8.3).
 //! - **Masking** (03 §3.7) is for what sopen shows from git: a URL the owner types (Add remote, a
 //!   retyped Edit remote field) shows as typed, while the result dialog and the log mask it.
+//! - **In cells** (X4-dialogs, 10 §17): every dialog without options, 03 §7.6–§7.7's forms and
+//!   a restore's are `ops::dialog`'s box on the panels' grid — the lost line, the options as the
+//!   kit's fields, message fields and choices, the plan in rows that scroll (at most three fifths
+//!   of the grid, eight at least, the kit giving them way first on a short grid), `[ Run ]` (off
+//!   until the plan is in and nothing refuses it), `[ Cancel ]` and the hint — and
+//!   [`ActionDialog::covers`] says its cells. Every other form of 03 §7.1–§7.5 is egui's until
+//!   X4-dialogs2. The keyboard opens on the form's first text field, or on nothing; Enter runs
+//!   (03 §8.1), but each Enter of a pass goes to what has the keyboard at that point — before the
+//!   pass's first Tab what had it then, after it what the Tab gave it to — so Enter on a focused
+//!   button is that button's press; Space is the kit's, once a press in the pass's order; Esc,
+//!   Cancel or a click outside cancels, and a pass that both cancels and runs cancels.
 
 use super::menu::{self, Target};
 use crate::git::actions::{
@@ -31,7 +42,8 @@ use crate::git::backup::{RestoreEntry, Subject, Value};
 use crate::git::model::{ObjectType, RefKind, RefLabel, StatusEntry};
 use crate::git::runner::mask_credentials;
 use crate::gui::browser::keys::{self, Mods};
-use crate::gui::cells::{Cells, Grid};
+use crate::gui::browser::ops::dialog::{self as kit, Button, Ink, Input, Inputs, Part};
+use crate::gui::cells::{self, Cells, Grid};
 use crate::gui::chrome;
 use eframe::egui::{self, Key, RichText};
 use std::collections::BTreeMap;
@@ -648,13 +660,16 @@ pub struct ActionDialog {
     repo: Repo,
     /// The draft last planned and its plan.
     planned: Option<(Action, Result<Plan, Refused>)>,
-    /// The form laid out a text field last pass: the typing goes there while nothing has it.
+    /// The form laid out a text field last pass: the typing goes there while nothing has it — in
+    /// cells also when it shows anew (Amend's message once "edit it" is chosen).
     typing: bool,
     /// The Cancel button's id, last pass: Enter while it has the focus cancels.
     cancel: Option<egui::Id>,
     /// Rebase's "Plan the commits first…" button's id, last pass: Enter while it has the focus
     /// is its click, never the rebase's Run.
     plan_first: Option<egui::Id>,
+    /// In cells: the first of the plan's rows shown.
+    plan_top: usize,
 }
 
 fn dialog_id() -> egui::Id {
@@ -662,9 +677,55 @@ fn dialog_id() -> egui::Id {
 }
 
 /// The id of a form's `n`th text field; the first has the typing.
-fn field_id(n: usize) -> egui::Id {
+pub(super) fn field_id(n: usize) -> egui::Id {
     dialog_id().with(("field", n))
 }
+
+/// In cells: the box's id (its modal), and its buttons'.
+fn cells_id() -> egui::Id {
+    dialog_id().with("cells")
+}
+
+pub(super) fn run_id() -> egui::Id {
+    cells_id().with("run")
+}
+
+pub(super) fn cancel_id() -> egui::Id {
+    cells_id().with("cancel")
+}
+
+fn plan_first_id() -> egui::Id {
+    cells_id().with("plan-first")
+}
+
+/// In cells: the id of a form's `k`th row of choices.
+pub(super) fn row_id(k: usize) -> egui::Id {
+    cells_id().with(("row", k))
+}
+
+/// An action's dialog's nominal width in cells, as egui's was (10 §6's rule widens it to its
+/// widest text, at most 76 cells inside).
+const NOMINAL: usize = 72;
+
+/// The rows an action's message field shows (Commit's, Amend's), as egui's did (X4-kit).
+const MESSAGE_ROWS: u16 = 4;
+
+/// The plan's rows before they scroll, on a grid of `rows` (X4-dialogs' decision): three fifths
+/// of it and eight at least, as egui's 60 % of the window and eight rows — the kit gives them way
+/// first where the grid leaves less (10 §6: a dialog stands between the title and status rows).
+fn plan_most(rows: u16) -> u16 {
+    let most = u32::from(rows) * 3 / 5;
+    u16::try_from(most).unwrap_or(u16::MAX).max(8)
+}
+
+/// The heading of the backups a plan writes first.
+const BACKED_UP: &str = "Backed up first, under refs/sopen-backup/<stamp>/";
+
+/// Delete backup's line: its group is the one thing removed without a backup (03 §8.2).
+const NO_BACKUP: &str = "Deleting a backup is the one removal sopen does without a backup.";
+
+/// What an action's dialog says Enter and Esc do (03 §8.1).
+const HINT: &str = "Enter runs · Esc cancels";
 
 /// A dialog's width: `cells` cells, within the window.
 pub(super) fn width(ctx: &egui::Context, cells: f32) -> f32 {
@@ -756,6 +817,7 @@ impl ActionDialog {
             typing: false,
             cancel: None,
             plan_first: None,
+            plan_top: 0,
         }))
     }
 
@@ -807,17 +869,49 @@ impl ActionDialog {
         }
     }
 
-    /// The cells of `grid` (the panels') the dialog covers, its box and its shadow, for the panel
-    /// and the other side to blank (10 §17, X4-graph's seam): none while egui draws it, until
-    /// X4-dialogs (X4-dialogs2 for 03 §7.1–§7.5's forms).
-    pub fn covers(&self, _grid: &Grid) -> Vec<Cells> {
-        Vec::new()
+    /// The dialog is cells (X4-dialogs): it has no options, or it is 03 §7.6–§7.7's form or a
+    /// restore's; the other forms are egui's until X4-dialogs2.
+    fn in_cells(&self) -> bool {
+        !self.form.options
+            || matches!(
+                self.form.draft,
+                Action::Commit { .. }
+                    | Action::Amend { .. }
+                    | Action::Stash { .. }
+                    | Action::ResetChanges { .. }
+                    | Action::Clean { .. }
+                    | Action::Fetch { .. }
+                    | Action::FetchRemote { .. }
+                    | Action::PruneRemote { .. }
+                    | Action::AddRemote { .. }
+                    | Action::EditRemote { .. }
+                    | Action::DeleteRemote { .. }
+                    | Action::User { .. }
+                    | Action::UserRemove { .. }
+                    | Action::Restore { .. }
+            )
     }
 
-    /// One pass on `grid` (the panels', where it stands once it is in cells): Esc and Enter are
-    /// taken before its widgets see them (Shift+Enter is a message field's new line); `planner`
-    /// plans the draft again whenever an option changed it.
-    pub fn ui(&mut self, ctx: &egui::Context, _grid: Grid, planner: Planner) -> Option<DialogEnd> {
+    /// The cells of `grid` (the panels') the dialog covers, its box and its shadow, for the panel
+    /// and the other side to blank (10 §17, X4-graph's seam), as the dialog stands now: none
+    /// while egui draws it (03 §7.1–§7.5's forms, until X4-dialogs2).
+    pub fn covers(&self, grid: &Grid) -> Vec<Cells> {
+        if !self.in_cells() {
+            return Vec::new();
+        }
+        // A restore's arrow is one cell either way: the box stands where the pass lays it.
+        let controls = controls(&self.form, false);
+        self.layout(*grid, &controls).covers()
+    }
+
+    /// One pass on `grid` (the panels'): Esc and Enter are taken before its widgets see them
+    /// (Shift+Enter is a message field's new line); `planner` plans the draft again whenever an
+    /// option changed it. In cells where [`ActionDialog::in_cells`] says so (see the module's
+    /// notes), else egui's.
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid, planner: Planner) -> Option<DialogEnd> {
+        if self.in_cells() {
+            return self.cells_ui(ctx, grid, planner);
+        }
         if self.replan(planner) {
             ctx.request_repaint();
         }
@@ -879,7 +973,7 @@ impl ActionDialog {
                     plan_first |= plan.clicked();
                 }
             });
-            ui.label(RichText::new("Enter runs · Esc cancels").weak());
+            ui.label(RichText::new(HINT).weak());
         });
         self.typing = typing;
         self.cancel = cancel_button;
@@ -913,61 +1007,260 @@ impl ActionDialog {
             && matches!(&self.planned, Some((a, Ok(_))) if *a == self.form.draft)
     }
 
-    /// The plan's parts (03 §8.1, §8.4), or the refusal — the dialog's own, else the plan's.
+    /// The plan's rows ([`plan_rows`]), and Delete backup's line.
+    fn plan_lines(&self) -> Vec<PlanRow> {
+        let own = self.form.refusal();
+        let planned = self.planned.as_ref().map(|(_, p)| p);
+        let shown = own.is_none() && matches!(planned, Some(Ok(_)));
+        let mut out = plan_rows(own, planned);
+        if shown && matches!(self.form.draft, Action::DeleteBackup { .. }) {
+            out.push(PlanRow::new(NO_BACKUP, Ink::Text, false));
+        }
+        out
+    }
+
+    /// The plan's rows in egui ([`ActionDialog::plan_lines`]), a heading's lines indented.
     fn plan_ui(&self, ui: &mut egui::Ui) {
         let error = ui.visuals().error_fg_color;
-        if let Some(why) = self.form.refusal() {
-            ui.add(egui::Label::new(RichText::new(why).color(error)).wrap());
-            return;
+        let rows = self.plan_lines();
+        let mut k = 0;
+        while k < rows.len() {
+            if rows[k].under {
+                let end = (k..rows.len()).find(|&i| !rows[i].under);
+                let end = end.unwrap_or(rows.len());
+                ui.indent(("sopen-git-plan", k), |ui| {
+                    for row in &rows[k..end] {
+                        ui.add(egui::Label::new(row.text.as_str()).wrap());
+                    }
+                });
+                k = end;
+                continue;
+            }
+            let row = &rows[k];
+            let text = match row.ink {
+                Ink::Error => RichText::new(row.text.as_str()).color(error),
+                Ink::Weak => RichText::new(row.text.as_str()).weak(),
+                Ink::Text => RichText::new(row.text.as_str()),
+            };
+            ui.add(egui::Label::new(text).wrap());
+            k += 1;
         }
-        let Some((_, planned)) = &self.planned else {
-            return;
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // In cells (X4-dialogs).
+
+    /// The box on `grid` with `controls` (the form's, [`controls`]): the lost line first, then the
+    /// options, the plan in rows that scroll ([`plan_part`]), the buttons and the hint; as wide as
+    /// its widest text by 10 §6's rule.
+    fn layout(&self, grid: Grid, controls: &[Control]) -> kit::Layout {
+        let title = self.title();
+        let lost = self.confirmation().and_then(|c| c.loses.clone());
+        let plan = self.plan_lines();
+        let wanted = (plan_wants(&plan))
+            .max(lost.as_deref().map_or(0, cells::width))
+            .max(cells::width(&title) + 2);
+        let width = kit::inside_width(grid.cols, NOMINAL, wanted);
+        let mut parts = Vec::new();
+        if let Some(lost) = lost {
+            parts.extend([Part::Text(lost, Ink::Text), Part::Blank]);
+        }
+        if !controls.is_empty() {
+            parts.extend(controls.iter().map(Control::part));
+            parts.push(Part::Blank);
+        }
+        if let Some(part) = plan_part(plan, grid, width, self.plan_top) {
+            parts.extend([part, Part::Blank]);
+        }
+        let mut run = Button::new("Run", run_id());
+        run.on = self.ready();
+        let mut buttons = vec![run, Button::new("Cancel", cancel_id())];
+        // 03 §7.1: Rebase offers the planner (its form is egui's until X4-dialogs2).
+        if matches!(self.form.draft, Action::Rebase { .. }) {
+            buttons.push(Button::new(PLAN_FIRST, plan_first_id()));
+        }
+        parts.push(Part::Buttons(buttons));
+        parts.push(Part::Text(HINT.to_string(), Ink::Weak));
+        kit::layout(grid, &title, NOMINAL, &parts)
+    }
+
+    /// One pass in cells (see the module's notes).
+    fn cells_ui(&mut self, ctx: &egui::Context, grid: Grid, planner: Planner) -> Option<DialogEnd> {
+        if self.replan(planner) {
+            ctx.request_repaint();
+        }
+        let escape = ctx.input_mut(|i| keys::take(i, Key::Escape, Mods::None));
+        let enters = take_enters(ctx);
+        let began = ctx.memory(|m| m.focused());
+        let mut controls = controls(&self.form, cells::ambiguous_wide(ctx));
+        let layout = self.layout(grid, &controls);
+        // The form's first text field takes the keyboard when it shows anew, or while nothing
+        // has it.
+        let typing = (controls.iter()).any(|c| c.text_field() == Some(0));
+        if typing && (!self.typing || began.is_none()) {
+            ctx.memory_mut(|m| m.request_focus(field_id(0)));
+        }
+        self.typing = typing;
+        let (run, cancel, plan_first) = (run_id(), cancel_id(), plan_first_id());
+        let mut by_id: Vec<(egui::Id, Input)> =
+            (controls.iter_mut()).filter_map(Control::input).collect();
+        // The buttons take the kit's presses, in the pass's order (F-kit-tab).
+        by_id.extend([run, cancel, plan_first].map(|b| (b, Input::Button)));
+        let inputs = Inputs {
+            top: Some(&mut self.plan_top),
+            by_id,
+            ..Inputs::default()
         };
-        let plan = match planned {
-            Ok(plan) => plan,
-            Err(Refused(why)) => {
-                ui.add(egui::Label::new(RichText::new(why).color(error)).wrap());
-                return;
-            }
-        };
-        match &plan.confirm {
-            Some(c) => {
-                lines(ui, "Changes", &c.changes);
-                lines(
-                    ui,
-                    "Backed up first, under refs/sopen-backup/<stamp>/",
-                    &c.backups,
-                );
-                lines(ui, "Runs", &c.commands);
-                for note in &c.notes {
-                    ui.add(egui::Label::new(note).wrap());
-                }
-            }
-            None => {
-                let steps: Vec<String> = plan.steps.iter().map(step_line).collect();
-                lines(ui, "Runs", &steps);
+        let shown = kit::show(ctx, cells_id(), &layout, inputs);
+        let now = ctx.memory(|m| m.focused());
+        apply(&mut self.form, &controls);
+        // The options as this pass left them, planned: Run below runs exactly what was typed.
+        if self.replan(planner) {
+            ctx.request_repaint();
+        }
+        let mut cancelled = escape || shown.clicked(cancel) || shown.modal.should_close();
+        let (mut ran, mut first) = (shown.clicked(run), shown.clicked(plan_first));
+        for after_tab in enters {
+            match if after_tab { now } else { began } {
+                Some(id) if id == cancel => cancelled = true,
+                Some(id) if id == plan_first => first = true,
+                _ => ran = true,
             }
         }
-        if let Action::DeleteBackup { .. } = self.form.draft {
-            ui.label("Deleting a backup is the one removal sopen does without a backup.");
+        if cancelled {
+            return Some(DialogEnd::Cancel);
         }
-        for change in plan.remote_changes() {
-            ui.add(egui::Label::new(RichText::new(remote_warning(change)).color(error)).wrap());
+        if let (true, Action::Rebase { onto, .. }) = (first, &self.form.draft) {
+            return Some(DialogEnd::PlanFirst(onto.clone()));
+        }
+        if ran && self.ready() {
+            let dont_ask_again =
+                self.form.dont_ask && matches!(self.form.draft, Action::Checkout { .. });
+            return Some(DialogEnd::Run {
+                action: self.form.draft.clone(),
+                dont_ask_again,
+            });
+        }
+        None
+    }
+}
+
+/// A row of a plan's part: its text, its ink, and whether it is a line under a heading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PlanRow {
+    pub(super) text: String,
+    pub(super) ink: Ink,
+    pub(super) under: bool,
+}
+
+impl PlanRow {
+    fn new(text: &str, ink: Ink, under: bool) -> Self {
+        Self {
+            text: text.to_string(),
+            ink,
+            under,
         }
     }
 }
 
-/// A heading and its lines, each a line of its own (nothing when there are none).
-fn lines(ui: &mut egui::Ui, heading: &str, lines: &[String]) {
-    if lines.is_empty() {
-        return;
+/// A plan's rows (03 §8.1, §8.4), or the refusal — `own`, the dialog's, else the plan's: what
+/// changes, the backups written first and the exact command lines, each under its heading in the
+/// weak colour, then the notes and §8.4's warning of each overwrite or delete on a remote in the
+/// error colour. Nothing while no plan is in. An action's dialog's, and a quick edit's to come
+/// (X4-quick).
+pub(super) fn plan_rows(
+    own: Option<String>,
+    planned: Option<&Result<Plan, Refused>>,
+) -> Vec<PlanRow> {
+    if let Some(why) = own {
+        return vec![PlanRow::new(&why, Ink::Error, false)];
     }
-    ui.label(RichText::new(heading).weak());
-    ui.indent(heading, |ui| {
-        for line in lines {
-            ui.add(egui::Label::new(line).wrap());
+    let plan = match planned {
+        None => return Vec::new(),
+        Some(Err(Refused(why))) => return vec![PlanRow::new(why, Ink::Error, false)],
+        Some(Ok(plan)) => plan,
+    };
+    let mut out = Vec::new();
+    let heading = |out: &mut Vec<PlanRow>, heading: &str, lines: &[String]| {
+        if !lines.is_empty() {
+            out.push(PlanRow::new(heading, Ink::Weak, false));
+            out.extend(lines.iter().map(|l| PlanRow::new(l, Ink::Text, true)));
         }
-    });
+    };
+    match &plan.confirm {
+        Some(c) => {
+            heading(&mut out, "Changes", &c.changes);
+            heading(&mut out, BACKED_UP, &c.backups);
+            heading(&mut out, "Runs", &c.commands);
+            out.extend(c.notes.iter().map(|n| PlanRow::new(n, Ink::Text, false)));
+        }
+        None => {
+            let steps: Vec<String> = plan.steps.iter().map(step_line).collect();
+            heading(&mut out, "Runs", &steps);
+        }
+    }
+    for change in plan.remote_changes() {
+        out.push(PlanRow::new(&remote_warning(change), Ink::Error, false));
+    }
+    out
+}
+
+/// How many cells a box wants inside for `rows` to stand whole, a heading's lines two cells in:
+/// a box at least this wide ([`kit::inside_width`]) holds [`plan_part`]'s rows.
+pub(super) fn plan_wants(rows: &[PlanRow]) -> usize {
+    (rows.iter())
+        .map(|r| cells::width(&r.text) + if r.under { 2 } else { 0 })
+        .max()
+        .unwrap_or(0)
+}
+
+/// `rows` as the kit's rows that scroll in a box `width` cells inside on `grid`, from row `top`:
+/// a heading's lines two cells in, wrapped there (a long line goes on two cells in), at most
+/// [`plan_most`] of them on screen; none for no rows.
+pub(super) fn plan_part(rows: Vec<PlanRow>, grid: Grid, width: usize, top: usize) -> Option<Part> {
+    let rows: Vec<(String, Ink)> = (rows.into_iter())
+        .flat_map(|r| match r.under {
+            true => (kit::wrap(&r.text, width.saturating_sub(2)).into_iter())
+                .map(|row| (format!("  {row}"), r.ink))
+                .collect(),
+            false => vec![(r.text, r.ink)],
+        })
+        .collect();
+    (!rows.is_empty()).then(|| Part::Scroll {
+        rows,
+        most: plan_most(grid.rows),
+        top,
+    })
+}
+
+/// The pass's presses of Enter with no modifiers, taken out of its input in order, each saying
+/// whether it came after the pass's first Tab — so no choice, button or field the keyboard is on
+/// reads it as its own: the dialog gives each to what has the keyboard then.
+fn take_enters(ctx: &egui::Context) -> Vec<bool> {
+    ctx.input_mut(|i| {
+        let (mut tab, mut out) = (false, Vec::new());
+        i.events.retain(|e| match e {
+            egui::Event::Key {
+                key: Key::Tab,
+                pressed: true,
+                ..
+            } => {
+                tab = true;
+                true
+            }
+            egui::Event::Key {
+                key: Key::Enter,
+                pressed: true,
+                modifiers,
+                ..
+            } if Mods::None.matches(*modifiers) => {
+                out.push(tab);
+                false
+            }
+            _ => true,
+        });
+        out
+    })
 }
 
 /// §8.4's warning for one overwrite or delete on a remote: never a plain `--force`.
@@ -1054,20 +1347,6 @@ fn field(ui: &mut egui::Ui, heading: &str, text: &mut String, n: usize) -> bool 
         );
     });
     true
-}
-
-/// A URL field: whether the owner changed it this pass.
-fn url_field(ui: &mut egui::Ui, heading: &str, text: &mut String, n: usize) -> bool {
-    ui.horizontal(|ui| {
-        ui.label(heading);
-        ui.add(
-            chrome::field(text)
-                .id(field_id(n))
-                .desired_width(ui.available_width()),
-        )
-        .changed()
-    })
-    .inner
 }
 
 /// A message field: several lines, Shift+Enter a new line (Enter runs the dialog). Whether the
@@ -1236,30 +1515,407 @@ fn value_text(value: &Value) -> String {
     }
 }
 
-/// The restore's entries (03 §8.3): each chosen or not, its value then, `moved since (now …)`,
-/// and for an occupied path its "replace".
-fn restore_ui(ui: &mut egui::Ui, entries: &mut [RestoreEntry]) {
-    if entries.is_empty() {
-        ui.label("nothing in this group to restore");
+// ---------------------------------------------------------------------------------------------
+// The forms in cells (X4-dialogs: 03 §7.6–§7.7's and a restore's).
+
+/// A control of a form in cells and its value this pass: copied from the form ([`controls`]),
+/// given to the kit by its id ([`Control::input`]) and written back ([`apply`]).
+#[derive(Debug)]
+enum Control {
+    /// The form's one-line field `n`.
+    Field {
+        label: &'static str,
+        n: usize,
+        text: String,
+    },
+    /// The form's message field `n` (Shift+Enter a new line).
+    Message {
+        label: &'static str,
+        n: usize,
+        text: String,
+    },
+    /// The form's row of choices `row`, one of several: the chosen one.
+    One {
+        label: &'static str,
+        row: usize,
+        words: Vec<String>,
+        at: Option<usize>,
+    },
+    /// The form's row of choices `row`, any of several: each on or off.
+    Any {
+        row: usize,
+        words: Vec<String>,
+        on: Vec<bool>,
+    },
+    /// A line of the form (a restore entry's state).
+    Note(String),
+}
+
+impl Control {
+    /// Its part of the dialog.
+    fn part(&self) -> Part {
+        match self {
+            Control::Field { label, n, .. } => Part::Field {
+                label: label.to_string(),
+                id: field_id(*n),
+            },
+            Control::Message { label, n, .. } => Part::Message {
+                label: label.to_string(),
+                id: field_id(*n),
+                rows: MESSAGE_ROWS,
+            },
+            Control::One {
+                label, row, words, ..
+            } => Part::Choices {
+                label: label.to_string(),
+                id: row_id(*row),
+                choices: words.clone(),
+                many: false,
+            },
+            Control::Any { row, words, .. } => Part::Choices {
+                label: String::new(),
+                id: row_id(*row),
+                choices: words.clone(),
+                many: true,
+            },
+            Control::Note(text) => Part::Text(text.clone(), Ink::Text),
+        }
     }
-    for e in entries {
-        ui.horizontal_wrapped(|ui| {
-            let text = format!("{} → {}", subject_text(&e.subject), value_text(&e.before));
-            toggle(ui, &mut e.chosen, &text);
-            if e.moved_since {
-                ui.label(format!("moved since (now {})", value_text(&e.now)));
+
+    /// Its state for the kit, by its part's id.
+    fn input(&mut self) -> Option<(egui::Id, Input<'_>)> {
+        match self {
+            Control::Field { n, text, .. } | Control::Message { n, text, .. } => {
+                Some((field_id(*n), Input::Text(text)))
             }
-            // In the way as S3-A's `entries` looked: a leaf of other bytes (`now` is its blob) or
-            // anything that is not a file (`occupied`) — S3-C: not `Occupied` alone.
-            if crate::git::backup::blocked(e) {
-                ui.label("occupied: left as it is unless replace is chosen");
-                toggle(ui, &mut e.replace, "replace");
-            }
-        });
+            Control::One { row, at, .. } => Some((row_id(*row), Input::One(at))),
+            Control::Any { row, on, .. } => Some((row_id(*row), Input::Any(on))),
+            Control::Note(_) => None,
+        }
+    }
+
+    /// The number of the text field it is, if it is one.
+    fn text_field(&self) -> Option<usize> {
+        match self {
+            Control::Field { n, .. } | Control::Message { n, .. } => Some(*n),
+            _ => None,
+        }
     }
 }
 
-/// The options of the form's draft, edited in place; whether a text field was laid out.
+fn words(all: &[&str]) -> Vec<String> {
+    all.iter().map(|w| w.to_string()).collect()
+}
+
+/// The controls of `form`'s options in cells, with their values now (none for a form without
+/// options, or one egui draws); `wide`: for an ambiguous-wide terminal ([`restore_controls`]).
+fn controls(form: &Form, wide: bool) -> Vec<Control> {
+    let one = |label, row, all: &[String], value: &str| Control::One {
+        label,
+        row,
+        words: all.to_vec(),
+        at: all.iter().position(|w| w == value),
+    };
+    let field = |label, n, text: &str| Control::Field {
+        label,
+        n,
+        text: text.to_string(),
+    };
+    let any = |row, all: &[&str], on: &[bool]| Control::Any {
+        row,
+        words: words(all),
+        on: on.to_vec(),
+    };
+    let scopes = |local: &str, scope: ConfigScope| Control::One {
+        label: "Where",
+        row: 0,
+        words: words(&[local, "globally"]),
+        at: Some(usize::from(scope == ConfigScope::Global)),
+    };
+    if !form.options {
+        return Vec::new();
+    }
+    match &form.draft {
+        Action::Commit {
+            message,
+            amend,
+            no_verify,
+        } => vec![
+            Control::Message {
+                label: "Message",
+                n: 0,
+                text: message.clone(),
+            },
+            any(
+                0,
+                &["Amend the last commit instead", "Skip hooks"],
+                &[*amend, *no_verify],
+            ),
+        ],
+        Action::Amend { message } => {
+            let mut all = vec![Control::One {
+                label: "Message",
+                row: 0,
+                words: words(&["keep its message", "edit it"]),
+                at: Some(usize::from(message.is_some())),
+            }];
+            if let Some(m) = message {
+                all.push(Control::Message {
+                    label: "New message",
+                    n: 0,
+                    text: m.clone(),
+                });
+            }
+            all
+        }
+        Action::Stash {
+            message,
+            include_untracked,
+        } => vec![
+            field("Message", 0, message),
+            any(0, &["Include untracked files"], &[*include_untracked]),
+        ],
+        Action::ResetChanges { hard } => vec![Control::One {
+            label: "Mode",
+            row: 0,
+            words: words(&["mixed (unstage all)", "hard (discard all tracked changes)"]),
+            at: Some(usize::from(*hard)),
+        }],
+        Action::Clean { folders } => vec![any(0, &["Folders too (-d)"], &[*folders])],
+        Action::Fetch { prune, prune_tags } => {
+            vec![any(0, &["Prune", "Prune tags"], &[*prune, *prune_tags])]
+        }
+        Action::FetchRemote {
+            remote,
+            prune,
+            prune_tags,
+        } => vec![
+            one("Remote", 0, &form.remotes, remote),
+            any(1, &["Prune", "Prune tags"], &[*prune, *prune_tags]),
+        ],
+        Action::PruneRemote { remote } | Action::DeleteRemote { remote } => {
+            vec![one("Remote", 0, &form.remotes, remote)]
+        }
+        Action::AddRemote {
+            name,
+            url,
+            fetch_now,
+            ..
+        } => vec![
+            field("Name", 0, name),
+            field("Fetch URL", 1, url),
+            field("Push URL (blank: the fetch URL)", 2, &form.text),
+            any(0, &["Fetch now"], &[*fetch_now]),
+        ],
+        Action::EditRemote { was, now } => vec![
+            one("Remote", 0, &form.remotes, &was.name),
+            field("Name", 0, &now.name),
+            field("Fetch URL", 1, &form.url),
+            field("Push URL (blank: the fetch URL)", 2, &form.text),
+        ],
+        Action::User { name, email, scope } => vec![
+            field("Name", 0, name),
+            field("Email", 1, email),
+            scopes("for this repository", *scope),
+        ],
+        Action::UserRemove { scope } => vec![scopes("this repository", *scope)],
+        Action::Restore { entries, .. } => restore_controls(entries, wide),
+        // The forms egui draws until X4-dialogs2 (`form_ui`).
+        _ => Vec::new(),
+    }
+}
+
+/// A restore's entries (03 §8.3): each a row of its own — `[X] <subject> → <value then>`, and for
+/// a path in the way its `[ ] replace` — with `moved since (now …)` and the occupied path's rule
+/// under it. The `→` is sopen's own, between a name and a value: `wide`, an ambiguous-wide
+/// terminal gets §10's `>` there, at the source (T38), as the panel's `↔` in a label.
+fn restore_controls(entries: &[RestoreEntry], wide: bool) -> Vec<Control> {
+    if entries.is_empty() {
+        return vec![Control::Note("nothing in this group to restore".into())];
+    }
+    let arrow = crate::gui::term::narrow("→")
+        .filter(|_| wide)
+        .unwrap_or("→");
+    let mut out = Vec::new();
+    for (k, e) in entries.iter().enumerate() {
+        let (subject, value) = (subject_text(&e.subject), value_text(&e.before));
+        let mut all = vec![format!("{subject} {arrow} {value}")];
+        let mut on = vec![e.chosen];
+        // In the way as S3-A's `entries` looked: a leaf of other bytes (`now` is its blob) or
+        // anything that is not a file (`occupied`) — S3-C: not `Occupied` alone.
+        let blocked = crate::git::backup::blocked(e);
+        if blocked {
+            all.push("replace".into());
+            on.push(e.replace);
+        }
+        out.push(Control::Any {
+            row: k,
+            words: all,
+            on,
+        });
+        // Under the entry's words, past its `[X] `.
+        if e.moved_since {
+            let now = value_text(&e.now);
+            out.push(Control::Note(format!("    moved since (now {now})")));
+        }
+        if blocked {
+            let rule = "    occupied: left as it is unless replace is chosen";
+            out.push(Control::Note(rule.into()));
+        }
+    }
+    out
+}
+
+/// `controls`, as the pass left them, written back into `form`'s draft (and what it keeps).
+fn apply(form: &mut Form, controls: &[Control]) {
+    let text = |n: usize| {
+        controls.iter().find_map(|c| match c {
+            Control::Field { n: k, text, .. } | Control::Message { n: k, text, .. } if *k == n => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+    };
+    let one = |row: usize| {
+        controls.iter().find_map(|c| match c {
+            Control::One { row: k, at, .. } if *k == row => *at,
+            _ => None,
+        })
+    };
+    let any = |row: usize, i: usize| {
+        controls.iter().find_map(|c| match c {
+            Control::Any { row: k, on, .. } if *k == row => on.get(i).copied(),
+            _ => None,
+        })
+    };
+    fn set<T>(to: &mut T, value: Option<T>) {
+        if let Some(value) = value {
+            *to = value;
+        }
+    }
+    let scope = |row| one(row).map(|k| [ConfigScope::Local, ConfigScope::Global][k.min(1)]);
+    let Form {
+        draft,
+        remotes,
+        kept,
+        text: push_text,
+        known: urls,
+        url: fetch_text,
+        url_touched,
+        push_touched,
+        ..
+    } = form;
+    let remote = |row| one(row).and_then(|k| remotes.get(k)).cloned();
+    match draft {
+        Action::Commit {
+            message,
+            amend,
+            no_verify,
+        } => {
+            set(message, text(0));
+            set(amend, any(0, 0));
+            set(no_verify, any(0, 1));
+        }
+        Action::Amend { message: m } => {
+            if let (Some(m), Some(typed)) = (m.as_mut(), text(0)) {
+                *m = typed;
+            }
+            // A message kept while "keep its message" is chosen, so "edit it" brings it back.
+            let edit = one(0) == Some(1);
+            if edit && m.is_none() {
+                *m = Some(std::mem::take(kept));
+            } else if !edit && m.is_some() {
+                *kept = m.take().unwrap_or_default();
+            }
+        }
+        Action::Stash {
+            message,
+            include_untracked,
+        } => {
+            set(message, text(0));
+            set(include_untracked, any(0, 0));
+        }
+        Action::ResetChanges { hard } => set(hard, one(0).map(|k| k == 1)),
+        Action::Clean { folders } => set(folders, any(0, 0)),
+        Action::Fetch { prune, prune_tags } => {
+            set(prune, any(0, 0));
+            set(prune_tags, any(0, 1));
+        }
+        Action::FetchRemote {
+            remote: r,
+            prune,
+            prune_tags,
+        } => {
+            set(r, remote(0));
+            set(prune, any(1, 0));
+            set(prune_tags, any(1, 1));
+        }
+        Action::PruneRemote { remote: r } | Action::DeleteRemote { remote: r } => set(r, remote(0)),
+        Action::AddRemote {
+            name,
+            url,
+            push_url,
+            fetch_now,
+        } => {
+            set(name, text(0));
+            set(url, text(1));
+            set(push_text, text(2));
+            *push_url = Some(push_text.trim().to_string()).filter(|u| !u.is_empty());
+            set(fetch_now, any(0, 0));
+        }
+        Action::EditRemote { was, now } => {
+            if let Some(chosen) = remote(0).filter(|r| *r != was.name) {
+                // Another remote: its URLs as read, nothing touched (this pass's typing was the
+                // other remote's).
+                *was = known(urls, &chosen);
+                *now = was.clone();
+                *fetch_text = was.url.clone();
+                *push_text = was.push_url.clone().unwrap_or_default();
+                (*url_touched, *push_touched) = (false, false);
+                return;
+            }
+            set(&mut now.name, text(0));
+            if let Some(typed) = text(1).filter(|t| t != fetch_text) {
+                (*fetch_text, *url_touched) = (typed, true);
+            }
+            if let Some(typed) = text(2).filter(|t| t != push_text) {
+                (*push_text, *push_touched) = (typed, true);
+            }
+            // A field left alone is the URL as it is set: `now` keeps `was`'s (masked) value, so
+            // the plan writes nothing for it (03 §3.7); a changed one is the URL as typed.
+            now.url = match url_touched {
+                true => fetch_text.trim().to_string(),
+                false => was.url.clone(),
+            };
+            now.push_url = match push_touched {
+                true => Some(push_text.trim().to_string()).filter(|u| !u.is_empty()),
+                false => was.push_url.clone(),
+            };
+        }
+        Action::User {
+            name,
+            email,
+            scope: s,
+        } => {
+            set(name, text(0));
+            set(email, text(1));
+            set(s, scope(0));
+        }
+        Action::UserRemove { scope: s } => set(s, scope(0)),
+        Action::Restore { entries, .. } => {
+            for (k, e) in entries.iter_mut().enumerate() {
+                set(&mut e.chosen, any(k, 0));
+                if crate::git::backup::blocked(e) {
+                    set(&mut e.replace, any(k, 1));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The options of the form's draft in egui (03 §7.1–§7.5's, until X4-dialogs2), edited in place;
+/// whether a text field was laid out.
 fn form_ui(ui: &mut egui::Ui, form: &mut Form) -> bool {
     let Form {
         draft,
@@ -1272,11 +1928,7 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form) -> bool {
         kept,
         text,
         dont_ask,
-        known: urls,
         how: kept_how,
-        url,
-        url_touched,
-        push_touched,
         ..
     } = form;
     let mut typing = false;
@@ -1458,137 +2110,8 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form) -> bool {
             toggle(ui, index, "Restore the index too (--index)")
         }
         Action::StashBranch { name, .. } => typing = field(ui, "Name", name, 0),
-        Action::Commit {
-            message: m,
-            amend,
-            no_verify,
-        } => {
-            message(ui, "Message", m, 0);
-            typing = true;
-            ui.horizontal_wrapped(|ui| {
-                toggle(ui, amend, "Amend the last commit instead");
-                toggle(ui, no_verify, "Skip hooks");
-            });
-        }
-        Action::Amend { message: m } => {
-            let mut edit = m.is_some();
-            if one_of(
-                ui,
-                "Message",
-                &mut edit,
-                &[(false, "keep its message"), (true, "edit it")],
-            ) {
-                if edit {
-                    *m = Some(std::mem::take(kept));
-                } else {
-                    *kept = m.take().unwrap_or_default();
-                }
-            }
-            if let Some(m) = m {
-                message(ui, "New message", m, 0);
-                typing = true;
-            }
-        }
-        Action::Stash {
-            message: m,
-            include_untracked,
-        } => {
-            typing = field(ui, "Message", m, 0);
-            toggle(ui, include_untracked, "Include untracked files");
-        }
-        Action::ResetChanges { hard } => {
-            one_of(
-                ui,
-                "Mode",
-                hard,
-                &[
-                    (false, "mixed (unstage all)"),
-                    (true, "hard (discard all tracked changes)"),
-                ],
-            );
-        }
-        Action::Clean { folders } => toggle(ui, folders, "Folders too (-d)"),
-        Action::Fetch { prune, prune_tags } => {
-            ui.horizontal_wrapped(|ui| {
-                toggle(ui, prune, "Prune");
-                toggle(ui, prune_tags, "Prune tags");
-            });
-        }
-        Action::FetchRemote {
-            remote,
-            prune,
-            prune_tags,
-        } => {
-            pick_name(ui, "Remote", remote, remotes);
-            ui.horizontal_wrapped(|ui| {
-                toggle(ui, prune, "Prune");
-                toggle(ui, prune_tags, "Prune tags");
-            });
-        }
-        Action::PruneRemote { remote } | Action::DeleteRemote { remote } => {
-            pick_name(ui, "Remote", remote, remotes);
-        }
-        Action::AddRemote {
-            name,
-            url,
-            push_url,
-            fetch_now,
-        } => {
-            typing = field(ui, "Name", name, 0);
-            field(ui, "Fetch URL", url, 1);
-            field(ui, "Push URL (blank: the fetch URL)", text, 2);
-            *push_url = Some(text.trim().to_string()).filter(|u| !u.is_empty());
-            toggle(ui, fetch_now, "Fetch now");
-        }
-        Action::EditRemote { was, now } => {
-            let mut chosen = was.name.clone();
-            if pick_name(ui, "Remote", &mut chosen, remotes) {
-                *was = known(urls, &chosen);
-                *now = was.clone();
-                *url = was.url.clone();
-                *text = was.push_url.clone().unwrap_or_default();
-                (*url_touched, *push_touched) = (false, false);
-            }
-            typing = field(ui, "Name", &mut now.name, 0);
-            *url_touched |= url_field(ui, "Fetch URL", url, 1);
-            *push_touched |= url_field(ui, "Push URL (blank: the fetch URL)", text, 2);
-            // A field left alone is the URL as it is set: `now` keeps `was`'s (masked) value, so
-            // the plan writes nothing for it (03 §3.7); a changed one is the URL as typed.
-            now.url = match url_touched {
-                true => url.trim().to_string(),
-                false => was.url.clone(),
-            };
-            now.push_url = match push_touched {
-                true => Some(text.trim().to_string()).filter(|u| !u.is_empty()),
-                false => was.push_url.clone(),
-            };
-        }
-        Action::User { name, email, scope } => {
-            typing = field(ui, "Name", name, 0);
-            field(ui, "Email", email, 1);
-            one_of(
-                ui,
-                "Where",
-                scope,
-                &[
-                    (ConfigScope::Local, "for this repository"),
-                    (ConfigScope::Global, "globally"),
-                ],
-            );
-        }
-        Action::UserRemove { scope } => {
-            one_of(
-                ui,
-                "Where",
-                scope,
-                &[
-                    (ConfigScope::Local, "this repository"),
-                    (ConfigScope::Global, "globally"),
-                ],
-            );
-        }
-        Action::Restore { entries, .. } => restore_ui(ui, entries),
-        // The actions without options (`has_options`), and any added later: their confirmation.
+        // 03 §7.6–§7.7's forms and a restore's are cells (`controls`); the actions without
+        // options have their confirmation alone.
         _ => {}
     }
     typing
