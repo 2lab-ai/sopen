@@ -39,6 +39,14 @@ Message 23 (2026-11-24):
 > 그리고 이 xtools는 터미널 tui가 디폴트고 (이미지나 영상 빼고 다 실제 tui랑 1:1 매칭되고 잇는 ui임
 > 그 tui상태에서 버튼 누르면 tui가 그대로 gui로 변하게 해줘 gui에서는 이미지나 영상등을 출력해줄수 있고 그 이미지 출력할수 있는 터미널 모드도 있지 않나? 거기서는 네이티브 터미널에서 그대로 이미지와 영상 출력할 수 있게 해주고 이것도 리서치해서 어떻게 하는게 가장 좋을지 고민하고 작업 해줘
 
+Message 25 (2026-11-27; it belongs to the CLI, 01 A18 — recorded here because it came in this drive):
+
+> 그리고 llmux 처럼 sopen channel stable|preview 고를수 있고 sopen update 할수 있도록해줘
+
+Message 26 (2026-11-27):
+
+> sopen 으로 url 넣으면 디폴트로 target의 xtools에서 브라우징해줘 지금은 아무것도 안되고 있음
+
 ## Fixed scope
 
 1. **Names (message 22).** The project and its command stay **sopen**: the CLI. The multi-function
@@ -77,6 +85,11 @@ Message 23 (2026-11-24):
    - The page is drawn by the engine each OS already has: WKWebView on macOS, WebKitGTK on Linux.
      sopen never builds or ships Chromium. The research note (`../research/web-view.md`, from VR-W)
      decides how it is embedded.
+   - Message 26 makes this the default on every route: `sopen URL` opens an xtools window with the
+     address on the machine that shows things (here, HOST through the tunnel, or HOST as written);
+     `--browser` keeps the system browser (09 §7). Its "nothing happens" half was a forward bug:
+     a KDE HOST's `xdg-open` ran a missing `kfmclient` and reported success, because the forward
+     did not import `KDE_SESSION_VERSION` (#160).
 
 Readings the workstream made on 2026-11-24 (reversible; the owner may change them):
 - "xtools" in message 18 is the same name message 22 gives the tool.

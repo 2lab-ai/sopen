@@ -355,3 +355,45 @@ Three units merged and shipped one by one, each prerelease installed on the Mac 
 | X2-switch | ✅ done 2026-11-26 | 10 §17's X2: the TUI's half over ssh, §7.3's outcomes, the question before switching; ships X2 (#154) | coder |
 | ED-screen | ✅ done 2026-11-26 | 12 §16: §4 in cells, the shared highlighter, EH-1–EH-3 (#153) | coder |
 | ED-dialogs | ✅ done 2026-11-27 | 12 §16: the editor's dialogs in cells with E6, ES-5 (#155) | coder |
+
+## R1 (part 10) — the X4 cut and its first units, the address in xtools, channels, closed 2026-11-27
+
+Eight PRs merged and shipped one by one, each prerelease installed on the Mac and, while it answered, the Linux host. Owner messages 25 and 26 came in this round; with WV-B and WV-E2, `sopen URL` opens the address in an xtools window by default.
+
+- **The X4 cut** (#157): 10 §17's X4 in 14 units, with X4's rule for shared files (each unit's tests in its own `git_panel/tests_x4_<unit>.rs`, created by X4-graph; in a shared file a unit edits only the lines its row names, the second to merge rebases); X6, X7 and XF cut first.
+- **X4-lanes** (#158): the git graph's lane glyphs in code page 437, one row a commit.
+- **The URL fix** (#160): `sopen URL` with a KDE Plasma 6 HOST printed "opened … in the browser" and nothing opened. The forward imported `XDG_CURRENT_DESKTOP=KDE` but not `KDE_SESSION_VERSION`, so `xdg-open` ran the missing `kfmclient` and its exit-code shim reported success. The forward now imports `KDE_SESSION_VERSION`, `KDE_FULL_SESSION`, `XDG_SESSION_DESKTOP` and `DESKTOP_SESSION`. Post-release receipt through the real forward with a recording browser on the Linux host: the address and `KDE_SESSION_VERSION=6` reached it.
+- **X4-kit** (#159): the dialog parts the git panel's dialogs need — choices (`(•)`/`[X]`, marked, not coloured), a multi-row message field (cut by cells, rows reused only for the very same text), a list with a bar, several fields and check boxes; the kit takes its own keys before egui's once-per-pass click.
+- **X4-tree** (#161): the F10 tree in cells in both backends; a `SOPEN_CELLS` run waits until no tree request is in flight and blanks the title row's clock with the mode button; the switch-state test's flake fixed.
+- **Channels** (#162, owner message 25): `sopen channel [stable|preview]` and `sopen update`, as llmux does — the channel is what brew installed; a switch installs the target first, relinks only if needed and retires the other formula last, so a failure never leaves no sopen on PATH; stable is refused before anything changes until the tap has its formula (the first `v*` release is the owner's).
+- **WV-B** (#163): the Linux web engine — WebKitGTK loaded at runtime, one GTK thread for the process, offscreen views copied into egui textures, the sandbox probed and read back, a file view's main frame held to its scheme (every `about:` refused: a top-level `about:srcdoc` replaced the page, measured). Linux has no blocked-request count and shows no IME preedit (09 §2.3, §3.3).
+- **WV-E2** (#164, owner message 26): `sopen URL` opens an xtools window with the address on every route; `--browser` keeps the system browser; no engine or no display falls back after a line.
+- **Receipts:**
+  - WV-B on the Linux host under a private headless KWin: the preview and the Enter viewer of an HTML file (CSS, a local image, a blocked outside image, Hangul, scripts off); 69 engine tests; quitting with a page open 5 times; the owner's session unchanged before and after every run.
+  - WV-E2 on the Mac with the installed build: `sopen --here http://127.0.0.1:<port>/` → `opened … in xtools`, the page in the window with its script run and Hangul shown.
+  - Channels on the Mac with real brew: `channel: preview (via brew)`; `sopen update` → up to date; `sopen channel stable` → the no-release line, exit 1, nothing changed.
+- **Reviews:** two engines per unit, then one fix-check; the orchestrator verified the last fixes at their lines. The ~5,000-line WV-B split its reviewers by focus (GPT on the security contract, Claude on FFI and lifecycle). Found and fixed: a channel switch that could leave no `bin/sopen`, a GTK thread that could start twice, a file view that could show an `about:` document, a sandbox never read back, a receipt rule that could pass a changing screen, cues said after an early input end.
+- **CI:** #162's first macOS run failed a stderr test that assumed two lines arrive in one read (macOS wrote them apart): reading and forwarding are now separate threads.
+- **The Linux host** stopped answering ssh after #161's install; #162–#164 are installed on the Mac only, and WV-E2's Linux end-to-end receipt waits (F-wv-rest).
+- **Prereleases:**
+  - preview-2026-11-27-0138-dc7a9c97cc2b (the X4 cut);
+  - preview-2026-11-27-0252-5be0be979975 (X4-lanes);
+  - preview-2026-11-27-0359-4c7d3e73989d (the URL fix);
+  - preview-2026-11-27-0514-d1cb4712b1aa (X4-kit);
+  - preview-2026-11-27-0543-90f19943c845 (X4-tree);
+  - preview-2026-11-27-0651-5f5819b8d386 (channels);
+  - preview-2026-11-27-0805-4f752f12d09f (WV-B);
+  - preview-2026-11-27-0837-17032859f5fd (WV-E2).
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| X4-cut | ✅ done 2026-11-27 | 10 §17: X4 in 14 units, X4's rule for shared files, X6/X7/XF's first cut (#157) | orchestrator |
+| X4-lanes | ✅ done 2026-11-27 | 10 §17: the graph's lane glyphs in code page 437 (#158) | coder |
+| F-url-kde | ✅ done 2026-11-27 | The forward imports the desktop's KDE variables, so `sopen URL` opens on a KDE HOST (#160) | coder |
+| X4-kit | ✅ done 2026-11-27 | 10 §17: choices, the message field, the list, several fields and check boxes in the dialog kit (#159) | coder |
+| X4-tree | ✅ done 2026-11-27 | 10 §17: the F10 tree in cells; the cells receipt waits for the tree (#161) | coder |
+| CH-update | ✅ done 2026-11-27 | Owner message 25: `sopen channel [stable|preview]` and `sopen update` (01 A18, §4b; #162) | coder |
+| WV-B | ✅ done 2026-11-27 | 09 §12: the Linux web engine (#163) | coder |
+| WV-E2 | ✅ done 2026-11-27 | 09 §12, owner message 26: the address window by default on every route (#164) | coder |
