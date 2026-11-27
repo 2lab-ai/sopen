@@ -21,21 +21,23 @@
 //! goes to what has the keyboard at that point: before the pass's first Tab what had it then,
 //! after it what the Tab gave it to. One after a Shift+Tab or an arrow that moves the keyboard
 //! (egui moves it after the pass) is dropped, and a Space too. Only what the screen showed is
-//! applied or turned: Enter and `[ Apply ]` apply only the filters the pass before painted,
-//! unchanged in that pass and this one — else the box says the filters changed and the next
-//! Enter applies them — and Space or a click on the list turns a branch only while the list
-//! holds the rows the pass before painted, in the box where it painted them (egui gives a click
-//! to the control the pass before laid out under the pointer; the list finds the row by where it
-//! stands now). A pass that types lays the list out before the text, so it paints the rows it
-//! held, and a click in the next pass, where the text changed them, turns nothing (in its own
-//! pass a click takes the keyboard from the field before it types, egui's rule). Esc, `[ Cancel ]` or a click outside cancels, and a pass that both cancels and applies
+//! applied or turned — the paintings of the last pass that reached the screen
+//! (`cells::OnScreen`: a terminal prints no pass while input waits): Enter and `[ Apply ]` apply
+//! only the filters such a pass painted, unchanged in it and in this one — else the box says the
+//! filters changed and the next Enter applies them — and Space or a click on the list turns a
+//! branch only while the list holds the rows it painted, in the box where it painted them (egui
+//! gives a click to the control the pass before laid out under the pointer; the list finds the
+//! row by where it stands now). A pass that types lays the list out before the text, so it
+//! paints the rows it held, and a click in the next pass, where the text changed them, turns
+//! nothing (in its own pass a click takes the keyboard from the field before it types, egui's
+//! rule). Esc, `[ Cancel ]` or a click outside cancels, and a pass that both cancels and applies
 //! cancels. Its ids are one set for the window, as the menu's ([`super::menu`]).
 
 use crate::git::model::{RefKind, RefLabel, StashRow};
 use crate::gui::browser::keys::{self, Mods};
 use crate::gui::browser::ops::dialog::{self as kit, Bar, Button, Ink, Input, Inputs, Part};
 use crate::gui::browser::ops::dialog::{Row, Rows};
-use crate::gui::cells::{Cells, Grid};
+use crate::gui::cells::{self, Cells, Grid};
 use eframe::egui::{self, Key};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -281,16 +283,17 @@ pub(super) struct Dialog {
     bar: Bar,
     /// How many times the shown branches changed: which rows the list holds.
     made: u64,
-    /// The `made` of the rows the last pass painted and where it painted the box (none before
-    /// the first pass).
-    painted: Option<(u64, Vec<Cells>)>,
+    /// The `made` of the rows and where the box stood, as the last pass that reached the screen
+    /// painted them (`cells::OnScreen`: a terminal prints no pass while input waits).
+    rows_screen: cells::OnScreen<(u64, Vec<Cells>)>,
     /// Bumped whenever a filter changes: which filters these are, compared in place of the
     /// filters themselves (a copy of 20,000 chosen branches a pass would not be bounded).
     revision: u64,
-    /// The `revision` the last pass painted, where it changed none of them (a pass that changes
-    /// one paints the choices as it leaves them and the list's marks as they were); a pass that
-    /// changes one keeps the record before it, so an Enter right after says the filters changed.
-    painted_filters: Option<u64>,
+    /// The `revision` the last pass that reached the screen painted, where it changed none of
+    /// them — `None` for a pass that changed one, which paints the choices as it leaves them and
+    /// the list's marks as they were: it shows no filters to apply, but an Enter after it says the
+    /// filters changed.
+    filters_screen: cells::OnScreen<Option<u64>>,
     /// An Enter or `[ Apply ]` came while the filters on screen were not the ones it would apply.
     changed: bool,
     /// The dialog's controls, as the last pass laid them (the ones that may hold the keyboard).
@@ -504,9 +507,9 @@ impl Dialog {
             rows: Rows::new(Vec::new()),
             bar: Bar::default(),
             made: 0,
-            painted: None,
+            rows_screen: cells::OnScreen::default(),
             revision: 0,
-            painted_filters: None,
+            filters_screen: cells::OnScreen::default(),
             changed: false,
             controls: Vec::new(),
         };
@@ -614,6 +617,10 @@ impl Dialog {
     /// One pass on `grid` (the panels'), in cells (see the module's notes): Esc and Enter are
     /// taken before its controls see them.
     pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> Option<DialogEnd> {
+        // What the screen shows as the owner pressed this pass's keys: the last paintings that
+        // reached it.
+        let seen_rows = self.rows_screen.start(ctx).cloned();
+        let seen = self.filters_screen.start(ctx).copied();
         let mut escape = false;
         while ctx.input_mut(|i| keys::take(i, Key::Escape, Mods::None)) {
             escape = true;
@@ -661,9 +668,8 @@ impl Dialog {
         // finds its row by where it stands now, and a box laid elsewhere (fewer or more rows, the
         // grid resized) has another row there.
         let at = (self.made, laid.covers());
-        // presented: once `cells::presented(ctx)` lands (X4-dialogs), the record counts only a
-        // pass that reached the screen.
-        let seen_rows = self.painted.replace(at.clone()) == Some(at);
+        let seen_rows = seen_rows.as_ref() == Some(&at);
+        self.rows_screen.painted(at);
         // Whether the branches' marks change: the Branches filter or Reflog commits.
         let mut marks = false;
         if seen_rows {
@@ -719,14 +725,11 @@ impl Dialog {
                 _ => apply = true,
             }
         }
+        let unchanged = self.revision == laid_revision;
+        self.filters_screen
+            .painted(unchanged.then_some(laid_revision));
         if cancel {
             return Some(DialogEnd::Cancel);
-        }
-        let unchanged = self.revision == laid_revision;
-        // presented: as the list's record above.
-        let seen = self.painted_filters;
-        if unchanged {
-            self.painted_filters = Some(laid_revision);
         }
         if !unchanged || narrowed {
             ctx.request_repaint();
@@ -734,9 +737,9 @@ impl Dialog {
         if !apply {
             return None;
         }
-        // Only what the screen showed is applied: the filters the pass before painted, which this
-        // pass left as they were.
-        if seen == Some(self.revision) {
+        // Only what the screen showed is applied: the filters the last pass that reached it
+        // painted, which this pass left as they were.
+        if seen == Some(Some(self.revision)) {
             return Some(DialogEnd::Apply(self.filters.clone()));
         }
         self.changed |= seen.is_some();

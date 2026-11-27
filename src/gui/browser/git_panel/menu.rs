@@ -23,8 +23,9 @@
 //! are taken before anything else sees them, and an Enter, Space, Esc or F10 it does not act on
 //! is dropped, never left for what is under it. A key at an
 //! item's right is that item's key in the panel, not while the menu is open (as egui's menu). Only
-//! what the screen showed is chosen: a choice acts only on the lines the pass before painted, in
-//! the box where it painted them, so a pass's choices after `Repository…` made the lines anew are
+//! what the screen showed is chosen: a choice acts only on the lines the last pass that reached
+//! the screen painted (`cells::OnScreen`: a terminal prints no pass while input waits), in the
+//! box where it painted them, so a pass's choices after `Repository…` made the lines anew are
 //! dropped (the menu's lines change no other way: a refresh does not touch an open menu), a box
 //! laid elsewhere (the grid resized) chooses nothing in that pass, and presses after a Tab in
 //! the pass are the kit's to drop. Its ids are one set for the window:
@@ -582,17 +583,17 @@ pub struct Menu {
     list: List,
 }
 
-/// A menu's lines in cells (X4-menu): the kit's rows, the bar, and which rows the last pass
-/// painted — a choice acts only on the rows the owner saw.
+/// A menu's lines in cells (X4-menu): the kit's rows, the bar, and which rows the screen shows —
+/// a choice acts only on the rows the owner saw.
 #[derive(Debug, Clone)]
 struct List {
     rows: Arc<Rows>,
     bar: Bar,
     /// How many times the rows were made anew (`Repository…`): which rows these are.
     made: u64,
-    /// The `made` of the rows the last pass painted and where it painted the box (none before
-    /// the first pass).
-    painted: Option<(u64, Vec<Cells>)>,
+    /// The `made` of the rows and where the box stood, as the last pass that reached the screen
+    /// painted them (`cells::OnScreen`: a terminal prints no pass while input waits).
+    screen: cells::OnScreen<(u64, Vec<Cells>)>,
 }
 
 impl List {
@@ -601,7 +602,7 @@ impl List {
             rows,
             bar: Bar::default(),
             made: 0,
-            painted: None,
+            screen: cells::OnScreen::default(),
         }
     }
 
@@ -769,6 +770,9 @@ fn drop_presses(ctx: &egui::Context, dropped: &[Key]) {
 /// One pass of a menu titled `title` with `list` on `grid` (see the module's notes): every Esc
 /// and F10 of the pass closes it; else the box, its list's keys and clicks, and the lines chosen.
 fn pass(ctx: &egui::Context, grid: Grid, title: &str, list: &mut List, nothing: bool) -> Pass {
+    // What the screen shows as the owner pressed this pass's keys: the last painting that
+    // reached it.
+    let seen = list.screen.start(ctx).cloned();
     // What follows the pass's first Enter waits: it may be the dialog's that Enter opens.
     let rest = set_aside(ctx);
     if closes(ctx) {
@@ -792,14 +796,13 @@ fn pass(ctx: &egui::Context, grid: Grid, title: &str, list: &mut List, nothing: 
         ..Inputs::default()
     };
     let shown = kit::show(ctx, menu_id(), &laid, inputs);
-    // What the owner saw when they chose: the rows the pass before painted, in the box where it
-    // painted them. egui gives a click to the widget the pass before laid out under the pointer
-    // (its hit test reads the last pass's widgets, `Context::begin_pass`), but the list finds its
-    // row by where it stands now: a box laid elsewhere (the grid resized) has another line there.
+    // What the owner saw when they chose: the rows the screen shows, in the box where it shows
+    // them. egui gives a click to the widget the pass before laid out under the pointer (its hit
+    // test reads the last pass's widgets, `Context::begin_pass`), but the list finds its row by
+    // where it stands now: a box laid elsewhere (the grid resized) has another line there.
     let now = (list.made, laid.covers());
-    // presented: once `cells::presented(ctx)` lands (X4-dialogs), the record counts only a pass
-    // that reached the screen.
-    let seen = list.painted.replace(now.clone()) == Some(now);
+    let seen = seen.as_ref() == Some(&now);
+    list.screen.painted(now);
     if shown.modal.should_close() {
         hand_on(ctx, rest, false);
         return Pass::Cancel;

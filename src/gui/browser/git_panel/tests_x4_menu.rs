@@ -1594,3 +1594,285 @@ mod ts4 {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// What reached the screen (X4-dialogs' `cells::OnScreen`): the terminal prints no pass while
+// input waits, so a pass it never printed was never seen.
+
+mod on_screen {
+    use super::super::tests::Host;
+    use super::*;
+    use crate::gui::term;
+    use crate::gui::Window;
+    use crossterm::event::{
+        Event as CEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    /// What the panel showed as each burst was sent: its menu open, a dialog's draft, the
+    /// filters open, the filters asked for so far.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct State {
+        menu: bool,
+        draft: bool,
+        filters: bool,
+        applied: usize,
+    }
+
+    /// A terminal that sends its bursts of events back to back — each waiting while the next is
+    /// unread, so the backend prints only the last pass of a burst — one burst once the backend
+    /// has asked three times since the last (its passes done and printed), then ends the run
+    /// (X4-dialogs' `Bursts`).
+    struct Bursts {
+        bursts: VecDeque<Vec<CEvent>>,
+        now: VecDeque<CEvent>,
+        asked: usize,
+        state: Rc<Cell<State>>,
+        sent_at: Rc<RefCell<Vec<State>>>,
+    }
+
+    impl term::Tty for Bursts {
+        fn raw(&mut self, _on: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn size(&mut self) -> std::io::Result<(u16, u16)> {
+            Ok((100, 30))
+        }
+        fn probe(&mut self) -> term::Probed {
+            term::Probed {
+                kitty: false,
+                ambiguous: false,
+            }
+        }
+        fn drop_input(&mut self) {}
+        fn next(&mut self, _wait: std::time::Duration) -> std::io::Result<Option<CEvent>> {
+            if let Some(ev) = self.now.pop_front() {
+                return Ok(Some(ev));
+            }
+            self.asked += 1;
+            assert!(self.asked < 20_000, "the script ran out without an end");
+            if self.asked >= 3 {
+                if let Some(burst) = self.bursts.pop_front() {
+                    self.sent_at.borrow_mut().push(self.state.get());
+                    self.asked = 0;
+                    self.now.extend(burst);
+                    return Ok(self.now.pop_front());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            Ok(None)
+        }
+        fn pending(&mut self) -> std::io::Result<bool> {
+            Ok(!self.now.is_empty())
+        }
+        fn stopped(&self) -> Option<i32> {
+            (self.bursts.is_empty() && self.now.is_empty() && self.asked >= 3)
+                .then_some(libc::SIGTERM)
+        }
+    }
+
+    /// The panel in the terminal, saying what it shows.
+    struct InTerminal {
+        host: Host,
+        state: Rc<Cell<State>>,
+    }
+
+    impl Window for InTerminal {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            self.host.ui(ui);
+            let v = &self.host.view;
+            let applied = (self.host.actions.iter())
+                .filter(|a| matches!(a, GitAction::FiltersChanged(_)))
+                .count();
+            self.state.set(State {
+                menu: v.menu.is_some(),
+                draft: v.draft().is_some(),
+                filters: v.filters_dialog.is_some(),
+                applied,
+            });
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+
+    /// The fixture's panel with the S3 repository, the bar on the merge.
+    fn host() -> Host {
+        host_of(fixture_view())
+    }
+
+    /// `view` with the S3 repository, the bar on the merge, as the panel's host.
+    fn host_of(mut view: GitView) -> Host {
+        view.set_repo(super::super::tests_s3::repo());
+        let _ = view.move_bar(1);
+        Host {
+            view,
+            active: true,
+            actions: Vec::new(),
+            rect: egui::Rect::NOTHING,
+            under: Vec::new(),
+            side: None,
+        }
+    }
+
+    fn press(code: KeyCode) -> CEvent {
+        CEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// A left press and release at cell (`column`, `row`), each an event.
+    fn click(column: u16, row: u16) -> [CEvent; 2] {
+        let at = |kind| {
+            CEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        [
+            at(MouseEventKind::Down(MouseButton::Left)),
+            at(MouseEventKind::Up(MouseButton::Left)),
+        ]
+    }
+
+    /// The cell where the window, laid out as the terminal lays it (100×30), shows `text` with
+    /// the filters open: their layout is a function of the grid alone.
+    fn cell_of(text: &str) -> (u16, u16) {
+        cell_in(host(), text)
+    }
+
+    /// [`cell_of`] in `win`.
+    fn cell_in(mut win: Host, text: &str) -> (u16, u16) {
+        win.view.open_filters();
+        let mut drv = Driver::new(800.0, 480.0);
+        drv.idle(&mut win, 3);
+        let at = drv
+            .find_text(text)
+            .unwrap_or_else(|| panic!("{text:?}"))
+            .center();
+        ((at.x / 8.0) as u16, (at.y / 16.0) as u16)
+    }
+
+    /// `win` run in the terminal over `bursts`: what showed as each burst was sent.
+    fn run(win: Host, bursts: Vec<Vec<CEvent>>) -> (InTerminal, Vec<State>) {
+        let state = Rc::new(Cell::new(State::default()));
+        let sent_at = Rc::new(RefCell::new(Vec::new()));
+        let mut all = vec![vec![CEvent::FocusGained], vec![CEvent::FocusGained]];
+        all.extend(bursts);
+        let tty = Bursts {
+            bursts: all.into(),
+            now: VecDeque::new(),
+            asked: 0,
+            state: state.clone(),
+            sent_at: sent_at.clone(),
+        };
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let mut b = term::Backend::new(tty, std::io::sink(), ctx, true);
+        let mut win = InTerminal { host: win, state };
+        let mut no_switch =
+            |_: &mut term::Backend<Bursts, std::io::Sink>| panic!("no switch in this test");
+        let end = b.run(&mut win, &mut no_switch).expect("the run");
+        assert_eq!(end, term::End::Signal(libc::SIGTERM));
+        let sent = sent_at.borrow().clone();
+        (win, sent)
+    }
+
+    /// F10 and Enter in one burst: F10's pass, which opened the menu, was never printed, so the
+    /// Enter chooses nothing; the next Enter, the menu on screen, chooses its first item.
+    #[test]
+    fn f10_and_enter_in_one_burst_choose_nothing() {
+        let (win, sent) = run(
+            host(),
+            vec![
+                vec![press(KeyCode::F(10)), press(KeyCode::Enter)],
+                vec![press(KeyCode::Enter)],
+            ],
+        );
+        let open = State {
+            menu: true,
+            ..State::default()
+        };
+        assert_eq!(
+            sent.last(),
+            Some(&open),
+            "nothing chosen before the last Enter"
+        );
+        assert_eq!(win.host.view.draft().map(Action::id), Some(ActionId::Tag));
+    }
+
+    /// F10 printed, then Enter: the menu was on screen, and Enter chooses its first item.
+    #[test]
+    fn f10_printed_then_enter_chooses() {
+        let (win, sent) = run(
+            host(),
+            vec![vec![press(KeyCode::F(10))], vec![press(KeyCode::Enter)]],
+        );
+        assert!(sent.last().is_some_and(|s| s.menu && !s.draft), "{sent:?}");
+        assert_eq!(win.host.view.draft().map(Action::id), Some(ActionId::Tag));
+    }
+
+    /// A filter turned and Enter in one burst — a pass that changes nothing between them — apply
+    /// nothing: the screen still showed Tags on. The next Enter, the change on screen, applies it.
+    #[test]
+    fn a_filter_turned_and_enter_in_one_burst_apply_nothing() {
+        let (x, y) = cell_of("[X] Tags");
+        let mut win = host();
+        win.view.open_filters();
+        let mut turn = click(x, y).to_vec();
+        turn.extend([CEvent::FocusGained, press(KeyCode::Enter)]);
+        let (win, sent) = run(win, vec![turn, vec![press(KeyCode::Enter)]]);
+        let last = sent.last().copied().unwrap_or_default();
+        assert!(
+            last.filters && last.applied == 0,
+            "nothing applied: {sent:?}"
+        );
+        let applied: Vec<&GitAction> = win.host.actions.iter().collect();
+        assert!(
+            matches!(&applied[..], [GitAction::FiltersChanged(f)] if !f.tags),
+            "{applied:?}"
+        );
+    }
+
+    /// A click on `[ Apply ]` whose press and release are read together — the press's pass not
+    /// printed — applies what shows: that pass changed nothing on screen.
+    #[test]
+    fn a_click_on_apply_read_together_applies_what_shows() {
+        let tags = cell_of("[X] Tags");
+        let apply = cell_of("[ Apply ]");
+        let mut win = host();
+        win.view.open_filters();
+        let (win, _) = run(
+            win,
+            vec![
+                click(tags.0, tags.1).to_vec(),
+                click(apply.0, apply.1).to_vec(),
+            ],
+        );
+        let applied: Vec<&GitAction> = win.host.actions.iter().collect();
+        assert!(
+            matches!(&applied[..], [GitAction::FiltersChanged(f)] if !f.tags),
+            "{applied:?}"
+        );
+        assert!(win.host.view.filters_dialog.is_none(), "applied and closed");
+    }
+
+    /// Typed text and a click on a branch in one burst, a pass that changes nothing between
+    /// them: the typing narrowed the rows after its pass, and no pass since reached the screen,
+    /// so the click — where `feature` showed, `fx-00` now — turns nothing; Enter applies nothing.
+    #[test]
+    fn typed_text_and_a_click_in_one_burst_turn_nothing_unseen() {
+        let feature = cell_in(host_of(super::many_view()), "[X] feature");
+        let mut win = host_of(super::many_view());
+        win.view.open_filters();
+        let mut burst = vec![press(KeyCode::Char('f')), press(KeyCode::Char('x'))];
+        burst.push(CEvent::FocusGained);
+        burst.extend(click(feature.0, feature.1));
+        let (win, _) = run(win, vec![burst, vec![press(KeyCode::Enter)]]);
+        assert!(win.host.actions.is_empty(), "{:?}", win.host.actions);
+        assert!(win.host.view.filters().is_default());
+    }
+}
