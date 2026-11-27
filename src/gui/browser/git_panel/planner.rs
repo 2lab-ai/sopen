@@ -880,12 +880,13 @@ enum PaneKey {
 
 impl PaneKey {
     /// Takes the earliest of `events` that is one of the pane's: a press (or a repeat) of its
-    /// keys with exactly their modifiers, or typed text. The others stay where they are.
-    fn take(events: &mut Vec<Event>) -> Option<PaneKey> {
+    /// keys with exactly their modifiers, or typed text. The others stay where they are. With
+    /// it, where it stood, so what is left of a text can be put back there.
+    fn take(events: &mut Vec<Event>) -> Option<(usize, PaneKey)> {
         let (at, pressed) =
             (events.iter().enumerate()).find_map(|(at, e)| Some((at, PaneKey::of(e)?)))?;
         events.remove(at);
-        Some(pressed)
+        Some((at, pressed))
     }
 
     fn of(e: &Event) -> Option<PaneKey> {
@@ -1095,10 +1096,12 @@ impl PlannerView {
 
     /// The pane's keys (03 §7.8.2), with exact modifiers (03 §9), one press at a time in the
     /// pass's order — two ↓ two rows, a letter typed before ↓ on the row it was typed on — until
-    /// one opens a dialog of the pane's or ends it: the rest of the pass's keys are the dialog's,
-    /// its typed text dropped.
+    /// one opens a dialog of the pane's or ends it. What the pass holds after a key that opens a
+    /// dialog — keys and text, the rest of a text that key was typed in too — stays where it
+    /// was, in its order, for the dialog [`draw`] shows in the same pass, as if typed once it
+    /// was open (10 §17, X4-planner).
     fn keys(&mut self, ctx: &egui::Context, seams: &Seams) -> Option<PlannerEnd> {
-        while let Some(pressed) = ctx.input_mut(|i| PaneKey::take(&mut i.events)) {
+        while let Some((at, pressed)) = ctx.input_mut(|i| PaneKey::take(&mut i.events)) {
             match pressed {
                 PaneKey::Move(toward) => {
                     if let Some(commit) = self.bar().cloned() {
@@ -1113,10 +1116,13 @@ impl PlannerView {
                     self.scroll.step(delta, self.model.rows.len());
                 }
                 // Typed letters set verbs here, and never start Find (03 §7.8.2): every typed
-                // character is the pane's, as typed or as an input method commits it.
+                // character is the pane's, as typed or as an input method commits it — up to
+                // one that opens a dialog, after which the rest of the text is the dialog's.
                 PaneKey::Typed(text) => {
-                    for c in text.chars() {
+                    for (k, c) in text.char_indices() {
                         if self.inner.is_some() {
+                            let rest = Event::Text(text[k..].to_string());
+                            ctx.input_mut(|i| i.events.insert(at, rest));
                             break;
                         }
                         let Some(commit) = self.bar().cloned() else {
@@ -1131,13 +1137,6 @@ impl PlannerView {
                 }
             }
             if self.inner.is_some() {
-                // The rest of the pass's typed text goes: no character typed before the dialog
-                // showed lands in its prefilled fields. Its other keys are the dialog's.
-                ctx.input_mut(|i| {
-                    i.events.retain(|e| {
-                        !matches!(e, Event::Text(_) | Event::Ime(egui::ImeEvent::Commit(_)))
-                    })
-                });
                 return None;
             }
         }

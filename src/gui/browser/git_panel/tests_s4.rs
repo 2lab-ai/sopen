@@ -425,8 +425,9 @@ impl Window for Host {
                     }
                     self.planner_ends.extend(end);
                 }
-                // The parts' cells, painted once, as the panel paints its buffer.
-                crate::gui::cells::paint(&ui.painter_at(grid.rect(all)), grid.origin, &buf, None);
+                // What the parts wrote in cells, as the panel paints its buffer.
+                let painter = ui.painter_at(grid.rect(all));
+                crate::gui::cells::paint(&painter, grid.origin, &buf, None);
             });
         // What the panel's own key lookup would still find: no typed letter may start Find.
         if !modal {

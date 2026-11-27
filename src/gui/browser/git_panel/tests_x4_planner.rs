@@ -359,6 +359,13 @@ fn the_pane_is_cells_over_the_body() {
     for y in [1, 26] {
         assert_eq!(cell(&fx, right, y).symbol, "║", "row {y}");
     }
+    for y in 1..27 {
+        assert_eq!(
+            cell(&fx, 0, y).symbol,
+            "║",
+            "the frame's left side, row {y}"
+        );
+    }
     assert_eq!(boxes(&fx), Vec::<Cells>::new(), "no hand-off box");
     // Not the keyboard's: the bar idle.
     fx.host.active = false;
@@ -678,8 +685,8 @@ fn an_ambiguous_wide_terminal_gets_the_hints_stand_ins() {
 }
 
 /// A key that opens a dialog of the pane's ends the pane's keys for the pass: the rest of the
-/// pass's keys are the dialog's. `a` then ↓ in one pass: the author dialog of the row `a` was
-/// typed on, the bar staying there; `r`, `x` and ↓: the reword, nothing, then the bar down.
+/// pass is the dialog's. `a` then ↓ in one pass: the author dialog of the row `a` was typed on,
+/// the bar staying there; `r`, `x` and ↓: the reword, nothing, then the bar down.
 #[test]
 fn a_key_that_opens_a_dialog_leaves_the_rest_of_the_pass_to_it() {
     let mut fx = with_planner(1000.0, 500.0, plain(6));
@@ -705,11 +712,49 @@ fn a_key_that_opens_a_dialog_leaves_the_rest_of_the_pass_to_it() {
     assert_eq!(bar_of(&fx), 1);
 }
 
-/// The rest of the pass's typed text is dropped once a key of the pane's opens a dialog, in the
-/// same text event or a later one: no character typed before the dialog showed lands in its
-/// prefilled fields (`a` then `x`: the author dialog with the commit's own name, kept as it was).
+/// What a pass holds after a key that opens a dialog of the pane's is the dialog's, as if typed
+/// once it was open (10 §17, X4-planner): on a reword row, Enter and a typed message in one pass
+/// — the message dialog's field, whose caret egui puts at the end of the text, holds the
+/// message with the typed text after it, as when the two come in two passes, and Enter keeps it;
+/// `a` and `x`, as two texts or as one, put the `x` at the end of the author's name, its field
+/// having the typing, and Enter keeps that name.
 #[test]
-fn text_typed_after_a_key_that_opens_a_dialog_is_dropped() {
+fn text_typed_after_a_key_that_opens_a_dialog_reaches_it() {
+    let message = format!(
+        "{}\n\nbody of 7\n",
+        "커밋 7: 한글 제목과 an English subject"
+    );
+    let typed = format!("{message}new message");
+    let shown = |fx: &Fx, text: &str| (fx.drv.texts().into_iter()).any(|(_, _, t)| t == text);
+    for split in [false, true] {
+        let mut fx = with_planner(1000.0, 500.0, plain(6));
+        fx.typed("r");
+        assert_eq!(verb_of(&fx, 0), Verb::Reword);
+        let text = vec![Event::Text("new message".into())];
+        if split {
+            fx.drv.frame(
+                &mut fx.host,
+                key_events(Key::Enter, Modifiers::NONE),
+                Modifiers::NONE,
+            );
+            fx.drv.frame(&mut fx.host, text, Modifiers::NONE);
+        } else {
+            let mut events = key_events(Key::Enter, Modifiers::NONE);
+            events.extend(text);
+            fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+        }
+        fx.idle();
+        assert!(pane(&fx).dialog_up(), "split {split}: the message dialog");
+        assert!(shown(&fx, &typed), "split {split}: {:#?}", fx.drv.texts());
+        fx.press(Key::Enter);
+        assert!(!pane(&fx).dialog_up(), "split {split}: Enter keeps it");
+        let row = &pane(&fx).model().rows[0];
+        assert_eq!(
+            row.message.as_deref(),
+            Some(typed.as_str()),
+            "split {split}"
+        );
+    }
     for events in [
         vec![Event::Text("a".into()), Event::Text("x".into())],
         vec![Event::Text("ax".into())],
@@ -718,16 +763,123 @@ fn text_typed_after_a_key_that_opens_a_dialog_is_dropped() {
         fx.drv.frame(&mut fx.host, events.clone(), Modifiers::NONE);
         fx.idle();
         assert!(pane(&fx).dialog_up(), "{events:?}: the author dialog");
-        let typed = (fx.drv.texts().into_iter()).find(|(_, _, t)| t.contains("Ann Leex"));
-        assert!(typed.is_none(), "{events:?}: {typed:?}");
+        assert!(shown(&fx, "Ann Leex"), "{events:?}: {:#?}", fx.drv.texts());
         fx.press(Key::Enter);
         assert!(!pane(&fx).dialog_up(), "{events:?}");
+        let author = pane(&fx).model().rows[0]
+            .author
+            .as_ref()
+            .map(|a| a.name.clone());
+        assert_eq!(author.as_deref(), Some("Ann Leex"), "{events:?}");
         assert_eq!(
-            pane(&fx).model().rows[0].author,
-            None,
-            "{events:?}: as it was"
+            text(&fx, 2, MARK_AT, MARK_AT + 1),
+            "A",
+            "{events:?}: the mark"
         );
     }
+}
+
+/// Keys with modifiers and repeats in one pass, in their order: ↓ then Cmd/Ctrl+↓ moves the bar,
+/// then its row; Shift+↓ is none of the pane's and moves nothing, the ↓ after it one row; a
+/// press and two repeats of ↓ three rows.
+#[test]
+fn keys_with_modifiers_and_repeats_in_one_pass() {
+    let mut fx = with_planner(1000.0, 500.0, plain(6));
+    let mut events = key_events(Key::ArrowDown, Modifiers::NONE);
+    events.extend(key_events(Key::ArrowDown, Modifiers::COMMAND));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    assert_eq!(bar_of(&fx), 2, "the bar with its row");
+    assert_eq!(
+        pane(&fx).model().rows[2].commit.row.oid,
+        id(6),
+        "row 1 moved down"
+    );
+    let mut fx = with_planner(1000.0, 500.0, plain(6));
+    let mut events = key_events(Key::ArrowDown, Modifiers::SHIFT);
+    events.extend(key_events(Key::ArrowDown, Modifiers::NONE));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    assert_eq!(bar_of(&fx), 1, "Shift+↓ is not the pane's");
+    let mut fx = with_planner(1000.0, 500.0, plain(6));
+    let down = |repeat| Event::Key {
+        key: Key::ArrowDown,
+        physical_key: None,
+        pressed: true,
+        repeat,
+        modifiers: Modifiers::NONE,
+    };
+    let events = vec![down(false), down(true), down(true)];
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    assert_eq!(bar_of(&fx), 3, "a press and two repeats");
+}
+
+/// The author and the date stand where the subject keeps 10 cells: in a pane of 67 cells (a grid
+/// of 69 columns) the author at the pane's cell 33 and the date at 51, the subject's room 10; a
+/// cell narrower, neither.
+#[test]
+fn the_author_and_the_date_need_ten_cells_of_subject() {
+    let fx = with_planner(69.0 * 8.0, 500.0, every_verb());
+    let heads = line(&fx, 1);
+    assert_eq!(at(&fx, 1, "Author"), Some(1 + 33), "{heads:?}");
+    assert_eq!(at(&fx, 1, "Date"), Some(1 + 51), "{heads:?}");
+    let cut = cells::fit_start(&long_hangul(), 10);
+    assert_eq!(at(&fx, 4, &cut), Some(SUBJECT_AT), "{:?}", line(&fx, 4));
+    assert_eq!(text(&fx, 4, 32, 34), "  ", "two blanks before the author");
+    let fx = with_planner(68.0 * 8.0, 500.0, every_verb());
+    let heads = line(&fx, 1);
+    assert!(
+        !heads.contains("Author") && !heads.contains("Date"),
+        "{heads:?}"
+    );
+}
+
+/// A button stands, and is pressed, only where it fits whole: in a pane of 18 cells `[ Run… ]`
+/// (8) is drawn and `[ Close ]` (9 more after two blanks) is not, and a click where it would
+/// stand closes nothing; a click on `[ Run… ]` opens the run's confirmation.
+#[test]
+fn a_button_stands_only_where_it_fits_whole() {
+    let mut fx = with_planner(20.0 * 8.0, 500.0, plain(6));
+    let y = 26;
+    let foot = line(&fx, y);
+    assert_eq!(at(&fx, y, "[ Run… ]"), Some(1), "{foot:?}");
+    assert!(!foot.contains("Close") && !foot.contains("[ C"), "{foot:?}");
+    let p = centre(&fx, 1 + 10 + 4, y);
+    fx.drv.frame(&mut fx.host, click_events(p), Modifiers::NONE);
+    fx.idle();
+    assert!(fx.view().planner_model().is_some(), "nothing closed");
+    assert!(!pane(&fx).dialog_up());
+    let p = centre(&fx, 4, y);
+    fx.drv.frame(&mut fx.host, click_events(p), Modifiers::NONE);
+    fx.idle();
+    assert!(pane(&fx).dialog_up(), "the control: Run…");
+}
+
+/// A focused button is in the bar's colours (10 §6): Tab moves egui's focus through the pane's
+/// rows to `[ Run… ]`, which then shows the bar's text on the bar.
+#[test]
+fn a_focused_button_is_in_the_bars_colours() {
+    let mut fx = with_planner(1000.0, 500.0, plain(3));
+    let y = 26;
+    let run = |fx: &Fx| {
+        let c = cell(fx, 3, y);
+        (c.fg, c.bg)
+    };
+    let idle = (Some(PALETTE.dialog_text), Some(PALETTE.dialog_back));
+    assert_eq!(run(&fx), idle, "the control: no focus");
+    let mut tabs = 0;
+    while run(&fx) == idle && tabs < 12 {
+        fx.press(Key::Tab);
+        tabs += 1;
+    }
+    assert_eq!(
+        run(&fx),
+        (Some(PALETTE.bar_text), Some(PALETTE.bar)),
+        "{tabs} tabs"
+    );
+    assert_eq!(
+        cell(&fx, 13, y).bg,
+        Some(PALETTE.dialog_back),
+        "Close not focused"
+    );
 }
 
 /// The S4 stand-in host (its fake seams): two ↓ in one pass move the bar two rows and leave no ↓
