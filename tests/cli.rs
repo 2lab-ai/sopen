@@ -4640,6 +4640,113 @@ fn sopen_web_travels_to_host() {
     }
 }
 
+/// Without `--browser` an address opens in xtools (09 §7); a process with no web engine
+/// (`SOPEN_WEB=off`, as Linux without WebKitGTK) takes §4's fallback on every route, before any
+/// window: one stderr line, then the system browser and today's lines — here; through a tunnel,
+/// HOST's half saying no window cue, so this side says today's open line; and passed to HOST as
+/// written. A `DISPLAY` name, so Linux takes the fallback and not the no-display route — which,
+/// without one, is the system browser as today with no line (§4, §8).
+#[test]
+fn without_a_web_engine_an_address_opens_in_the_system_browser_after_a_line() {
+    let off = ("SOPEN_WEB", "off");
+    let line = |shown: &str| {
+        format!(
+            "sopen: no web engine here (turned off (SOPEN_WEB=off)); opening {shown} in the \
+             system browser"
+        )
+    };
+    // Here.
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, calls) = stand_in_browser(tmp.path());
+    let env = [
+        ("SOPEN_BROWSER", browser.to_str().unwrap()),
+        ("SOPEN_EDITOR_WAIT", "60"),
+        ("DISPLAY", ":77"),
+        off,
+    ];
+    let out = sopen(tmp.path(), &["--here", SECRET_URL], &env);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(err, format!("{}\n", line(SECRET_SHOWN)));
+    assert_eq!(
+        text(&out.stdout),
+        format!("opened {SECRET_SHOWN} in the browser\n")
+    );
+    assert_eq!(browser_calls(&calls), [[SECRET_URL]]);
+    no_secrets(&text(&out.stdout));
+    #[cfg(target_os = "linux")]
+    {
+        let mut cmd = sopen_command(tmp.path());
+        cmd.args(["--here", SECRET_URL])
+            .env("SOPEN_BROWSER", &browser)
+            .env("SOPEN_EDITOR_WAIT", "60")
+            .env("SOPEN_WEB", "off")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY");
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(text(&out.stderr), "", "no display: today's route, no line");
+        assert_eq!(browser_calls(&calls).len(), 2);
+    }
+
+    // Through a tunnel: HOST's half (the real one) gets no `--browser`, falls back, says only
+    // the open cue.
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, calls) = stand_in_browser(tmp.path());
+    let ssh = FakeSsh::new(tmp.path());
+    let mut run = Tunnelled::start_with(tmp.path(), &ssh, &browser, &[SECRET_URL], &[off]);
+    assert_eq!(
+        run.first_line(),
+        format!("{SECRET_SHOWN} is open on {HOST} through a tunnel — Ctrl-C closes it")
+    );
+    let pids = tunnel_pids(&ssh);
+    assert_eq!(browser_calls(&calls), [[SECRET_URL]]);
+    let argv = &ssh_calls(&ssh)[0];
+    assert_eq!(
+        argv[argv.len() - 3..],
+        [q("--hold-until-eof"), q("--"), q(SECRET_URL)],
+        "{argv:#?}"
+    );
+    run.signal(libc::SIGTERM);
+    let (status, err) = run.ended();
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(err.contains(&line(SECRET_SHOWN)), "{err}");
+    assert_eq!(run.to_end(), Vec::<String>::new());
+    no_secrets(&err);
+    all_gone(&pids);
+
+    // Passed to HOST as written.
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, calls) = stand_in_browser(tmp.path());
+    let ssh = FakeSsh::new(tmp.path());
+    let url = "https://example.com/a?b";
+    let out = sopen(
+        tmp.path(),
+        &["--target", HOST, url],
+        &[
+            ("PATH", ssh.path.as_str()),
+            ("SOPEN_TARGET_BIN", env!("CARGO_BIN_EXE_sopen")),
+            ("SOPEN_BROWSER", browser.to_str().unwrap()),
+            ("SOPEN_EDITOR_WAIT", "60"),
+            off,
+        ],
+    );
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains(&line("https://example.com/a?…")), "{err}");
+    assert_eq!(
+        text(&out.stdout),
+        "opened https://example.com/a?… in the browser\n"
+    );
+    assert_eq!(browser_calls(&calls), [[url]]);
+    let argv = ssh.argv().unwrap();
+    assert_eq!(
+        argv[argv.len() - 3..],
+        [q("sopen"), q("--"), q(url)],
+        "{argv:#?}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The cues of 09 §7 on this side. HOST's half is the stand-in sopen playing a HOST of any
 // version (`FAKE_SOPEN_SAY`, `FAKE_SOPEN_HOLD`): an older one, or one that opened the system

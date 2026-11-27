@@ -34,6 +34,7 @@
 //!   ([`snapshots`]) before the read-back, which has an empty rect where such a page is, and
 //!   draws each at its frame ([`compose`]).
 
+pub mod address;
 #[cfg(test)]
 pub(crate) mod fake;
 #[cfg(target_os = "macos")]
