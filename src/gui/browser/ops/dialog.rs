@@ -684,6 +684,12 @@ impl Layout {
         [self.frame, right, under]
     }
 
+    /// Whether the box stands whole on its grid: one whose parts that never give way (choices,
+    /// fields, buttons) are more than the grid holds stands past its foot (X4-dialogs).
+    pub fn fits(&self) -> bool {
+        self.frame.intersection(self.grid.all()) == self.frame
+    }
+
     /// The box and its shadow, cut to the grid.
     pub fn covers(&self) -> Vec<Cells> {
         let all = self.grid.all();

@@ -24,13 +24,16 @@
 //!   a restore's are `ops::dialog`'s box on the panels' grid — the lost line, the options as the
 //!   kit's fields, message fields and choices, the plan in rows that scroll (at most three fifths
 //!   of the grid, eight at least, the kit giving them way first on a short grid), `[ Run ]` (off
-//!   until the plan is in and nothing refuses it), `[ Cancel ]` and the hint — and
-//!   [`ActionDialog::covers`] says its cells. Every other form of 03 §7.1–§7.5 is egui's until
-//!   X4-dialogs2. The keyboard opens on the form's first text field, or on nothing; Enter runs
-//!   (03 §8.1), but each Enter of a pass goes to what has the keyboard at that point — before the
-//!   pass's first Tab what had it then, after it what the Tab gave it to — so Enter on a focused
-//!   button is that button's press; Space is the kit's, once a press in the pass's order; Esc,
-//!   Cancel or a click outside cancels, and a pass that both cancels and runs cancels.
+//!   until the plan is in and nothing refuses it, and while the grid holds less than all of the
+//!   box), `[ Cancel ]` and the hint — and [`ActionDialog::covers`] says its cells. Every other
+//!   form of 03 §7.1–§7.5 is egui's until X4-dialogs2. The keyboard opens on the form's first
+//!   text field, or on nothing; Enter runs (03 §8.1), but each Enter of a pass goes to what has
+//!   the keyboard at that point — before the pass's first Tab what had it then, after it what the
+//!   Tab gave it to — so Enter on a focused button is that button's press, and one after a
+//!   Shift+Tab or an arrow that moves the keyboard (egui moves it later) is dropped; only the plan
+//!   on screen runs: a pass that changed it shows the new one and its Run or Enter is dropped,
+//!   [`CHANGED`] saying so. Space is the kit's, once a press in the pass's order; Esc, Cancel or
+//!   a click outside cancels, and a pass that both cancels and runs cancels.
 
 use super::menu::{self, Target};
 use crate::git::actions::{
@@ -670,6 +673,9 @@ pub struct ActionDialog {
     plan_first: Option<egui::Id>,
     /// In cells: the first of the plan's rows shown.
     plan_top: usize,
+    /// In cells: a Run or an Enter came in a pass that changed the plan, and was not acted on —
+    /// the hint says the plan changed and Enter runs it.
+    changed: bool,
 }
 
 fn dialog_id() -> egui::Id {
@@ -726,6 +732,16 @@ const NO_BACKUP: &str = "Deleting a backup is the one removal sopen does without
 
 /// What an action's dialog says Enter and Esc do (03 §8.1).
 const HINT: &str = "Enter runs · Esc cancels";
+
+/// The hint once a Run or an Enter came in a pass that changed the plan: only a plan that was on
+/// screen runs (X4-dialogs' round-1 decision).
+pub(super) const CHANGED: &str = "the plan changed — Enter runs it · Esc cancels";
+
+/// The box's first line when the grid holds less than it: its parts that never give way stand
+/// past the grid's foot, so it does not run until all of it shows (X4-dialogs, until a restore's
+/// entries scroll).
+pub(super) const TOO_SHORT: &str =
+    "the window is too short for all of it: make it taller to run it";
 
 /// A dialog's width: `cells` cells, within the window.
 pub(super) fn width(ctx: &egui::Context, cells: f32) -> f32 {
@@ -818,6 +834,7 @@ impl ActionDialog {
             cancel: None,
             plan_first: None,
             plan_top: 0,
+            changed: false,
         }))
     }
 
@@ -901,7 +918,7 @@ impl ActionDialog {
         }
         // A restore's arrow is one cell either way: the box stands where the pass lays it.
         let controls = controls(&self.form, false);
-        self.layout(*grid, &controls).covers()
+        self.layout(*grid, &controls).0.covers()
     }
 
     /// One pass on `grid` (the panels'): Esc and Enter are taken before its widgets see them
@@ -1050,10 +1067,20 @@ impl ActionDialog {
     // -----------------------------------------------------------------------------------------
     // In cells (X4-dialogs).
 
-    /// The box on `grid` with `controls` (the form's, [`controls`]): the lost line first, then the
-    /// options, the plan in rows that scroll ([`plan_part`]), the buttons and the hint; as wide as
-    /// its widest text by 10 §6's rule.
-    fn layout(&self, grid: Grid, controls: &[Control]) -> kit::Layout {
+    /// The box on `grid` with `controls` (the form's, [`controls`]), and whether it stands whole
+    /// there: if not, it says so first ([`TOO_SHORT`]) and its Run is off.
+    fn layout(&self, grid: Grid, controls: &[Control]) -> (kit::Layout, bool) {
+        let whole = self.laid(grid, controls, true);
+        if whole.fits() {
+            return (whole, true);
+        }
+        (self.laid(grid, controls, false), false)
+    }
+
+    /// The box on `grid` with `controls`: the lost line first, then the options, the plan in rows
+    /// that scroll ([`plan_part`]), the buttons and the hint; as wide as its widest text by 10
+    /// §6's rule. Not `fits`: [`TOO_SHORT`] before all of it, Run off.
+    fn laid(&self, grid: Grid, controls: &[Control], fits: bool) -> kit::Layout {
         let title = self.title();
         let lost = self.confirmation().and_then(|c| c.loses.clone());
         let plan = self.plan_lines();
@@ -1062,6 +1089,9 @@ impl ActionDialog {
             .max(cells::width(&title) + 2);
         let width = kit::inside_width(grid.cols, NOMINAL, wanted);
         let mut parts = Vec::new();
+        if !fits {
+            parts.push(Part::Text(TOO_SHORT.to_string(), Ink::Error));
+        }
         if let Some(lost) = lost {
             parts.extend([Part::Text(lost, Ink::Text), Part::Blank]);
         }
@@ -1073,14 +1103,17 @@ impl ActionDialog {
             parts.extend([part, Part::Blank]);
         }
         let mut run = Button::new("Run", run_id());
-        run.on = self.ready();
+        run.on = fits && self.ready();
         let mut buttons = vec![run, Button::new("Cancel", cancel_id())];
         // 03 §7.1: Rebase offers the planner (its form is egui's until X4-dialogs2).
         if matches!(self.form.draft, Action::Rebase { .. }) {
             buttons.push(Button::new(PLAN_FIRST, plan_first_id()));
         }
         parts.push(Part::Buttons(buttons));
-        parts.push(Part::Text(HINT.to_string(), Ink::Weak));
+        parts.push(match self.changed {
+            true => Part::Text(CHANGED.to_string(), Ink::Text),
+            false => Part::Text(HINT.to_string(), Ink::Weak),
+        });
         kit::layout(grid, &title, NOMINAL, &parts)
     }
 
@@ -1090,10 +1123,16 @@ impl ActionDialog {
             ctx.request_repaint();
         }
         let escape = ctx.input_mut(|i| keys::take(i, Key::Escape, Mods::None));
-        let enters = take_enters(ctx);
         let began = ctx.memory(|m| m.focused());
         let mut controls = controls(&self.form, cells::ambiguous_wide(ctx));
-        let layout = self.layout(grid, &controls);
+        // egui moves the keyboard by an arrow unless a field has it (its caret's).
+        let in_field = (controls.iter())
+            .filter_map(Control::text_field)
+            .any(|n| began == Some(field_id(n)));
+        let enters = take_enters(ctx, began.is_some() && !in_field);
+        let (layout, fits) = self.layout(grid, &controls);
+        // What the screen shows this pass: only this draft, its Run on, may run.
+        let (shown, runs) = (self.form.draft.clone(), fits && self.ready());
         // The form's first text field takes the keyboard when it shows anew, or while nothing
         // has it.
         let typing = (controls.iter()).any(|c| c.text_field() == Some(0));
@@ -1111,15 +1150,15 @@ impl ActionDialog {
             by_id,
             ..Inputs::default()
         };
-        let shown = kit::show(ctx, cells_id(), &layout, inputs);
+        let pass = kit::show(ctx, cells_id(), &layout, inputs);
         let now = ctx.memory(|m| m.focused());
         apply(&mut self.form, &controls);
-        // The options as this pass left them, planned: Run below runs exactly what was typed.
+        // The options as this pass left them, planned: the next pass shows it.
         if self.replan(planner) {
             ctx.request_repaint();
         }
-        let mut cancelled = escape || shown.clicked(cancel) || shown.modal.should_close();
-        let (mut ran, mut first) = (shown.clicked(run), shown.clicked(plan_first));
+        let mut cancelled = escape || pass.clicked(cancel) || pass.modal.should_close();
+        let (mut ran, mut first) = (pass.clicked(run), pass.clicked(plan_first));
         for after_tab in enters {
             match if after_tab { now } else { began } {
                 Some(id) if id == cancel => cancelled = true,
@@ -1133,7 +1172,17 @@ impl ActionDialog {
         if let (true, Action::Rebase { onto, .. }) = (first, &self.form.draft) {
             return Some(DialogEnd::PlanFirst(onto.clone()));
         }
-        if ran && self.ready() {
+        if !ran {
+            return None;
+        }
+        // Only the plan the screen showed runs: a pass that changed it shows the new one, and
+        // its Run or Enter waits for the next (round 1).
+        if self.form.draft != shown {
+            self.changed = true;
+            ctx.request_repaint();
+            return None;
+        }
+        if runs && self.ready() {
             let dont_ask_again =
                 self.form.dont_ask && matches!(self.form.draft, Action::Checkout { .. });
             return Some(DialogEnd::Run {
@@ -1234,30 +1283,56 @@ pub(super) fn plan_part(rows: Vec<PlanRow>, grid: Grid, width: usize, top: usize
 }
 
 /// The pass's presses of Enter with no modifiers, taken out of its input in order, each saying
-/// whether it came after the pass's first Tab — so no choice, button or field the keyboard is on
-/// reads it as its own: the dialog gives each to what has the keyboard then.
-fn take_enters(ctx: &egui::Context) -> Vec<bool> {
+/// whether it came after the pass's first move of the keyboard (a Tab, or an arrow where
+/// `arrows_move`: on a control whose arrows egui takes as a move, not a field's caret) — so no
+/// choice, button or field the keyboard is on reads it as its own: the dialog gives each to what
+/// has the keyboard then. egui moves the keyboard for a Shift+Tab only on the next pass and for an
+/// arrow at the pass's end, where an Enter after it in the pass cannot follow: in a pass with one,
+/// an Enter after a move is taken and dropped, and the owner presses it again on what now shows
+/// the keyboard (round 1).
+fn take_enters(ctx: &egui::Context, arrows_move: bool) -> Vec<bool> {
+    let arrow = |key: &Key| {
+        matches!(
+            key,
+            Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight
+        )
+    };
+    // Whether a key moves the keyboard as egui reads it (`None`: not), and whether egui makes
+    // that move only later (`true`: a Shift+Tab, an arrow) rather than in the pass (a Tab).
+    let moves = |e: &egui::Event| match e {
+        egui::Event::Key {
+            key: Key::Tab,
+            pressed: true,
+            modifiers,
+            ..
+        } if !modifiers.any() || modifiers.shift_only() => Some(modifiers.shift),
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } if arrows_move && arrow(key) && !modifiers.any() => Some(true),
+        _ => None,
+    };
     ctx.input_mut(|i| {
-        let (mut tab, mut out) = (false, Vec::new());
+        let later = i.events.iter().any(|e| moves(e) == Some(true));
+        let (mut moved, mut out) = (false, Vec::new());
         i.events.retain(|e| match e {
-            egui::Event::Key {
-                key: Key::Tab,
-                pressed: true,
-                ..
-            } => {
-                tab = true;
-                true
-            }
             egui::Event::Key {
                 key: Key::Enter,
                 pressed: true,
                 modifiers,
                 ..
             } if Mods::None.matches(*modifiers) => {
-                out.push(tab);
+                if !(moved && later) {
+                    out.push(moved);
+                }
                 false
             }
-            _ => true,
+            e => {
+                moved |= moves(e).is_some();
+                true
+            }
         });
         out
     })

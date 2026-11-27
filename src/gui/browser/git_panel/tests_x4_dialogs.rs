@@ -216,7 +216,8 @@ impl Window for Host {
         let body = Pen::new(PALETTE.text, PALETTE.back);
         let mut under = Buffer::empty(grid.all());
         cells::fill(&mut under, grid.all(), body);
-        let words = "한글 under ".repeat(30);
+        // No blank cell anywhere: a cell left as it was under a dialog shows.
+        let words = "한글under".repeat(30);
         for y in 0..grid.rows {
             cells::put(&mut under, 0, y, &words, usize::from(grid.cols), body);
         }
@@ -542,9 +543,14 @@ fn x4d_the_dialog_covers_its_box_and_shadow() {
         "the box's corner"
     );
     let under = cells::layers(&fx.drv.ctx)[0].clone();
+    let seen = under.seen();
     for strip in &fx.host.covers[1..] {
-        let seen = &under.seen()[usize::from(strip.y)][usize::from(strip.x)];
-        assert_eq!(seen.symbol, " ", "the screen blank under the shadow");
+        for y in strip.top()..strip.bottom() {
+            for x in strip.left()..strip.right() {
+                let cell = &seen[usize::from(y)][usize::from(x)].symbol;
+                assert_eq!(cell, " ", "the screen blank under the shadow at {x},{y}");
+            }
+        }
     }
     // An egui form: no cells, nothing covered.
     let bar = Target::Commit {
@@ -604,6 +610,140 @@ fn x4d_enter_presses_the_focused_button_in_the_pass_s_order() {
     let mut fx = Fx::new(d(), fake, 100, 30);
     fx.press(Key::Enter);
     assert_eq!(fx.host.ends, [ran]);
+
+    // Enter and Esc in one pass: it cancels.
+    let mut fx = Fx::new(d(), fake, 100, 30);
+    fx.frame(vec![down(Key::Enter), down(Key::Escape)]);
+    assert_eq!(fx.host.ends, [DialogEnd::Cancel]);
+}
+
+/// egui moves the keyboard for a Shift+Tab on the next pass and for an arrow at the pass's end:
+/// an Enter after one in the same pass is dropped — `[Shift+Tab, Enter]` from Run, the first
+/// control, and `[→, Enter]` from Run run nothing and leave the keyboard on Cancel, where the
+/// same keys in two passes land; the next Enter cancels.
+#[test]
+fn x4d_an_enter_after_a_move_egui_makes_later_is_dropped() {
+    let stash = Target::Stash(stash_row());
+    for first in [key(Key::Tab, true, Modifiers::SHIFT), down(Key::ArrowRight)] {
+        let what = format!("{first:?}");
+        let d = open(A::StashDrop, stash.clone(), &repo(), fake);
+        let mut fx = Fx::new(d, fake, 100, 30);
+        fx.focus(dialogs::run_id());
+        fx.frame(vec![first, down(Key::Enter)]);
+        assert!(fx.host.ends.is_empty(), "{what}: {:?}", fx.host.ends);
+        assert_eq!(fx.focused(), Some(dialogs::cancel_id()), "{what}");
+        fx.press(Key::Enter);
+        assert_eq!(fx.host.ends, [DialogEnd::Cancel], "{what}");
+    }
+    // In a field the arrows are the caret's: an Enter after one runs.
+    let d = open(A::Stash, Target::Uncommitted, &dirty(), fake);
+    let mut fx = Fx::new(d, fake, 100, 30);
+    assert_eq!(fx.focused(), Some(dialogs::field_id(0)));
+    fx.frame(vec![down(Key::ArrowLeft), down(Key::Enter)]);
+    assert!(
+        matches!(&fx.host.ends[..], [DialogEnd::Run { .. }]),
+        "{:?}",
+        fx.host.ends
+    );
+}
+
+/// A planner that shows its action whole in its command line, so a plan says what runs.
+fn literal(action: &Action, repo: &Repo) -> Result<Plan, Refused> {
+    let mut p = fake(action, repo)?;
+    if let Some(c) = &mut p.confirm {
+        c.commands = vec![format!("{action:?}")];
+    }
+    Ok(p)
+}
+
+/// Only the plan on screen runs: Space on Fetch's "Prune" and Enter in one pass change the plan,
+/// so nothing runs — the plan now shows the prune and the hint says it changed — and the next
+/// Enter runs it with the prune; a click on Run runs the plan shown.
+#[test]
+fn x4d_a_pass_that_changes_the_plan_does_not_run() {
+    let d = open(A::Fetch, Target::Repository, &dirty(), literal);
+    let mut fx = Fx::new(d, literal, 100, 30);
+    let l = fx.boxed("Fake fetch");
+    assert!(rows(&l).join("\n").contains("prune: false"));
+    fx.focus(choice_id(dialogs::row_id(0), 0));
+    let mut events = space();
+    events.push(down(Key::Enter));
+    fx.frame(events);
+    assert!(fx.host.ends.is_empty(), "ran: {:?}", fx.host.ends);
+    let l = fx.boxed("Fake fetch");
+    let all = rows(&l).join("\n");
+    assert!(
+        all.contains("Fetch { prune: true, prune_tags: false }"),
+        "{all}"
+    );
+    assert!(all.contains(dialogs::CHANGED), "{all}");
+    assert_eq!(pen_of(&l, dialogs::CHANGED), text_pen());
+    fx.press(Key::Enter);
+    assert_eq!(
+        fx.host.ends,
+        [DialogEnd::Run {
+            action: Action::Fetch {
+                prune: true,
+                prune_tags: false
+            },
+            dont_ask_again: false
+        }]
+    );
+}
+
+/// A restore of more entries than the grid holds stands past its foot (its entries do not scroll
+/// yet): it says so first, Run is off and Enter restores nothing, Esc still cancels; on a taller
+/// window all of it shows and Enter runs.
+#[test]
+fn x4d_a_restore_taller_than_the_grid_never_runs() {
+    let stamp = "20261128T101500Z";
+    let many: Vec<RestoreEntry> = (0..30)
+        .map(|k| RestoreEntry {
+            subject: Subject::Path(format!("dir/file{k:02}.txt")),
+            how: RestoreHow::Files,
+            backup: None,
+            before: Value::Object(oid('f')),
+            now: Value::Absent,
+            moved_since: false,
+            chosen: false,
+            replace: false,
+        })
+        .collect();
+    let d = || {
+        dialog(ActionDialog::restore(
+            stamp.into(),
+            many.clone(),
+            None,
+            &repo(),
+            fake,
+        ))
+    };
+    let mut fx = Fx::new(d(), fake, 100, 20);
+    let l = fx.boxed(dialogs::TOO_SHORT);
+    assert_eq!(pen_of(&l, dialogs::TOO_SHORT), error_pen());
+    assert!(
+        fx.host.covers[0].bottom() >= 20,
+        "past the foot: {:?}",
+        fx.host.covers
+    );
+    fx.press(Key::Enter);
+    fx.frame(vec![down(Key::Enter)]);
+    assert!(fx.host.ends.is_empty(), "restored: {:?}", fx.host.ends);
+    fx.press(Key::Escape);
+    assert_eq!(fx.host.ends, [DialogEnd::Cancel]);
+
+    let mut fx = Fx::new(d(), fake, 100, 20);
+    fx.drv.resize(800.0, 60.0 * CELL.y);
+    fx.idle(2);
+    let l = fx.boxed("Fake restore");
+    assert!(!rows(&l).join("\n").contains(dialogs::TOO_SHORT));
+    assert_eq!(pen_of(&l, "[ Run ]"), text_pen(), "Run is on");
+    fx.press(Key::Enter);
+    assert!(
+        matches!(&fx.host.ends[..], [DialogEnd::Run { .. }]),
+        "{:?}",
+        fx.host.ends
+    );
 }
 
 /// F-kit-tab in an action's dialog: `[Tab, Space]` from a field types the blank there and presses
@@ -652,10 +792,11 @@ fn x4d_space_in_one_pass_with_a_tab_presses_only_what_had_the_keyboard() {
     );
 }
 
-/// Typing, Shift+Enter and Enter in one pass: the message holds the new line and Enter runs the
-/// action with exactly what was typed before it.
+/// Typing, Shift+Enter and Enter in one pass: the message holds the new line, but the screen
+/// showed the plan before it, so that Enter runs nothing and the hint says the plan changed; the
+/// next Enter runs exactly what was typed.
 #[test]
-fn x4d_typing_and_enter_in_one_pass_run_what_was_typed() {
+fn x4d_typing_and_enter_in_one_pass_show_the_plan_before_it_runs() {
     let d = open(A::Commit, Target::Uncommitted, &dirty(), fake);
     let mut fx = Fx::new(d, fake, 100, 30);
     fx.frame(vec![
@@ -664,6 +805,14 @@ fn x4d_typing_and_enter_in_one_pass_run_what_was_typed() {
         Event::Text("나".into()),
         down(Key::Enter),
     ]);
+    assert!(fx.host.ends.is_empty(), "{:?}", fx.host.ends);
+    let l = fx.boxed("Fake commit");
+    assert!(
+        rows(&l).join("\n").contains(dialogs::CHANGED),
+        "{:#?}",
+        rows(&l)
+    );
+    fx.press(Key::Enter);
     assert_eq!(
         fx.host.ends,
         [DialogEnd::Run {
@@ -678,7 +827,7 @@ fn x4d_typing_and_enter_in_one_pass_run_what_was_typed() {
 }
 
 /// Space chooses one of several and turns any of several, once a press, and each change plans
-/// again: Name and email's "globally", Commit's "Skip hooks" (three presses in one pass).
+/// again: Name and email's "globally", Commit's "Skip hooks" (two presses in one pass: off again).
 #[test]
 fn x4d_choices_by_the_keyboard_plan_again() {
     let d = open(A::User, Target::Repository, &dirty(), fake);
@@ -711,16 +860,27 @@ fn x4d_choices_by_the_keyboard_plan_again() {
     let d = open(A::Commit, Target::Uncommitted, &dirty(), fake);
     let mut fx = Fx::new(d, fake, 100, 30);
     fx.focus(choice_id(dialogs::row_id(0), 1));
-    let mut thrice = space();
-    thrice.extend(space());
-    thrice.extend(space());
-    fx.frame(thrice);
+    let mut twice = space();
+    twice.extend(space());
+    fx.frame(twice);
+    assert!(
+        matches!(
+            fx.draft(),
+            Action::Commit {
+                no_verify: false,
+                amend: false,
+                ..
+            }
+        ),
+        "{:?}",
+        fx.draft()
+    );
+    fx.frame(space());
     assert!(
         matches!(
             fx.draft(),
             Action::Commit {
                 no_verify: true,
-                amend: false,
                 ..
             }
         ),
@@ -853,18 +1013,21 @@ fn x4d_a_restore_lists_its_entries_in_cells() {
     assert_eq!(moved, place(&l, "refs/heads/feature").y + 1, "under it");
     same_in_a_terminal(&fx.drv);
     fx.click("[ ] replace");
-    let Some(Action::Restore { entries, .. }) = asked().last().cloned() else {
+    let Some(Action::Restore {
+        entries: planned, ..
+    }) = asked().last().cloned()
+    else {
         panic!("{:?}", asked());
     };
-    assert!(entries[2].replace, "replace chosen for the occupied path");
+    assert!(planned[2].replace, "replace chosen for the occupied path");
     // Space on the entry that moved: its second, explicit choice.
     fx.focus(choice_id(dialogs::row_id(1), 0));
     fx.frame(space());
-    let Action::Restore { entries, .. } = fx.draft() else {
+    let Action::Restore { entries: now, .. } = fx.draft() else {
         panic!("{:?}", fx.draft());
     };
     assert_eq!(
-        entries.iter().map(|e| e.chosen).collect::<Vec<_>>(),
+        now.iter().map(|e| e.chosen).collect::<Vec<_>>(),
         [true, true, true]
     );
     fx.press(Key::Enter);
@@ -875,6 +1038,29 @@ fn x4d_a_restore_lists_its_entries_in_cells() {
             ..
         }]
     ));
+
+    // What runs is what the entries say: Space on the first entry turns it off; nothing replaces.
+    let d = dialog(ActionDialog::restore(
+        stamp.into(),
+        entries(stamp),
+        None,
+        &repo(),
+        fake,
+    ));
+    let mut fx = Fx::new(d, fake, 100, 30);
+    fx.focus(choice_id(dialogs::row_id(0), 0));
+    fx.frame(space());
+    fx.press(Key::Enter);
+    match &fx.host.ends[..] {
+        [DialogEnd::Run {
+            action: Action::Restore { entries, .. },
+            ..
+        }] => {
+            assert!(!entries[0].chosen, "turned off");
+            assert!(entries[2].chosen && !entries[2].replace, "left as it is");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// In an ambiguous-wide terminal a restore entry's `→`, sopen's own between a name and a value,
