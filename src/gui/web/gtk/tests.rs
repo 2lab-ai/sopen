@@ -372,7 +372,11 @@ fn a_view_keeps_to_its_scope() {
         navigation(&page, "data:text/html,<p>x", false, false),
         Nav::Allow
     );
-    assert_eq!(navigation(&page, "about:srcdoc", false, false), Nav::Allow);
+    assert_eq!(
+        navigation(&page, "about:srcdoc", false, false),
+        Nav::Refuse { clicked: false },
+        "about:srcdoc too: a main frame going there reached the screen"
+    );
     assert_eq!(
         navigation(&page, "data:text/html,<p>x", true, false),
         Nav::Refuse { clicked: true }
@@ -400,16 +404,26 @@ fn a_view_keeps_to_its_scope() {
     assert!(main_out(&page, "blob:sopen-page://h/1"));
     assert!(!main_out(&page, &own));
     assert!(!main_out(&page, ""), "no address yet: nothing to hold");
-    // `about:` fails closed in a file view, every frame — but `about:srcdoc` (a frame's only).
-    assert_eq!(
-        navigation(&page, "about:blank", false, false),
-        Nav::Refuse { clicked: false }
-    );
-    assert_eq!(navigation(&page, "ABOUT:srcdoc", false, false), Nav::Allow);
-    assert_eq!(
-        navigation(&page, "about:srcdocx", false, false),
-        Nav::Refuse { clicked: false }
-    );
+    // `about:` fails closed in a file view, every frame, every spelling.
+    for about in [
+        "about:blank",
+        "ABOUT:srcdoc",
+        "about:srcdoc#x",
+        "about:srcdoc?x",
+    ] {
+        assert_eq!(
+            navigation(&page, about, false, false),
+            Nav::Refuse { clicked: false },
+            "{about}"
+        );
+    }
+    // The commit's last line: any document outside the view's scope.
+    assert!(commit_out(&page, "about:srcdoc"));
+    assert!(commit_out(&page, "data:text/html,x"));
+    assert!(!commit_out(&page, &own));
+    assert!(!commit_out(&page, ""));
+    assert!(commit_out(&address, "http://127.0.0.1:8081/"));
+    assert!(!commit_out(&address, "http://127.0.0.1:8080/x"));
     assert_eq!(
         navigation(&address, "about:blank", false, false),
         Nav::Allow
@@ -1306,11 +1320,26 @@ fn wv_b_an_address_window_keeps_to_its_origin() {
     file.shows("the file view beside it", 50.0, 30.0, "red");
 }
 
-/// §3.4: a file view's main frame never leaves its scheme host for an in-process document — a
-/// meta refresh to `about:blank` or to a `data:` page, a script's `location` to `data:`,
-/// `about:blank` or a `blob:` — the page stays on screen (its red), the navigation is refused
-/// and said, and nothing reaches an outside server; a `data:` frame still shows (its green), a
-/// `srcdoc` frame only with scripts on.
+/// What a main-frame input should come to.
+#[derive(Clone, Copy, Debug)]
+enum Comes {
+    /// Refused and said: a `Refused` whose target starts with this.
+    Refused(&'static str),
+    /// Nothing visible: after a fixed second the page is still there.
+    Stays,
+    /// The page's own script replaces its content (a `javascript:` URL's result, as
+    /// `document.write` would): no navigation, the document still the scheme's — at its address,
+    /// nothing outside reached — only no longer red.
+    Rewritten,
+}
+
+/// §3.4: a file view's main frame never leaves its scheme host — a meta refresh, a script's
+/// `location`, a form, `window.open`, `history.back()`, to `about:`, `data:` or `blob:`
+/// documents, `about:srcdoc` in every spelling included — the page stays on screen (its red), its
+/// address the scheme's, no document outside the scheme said, nothing reaching an outside
+/// server, and the policy and the main resource's hold alone hold every input (the commit's check
+/// never had to act); a `javascript:` URL's result rewrites the page in place, still the
+/// scheme's; a `data:` frame still shows (its green), a `srcdoc` frame never.
 #[test]
 fn wv_b_a_file_views_main_frame_keeps_to_its_scheme() {
     let Some((_turn, engine)) = turn("wv_b_a_file_views_main_frame_keeps_to_its_scheme") else {
@@ -1328,60 +1357,225 @@ fn wv_b_a_file_views_main_frame_keeps_to_its_scheme() {
          border:0'></iframe><iframe srcdoc=\"<body style='margin:0;background:#0f0'>\" \
          style='position:fixed;left:100px;top:150px;width:90px;height:40px;border:0'></iframe>"
     );
-    let blob = "<script>setTimeout(() => location = URL.createObjectURL(new Blob(\
-        ['<body style=\"background:#00f\">'], {type: 'text/html'})), 50)</script>";
-    for (name, scripts, head) in [
+    let later = |js: &str| format!("<script>setTimeout(() => {{ {js} }}, 50)</script>");
+    let blob = later(
+        "location = URL.createObjectURL(new Blob(['<body style=\"background:#00f\">'], \
+         {type: 'text/html'}))",
+    );
+    let back = "<script>setTimeout(() => { if (!history.state) { history.replaceState(1, ''); \
+        location = 'q.html' } }, 50)</script>";
+    let cases: Vec<(&str, bool, String, Comes)> = vec![
         (
-            "about",
+            "meta about:blank",
             false,
-            "<meta http-equiv=refresh content='0;url=about:blank'>".to_string(),
+            "<meta http-equiv=refresh content='0;url=about:blank'>".into(),
+            Comes::Refused("about:blank"),
         ),
         (
-            "data",
+            "meta data:",
             false,
             format!("<meta http-equiv=refresh content=\"0;url={data}\">"),
+            Comes::Refused("data:"),
         ),
         (
-            "script data",
+            "script data:",
             true,
-            format!("<script>setTimeout(() => location = \"{data}\", 50)</script>"),
+            later(&format!("location = \"{data}\"")),
+            Comes::Refused("data:"),
         ),
         (
-            "script about",
+            "script about:blank",
             true,
-            "<script>setTimeout(() => location = 'about:blank', 50)</script>".to_string(),
+            later("location = 'about:blank'"),
+            Comes::Refused("about:blank"),
         ),
-        ("script blob", true, blob.to_string()),
-    ] {
+        ("script blob:", true, blob, Comes::Refused("blob:")),
+        (
+            "meta about:srcdoc",
+            false,
+            "<meta http-equiv=refresh content='0;url=about:srcdoc'>".into(),
+            Comes::Stays,
+        ),
+        (
+            "script about:srcdoc",
+            true,
+            later("location = 'about:srcdoc'"),
+            Comes::Stays,
+        ),
+        (
+            "script about:SRCDOC",
+            true,
+            later("location = 'about:SRCDOC'"),
+            Comes::Stays,
+        ),
+        (
+            "script about:srcdoc#x",
+            true,
+            later("location = 'about:srcdoc#x'"),
+            Comes::Stays,
+        ),
+        (
+            "script about:srcdoc?x",
+            true,
+            later("location = 'about:srcdoc?x'"),
+            Comes::Stays,
+        ),
+        (
+            "script javascript:",
+            true,
+            later("location = 'javascript:\"<h1>x</h1>\"'"),
+            Comes::Rewritten,
+        ),
+        (
+            "window.open data:",
+            true,
+            later(&format!("window.open(\"{data}\")")),
+            Comes::Stays,
+        ),
+        (
+            "window.open _self",
+            true,
+            later("window.open('', '_self')"),
+            Comes::Stays,
+        ),
+        (
+            "form data:",
+            true,
+            format!(
+                "<form id=f action=\"data:text/html,<body style='background:%2300f'>\"></form>{}",
+                later("f.submit()")
+            ),
+            Comes::Refused("data:"),
+        ),
+        ("history.back", true, back.into(), Comes::Stays),
+    ];
+    let mut failed = vec![];
+    let sent_home = COMMITS_SENT_HOME.load(Ordering::SeqCst);
+    for (name, scripts, head, comes) in cases {
         let page =
             format!("<!doctype html>{head}<style>body{{margin:0;background:#f00}}</style>{frames}");
-        let site = Site::with(&[("/p.html", "text/html", page.into_bytes().leak())]);
+        let q = "<!doctype html><style>body{background:#00f}</style>\
+            <script>setTimeout(() => history.back(), 50)</script>";
+        let site = Site::with(&[
+            ("/p.html", "text/html", page.into_bytes().leak()),
+            ("/q.html", "text/html", q.as_bytes()),
+        ]);
         let mut shown = Shown::page(&engine, &site, scripts, Contain::ALL);
         shown.place(200.0, 200.0, 1.0);
         shown.load("p.html");
-        shown.until(&format!("{name}: refused"), 10.0, |e| {
-            e.iter()
-                .any(|e| matches!(e, Event::Refused { clicked: false, .. }))
-        });
-        std::thread::sleep(Duration::from_millis(700));
+        match comes {
+            Comes::Refused(target) => shown.until(&format!("{name}: refused"), 10.0, |e| {
+                e.iter().any(|e| {
+                    matches!(e, Event::Refused { target: t, clicked: false } if t.starts_with(target))
+                })
+            }),
+            Comes::Stays | Comes::Rewritten => shown.finished(),
+        }
+        std::thread::sleep(Duration::from_millis(1000));
         shown.drain();
         println!("main frame {name}: said {:?}", shown.seen);
-        shown.shows(&format!("{name}: the page stays"), 100.0, 60.0, "red");
-        shown.shows(&format!("{name}: the data: frame"), 45.0, 170.0, "green");
-        // With scripts off WebKitGTK asks for an `<iframe srcdoc>` as `about:blank` (measured),
-        // which a file view refuses in every frame: the frame shows nothing, the page's red
-        // through it. With scripts on it asks for `about:srcdoc`, which goes.
-        let srcdoc = if scripts { "green" } else { "red" };
-        shown.shows(&format!("{name}: the srcdoc frame"), 145.0, 170.0, srcdoc);
+        let mut wrong = vec![];
+        let rewritten = matches!(comes, Comes::Rewritten);
+        if !rewritten && shown.colour(100.0, 60.0) != "red" {
+            wrong.push(format!("the page left ({})", shown.colour(100.0, 60.0)));
+        }
+        if !rewritten && shown.colour(45.0, 170.0) != "green" {
+            wrong.push("no data: frame".to_string());
+        }
+        // SAFETY: the view's address, on the GTK thread.
+        let at = shown
+            .view
+            .probe(|api, web| unsafe { text((api.webkit_web_view_get_uri)(web)) });
+        if !shown
+            .host
+            .path_of(&at)
+            .is_some_and(|p| p.ends_with(".html"))
+        {
+            wrong.push(format!("the view's address left the scheme: {at}"));
+        }
+        if COMMITS_SENT_HOME.load(Ordering::SeqCst) != sent_home {
+            wrong.push("the commit's check had to act: the policy missed it".to_string());
+        }
+        if !rewritten && shown.colour(145.0, 170.0) != "red" {
+            wrong.push("a srcdoc frame".to_string());
+        }
+        // A document under the root is a path; one outside the scheme is said as its address.
+        if shown
+            .seen
+            .iter()
+            .any(|e| matches!(e, Event::Document(d) if d.contains(':')))
+        {
+            wrong.push("a document outside the scheme".to_string());
+        }
+        if outside.accepted() > 0 {
+            wrong.push(format!("the outside server reached: {:?}", outside.log()));
+        }
+        if !wrong.is_empty() {
+            failed.push(format!("{name}: {wrong:?} — said {:?}", shown.seen));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// The commit's check, the last line: with the policy's `about:` refusal taken away (the tests'
+/// hook), a script sending the main frame to `about:blank` commits there — and the view stops,
+/// says it, and loads its own page back.
+#[test]
+fn wv_b_a_document_outside_the_scheme_is_sent_home() {
+    let Some((_turn, engine)) = turn("wv_b_a_document_outside_the_scheme_is_sent_home") else {
+        return;
+    };
+    /// The hook off again however the test ends.
+    struct Held;
+    impl Drop for Held {
+        fn drop(&mut self) {
+            ALLOW_ABOUT.store(false, Ordering::SeqCst);
+        }
+    }
+    let held = Held;
+    ALLOW_ABOUT.store(true, Ordering::SeqCst);
+    let page = b"<!doctype html><style>body{margin:0;background:#f00}</style>\
+        <script>setTimeout(() => { if (!sessionStorage.gone) { sessionStorage.gone = 1; \
+        location = 'about:blank' } }, 50)</script>";
+    let site = Site::with(&[("/p.html", "text/html", page)]);
+    let before = COMMITS_SENT_HOME.load(Ordering::SeqCst);
+    let mut shown = Shown::page(&engine, &site, true, Contain::ALL);
+    shown.place(100.0, 100.0, 1.0);
+    shown.load("p.html");
+    let out = Event::Refused {
+        target: "about:blank".to_string(),
+        clicked: false,
+    };
+    shown.until("the commit sent home", 10.0, |e| e.contains(&out));
+    shown.until("its page loaded back", 10.0, |e| {
+        e.iter()
+            .filter(|e| **e == Event::Document("p.html".into()))
+            .count()
+            >= 2
+    });
+    drop(held);
+    shown.shows("its page again", 50.0, 50.0, "red");
+    shown.drain();
+    println!("sent home: said {:?}", shown.seen);
+    assert_eq!(COMMITS_SENT_HOME.load(Ordering::SeqCst), before + 1);
+    assert!(
+        !shown.seen.contains(&Event::Document("about:blank".into())),
+        "never said as the document: {:?}",
+        shown.seen
+    );
+}
+
+/// §3.2: WebKit's variable that turns its sandbox off refuses the engine, but for `0`.
+#[test]
+fn the_sandbox_off_variable_refuses_the_engine() {
+    assert_eq!(sandbox_variable(None), Ok(()));
+    assert_eq!(sandbox_variable(Some("0")), Ok(()));
+    for value in ["1", "", "yes"] {
+        let why = sandbox_variable(Some(value)).unwrap_err();
         assert!(
-            !shown
-                .seen
-                .iter()
-                .any(|e| matches!(e, Event::Document(d) if !d.ends_with("p.html"))),
-            "{name}: no other document: {:?}",
-            shown.seen
+            why.starts_with("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS is set"),
+            "{value:?}: {why}"
         );
-        assert_eq!(outside.accepted(), 0, "{name}: {:?}", outside.log());
     }
 }
 

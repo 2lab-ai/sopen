@@ -107,20 +107,25 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   `src/gui/web/gtk/api.rs`). Nothing is linked, as for sopen's other runtime libraries
   (fnkeys/macos.rs, remote/local/trash.rs): `ldd` does not change (WV-B: the release binary's `ldd`
   names libstdc++, libm, libasound, libgcc_s, libc only; CI checks it). A missing library fails in
-  0.1–0.2 ms → §4, and so does a machine without the tools WebKit's sandbox runs each web process
-  under (`/usr/bin/bwrap`, `/usr/bin/xdg-dbus-proxy`, WebKit's compiled-in paths), or one where
-  `bwrap` cannot make the sandbox: once per process, before the first view, `bwrap --unshare-all`
-  runs `/bin/sh -c :` (5.5–6.3 ms in the release receipts; 0.7 ms to fail) and a failure is the
-  reason — WV-B measured WebKit itself aborting
-  the whole process at its first web process when unprivileged user namespaces were denied
-  (`g_error` "Failed to fully launch dbus-proxy", SIGABRT), and with the probe the same run gets
-  `no web engine here (WebKitGTK's web process sandbox cannot start here (…))` instead
-  **[decision]**.
+  0.1–0.2 ms → §4 (the windows' thread does nothing more before the first view). The sandbox is
+  checked by the GTK thread's one-time start, before GTK or WebKit, never on the windows' thread,
+  and a failure is the start's (the queued views told, every later one §4): WebKit's
+  `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS` set to anything but `0` (WebKit then runs its web
+  processes unsandboxed whatever the context's setting reads), a machine without the tools its
+  sandbox runs each web process under (`/usr/bin/bwrap`, `/usr/bin/xdg-dbus-proxy`, WebKit's
+  compiled-in paths), or one where `bwrap` cannot make the sandbox — `bwrap --unshare-all` runs
+  `/bin/sh -c :` (5.5–6.3 ms in the release receipts), given up after 2 s. WV-B measured WebKit
+  itself aborting the whole process at its first web process when unprivileged user namespaces
+  were denied (`g_error` "Failed to fully launch dbus-proxy", SIGABRT); with the start's check the
+  same run gets `no web engine here (WebKitGTK's web process sandbox cannot start here (…))`
+  instead **[decision]**.
 - **Thread**: one GTK thread per process, **spawned at most once**, by the first view; the windows'
   thread never waits for it — views opened while it starts are queued and told (`Failed`, §4's line)
   should it not start: `gtk_init_check` false, no seat, GLib's default main context another
   thread's, or nothing within 20 s; every later view then gets that reason synchronously (§4's
-  fallback). Those checks come before WebKit's first use, which binds WebKit to the thread. There it
+  fallback). Those checks come before WebKit's first use, which binds WebKit to the thread; a start
+  the watchdog gave up on that later passes them has bound WebKit to a thread that then returns —
+  `Failed` is final, nothing is ever sent to it and no view is made in the process. There it
   blocks in `g_main_context_iteration`, the default context acquired for good (so no
   `g_main_context_invoke` from another thread runs inline), woken by `g_main_context_wakeup`. GTK is
   not let set the process's locale (`gtk_disable_setlocale` first). **It is never joined**: WebKit
@@ -558,10 +563,20 @@ one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it has one (Linux
   apart as the view's main resource starts and is stopped and said, the page staying on screen
   (WV-B measured: a meta refresh to `data:`, a script's `location` to `data:` and to a `blob:`).
   **`about:` fails closed**: an `about:` page loads no resource, so a main frame going there cannot
-  be told apart (measured: a meta refresh to `about:blank` reached the screen), and every frame's
-  `about:` navigation is refused but `about:srcdoc`'s. **Frame limit**: with scripts off WebKitGTK
-  asks for an `<iframe srcdoc>` as `about:blank` (measured), so a file view shows srcdoc frames only
-  with scripts on, where it asks for `about:srcdoc` **[decision]**.
+  be told apart — measured: a meta refresh to `about:blank`, and a meta refresh or a script's
+  `location` to `about:srcdoc` (`#x` and `?x` too), reached the screen — so every frame's `about:`
+  navigation is refused, `about:srcdoc` included. **Frame limit**: a file view never shows an
+  `<iframe srcdoc>` (WebKitGTK asks for one as `about:srcdoc` with scripts on, as `about:blank`
+  with them off) **[decision]**. Measured held as well, each page staying on screen at its own
+  address with nothing outside reached: a form submitted to `data:` (held at its main resource),
+  `window.open` of a `data:` page and `window.open('', '_self')` (nothing navigates),
+  `history.back()` after a navigation within the root (back within it). A script's `javascript:`
+  URL replaces the page's content with its result in place — the page's own script, as
+  `document.write` would, the document still the scheme's at its address. A scheme response cannot
+  redirect: the page server's heads are 200, 206, 403, 404 and 416 only. **Behind all of it**, the
+  commit is checked: a main-frame document committed outside the view's scope is stopped, said, and
+  the view's own page loaded back (no input of the tests reached it; with the `about:` refusal taken
+  away by a test hook, a script's `about:blank` was sent home so).
 - **Only through the view's policy.** WebKit's ways of following a link outside the view's own
   navigation policy are closed on macOS: the link preview (off, §3.2) and the context menu's Open
   … in New Window (gone, §3.2); its Open Link is a click like any other (refused out of the
