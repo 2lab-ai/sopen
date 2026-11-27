@@ -212,8 +212,15 @@ fn q1_panes_on_cell_rects_clip_there_and_follow_a_resize() {
     fx.key(Key::F10);
     fx.settle();
     assert!(fx.b.tree.is_some(), "F10 opened the tree");
-    let [l, r] = sides(&grid(641.0, 333.0));
-    assert!(cells_in(&fx, r).is_empty(), "the tree is egui's");
+    let g = grid(641.0, 333.0);
+    let [l, r] = sides(&g);
+    let tree = cells_in(&fx, r);
+    assert_eq!(
+        tree.len(),
+        usize::from(g.rows),
+        "the tree's cells: {tree:?}"
+    );
+    assert!(tree.iter().all(|(at, _)| at.width() == r.width()));
     assert!(!cells_in(&fx, l).is_empty(), "the other side's list");
     each_in_its_place(&fx, 641.0, 333.0);
     fx.sized(1000.0, 700.0);
