@@ -763,8 +763,9 @@ prereleases) and, from the first `v*` release on, `sopen` (stable); both link `b
 - **The channel** is derived from what brew has installed; there is no config field. One formula installed is the
   channel: `channel: preview (via brew)`. With both installed, the one whose keg `bin/sopen` resolves into decides,
   and a warning on stderr names it and what each switch removes; when no link says, preview wins. Only a sopen
-  that runs from a sopen keg in brew's own Cellar (`<brew --cellar>/<sopen|sopen-preview>/<version>/bin/sopen`,
-  links resolved) is installed by brew. When brew cannot answer, the build marker does (`SOPEN_BUILD_CHANNEL`:
+  built `preview` or `release` that runs from a sopen keg in brew's own Cellar
+  (`<brew --cellar>/<sopen|sopen-preview>/<version>/bin/sopen`, links resolved) is installed by brew; a `dev` build
+  never is, wherever it lies. When brew cannot answer, the build marker does (`SOPEN_BUILD_CHANNEL`:
   `preview` from preview.yml, `release` from release.yml): `channel: preview (via build marker (brew
   unavailable))`. A sopen brew did not install — a source build, a copied binary — answers from its marker too,
   `… (via build marker (not installed by brew))`, whatever brew has installed beside it, since `sopen update` would
@@ -772,33 +773,46 @@ prereleases) and, from the first `v*` release on, `sopen` (stable); both link `b
   channel: it was not installed by brew and its build marker is dev`, exit 1.
 - **Not installed by brew:** `sopen update` and `sopen channel stable|preview` refuse before brew runs at all —
   `this sopen was not installed by brew (<why>); install it with: brew install 2lab-ai/tap/sopen-preview`, exit 1.
-  A binary that is not shaped like a keg is decided without asking brew anything. The line names no path.
+  A `dev` build, or a binary that is not shaped like a keg, is decided without asking brew anything. A keg whose
+  brew does not answer `brew --cellar` may well be brew's, so it gets `` brew is not available here (`brew
+  --cellar` did not answer); sopen updates and switches only through brew `` instead. The lines name no path.
 - **The tap refresh** before a switch or an update is `brew update`, its output the user's. When it fails (one
   third-party tap that fails to update is enough), one stderr line says so — `` `brew update` failed (exit 1):
   <its last line>; refreshing only 2lab-ai/tap by its git `` — and only the tap's checkout is fast-forwarded:
   `git fetch -q https://github.com/2lab-ai/homebrew-tap.git master` and `git merge -q --ff-only FETCH_HEAD` in
-  `brew --repo 2lab-ai/tap`; that failing too ends the command with nothing installed or removed. brew always runs
-  with `HOMEBREW_NO_AUTO_UPDATE=1`.
+  `brew --repo 2lab-ai/tap`, git never prompting (`GIT_TERMINAL_PROMPT=0`) and never looking for a repository
+  above that folder (`GIT_CEILING_DIRECTORIES`); that failing too ends the command with nothing installed or
+  removed. brew always runs with `HOMEBREW_NO_AUTO_UPDATE=1`.
 - **A switch** refreshes the tap, then looks the target up in it (`brew info --formula 2lab-ai/tap/<formula>`).
   The stable channel without a release is refused there, before anything is installed or removed: `the stable
   channel has no release yet (its first v* release is the owner's step); staying on preview`, exit 1 — read from
-  brew, so the same command switches the day the release lands. Then, the target first so that a failure leaves the
-  old channel whole (llmux's order): what depends on the outgoing formula is asked (`brew uses --installed`; no
-  answer ends it with nothing changed); the target is installed (`brew install 2lab-ai/tap/<formula>`, `upgrade`
-  when it already is); the outgoing formula is removed with every keg (`uninstall --force`), or only unlinked when
-  another installed formula depends on it (`kept sopen installed (required by …) — unlinked`); the target is
-  relinked (`unlink`, `link --overwrite`). Last: `switched to the stable channel: sopen-preview 2026.11.27.0138 →
-  sopen 0.2.0`.
+  brew, so the same command switches the day the release lands. Then the target first, so that a failure leaves
+  the old channel whole: what depends on the outgoing formula is asked (`brew uses --installed`; no answer ends it
+  with nothing changed); the target is installed (`brew install 2lab-ai/tap/<formula>`, `upgrade` when it already
+  is); `bin/sopen` is read again and the target relinked (`unlink`, `link --overwrite`) only when it is not the
+  target's — a fresh install has linked it already; and the outgoing formula is retired last, removed with every
+  keg (`uninstall --force`) or only unlinked when another installed formula depends on it (`kept sopen installed
+  (required by …) — unlinked`). By then `bin/sopen` resolves into the target, and brew's uninstall and unlink
+  remove only the links into their own keg, so a failure or Ctrl-C at any step leaves a sopen on PATH. (llmux
+  retires before it relinks: `uninstall --force` unlinks a `bin/sopen` that still points into the retired keg, and
+  its closing `unlink` takes away the one the install made — a failure there left no sopen to run.) Last:
+  `switched to the stable channel: sopen-preview 2026.11.27.0138 → sopen 0.2.0`. A step that fails ends with what
+  is installed, whose `bin/sopen` is and the way back: after the install step `` …; it stopped part way —
+  installed: sopen-preview 2026.11.27.0138, sopen 0.2.0; bin/sopen is sopen-preview's; to make bin/sopen the
+  preview one: brew link --overwrite sopen-preview ``, at it `` …; nothing was removed — installed: …; bin/sopen
+  is sopen's ``.
 - **The same channel again** does what llmux's does: `already on the preview channel — nothing to do`, a relink
-  when `bin/sopen` is not its binary, or the other formula retired when both are installed. It never upgrades —
-  that is `sopen update` — and refreshes no tap.
+  when `bin/sopen` is not its binary, or the other formula retired when both are installed — the target linked
+  first and the other retired last, as in a switch. It never upgrades — that is `sopen update` — and refreshes no
+  tap.
 - **`sopen update`** refreshes the tap, runs `brew upgrade 2lab-ai/tap/<the channel's formula>` and prints
   `sopen-preview 2026.11.27.0138 → 2026.11.28.0101`, or `sopen-preview is up to date (2026.11.27.0138)`.
 - After a switch, or an update that changed the version: `sopen windows already open keep running the old version
   until they are reopened` — each window is a sopen process of its own, on the binary it started from.
 - Exit codes: 0 done or up to date; 1 refused, or brew or git failed — the failure names the command, its exit and
   the last line it wrote on stderr (`` `brew upgrade 2lab-ai/tap/sopen-preview` failed (exit 1): Error: … ``); 2
-  a usage error. brew's own output reaches the terminal as it runs.
+  a usage error. brew's own output reaches the terminal as it runs; its stderr is read for at most 2 s past its
+  exit, so a descendant that keeps it open cannot hold sopen.
 - `channel` and `update` are commands: a file or folder of that name is given as `./channel` / `./update`, as
   `./config` is.
 

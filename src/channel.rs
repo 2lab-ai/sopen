@@ -13,8 +13,9 @@
 //! - The channel is derived from what brew has installed — no config field. With both formulas
 //!   installed the one whose keg `bin/sopen` resolves into decides, with a warning; when no link
 //!   says, preview wins (llmux's rule).
-//! - Only a sopen that runs from a sopen keg in brew's own Cellar is installed by brew
-//!   ([`install_from`]). Any other — a source build, a `dev` marker, a copied binary — reports its
+//! - Only a sopen built `preview` or `release` that runs from a sopen keg in brew's own Cellar
+//!   is installed by brew ([`install_from`]). Any other — a source build, a `dev` marker even in
+//!   a keg's place, a copied binary — reports its
 //!   build marker in `sopen channel` (a `dev` one has no channel: an error), and `sopen update` and
 //!   `sopen channel <c>` refuse: brew would change another binary than the one that runs. llmux
 //!   reports brew's formula whatever binary asks; sopen does not.
@@ -23,14 +24,19 @@
 //!   `bin/sopen`, or the other formula retired. It never upgrades: that is `sopen update`.
 //! - A switch refreshes the tap and looks the target up in it, so the stable channel without a
 //!   release is refused before anything is installed — found from brew, not a flag, so it works
-//!   the day `Formula/sopen.rb` lands. Then, in llmux's order, the target first so a failure leaves
-//!   the old channel whole: the target installed (upgraded when it already is), the other retired
-//!   (`uninstall --force`, or only `unlink` when another installed formula depends on it), the
-//!   target relinked.
+//!   the day `Formula/sopen.rb` lands. Then the target first, so a failure leaves the old channel
+//!   whole: installed (upgraded when it already is); relinked only when `bin/sopen` is not its
+//!   own once that ran; the other formula retired LAST (`uninstall --force`, or only `unlink` when
+//!   another installed formula depends on it), when `bin/sopen` already resolves into the target —
+//!   so a failure or Ctrl-C at any step leaves a sopen on PATH. llmux retires before it relinks,
+//!   and `uninstall --force` unlinks `bin/sopen` while it points into the retired keg; sopen does
+//!   not follow it there ([`converge_plan`]). A failed step's error line also says what is
+//!   installed, whose `bin/sopen` is, and the way back (`brew link --overwrite <target>`).
 //! - The tap refresh is `brew update`; when it fails (a broken third-party tap is enough), one
-//!   line says so and only this tap's git is fast-forwarded. brew always runs with
+//!   line says so and only this tap's git is fast-forwarded — never prompting, never looking for
+//!   a repository above the tap ([`git_command`]). brew always runs with
 //!   `HOMEBREW_NO_AUTO_UPDATE=1`, its stdout the user's, its stderr passed on with its last line
-//!   kept for the error ([`Failed`]).
+//!   kept for the error ([`Failed`]); stderr is read for at most [`DRAIN`] past the command's exit.
 //!
 //! Every side effect is behind [`Host`]: [`RealHost`] runs brew and git, the tests' `FakeHost`
 //! scripts them.
@@ -40,6 +46,8 @@ use std::cell::OnceCell;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 #[cfg(test)]
 mod tests;
@@ -157,17 +165,6 @@ pub enum NotBrew {
     OutsideKeg,
 }
 
-impl NotBrew {
-    fn reason(self) -> &'static str {
-        match self {
-            NotBrew::DevBuild => "it is a dev build",
-            NotBrew::BrewUnavailable => "brew is not available here",
-            NotBrew::ExeUnknown => "its own path cannot be read",
-            NotBrew::OutsideKeg => "it does not run from a sopen keg in brew's Cellar",
-        }
-    }
-}
-
 /// Is the sopen that runs brew's?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Install {
@@ -199,18 +196,20 @@ fn resolved(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Installed by brew = `exe` is a keg ([`keg_shape`]) in brew's own Cellar (`cellar`, asked only
-/// for a binary shaped like a keg, so a source build never runs brew), both with their links
+/// Installed by brew = built `preview` or `release` (brew's binaries are; a `dev` build never
+/// is, wherever it lies) and `exe` is a keg ([`keg_shape`]) in brew's own Cellar (`cellar`, asked
+/// only for a binary shaped like a keg, so a source build never runs brew), both with their links
 /// resolved — a prefix reached through a symlink is still brew's.
 pub fn install_from(
     exe: Option<&Path>,
     cellar: impl FnOnce() -> Option<PathBuf>,
     marker: &str,
 ) -> Install {
+    if marker_channel(marker).is_none() {
+        return Install::Not(NotBrew::DevBuild);
+    }
     let Some((keg_cellar, channel)) = exe.and_then(|exe| keg_shape(&resolved(exe))) else {
-        return Install::Not(if marker_channel(marker).is_none() {
-            NotBrew::DevBuild
-        } else if exe.is_none() {
+        return Install::Not(if exe.is_none() {
             NotBrew::ExeUnknown
         } else {
             NotBrew::OutsideKeg
@@ -228,11 +227,22 @@ pub fn installed(host: &dyn Host) -> Install {
     install_from(host.exe().as_deref(), || host.cellar(), &host.marker())
 }
 
-/// The one line `sopen update` and a switch refuse with. No path in it: a receipt is public.
+/// The one line `sopen update` and a switch refuse with. No path in it: a receipt is public. A
+/// keg brew cannot be asked about may well be brew's, so that one says only that brew is not
+/// there.
 pub fn refusal(why: NotBrew) -> String {
+    let reason = match why {
+        NotBrew::BrewUnavailable => {
+            return "brew is not available here (`brew --cellar` did not answer); sopen updates \
+                    and switches only through brew"
+                .to_string()
+        }
+        NotBrew::DevBuild => "it is a dev build",
+        NotBrew::ExeUnknown => "its own path cannot be read",
+        NotBrew::OutsideKeg => "it does not run from a sopen keg in brew's Cellar",
+    };
     format!(
-        "this sopen was not installed by brew ({}); install it with: brew install {}",
-        why.reason(),
+        "this sopen was not installed by brew ({reason}); install it with: brew install {}",
         Channel::Preview.full_name()
     )
 }
@@ -493,7 +503,9 @@ fn retire(formula: &str, dependents: &[String]) -> BrewCmd {
 }
 
 /// PURE: `bin/sopen` made the formula's for certain. A bare `link` of a keg whose link record
-/// survived answers "Already linked" and does nothing; `unlink` first clears it.
+/// survived answers "Already linked" and does nothing; `unlink` first clears it. Run only when
+/// `bin/sopen` is not the formula's ([`converge_plan`]), so this `unlink` never takes a working
+/// `bin/sopen` away: brew's `unlink` removes only the links into the formula's own keg.
 fn relink(formula: &str) -> [BrewCmd; 2] {
     [
         BrewCmd::new(["unlink", formula]),
@@ -501,33 +513,81 @@ fn relink(formula: &str) -> [BrewCmd; 2] {
     ]
 }
 
-/// PURE: a switch from `current` to `target`, the target first so a failure leaves the old
-/// channel whole: install it (upgrade it when already installed: `install` would leave a stale
-/// keg), retire the outgoing formula ([`retire`]), relink the target. The tap refresh comes
-/// before, outside the plan ([`refresh_tap`]).
-pub fn switch_plan(
-    current: Channel,
-    target: Channel,
-    target_installed: bool,
-    outgoing_dependents: &[String],
-) -> Vec<BrewCmd> {
+/// PURE: a switch's first step, after the tap refresh: install the target, or upgrade it when it
+/// is already installed (`install` would leave a stale keg as it is). Nothing is unlinked or
+/// removed before it, so its failure leaves the old channel whole.
+pub fn install_step(target: Channel, target_installed: bool) -> BrewCmd {
     let full = target.full_name();
-    let mut cmds = vec![if target_installed {
+    if target_installed {
         BrewCmd::new(["upgrade", &full])
     } else {
         BrewCmd::new(["install", &full])
-    }];
-    cmds.push(retire(current.formula(), outgoing_dependents));
-    cmds.extend(relink(target.formula()));
+    }
+}
+
+/// PURE: what makes `bin/sopen` the target's and retires the other formula, from `linked` as it
+/// is now (after the install step, or the same channel's preflight). The target is relinked
+/// only when `bin/sopen` is not solely its own (or the link is unknown): `brew install` and
+/// `upgrade` of a linked keg already link it over `bin/sopen`. The other formula is retired
+/// LAST ([`retire`]): `bin/sopen` then resolves into the target, and `uninstall --force` or
+/// `unlink` remove only the links into their own keg, so a failure or Ctrl-C at any step still
+/// leaves a sopen on PATH (llmux retires first and relinks last, which can leave none).
+pub fn converge_plan(
+    target: Channel,
+    linked: Option<&[String]>,
+    other_dependents: &[String],
+) -> Vec<BrewCmd> {
+    let mut cmds = Vec::new();
+    if linked.and_then(sole_linked) != Some(target) {
+        cmds.extend(relink(target.formula()));
+    }
+    cmds.push(retire(target.other().formula(), other_dependents));
     cmds
 }
 
-/// PURE: the channel chosen again with the other formula still installed: retire it and relink
-/// the target (it may have owned `bin/sopen`).
-pub fn consolidate_plan(target: Channel, stray_dependents: &[String]) -> Vec<BrewCmd> {
-    let mut cmds = vec![retire(target.other().formula(), stray_dependents)];
-    cmds.extend(relink(target.formula()));
-    cmds
+/// The rest of the error line when a switch (or a convergence on the same channel) stopped at a
+/// failed step, read from brew as it is now: what is installed, whose `bin/sopen` is, and the
+/// way back to a sopen on PATH — after the install step, `brew link --overwrite <target>`.
+fn where_it_stopped(host: &dyn Host, from: Channel, to: Channel, past_install: bool) -> String {
+    let installed: Vec<String> = [to, from]
+        .into_iter()
+        .filter_map(|c| {
+            let version = host.installed_version(c.formula())?;
+            Some(format!("{} {version}", c.formula()))
+        })
+        .collect();
+    let installed = if installed.is_empty() {
+        "neither formula".to_string()
+    } else {
+        installed.join(", ")
+    };
+    let linked = host.linked();
+    let owner = linked.as_deref().and_then(sole_linked);
+    let bin = match (&linked, owner) {
+        (_, Some(c)) => format!("bin/sopen is {}'s", c.formula()),
+        (Some(_), None) => "nothing is linked as bin/sopen".to_string(),
+        (None, None) => "bin/sopen could not be read".to_string(),
+    };
+    let link_back = |c: Channel| {
+        format!(
+            "; to make bin/sopen the {} one: brew link --overwrite {}",
+            c.label(),
+            c.formula()
+        )
+    };
+    if past_install {
+        format!(
+            "it stopped part way — installed: {installed}; {bin}{}",
+            link_back(to)
+        )
+    } else if owner == Some(from) || host.installed_version(from.formula()).is_none() {
+        format!("nothing was removed — installed: {installed}; {bin}")
+    } else {
+        format!(
+            "nothing was removed — installed: {installed}; {bin}{}",
+            link_back(from)
+        )
+    }
 }
 
 /// A formula a plan only unlinked, because installed formulas depend on it.
@@ -566,7 +626,7 @@ pub enum SameChannel {
     Relink,
     /// Both installed, the other kept for its dependents, already unlinked: converged.
     KeptUnlinked(KeptFormula),
-    /// Both installed: [`consolidate_plan`]; `kept` when the other only gets unlinked.
+    /// Both installed: [`converge_plan`]; `kept` when the other only gets unlinked.
     Consolidate { kept: Option<KeptFormula> },
 }
 
@@ -751,10 +811,17 @@ pub fn switch(
         current.label(),
         target.label()
     )?;
-    run_plan(
-        host,
-        &switch_plan(current, target, target_installed, &dependents),
-    )?;
+    let install = install_step(target, target_installed);
+    host.run_brew(&install.args()).map_err(|failed| {
+        anyhow!(
+            "{failed}; {}",
+            where_it_stopped(host, current, target, false)
+        )
+    })?;
+    // Whose `bin/sopen` is now decides whether the target needs relinking.
+    let linked = host.linked();
+    run_plan(host, &converge_plan(target, linked.as_deref(), &dependents))
+        .map_err(|e| anyhow!("{e:#}; {}", where_it_stopped(host, current, target, true)))?;
     if let Some(kept) = KeptFormula::from_dependents(current.formula(), &dependents) {
         writeln!(out, "{}", kept.summary())?;
     }
@@ -795,10 +862,11 @@ fn same_channel(host: &dyn Host, target: Channel, out: &mut dyn Write) -> Result
     let cmds = match &action {
         SameChannel::NothingToDo | SameChannel::KeptUnlinked(_) => Vec::new(),
         SameChannel::Relink => relink(target.formula()).to_vec(),
-        SameChannel::Consolidate { .. } => consolidate_plan(target, &dependents),
+        SameChannel::Consolidate { .. } => converge_plan(target, linked.as_deref(), &dependents),
     };
     writeln!(out, "{}", action.headline(target))?;
-    run_plan(host, &cmds)?;
+    run_plan(host, &cmds)
+        .map_err(|e| anyhow!("{e:#}; {}", where_it_stopped(host, other, target, true)))?;
     if let Some(outcome) = action.outcome(target) {
         writeln!(out, "{outcome}")?;
     }
@@ -974,7 +1042,12 @@ impl Host for RealHost {
     fn run_brew(&self, args: &[&str]) -> std::result::Result<(), Failed> {
         let mut command = brew();
         command.args(args);
-        run_passing_stderr(command, format!("brew {}", args.join(" ")))
+        run_passing_stderr(
+            command,
+            format!("brew {}", args.join(" ")),
+            Box::new(std::io::stderr()),
+            DRAIN,
+        )
     }
 
     fn tap_repo(&self) -> Option<PathBuf> {
@@ -982,19 +1055,50 @@ impl Host for RealHost {
     }
 
     fn run_git(&self, repo: &Path, args: &[&str]) -> std::result::Result<(), Failed> {
-        let mut command = Command::new("git");
-        command.arg("-C").arg(repo).args(args).stdin(Stdio::null());
-        run_passing_stderr(command, format!("git {}", args.join(" ")))
+        run_passing_stderr(
+            git_command(repo, args),
+            format!("git -C {} {}", repo.display(), args.join(" ")),
+            Box::new(std::io::stderr()),
+            DRAIN,
+        )
     }
+}
+
+/// `git -C <repo> <args>` for the tap's own checkout: git never asks for a password (a prompt
+/// would go to the terminal past sopen's output; `GIT_TERMINAL_PROMPT=0` fails instead), and
+/// never looks above the tap for a repository (`GIT_CEILING_DIRECTORIES`): a tap folder that is
+/// no repository must not let `fetch` and `merge` run in Homebrew's own.
+fn git_command(repo: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(parent) = resolved(repo).parent() {
+        command.env("GIT_CEILING_DIRECTORIES", parent);
+    }
+    command
 }
 
 /// How much of a command's stderr is kept to find its last line.
 const STDERR_TAIL: usize = 64 * 1024;
 
-/// Runs `command` (its stdout and stdin as they are) with its stderr passed on to ours as it
+/// How long stderr is still read once the command has ended: what it wrote is in the pipe
+/// already, and a descendant that keeps the pipe open (none of brew's is known to) must not hold
+/// sopen.
+const DRAIN: Duration = Duration::from_secs(2);
+
+/// Runs `command` (its stdout and stdin as they are) with its stderr copied to `copy` as it
 /// comes, keeping the tail to name its last line when it fails. `shown` is how the failure
-/// names it.
-fn run_passing_stderr(mut command: Command, shown: String) -> std::result::Result<(), Failed> {
+/// names it. The command's exit is waited for on its own; its stderr only for `drain` more.
+fn run_passing_stderr(
+    mut command: Command,
+    shown: String,
+    mut copy: Box<dyn Write + Send>,
+    drain: Duration,
+) -> std::result::Result<(), Failed> {
     let fail = |how: String, last_line: Option<String>| Failed {
         command: shown.clone(),
         how,
@@ -1004,33 +1108,43 @@ fn run_passing_stderr(mut command: Command, shown: String) -> std::result::Resul
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| fail(format!("could not start it: {e}"), None))?;
-    let mut tail = Vec::new();
+    let tail = Arc::new(Mutex::new(Vec::new()));
+    let (ended, read_to_end) = mpsc::channel::<()>();
     if let Some(mut pipe) = child.stderr.take() {
-        let mut stderr = std::io::stderr();
-        let mut buf = [0u8; 8192];
-        loop {
-            match pipe.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    // A standard error whose reader is gone loses the copy, not the run.
-                    let _ = stderr.write_all(&buf[..n]);
-                    let _ = stderr.flush();
-                    tail.extend_from_slice(&buf[..n]);
-                    if tail.len() > STDERR_TAIL {
-                        tail.drain(..tail.len() - STDERR_TAIL);
+        let tail = Arc::clone(&tail);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        // A standard error whose reader is gone loses the copy, not the run.
+                        let _ = copy.write_all(&buf[..n]);
+                        let _ = copy.flush();
+                        let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+                        tail.extend_from_slice(&buf[..n]);
+                        if tail.len() > STDERR_TAIL {
+                            let excess = tail.len() - STDERR_TAIL;
+                            tail.drain(..excess);
+                        }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
             }
-        }
+            let _ = ended.send(());
+        });
     }
     let status = child
         .wait()
         .map_err(|e| fail(format!("could not wait for it: {e}"), None))?;
+    // Its own output is read by now or within the bound; a pipe still open past it is left to
+    // the reader thread, which ends with the pipe.
+    let _ = read_to_end.recv_timeout(drain);
     if status.success() {
         return Ok(());
     }
+    let tail = tail.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let how = match status.code() {
         Some(code) => format!("exit {code}"),
         None => {
