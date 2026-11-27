@@ -867,6 +867,195 @@ fn x4d_a_space_after_an_arrow_presses_nothing() {
     );
 }
 
+/// Review of X4-find: egui moves the keyboard once a pass (its last direction), so after a second
+/// move every Enter and Space of the pass is dropped. `[Tab, Tab, Enter]` from the push URL field,
+/// the field before Run, runs nothing (the two Tabs aimed past Run; egui stops on it); `[Tab, Tab,
+/// Space]` from a focused Run presses nothing (egui stops on Cancel).
+#[test]
+fn x4d_after_two_moves_in_one_pass_enter_presses_nothing() {
+    let prefill = Prefill {
+        remotes: vec![Remote {
+            name: "origin".into(),
+            url: "https://example.com/x.git".into(),
+            push_url: None,
+        }],
+        ..Prefill::default()
+    };
+    let opened = ActionDialog::open(A::EditRemote, &Target::Repository, &dirty(), &prefill, fake);
+    let mut fx = Fx::new(dialog(opened), fake, 100, 30);
+    fx.focus(dialogs::field_id(2));
+    fx.frame(vec![down(Key::Tab), down(Key::Tab), down(Key::Enter)]);
+    assert!(fx.host.ends.is_empty(), "ran: {:?}", fx.host.ends);
+    assert_eq!(fx.focused(), Some(dialogs::run_id()), "egui moved once");
+}
+
+#[test]
+fn x4d_after_two_moves_in_one_pass_space_presses_nothing() {
+    let stash = Target::Stash(stash_row());
+    let mut fx = Fx::new(open(A::StashDrop, stash, &repo(), fake), fake, 100, 30);
+    fx.focus(dialogs::run_id());
+    let mut events = vec![down(Key::Tab), down(Key::Tab)];
+    events.extend(space());
+    fx.frame(events);
+    assert!(fx.host.ends.is_empty(), "pressed: {:?}", fx.host.ends);
+    assert_eq!(fx.focused(), Some(dialogs::cancel_id()), "egui moved once");
+}
+
+/// Review of X4-find: a Space after a Shift+Tab in a pass that began on a text field is the
+/// field's blank — the kit keeps any other control from pressing it — so Commit's message gets
+/// `a b` from `[Shift+Tab, a, Space, b]`.
+#[test]
+fn x4d_a_space_after_a_shift_tab_in_a_field_is_typed() {
+    let d = open(A::Commit, Target::Uncommitted, &dirty(), fake);
+    let mut fx = Fx::new(d, fake, 100, 30);
+    assert_eq!(fx.focused(), Some(dialogs::field_id(0)));
+    let mut events = vec![
+        key(Key::Tab, true, Modifiers::SHIFT),
+        Event::Text("a".into()),
+    ];
+    events.extend(space());
+    events.push(Event::Text("b".into()));
+    fx.frame(events);
+    let Action::Commit { message, .. } = fx.draft() else {
+        panic!("{:?}", fx.draft());
+    };
+    assert_eq!(message, "a b");
+}
+
+/// A terminal for [`x4d_a_pass_the_terminal_never_printed_was_never_seen`]: it sends its bursts
+/// of events back to back — each waiting while the next is unread, so the backend prints only the
+/// last pass of a burst — one burst once the backend has asked twice since the last (its pass is
+/// done and printed), then ends the run.
+struct Bursts {
+    bursts: std::collections::VecDeque<Vec<crossterm::event::Event>>,
+    now: std::collections::VecDeque<crossterm::event::Event>,
+    asked: usize,
+    /// The dialog's ends so far, as the host left them, when each burst was sent.
+    ends: std::rc::Rc<std::cell::Cell<usize>>,
+    sent_at: std::rc::Rc<RefCell<Vec<usize>>>,
+}
+
+impl term::Tty for Bursts {
+    fn raw(&mut self, _on: bool) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn size(&mut self) -> std::io::Result<(u16, u16)> {
+        Ok((100, 30))
+    }
+    fn probe(&mut self) -> term::Probed {
+        term::Probed {
+            kitty: false,
+            ambiguous: false,
+        }
+    }
+    fn drop_input(&mut self) {}
+    fn next(
+        &mut self,
+        _wait: std::time::Duration,
+    ) -> std::io::Result<Option<crossterm::event::Event>> {
+        if let Some(ev) = self.now.pop_front() {
+            return Ok(Some(ev));
+        }
+        self.asked += 1;
+        assert!(self.asked < 20_000, "the script ran out without an end");
+        if self.asked >= 3 {
+            if let Some(burst) = self.bursts.pop_front() {
+                self.sent_at.borrow_mut().push(self.ends.get());
+                self.asked = 0;
+                self.now.extend(burst);
+                return Ok(self.now.pop_front());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        Ok(None)
+    }
+    fn pending(&mut self) -> std::io::Result<bool> {
+        Ok(!self.now.is_empty())
+    }
+    fn stopped(&self) -> Option<i32> {
+        (self.bursts.is_empty() && self.now.is_empty() && self.asked >= 3).then_some(libc::SIGTERM)
+    }
+}
+
+/// [`Host`] in the terminal, saying how many ends it has.
+struct InTerminal {
+    host: Host,
+    ends: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl Window for InTerminal {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        self.host.ui(ui);
+        self.ends.set(self.host.ends.len());
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// Review of X4-find: the terminal prints no pass while input waits (`term::Backend::serve`), and
+/// says so ([`cells::presented`]); a pass it never printed was never seen. Fetch's form, Prune
+/// focused, then `[Space, a focus report, Enter]` back to back: the Space's and the report's
+/// passes are not printed, so the Enter — whose pass would run what the report's pass laid out —
+/// runs nothing; the next Enter, after the new plan was printed, runs it with the prune.
+#[test]
+fn x4d_a_pass_the_terminal_never_printed_was_never_seen() {
+    use crossterm::event::{Event as CEvent, KeyCode, KeyEvent, KeyModifiers};
+    let press = |code| CEvent::Key(KeyEvent::new(code, KeyModifiers::NONE));
+    let ends = std::rc::Rc::new(std::cell::Cell::new(0));
+    let sent_at = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let tty = Bursts {
+        bursts: [
+            vec![CEvent::FocusGained],
+            vec![CEvent::FocusGained],
+            vec![press(KeyCode::Tab)],
+            vec![
+                press(KeyCode::Char(' ')),
+                CEvent::FocusGained,
+                press(KeyCode::Enter),
+            ],
+            vec![press(KeyCode::Enter)],
+        ]
+        .into(),
+        now: Default::default(),
+        asked: 0,
+        ends: ends.clone(),
+        sent_at: sent_at.clone(),
+    };
+    let ctx = egui::Context::default();
+    chrome::install(&ctx);
+    let mut b = term::Backend::new(tty, std::io::sink(), ctx, true);
+    let mut win = InTerminal {
+        host: Host {
+            dialog: Some(open(A::Fetch, Target::Repository, &dirty(), literal)),
+            planner: literal,
+            ends: Vec::new(),
+            covers: Vec::new(),
+        },
+        ends,
+    };
+    let mut no_switch =
+        |_: &mut term::Backend<Bursts, std::io::Sink>| panic!("no switch in this test");
+    let end = b.run(&mut win, &mut no_switch).expect("the run");
+    assert_eq!(end, term::End::Signal(libc::SIGTERM));
+    assert_eq!(
+        *sent_at.borrow(),
+        [0, 0, 0, 0, 0],
+        "nothing ran before the last Enter"
+    );
+    assert_eq!(
+        win.host.ends,
+        [DialogEnd::Run {
+            action: Action::Fetch {
+                prune: true,
+                prune_tags: false
+            },
+            dont_ask_again: false
+        }]
+    );
+}
+
 /// A restore of more entries than the grid holds stands past its foot (its entries do not scroll
 /// yet): it says so first, Run is off and Enter restores nothing, Esc still cancels; on a taller
 /// window all of it shows and Enter runs.

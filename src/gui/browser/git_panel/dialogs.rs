@@ -32,7 +32,9 @@
 //!   Tab gave it to — so Enter on a focused button is that button's press, and one after a
 //!   Shift+Tab or an arrow that moves the keyboard (egui moves it later) is dropped, a Space too;
 //!   only what the screen showed runs: a Run or an Enter runs when what would run is what the
-//!   pass before painted, else it is dropped and [`CHANGED`] says so. Space is the kit's, once a
+//!   pass before painted and the host put on screen (`cells::presented`), else it is dropped and
+//!   [`CHANGED`] says so; after two moves in a pass every later Enter is dropped, a Space too
+//!   unless the pass began on a text field. Space is the kit's, once a
 //!   press in the pass's order; Esc, Cancel or a click outside cancels, and a pass that both
 //!   cancels and runs cancels.
 
@@ -1158,10 +1160,12 @@ impl ActionDialog {
         let in_field = (controls.iter())
             .filter_map(Control::text_field)
             .any(|n| began == Some(field_id(n)));
-        let enters = take_enters(ctx, began.is_some() && !in_field);
+        let enters = take_enters(ctx, began.is_some() && !in_field, in_field);
         let (layout, fits) = self.layout(grid, &controls);
         // What the owner saw (the last pass's painting), and what this pass paints.
-        let seen = self.on_screen.take();
+        // A pass the host did not put on screen was never seen (the terminal prints none while
+        // input waits): no record, so its Run or Enter waits for one that was.
+        let seen = self.on_screen.take().filter(|_| cells::presented(ctx));
         if std::mem::replace(&mut self.laid_once, true) {
             self.on_screen = Some(self.painted(fits));
         }
@@ -1322,12 +1326,17 @@ pub(super) fn plan_part(rows: Vec<PlanRow>, grid: Grid, width: usize, top: usize
 /// whether it came after the pass's first move of the keyboard (a Tab, or an arrow where
 /// `arrows_move`: on a control whose arrows egui takes as a move, not a field's caret) — so no
 /// choice, button or field the keyboard is on reads it as its own: the dialog gives each to what
-/// has the keyboard then. egui moves the keyboard for a Shift+Tab only on the next pass and for an
-/// arrow at the pass's end, where an Enter after it in the pass cannot follow: in a pass with one,
-/// an Enter after a move is taken and dropped, and the owner presses it again on what now shows
-/// the keyboard (round 1) — a Space too, with its text, which a button or a choice the keyboard is
-/// leaving would take (fix-check).
-fn take_enters(ctx: &egui::Context, arrows_move: bool) -> Vec<bool> {
+/// has the keyboard then. Where egui cannot follow the moves the owner made before an Enter, that
+/// Enter is taken and dropped, and the owner presses it again on what now shows the keyboard:
+/// - after a move, in a pass with a Shift+Tab or an arrow that moves the keyboard — egui moves it
+///   only on the next pass, or at the pass's end (round 1);
+/// - after a second move — egui moves the keyboard once a pass, its last direction (review of
+///   X4-find).
+///
+/// A Space there is dropped too, with its text, which a button or a choice the keyboard is
+/// leaving would take (fix-check) — unless the pass began on a text field (`!on_text`), which
+/// types it and whose Tab the kit already keeps any other control from pressing (review of X4-find).
+fn take_enters(ctx: &egui::Context, arrows_move: bool, on_text: bool) -> Vec<bool> {
     let arrow = |key: &Key| {
         matches!(
             key,
@@ -1353,7 +1362,9 @@ fn take_enters(ctx: &egui::Context, arrows_move: bool) -> Vec<bool> {
     };
     ctx.input_mut(|i| {
         let later = i.events.iter().any(|e| moves(e) == Some(true));
-        let (mut moved, mut out, mut typed) = (false, Vec::new(), false);
+        let (mut moved, mut out, mut typed) = (0usize, Vec::new(), false);
+        // A press here goes where egui cannot follow the owner's moves.
+        let lost = |moved: usize| moved >= 2 || (moved == 1 && later);
         i.events.retain(|e| match (e, std::mem::take(&mut typed)) {
             (egui::Event::Text(text), true) if text == " " => false,
             (
@@ -1365,8 +1376,8 @@ fn take_enters(ctx: &egui::Context, arrows_move: bool) -> Vec<bool> {
                 },
                 _,
             ) if Mods::None.matches(*modifiers) => {
-                if !(moved && later) {
-                    out.push(moved);
+                if !lost(moved) {
+                    out.push(moved > 0);
                 }
                 false
             }
@@ -1378,12 +1389,12 @@ fn take_enters(ctx: &egui::Context, arrows_move: bool) -> Vec<bool> {
                     ..
                 },
                 _,
-            ) if moved && later && Mods::None.matches(*modifiers) => {
+            ) if !on_text && lost(moved) && Mods::None.matches(*modifiers) => {
                 typed = true;
                 false
             }
             (e, _) => {
-                moved |= moves(e).is_some();
+                moved += usize::from(moves(e).is_some());
                 true
             }
         });

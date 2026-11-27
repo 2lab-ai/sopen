@@ -184,6 +184,37 @@ pub fn ambiguous_wide(ctx: &egui::Context) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
+// What reached the screen.
+
+/// The context's last pass was not put on screen ([`set_presented`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct Unpresented;
+
+fn unpresented_id() -> egui::Id {
+    egui::Id::unique("sopen-unpresented")
+}
+
+/// Says whether the pass just run in `ctx` reached the screen: the terminal backend does after
+/// each pass, which it does not print while input is waiting (`term::Backend::serve`); a window
+/// shows every pass and never says.
+pub fn set_presented(ctx: &egui::Context, presented: bool) {
+    ctx.data_mut(|d| {
+        if presented {
+            d.remove_temp::<Unpresented>(unpresented_id());
+        } else {
+            d.insert_temp(unpresented_id(), Unpresented);
+        }
+    });
+}
+
+/// Whether the pass before this one reached the screen ([`set_presented`]): what the owner saw
+/// when they pressed this pass's keys. A screen that acts only on what was on screen (an action's
+/// dialog, X4-dialogs) counts a pass that did not as unseen.
+pub fn presented(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<Unpresented>(unpresented_id()).is_none())
+}
+
+// ---------------------------------------------------------------------------------------------
 // Widths.
 
 /// The graphemes of `span` as [`Buffer::set_stringn`] lays them out — those with a control
