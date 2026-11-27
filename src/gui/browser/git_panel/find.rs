@@ -451,8 +451,9 @@ pub(super) enum SearchEnd {
 /// runs the query the pass before painted, unchanged in this one — not in the pass that lays the
 /// box out unseen, nor the first one seen — else the note says the search changed and the next
 /// Enter runs it. An empty query is refused there (`type what to search for`), and a query with a
-/// field that is not on the grid (the box taller than it, a field of no cells) is never run: the
-/// box says so first ([`TOO_SMALL`]) and its Search is off (review round 1). Esc, Cancel or a click
+/// control that is not on the grid and holds something (the box taller than it, a field of no
+/// cells; a field's text, Match case on) is never run: the box says so first ([`TOO_SMALL`]) and
+/// its Search is off (review round 1, fix-check). Esc, Cancel or a click
 /// outside cancels; a pass that both cancels and searches cancels. What is typed in the pass that
 /// opens it lands in Message, in order (its field reads that pass too). A change of the note asks
 /// for a pass, so it shows at once.
@@ -463,7 +464,8 @@ pub(super) struct SearchDialog {
     note: Note,
     /// The query the last pass painted where it could be seen (`None` until one has).
     shown: Option<SearchQuery>,
-    /// The last pass laid out no cells for a field that holds text: [`TOO_SMALL`], Search off.
+    /// The last pass laid out no cells for a control that holds something (a field's text, Match
+    /// case on): [`TOO_SMALL`], Search off.
     off_grid: bool,
 }
 
@@ -648,11 +650,14 @@ impl SearchDialog {
         let now = ctx.memory(|m| m.focused());
         // What this pass painted, where it could be seen: the next pass's Enter runs it.
         self.shown = (!unseen).then(|| self.query.clone());
-        // A field that holds text with no cells this pass (`Shown::controls` lists the laid ones):
-        // never run, the box saying so from the next pass.
-        let laid = |k: usize| pass.controls.contains(&search_field_id(k));
+        // A control that holds something other than its default with no cells this pass
+        // (`Shown::controls` lists the laid ones) — a field with text, Match case on: never run,
+        // the box saying so from the next pass (fix-check: Match case below the grid's foot was
+        // searched).
+        let laid = |id: egui::Id| pass.controls.contains(&id);
         let texts = self.query.texts();
-        let off_grid = (0..texts.len()).any(|k| !texts[k].is_empty() && !laid(k));
+        let off_grid = (0..texts.len()).any(|k| !texts[k].is_empty() && !laid(search_field_id(k)))
+            || (self.query.case && !laid(match_case_id()));
         let was_off = std::mem::replace(&mut self.off_grid, off_grid);
         if was_off != off_grid {
             ctx.request_repaint();

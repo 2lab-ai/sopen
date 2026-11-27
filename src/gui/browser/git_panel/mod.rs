@@ -3064,8 +3064,12 @@ pub fn draw(
 /// anything typed are taken out first ([`find::take_trailing`]: the field's engine would end its
 /// typing at an Enter), the field types, the bar jumps to the first match of a changed text, then
 /// each acts — Enter the next match, Shift+Enter the previous, Esc closes Find (the caret gone),
-/// what came after the Esc going on to the graph's keys ([`keys`]). Its caret in `caret`; what
-/// the keys ask, and whether an Esc closed Find.
+/// what came after the Esc going on to the graph's keys ([`keys`]). Where those open Find again (a
+/// letter typed after the Esc), the reopened field is laid in the same pass, so the rest of the
+/// pass types into it in order and its cells show what it holds (fix-check: `[x, Esc, y, z]` lost
+/// the z, the row blank for that pass) — the same id at the same cells again, which egui takes for
+/// one widget seen twice, no clash. Its caret in `caret`; what the keys ask, and whether an Esc
+/// left Find closed.
 fn find_ui(
     ui: &mut egui::Ui,
     grid: &Grid,
@@ -3076,31 +3080,46 @@ fn find_ui(
     caret: &mut Option<cells::Position>,
 ) -> (Vec<GitAction>, bool) {
     let ctx = ui.ctx().clone();
-    // Only the keyboard's own: a panel without it, or under a dialog of its own, leaves the pass's
-    // Enter and Esc to what has the keyboard.
-    let (after, rest) = match typing {
-        true => ctx.input_mut(|i| find::take_trailing(&mut i.events)),
-        false => Default::default(),
-    };
     let key = view.find_key;
-    if let Some(find) = &mut view.find {
-        *caret = find::field(ui, grid, cells, buf, find, typing, key);
-    }
-    let mut asked = view.find_jump();
-    for pressed in after {
-        match pressed {
-            find::FindKey::Next => asked.extend(view.find_step(true)),
-            find::FindKey::Previous => asked.extend(view.find_step(false)),
-            find::FindKey::Close => {
-                asked.extend(view.find_close());
-                *caret = None;
-                ctx.input_mut(|i| find::closed_with(&mut i.events, rest));
-                asked.extend(keys(&ctx, view));
-                return (asked, true);
+    let mut asked = Vec::new();
+    // Each turn ends at an Esc after typing; the next lays Find again where the rest opened it.
+    let mut typing = typing;
+    loop {
+        // Only the keyboard's own: a panel without it, or under a dialog of its own, leaves the
+        // pass's Enter and Esc to what has the keyboard.
+        let (after, rest) = match typing {
+            true => ctx.input_mut(|i| find::take_trailing(&mut i.events)),
+            false => Default::default(),
+        };
+        if let Some(find) = &mut view.find {
+            *caret = find::field(ui, grid, cells, buf, find, typing, key);
+        }
+        asked.extend(view.find_jump());
+        let mut closed = false;
+        for pressed in after {
+            match pressed {
+                find::FindKey::Next => asked.extend(view.find_step(true)),
+                find::FindKey::Previous => asked.extend(view.find_step(false)),
+                find::FindKey::Close => {
+                    asked.extend(view.find_close());
+                    *caret = None;
+                    ctx.input_mut(|i| find::closed_with(&mut i.events, rest));
+                    asked.extend(keys(&ctx, view));
+                    closed = true;
+                    break;
+                }
             }
         }
+        if !closed {
+            return (asked, false);
+        }
+        if view.find.is_none() || view.search.is_some() {
+            return (asked, true);
+        }
+        // Opened again by what followed the Esc: its field this pass, typing unless the rest
+        // opened a dialog of the panel's.
+        typing = typing && !view.dialog_up();
     }
-    (asked, false)
 }
 
 /// The graph's part of a pass ([`draw`]): Find's field in the heads' row ([`find_ui`]: its text
@@ -3126,15 +3145,9 @@ fn graph_ui(
         let (found, closed) = find_ui(ui, grid, at.head, buf, view, typing, caret);
         asked.extend(found);
         if closed {
-            // An Esc after what was typed closed it: this pass's cells show the heads — or a
-            // blank row where a letter after the Esc opened it again, its field from the next
-            // pass.
+            // An Esc after what was typed closed it: this pass's cells show the heads.
             let p = chrome::PALETTE;
             cells::fill(buf, at.head, Pen::new(p.text, p.back));
-            if view.find.is_some() {
-                heads = None;
-                ui.ctx().request_repaint();
-            }
         } else {
             heads = None;
             if !find::PAINTS_CELLS {

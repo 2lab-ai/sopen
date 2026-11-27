@@ -1013,6 +1013,36 @@ fn a_field_off_the_grid_is_never_searched() {
     assert_eq!(asked, [GitAction::Search(wanted)]);
 }
 
+/// Match case off the grid is never searched either (fix-check): with Message on screen and Match
+/// case on but below the grid's foot, Enter searches nothing and the box says so; a taller grid
+/// searches it, case and all.
+#[test]
+fn match_case_off_the_grid_is_never_searched() {
+    let mut fx = with_search(1000.0, 16.0 + 8.0 * 16.0);
+    fx.view_mut().search_dialog.as_mut().unwrap().query.case = true;
+    fx.typed("one");
+    fx.idle();
+    assert!(
+        !search_rows(&fx).iter().any(|r| r.contains("Match case")),
+        "Match case is off the grid: {:#?}",
+        search_rows(&fx)
+    );
+    assert!(search_rows(&fx).iter().any(|r| r.contains("Message")));
+    let asked = fx.press(Key::Enter);
+    assert!(asked.is_empty(), "{asked:?}");
+    search_at(&fx, find::TOO_SMALL);
+    fx.drv.resize(1000.0, 500.0);
+    fx.idle();
+    fx.idle();
+    let asked = fx.press(Key::Enter);
+    let wanted = SearchQuery {
+        message: "one".into(),
+        case: true,
+        ..Default::default()
+    };
+    assert_eq!(asked, [GitAction::Search(wanted)]);
+}
+
 /// Two moves of the keyboard in one pass (MUST 5): egui moves it once, so an Enter or a Space
 /// after the second is dropped — `[Tab, Tab, Enter]` from Match case neither searches nor
 /// cancels.
@@ -1028,15 +1058,19 @@ fn presses_after_a_second_move_in_one_pass_are_dropped() {
         Some(find::match_case_id()),
         "on Match case"
     );
+    let before = query(&fx);
     for last in [Key::Enter, Key::Space] {
         let mut events = key_events(Key::Tab, Modifiers::NONE);
         events.extend(key_events(Key::Tab, Modifiers::NONE));
-        events.extend(key_events(last, Modifiers::NONE));
+        events.extend(match last {
+            Key::Space => space_events(),
+            _ => key_events(last, Modifiers::NONE),
+        });
         fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
         fx.idle();
         assert!(fx.take().is_empty(), "{last:?}: nothing pressed");
         assert!(fx.view().search_dialog.is_some(), "{last:?}: not cancelled");
-        assert!(!query(&fx).case);
+        assert_eq!(query(&fx), before, "{last:?}: no field or box changed");
         fx.drv
             .ctx
             .memory_mut(|m| m.request_focus(find::match_case_id()));
@@ -1061,11 +1095,21 @@ fn finds_enter_acts_after_what_was_typed() {
     );
     fx.idle();
     assert!(fx.shows("2 of 3"));
-    // Shift+Enter after typing: the previous.
-    let mut events = vec![Event::Text("".into())];
+    fx.press(Key::Escape);
+    // Shift+Enter after typing that changes the matches: `one` matches `x: one` (3) and
+    // `y: one` (2); the bar jumps to the first, 3, then Shift+Enter goes to the previous, around
+    // the ends, 2 — never stepping first among no matches, then jumping to 3.
+    fx.press(Key::Home);
+    fx.key(Key::F, Modifiers::COMMAND);
+    let mut events = vec![Event::Text("one".into())];
     events.extend(key_events(Key::Enter, Modifiers::SHIFT));
     fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
-    assert_eq!(fx.bar(), RowKey::Commit(oid(9)));
+    assert_eq!(fx.view().find_text(), Some("one"));
+    assert_eq!(
+        fx.bar(),
+        RowKey::Commit(oid(2)),
+        "the previous of `one`'s first match"
+    );
     fx.press(Key::Escape);
     // Find closed, `[m, Enter]`: the m opens it, the bar jumps to its first match, then the next.
     fx.press(Key::Home);
@@ -1183,6 +1227,62 @@ fn an_esc_after_typing_closes_find_for_good() {
     events.push(Event::Text("y".into()));
     fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
     assert_eq!(fx.view().find_text(), Some("y"));
+}
+
+/// What comes after an Esc that closed Find after typing and opened it again goes into the
+/// reopened field in that pass (fix-check): `[x, Esc, y, z]` reads `yz` (as `[x, Esc, yz]` does),
+/// the field showing it in that pass; `[x, Esc, y, Enter]` steps from `y`'s matches, the field
+/// showing `y`. In a panel too short for its parts too. No id clash is painted for the field laid
+/// twice in one pass.
+#[test]
+fn the_rest_after_an_esc_types_into_the_reopened_find() {
+    let tails: [Vec<Event>; 3] = [
+        vec![Event::Text("y".into()), Event::Text("z".into())],
+        vec![Event::Text("yz".into())],
+        {
+            let mut tail = vec![Event::Text("y".into())];
+            tail.extend(key_events(Key::Enter, Modifiers::NONE));
+            tail
+        },
+    ];
+    for short in [false, true] {
+        for (k, tail) in tails.iter().enumerate() {
+            let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+            fx.press(Key::Home);
+            fx.key(Key::F, Modifiers::COMMAND);
+            if short {
+                fx.drv.resize(1000.0, 16.0 + 3.0 * 16.0);
+                fx.idle();
+                fx.idle();
+            }
+            let mut events = vec![Event::Text("x".into())];
+            events.extend(key_events(Key::Escape, Modifiers::NONE));
+            events.extend(tail.iter().cloned());
+            fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+            let what = format!("short {short}, tail {k}");
+            let enter = k == 2;
+            let wanted = if enter { "y" } else { "yz" };
+            assert_eq!(fx.view().find_text(), Some(wanted), "{what}");
+            let clash = (fx.drv.galleys().iter()).any(|(_, g)| g.text().contains('🔥'));
+            assert!(!clash, "{what}: an id clash painted");
+            if !short {
+                let l = panel(&fx);
+                assert_eq!(text(&l, HEAD, 6, 6 + wanted.len() as u16), wanted, "{what}");
+                let caret = Position::new(6 + wanted.len() as u16, HEAD);
+                assert_eq!(l.caret, Some(caret), "{what}: in that pass");
+            }
+            if enter {
+                // The x's match, the octopus merge (`… x and y`), is where the reopened Find
+                // starts; `y`'s first match from there is it, and the next `x: one` (by Cy).
+                let next = index_of(&fx, "x: one");
+                assert_eq!(
+                    fx.view().bar_place().0,
+                    next,
+                    "{what}: stepped from y's first"
+                );
+            }
+        }
+    }
 }
 
 /// A key the graph takes takes its text with it (item 7): with Find closed, Space then a letter
