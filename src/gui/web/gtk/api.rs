@@ -186,6 +186,7 @@ api! {
     webkit_file_chooser_request_cancel: unsafe extern "C" fn(P);
     webkit_color_chooser_request_cancel: unsafe extern "C" fn(P);
     webkit_authentication_request_cancel: unsafe extern "C" fn(P);
+    webkit_authentication_request_get_scheme: unsafe extern "C" fn(P) -> c_int;
 }
 
 // SAFETY: function pointers into libraries that stay loaded for the process; calling them is

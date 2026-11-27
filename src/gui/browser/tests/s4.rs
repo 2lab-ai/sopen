@@ -552,7 +552,7 @@ fn g_h3_split_a_commit_and_continue_once_both_are_committed() {
     assert!(g.shows("git reset --mixed "), "{:#?}", g.texts());
     g.run();
     assert!(g.shows("stopped to edit"), "{:#?}", g.texts());
-    for button in ["Amend", "Split", "Continue", "Abort"] {
+    for button in ["[ Amend ]", "[ Split ]", "[ Continue ]", "[ Abort ]"] {
         assert!(g.painted(button), "{button}: {:#?}", g.texts());
     }
     let top = g.top();
@@ -1500,7 +1500,7 @@ fn the_planner_takes_its_keys_first_and_the_banner_keys_wait() {
     let mut g = Gx::new(stopped);
     g.ready_in_git();
     assert!(g.shows("stopped to edit"), "{:#?}", g.texts());
-    for button in ["Amend", "Split", "Continue", "Abort"] {
+    for button in ["[ Amend ]", "[ Split ]", "[ Continue ]", "[ Abort ]"] {
         assert!(g.painted(button), "{button}");
     }
     let cmd_shift = keys::Mods::CommandShift.prefix();

@@ -422,6 +422,42 @@ fn wv_e2_the_failure_lines() {
         ("x (NSURLErrorDomain -12020)", Failure::Load),
         ("x (WebKitErrorDomain -1202)", Failure::Load),
         ("cannot show application/zip", Failure::Load),
+        // WebKitGTK's, `<message> (<GLib error domain> <code>)` (WV-B's engine): measured under a
+        // private compositor — a self-signed server, a refused port.
+        (
+            "Unacceptable TLS certificate (g-tls-error-quark 2)",
+            Failure::Untrusted,
+        ),
+        (
+            "Could not connect to 127.0.0.1: Connection refused (g-io-error-quark 39)",
+            Failure::Load,
+        ),
+        ("x (g-tls-error-quark 4)", Failure::Load),
+        ("x (g-io-error-quark 2)", Failure::Load),
+        ("x (WebKitNetworkError 2)", Failure::Load),
+        ("x (g-tls-error-quark 5)", Failure::ClientCertificate),
+        // The WebKitGTK engine's own word on an authentication request (`gtk::asks`).
+        (
+            "the page asks for a login, which is refused (WebKitAuthenticationScheme 2)",
+            Failure::Login,
+        ),
+        (
+            "the page asks for a client certificate, which is refused \
+             (WebKitAuthenticationScheme 7)",
+            Failure::ClientCertificate,
+        ),
+        (
+            "x (WebKitAuthenticationScheme 9)",
+            Failure::ClientCertificate,
+        ),
+        ("x (WebKitAuthenticationScheme 8)", Failure::Untrusted),
+        // Not an engine's suffix: the whole text.
+        (
+            "port 9 is one WebKit never connects to (a restricted port)",
+            Failure::Load,
+        ),
+        ("x (NSURLErrorDomain)", Failure::Load),
+        ("x (g-tls-error-quark two)", Failure::Load),
     ] {
         assert_eq!(failure(why), kind, "{why}");
     }

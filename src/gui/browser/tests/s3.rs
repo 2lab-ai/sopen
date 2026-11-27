@@ -638,7 +638,7 @@ fn g_s3_a_merge_conflict_shows_the_banner_and_abort_ends_it() {
     g.key(Key::Enter);
     g.idle(2);
     assert!(g.shows("MERGE of side · 1 conflict"), "{:#?}", g.texts());
-    assert!(g.painted("Continue") && g.painted("Abort") && !g.painted("Skip"));
+    assert!(g.painted("[ Continue ]") && g.painted("[ Abort ]") && !g.painted("[ Skip ]"));
     g.cmd_shift(Key::S);
     assert!(
         g.status()
