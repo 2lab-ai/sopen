@@ -16,11 +16,14 @@ const PREVIEW_V: &str = "2026.11.27.0138";
 const PREVIEW_NEXT: &str = "2026.11.28.0101";
 const STABLE_V: &str = "0.2.0";
 
-/// One injected failure: the logged call that fails, how, and whether its effect lands before
-/// it fails (brew's `uninstall --force` unlinks `bin/sopen` first, then can still fail).
+/// One injected fault on a logged call: it fails before its effect, fails after it (brew's
+/// `uninstall --force` unlinks `bin/sopen` first, then can still fail), or exits 0 having done
+/// nothing (brew's `link` takes the newest keg, its `unlink` the opt link's: on a mismatched rack
+/// a `link --overwrite` can succeed without touching `bin/sopen`).
 struct Fault {
     call: String,
-    failed: Failed,
+    /// `None`: it exits 0.
+    failed: Option<Failed>,
     effect_first: bool,
 }
 
@@ -34,6 +37,9 @@ struct FakeHost {
     versions: RefCell<Vec<(String, String)>>,
     /// The formula whose keg `bin/sopen` resolves into.
     bin_sopen: RefCell<Option<String>>,
+    /// Formulas with a `var/homebrew/linked` record: `brew link` of one answers "Already
+    /// linked" and does nothing (cmd/link.rb), whatever `bin/sopen` is.
+    records: RefCell<Vec<String>>,
     /// `linked` cannot read the link.
     link_unknown: bool,
     /// What the tap offers, formula → the version `install` / `upgrade` give; a formula not
@@ -70,6 +76,7 @@ impl FakeHost {
             lists: true,
             versions: RefCell::new(vec![("sopen-preview".into(), PREVIEW_V.into())]),
             bin_sopen: RefCell::new(Some("sopen-preview".into())),
+            records: RefCell::new(strs(&["sopen-preview"])),
             link_unknown: false,
             tap: vec![("sopen-preview".into(), PREVIEW_V.into())],
             tap_unknown: false,
@@ -88,6 +95,7 @@ impl FakeHost {
         FakeHost {
             versions: RefCell::new(vec![("sopen".into(), STABLE_V.into())]),
             bin_sopen: RefCell::new(Some("sopen".into())),
+            records: RefCell::new(strs(&["sopen"])),
             tap: vec![
                 ("sopen".into(), STABLE_V.into()),
                 ("sopen-preview".into(), PREVIEW_V.into()),
@@ -107,6 +115,7 @@ impl FakeHost {
         }
     }
 
+    /// `formula` installed, unlinked (no link record).
     fn with_installed(self, formula: &str, version: &str) -> Self {
         set_version(&self.versions, formula, Some(version));
         self
@@ -116,12 +125,22 @@ impl FakeHost {
     fn failing(mut self, call: &str, last: &str, effect_first: bool) -> Self {
         self.faults.push(Fault {
             call: call.to_string(),
-            failed: Failed {
+            failed: Some(Failed {
                 command: call.to_string(),
                 how: "exit 1".to_string(),
                 last_line: Some(last.to_string()),
-            },
+            }),
             effect_first,
+        });
+        self
+    }
+
+    /// `call` exits 0 having changed nothing.
+    fn doing_nothing(mut self, call: &str) -> Self {
+        self.faults.push(Fault {
+            call: call.to_string(),
+            failed: None,
+            effect_first: false,
         });
         self
     }
@@ -166,7 +185,7 @@ impl FakeHost {
                 if let Some(v) = self.offered(&f) {
                     set_version(&self.versions, &f, Some(&v));
                     // Both formulas `link_overwrite "bin/sopen"`.
-                    *self.bin_sopen.borrow_mut() = Some(f);
+                    self.link(&f);
                 }
             }
             ["upgrade", name] => {
@@ -184,15 +203,27 @@ impl FakeHost {
                 self.unlink(f);
             }
             ["unlink", f] => self.unlink(f),
-            ["link", "--overwrite", f] if self.version_of(f).is_some() => {
-                *self.bin_sopen.borrow_mut() = Some(f.to_string());
+            // "Already linked" while its record survives, whatever `bin/sopen` is.
+            ["link", "--overwrite", f]
+                if self.version_of(f).is_some()
+                    && !self.records.borrow().iter().any(|r| r == f) =>
+            {
+                self.link(f)
             }
             _ => {}
         }
     }
 
-    /// `brew unlink` removes only the links into the formula's own keg.
+    fn link(&self, formula: &str) {
+        *self.bin_sopen.borrow_mut() = Some(formula.to_string());
+        let mut records = self.records.borrow_mut();
+        records.retain(|r| r != formula);
+        records.push(formula.to_string());
+    }
+
+    /// `brew unlink` removes the formula's record and only the links into its own keg.
     fn unlink(&self, formula: &str) {
+        self.records.borrow_mut().retain(|r| r != formula);
         let mut bin = self.bin_sopen.borrow_mut();
         if bin.as_deref() == Some(formula) {
             *bin = None;
@@ -263,7 +294,10 @@ impl Host for FakeHost {
                 if fault.effect_first {
                     self.apply(args);
                 }
-                Err(fault.failed.clone())
+                match &fault.failed {
+                    Some(failed) => Err(failed.clone()),
+                    None => Ok(()),
+                }
             }
             None => {
                 self.apply(args);
@@ -278,8 +312,8 @@ impl Host for FakeHost {
     fn run_git(&self, repo: &Path, args: &[&str]) -> std::result::Result<(), Failed> {
         let call = format!("git -C {} {}", repo.display(), args.join(" "));
         self.log(call.clone());
-        match self.fault(&call) {
-            Some(fault) => Err(fault.failed.clone()),
+        match self.fault(&call).and_then(|f| f.failed.clone()) {
+            Some(failed) => Err(failed),
             None => Ok(()),
         }
     }
@@ -773,6 +807,37 @@ fn a_child_left_holding_stderr_does_not_hold_the_command() {
     assert_eq!(failed.last_line.as_deref(), Some("b: boom"));
 }
 
+/// A standard error that blocks (a paused terminal) holds the copy, never the failing line:
+/// each chunk is kept before it is passed on.
+#[test]
+fn a_stderr_that_blocks_keeps_the_last_line() {
+    /// Every write waits until the test lets go (its sender dropped), then fails.
+    struct Blocking(Mutex<std::sync::mpsc::Receiver<()>>);
+    impl Write for Blocking {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.lock().unwrap().recv();
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (release, blocked) = std::sync::mpsc::channel::<()>();
+    let started = Instant::now();
+    let failed = run_passing_stderr(
+        sh("printf 'a\\nb: boom\\n' >&2; exit 3"),
+        "sh".into(),
+        Box::new(Blocking(Mutex::new(blocked))),
+        DRAIN,
+    )
+    .unwrap_err();
+    let took = started.elapsed();
+    drop(release);
+    assert!(took < DRAIN + Duration::from_secs(8), "took {took:?}");
+    assert_eq!(failed.how, "exit 3");
+    assert_eq!(failed.last_line.as_deref(), Some("b: boom"));
+}
+
 #[test]
 fn git_never_prompts_and_never_climbs_out_of_the_tap() {
     let tmp = tempfile::tempdir().unwrap();
@@ -784,6 +849,15 @@ fn git_never_prompts_and_never_climbs_out_of_the_tap() {
         .get_envs()
         .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
         .collect();
+    // An inherited GIT_DIR or GIT_WORK_TREE would override `-C` and the ceiling: removed.
+    let removed: Vec<&std::ffi::OsStr> = command
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k)
+        .collect();
+    for key in ["GIT_DIR", "GIT_WORK_TREE"] {
+        assert!(removed.contains(&std::ffi::OsStr::new(key)), "{removed:?}");
+    }
     assert!(
         envs.contains(&("GIT_TERMINAL_PROMPT".into(), "0".into())),
         "{envs:?}"
@@ -835,31 +909,23 @@ fn the_install_step_installs_or_upgrades_the_target() {
     );
 }
 
-/// `bin/sopen` already the target's: nothing unlinks it; the other formula goes last.
+/// `bin/sopen` already the target's: nothing unlinks it, the other formula is retired. Not the
+/// target's: relink first. Unreadable: neither — an `unlink` of a target that does own
+/// `bin/sopen` would take sopen off PATH.
 #[test]
-fn converging_relinks_only_when_bin_sopen_is_not_the_targets_and_retires_last() {
+fn converging_relinks_only_a_bin_sopen_known_not_to_be_the_targets() {
     let p = Channel::Preview;
     assert_eq!(
-        converge_plan(p, Some(&strs(&["sopen-preview"])), &[]),
-        vec![BrewCmd(strs(&["uninstall", "--force", "sopen"]))]
+        first_step(p, Some(&strs(&["sopen-preview"]))),
+        First::Retire
     );
-    let relink_then_retire = vec![
-        BrewCmd(strs(&["unlink", "sopen-preview"])),
-        BrewCmd(strs(&["link", "--overwrite", "sopen-preview"])),
-        BrewCmd(strs(&["uninstall", "--force", "sopen"])),
-    ];
     assert_eq!(
-        converge_plan(p, Some(&strs(&["sopen"])), &[]),
-        relink_then_retire
+        first_step(p, Some(&strs(&["sopen"]))),
+        First::RelinkThenRetire
     );
-    assert_eq!(converge_plan(p, Some(&[]), &[]), relink_then_retire);
-    // Unknown link: relinked, to be certain.
-    assert_eq!(converge_plan(p, None, &[]), relink_then_retire);
+    assert_eq!(first_step(p, Some(&[])), First::RelinkThenRetire);
+    assert_eq!(first_step(p, None), First::Unreadable);
     let needed = strs(&["someone/tap/sopen-plugin"]);
-    assert_eq!(
-        converge_plan(Channel::Stable, Some(&strs(&["sopen"])), &needed),
-        vec![BrewCmd(strs(&["unlink", "sopen-preview"]))]
-    );
     assert_eq!(blocking_dependents(&needed), strs(&["sopen-plugin"]));
 }
 
@@ -1052,46 +1118,55 @@ fn a_switch_to_the_same_channel_is_one_line_and_runs_nothing() {
         s.out
     );
     assert_sopen_on_path(&host, "sopen-preview");
+    // A link that exits 0 having done nothing is not reported as done.
+    let host = FakeHost::preview().doing_nothing("brew link --overwrite sopen-preview");
+    *host.bin_sopen.borrow_mut() = None;
+    let s = said(|o, e| switch(&host, Channel::Preview, o, e));
+    let e = error_of(&s);
+    assert!(
+        e.starts_with(
+            "`brew link --overwrite sopen-preview` exited 0 but bin/sopen is not sopen-preview's"
+        ),
+        "{e}"
+    );
+    assert!(!s.out.contains("relinked"), "{}", s.out);
 }
 
-/// Both installed and `bin/sopen` neither's (or unreadable): preview wins, and `sopen channel
-/// preview` links it first and retires the stray last, so a failure at the retire leaves the
-/// target on PATH.
+const HINT_PREVIEW: &str = "to make bin/sopen the preview one: brew unlink sopen-preview && \
+                            brew link --overwrite sopen-preview";
+
+/// Both installed and `bin/sopen` neither's: preview wins, and `sopen channel preview` links it
+/// first and retires the stray last, so a failure at the retire leaves the target on PATH.
 #[test]
 fn the_same_channel_with_both_installed_relinks_first_and_retires_last() {
-    for link_unknown in [false, true] {
-        let mut host = FakeHost::preview()
-            .with_installed("sopen", STABLE_V)
-            .failing(
-                "brew uninstall --force sopen",
-                "Error: Permission denied @ unlink_internal",
-                true,
-            );
-        *host.bin_sopen.borrow_mut() = None;
-        host.link_unknown = link_unknown;
-        let s = said(|o, e| switch(&host, Channel::Preview, o, e));
-        assert_eq!(
-            host.ran(),
-            strs(&[
-                "brew unlink sopen-preview",
-                "brew link --overwrite sopen-preview",
-                "brew uninstall --force sopen",
-            ])
+    let host = FakeHost::preview()
+        .with_installed("sopen", STABLE_V)
+        .failing(
+            "brew uninstall --force sopen",
+            "Error: Permission denied @ unlink_internal",
+            true,
         );
-        assert!(
-            s.out.starts_with(
-                "already on the preview channel — retiring the other formula, sopen…\n"
-            ),
-            "{}",
-            s.out
-        );
-        let e = error_of(&s);
-        assert!(
-            e.ends_with("to make bin/sopen the preview one: brew link --overwrite sopen-preview"),
-            "{e}"
-        );
-        assert_sopen_on_path(&host, "sopen-preview");
-    }
+    // `bin/sopen` gone, sopen-preview's link record left (#202's trap): `unlink` clears it.
+    *host.bin_sopen.borrow_mut() = None;
+    let s = said(|o, e| switch(&host, Channel::Preview, o, e));
+    assert_eq!(
+        host.ran(),
+        strs(&[
+            "brew unlink sopen-preview",
+            "brew link --overwrite sopen-preview",
+            "brew uninstall --force sopen",
+        ])
+    );
+    let headline = "already on the preview channel — retiring the other formula, sopen…\n";
+    assert!(s.out.starts_with(headline), "{}", s.out);
+    // Already on PATH: no way back to give.
+    let e = error_of(&s);
+    let end = format!(
+        "it stopped part way — installed: sopen-preview {PREVIEW_V}; bin/sopen is \
+         sopen-preview's"
+    );
+    assert!(e.ends_with(&end), "{e}");
+    assert_sopen_on_path(&host, "sopen-preview");
     // Without the failure: converged, the stray gone.
     let host = FakeHost::preview().with_installed("sopen", STABLE_V);
     *host.bin_sopen.borrow_mut() = None;
@@ -1100,6 +1175,78 @@ fn the_same_channel_with_both_installed_relinks_first_and_retires_last() {
     assert!(s.out.ends_with("removed sopen\n"), "{}", s.out);
     assert_sopen_on_path(&host, "sopen-preview");
     assert_eq!(host.version_of("sopen"), None);
+}
+
+/// Whose `bin/sopen` is cannot be read: the target may own it, and an `unlink` of it — cut off
+/// after its effect — would leave none. Nothing is unlinked or retired; the line says what to
+/// run.
+#[test]
+fn an_unreadable_bin_sopen_is_never_unlinked() {
+    // After the install step of a switch: `brew install` linked sopen-preview for real.
+    let mut host = FakeHost::stable().failing("brew unlink sopen-preview", "Error: boom", true);
+    host.link_unknown = true;
+    let s = said(|o, e| switch(&host, Channel::Preview, o, e));
+    assert_eq!(
+        host.ran(),
+        strs(&["brew update", "brew install 2lab-ai/tap/sopen-preview"])
+    );
+    assert_sopen_on_path(&host, "sopen-preview");
+    assert_eq!(host.version_of("sopen").as_deref(), Some(STABLE_V));
+    let e = error_of(&s);
+    assert!(
+        e.starts_with(
+            "stopped after installing sopen-preview: whose bin/sopen is could not be read, so \
+             nothing was unlinked or removed — installed: sopen-preview 2026.11.27.0138, sopen \
+             0.2.0; "
+        ),
+        "{e}"
+    );
+    assert!(e.ends_with(HINT_PREVIEW), "{e}");
+    // The same channel with both installed: refused before its headline.
+    let mut host = FakeHost::preview()
+        .with_installed("sopen", STABLE_V)
+        .failing("brew unlink sopen-preview", "Error: boom", true);
+    host.link_unknown = true;
+    let s = said(|o, e| switch(&host, Channel::Preview, o, e));
+    assert!(host.ran().is_empty(), "{:?}", host.ran());
+    assert_eq!(s.out, "");
+    let e = error_of(&s);
+    assert!(
+        e.starts_with("whose bin/sopen is could not be read, so nothing was changed — "),
+        "{e}"
+    );
+    assert!(e.ends_with(HINT_PREVIEW), "{e}");
+    assert_sopen_on_path(&host, "sopen-preview");
+}
+
+/// brew's `link` takes the newest keg, its `unlink` the opt link's: on a mismatched rack
+/// `link --overwrite` can exit 0 having done nothing. `bin/sopen` is read again before the
+/// other formula is retired — it is the only sopen on PATH then.
+#[test]
+fn a_relink_that_did_nothing_retires_nothing() {
+    let host = FakeHost::stable()
+        .with_installed("sopen-preview", PREVIEW_V)
+        .doing_nothing("brew link --overwrite sopen-preview");
+    let s = said(|o, e| switch(&host, Channel::Preview, o, e));
+    assert_eq!(
+        host.ran(),
+        strs(&[
+            "brew update",
+            "brew upgrade 2lab-ai/tap/sopen-preview",
+            "brew unlink sopen-preview",
+            "brew link --overwrite sopen-preview",
+        ])
+    );
+    assert_sopen_on_path(&host, "sopen");
+    let e = error_of(&s);
+    assert!(
+        e.starts_with(
+            "`brew link --overwrite sopen-preview` exited 0 but bin/sopen is not \
+             sopen-preview's, so sopen was not removed — installed: "
+        ),
+        "{e}"
+    );
+    assert!(e.ends_with(HINT_PREVIEW), "{e}");
 }
 
 #[test]
@@ -1121,6 +1268,28 @@ fn a_failed_install_stops_the_switch_with_the_old_channel_whole() {
         strs(&["brew update", "brew install 2lab-ai/tap/sopen-preview"])
     );
     assert_sopen_on_path(&host, "sopen");
+}
+
+/// An install that linked its keg and then failed (a post-install step): sopen-preview is on
+/// PATH, sopen still installed, and the way back to it is given.
+#[test]
+fn an_install_that_failed_after_linking_gives_the_way_back() {
+    let host = FakeHost::stable().failing(
+        "brew install 2lab-ai/tap/sopen-preview",
+        "Error: An exception occurred within a post_install block",
+        true,
+    );
+    let s = said(|o, e| switch(&host, Channel::Preview, o, e));
+    assert_eq!(
+        error_of(&s),
+        format!(
+            "`brew install 2lab-ai/tap/sopen-preview` failed (exit 1): Error: An exception \
+             occurred within a post_install block; nothing was removed — installed: \
+             sopen-preview {PREVIEW_V}, sopen {STABLE_V}; bin/sopen is sopen-preview's; to make \
+             bin/sopen the stable one: brew unlink sopen && brew link --overwrite sopen"
+        )
+    );
+    assert_sopen_on_path(&host, "sopen-preview");
 }
 
 #[test]
@@ -1148,9 +1317,9 @@ fn a_failed_upgrade_of_an_installed_target_removes_nothing() {
 }
 
 /// The retire is the last step: whether `uninstall --force` fails before or after unlinking
-/// its own keg, `bin/sopen` is already the target's.
+/// its own keg, `bin/sopen` is already the target's — so no way back is needed.
 #[test]
-fn a_failed_retire_leaves_the_target_on_path_and_says_the_way_back() {
+fn a_failed_retire_leaves_the_target_on_path() {
     for effect_first in [false, true] {
         let host = FakeHost::stable().failing(
             "brew uninstall --force sopen",
@@ -1169,8 +1338,7 @@ fn a_failed_retire_leaves_the_target_on_path_and_says_the_way_back() {
             format!(
                 "`brew uninstall --force sopen` failed (exit 1): Error: Permission denied @ \
                  unlink_internal; it stopped part way — installed: {installed}; bin/sopen is \
-                 sopen-preview's; to make bin/sopen the preview one: brew link --overwrite \
-                 sopen-preview"
+                 sopen-preview's"
             )
         );
     }
@@ -1203,10 +1371,11 @@ fn a_failed_relink_leaves_a_sopen_on_path() {
         );
         assert_sopen_on_path(&host, on_path);
         let e = error_of(&s);
-        assert!(
-            e.ends_with("to make bin/sopen the preview one: brew link --overwrite sopen-preview"),
-            "{call}: {e}"
-        );
+        if on_path == "sopen-preview" {
+            assert!(e.ends_with("bin/sopen is sopen-preview's"), "{call}: {e}");
+        } else {
+            assert!(e.ends_with(HINT_PREVIEW), "{call}: {e}");
+        }
     }
     // No failure: relinked, then the other retired.
     let host = FakeHost::stable().with_installed("sopen-preview", PREVIEW_V);

@@ -781,30 +781,39 @@ prereleases) and, from the first `v*` release on, `sopen` (stable); both link `b
   <its last line>; refreshing only 2lab-ai/tap by its git `` — and only the tap's checkout is fast-forwarded:
   `git fetch -q https://github.com/2lab-ai/homebrew-tap.git master` and `git merge -q --ff-only FETCH_HEAD` in
   `brew --repo 2lab-ai/tap`, git never prompting (`GIT_TERMINAL_PROMPT=0`) and never looking for a repository
-  above that folder (`GIT_CEILING_DIRECTORIES`); that failing too ends the command with nothing installed or
-  removed. brew always runs with `HOMEBREW_NO_AUTO_UPDATE=1`.
+  above that folder (`GIT_CEILING_DIRECTORIES`; an inherited `GIT_DIR` or `GIT_WORK_TREE` is removed, since it
+  would override both); that failing too ends the command with nothing installed or removed. brew always runs
+  with `HOMEBREW_NO_AUTO_UPDATE=1`.
 - **A switch** refreshes the tap, then looks the target up in it (`brew info --formula 2lab-ai/tap/<formula>`).
   The stable channel without a release is refused there, before anything is installed or removed: `the stable
   channel has no release yet (its first v* release is the owner's step); staying on preview`, exit 1 — read from
   brew, so the same command switches the day the release lands. Then the target first, so that a failure leaves
   the old channel whole: what depends on the outgoing formula is asked (`brew uses --installed`; no answer ends it
   with nothing changed); the target is installed (`brew install 2lab-ai/tap/<formula>`, `upgrade` when it already
-  is); `bin/sopen` is read again and the target relinked (`unlink`, `link --overwrite`) only when it is not the
-  target's — a fresh install has linked it already; and the outgoing formula is retired last, removed with every
-  keg (`uninstall --force`) or only unlinked when another installed formula depends on it (`kept sopen installed
-  (required by …) — unlinked`). By then `bin/sopen` resolves into the target, and brew's uninstall and unlink
-  remove only the links into their own keg, so a failure or Ctrl-C at any step leaves a sopen on PATH. (llmux
-  retires before it relinks: `uninstall --force` unlinks a `bin/sopen` that still points into the retired keg, and
-  its closing `unlink` takes away the one the install made — a failure there left no sopen to run.) Last:
-  `switched to the stable channel: sopen-preview 2026.11.27.0138 → sopen 0.2.0`. A step that fails ends with what
-  is installed, whose `bin/sopen` is and the way back: after the install step `` …; it stopped part way —
-  installed: sopen-preview 2026.11.27.0138, sopen 0.2.0; bin/sopen is sopen-preview's; to make bin/sopen the
-  preview one: brew link --overwrite sopen-preview ``, at it `` …; nothing was removed — installed: …; bin/sopen
-  is sopen's ``.
+  is); `bin/sopen` is read again, and the target relinked (`unlink`, `link --overwrite`) only when it is known not
+  to be the target's — a fresh install has linked it already — and read once more after that (brew's `link` takes
+  the newest keg and its `unlink` the opt link's, so on a mismatched rack `link --overwrite` can exit 0 having done
+  nothing); the outgoing formula is retired last, and only once `bin/sopen` reads as the target's, removed with
+  every keg (`uninstall --force`) or only unlinked when another installed formula depends on it (`kept sopen
+  installed (required by …) — unlinked`). A `bin/sopen` that cannot be read stops the switch there, before any
+  unlink or retire — the target may own it, and an unlink of it cut off after its effect would leave none: `stopped
+  after installing sopen-preview: whose bin/sopen is could not be read, so nothing was unlinked or removed — …`.
+  brew's uninstall and unlink remove only the links into their own keg, so a failure or Ctrl-C at any step leaves a
+  sopen on PATH, except inside `brew link --overwrite` itself, which deletes and then links. (llmux retires before
+  it relinks: `uninstall --force` unlinks a `bin/sopen` that still points into the retired keg, and its closing
+  `unlink` takes away the one the install made — a failure there left no sopen to run.) Last: `switched to the
+  stable channel: sopen-preview 2026.11.27.0138 → sopen 0.2.0`. A step that fails ends with what is installed,
+  whose `bin/sopen` is and — unless it is already so — the way back, `brew unlink <f> && brew link --overwrite <f>`
+  (a bare `link` answers "Already linked" and does nothing while the formula's link record survives): to the
+  target after the install step (`` …; it stopped part way — installed: sopen-preview 2026.11.27.0138, sopen 0.2.0;
+  bin/sopen is sopen's; to make bin/sopen the preview one: brew unlink sopen-preview && brew link --overwrite
+  sopen-preview ``), to the old channel at it (`` …; nothing was removed — installed: sopen 0.2.0; bin/sopen is
+  sopen's `` needs none).
 - **The same channel again** does what llmux's does: `already on the preview channel — nothing to do`, a relink
   when `bin/sopen` is not its binary, or the other formula retired when both are installed — the target linked
-  first and the other retired last, as in a switch. It never upgrades — that is `sopen update` — and refreshes no
-  tap.
+  first and the other retired last, each read back as in a switch; with both installed and `bin/sopen` unreadable
+  it refuses before its first line, `whose bin/sopen is could not be read, so nothing was changed — …`. It never
+  upgrades — that is `sopen update` — and refreshes no tap.
 - **`sopen update`** refreshes the tap, runs `brew upgrade 2lab-ai/tap/<the channel's formula>` and prints
   `sopen-preview 2026.11.27.0138 → 2026.11.28.0101`, or `sopen-preview is up to date (2026.11.27.0138)`.
 - After a switch, or an update that changed the version: `sopen windows already open keep running the old version

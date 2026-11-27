@@ -25,13 +25,17 @@
 //! - A switch refreshes the tap and looks the target up in it, so the stable channel without a
 //!   release is refused before anything is installed — found from brew, not a flag, so it works
 //!   the day `Formula/sopen.rb` lands. Then the target first, so a failure leaves the old channel
-//!   whole: installed (upgraded when it already is); relinked only when `bin/sopen` is not its
-//!   own once that ran; the other formula retired LAST (`uninstall --force`, or only `unlink` when
-//!   another installed formula depends on it), when `bin/sopen` already resolves into the target —
-//!   so a failure or Ctrl-C at any step leaves a sopen on PATH. llmux retires before it relinks,
-//!   and `uninstall --force` unlinks `bin/sopen` while it points into the retired keg; sopen does
-//!   not follow it there ([`converge_plan`]). A failed step's error line also says what is
-//!   installed, whose `bin/sopen` is, and the way back (`brew link --overwrite <target>`).
+//!   whole: installed (upgraded when it already is); `bin/sopen` read again and the target
+//!   relinked only when it is known not to be its own — read once more after the relink; the
+//!   other formula retired LAST (`uninstall --force`, or only `unlink` when another installed
+//!   formula depends on it), only once `bin/sopen` resolves into the target. A `bin/sopen` that
+//!   cannot be read stops it before any unlink or retire. So a failure or Ctrl-C at any step
+//!   leaves a sopen on PATH, except inside `brew link --overwrite` itself (it deletes, then
+//!   links). llmux retires
+//!   before it relinks, and `uninstall --force` unlinks `bin/sopen` while it points into the
+//!   retired keg; sopen does not follow it there ([`converge`]). A failed step's error line also
+//!   says what is installed, whose `bin/sopen` is and, unless it is already so, the way back
+//!   (`brew unlink <f> && brew link --overwrite <f>`).
 //! - The tap refresh is `brew update`; when it fails (a broken third-party tap is enough), one
 //!   line says so and only this tap's git is fast-forwarded — never prompting, never looking for
 //!   a repository above the tap ([`git_command`]). brew always runs with
@@ -504,8 +508,8 @@ fn retire(formula: &str, dependents: &[String]) -> BrewCmd {
 
 /// PURE: `bin/sopen` made the formula's for certain. A bare `link` of a keg whose link record
 /// survived answers "Already linked" and does nothing; `unlink` first clears it. Run only when
-/// `bin/sopen` is not the formula's ([`converge_plan`]), so this `unlink` never takes a working
-/// `bin/sopen` away: brew's `unlink` removes only the links into the formula's own keg.
+/// `bin/sopen` is known not to be the formula's ([`first_step`]), so this `unlink` never takes
+/// a working `bin/sopen` away: brew's `unlink` removes only the links into the formula's keg.
 fn relink(formula: &str) -> [BrewCmd; 2] {
     [
         BrewCmd::new(["unlink", formula]),
@@ -525,30 +529,80 @@ pub fn install_step(target: Channel, target_installed: bool) -> BrewCmd {
     }
 }
 
-/// PURE: what makes `bin/sopen` the target's and retires the other formula, from `linked` as it
-/// is now (after the install step, or the same channel's preflight). The target is relinked
-/// only when `bin/sopen` is not solely its own (or the link is unknown): `brew install` and
-/// `upgrade` of a linked keg already link it over `bin/sopen`. The other formula is retired
-/// LAST ([`retire`]): `bin/sopen` then resolves into the target, and `uninstall --force` or
-/// `unlink` remove only the links into their own keg, so a failure or Ctrl-C at any step still
-/// leaves a sopen on PATH (llmux retires first and relinks last, which can leave none).
-pub fn converge_plan(
-    target: Channel,
-    linked: Option<&[String]>,
-    other_dependents: &[String],
-) -> Vec<BrewCmd> {
-    let mut cmds = Vec::new();
-    if linked.and_then(sole_linked) != Some(target) {
-        cmds.extend(relink(target.formula()));
-    }
-    cmds.push(retire(target.other().formula(), other_dependents));
-    cmds
+/// What making `bin/sopen` the target's starts with, from whose it is now ([`first_step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum First {
+    /// `bin/sopen` is the target's already: only the other formula is retired.
+    Retire,
+    /// It is known not to be: relink the target, read it again, then retire.
+    RelinkThenRetire,
+    /// It cannot be read: nothing is unlinked or retired. The target may own it, and an
+    /// `unlink` of it cut off after its effect would leave no sopen on PATH.
+    Unreadable,
 }
 
-/// The rest of the error line when a switch (or a convergence on the same channel) stopped at a
-/// failed step, read from brew as it is now: what is installed, whose `bin/sopen` is, and the
-/// way back to a sopen on PATH — after the install step, `brew link --overwrite <target>`.
-fn where_it_stopped(host: &dyn Host, from: Channel, to: Channel, past_install: bool) -> String {
+/// PURE: [`First`] from `linked` as read now (after the install step, or the same channel's
+/// preflight). `brew install` and `upgrade` of a linked keg already link the target over
+/// `bin/sopen`, so a relink is the exception.
+pub fn first_step(target: Channel, linked: Option<&[String]>) -> First {
+    match linked {
+        None => First::Unreadable,
+        Some(names) if sole_linked(names) == Some(target) => First::Retire,
+        Some(_) => First::RelinkThenRetire,
+    }
+}
+
+/// Makes `bin/sopen` the target's and retires the other formula LAST, each step on what brew
+/// says now: an unreadable link stops before anything ([`First::Unreadable`]); a relink is
+/// checked by reading `bin/sopen` again (brew's `link` takes the newest keg and its `unlink` the
+/// opt link's, so on a mismatched rack `link --overwrite` can exit 0 having done nothing); the
+/// retire runs only once `bin/sopen` resolves into the target — `uninstall --force` and `unlink`
+/// remove only the links into their own keg, so it is left alone. A failure or Ctrl-C at any
+/// step leaves a sopen on PATH, except inside `brew link --overwrite` itself (it deletes, then
+/// links). llmux retires before it relinks: `uninstall --force` unlinks a `bin/sopen` still in
+/// the retired keg, and its last `unlink` takes away the link the install made.
+fn converge(
+    host: &dyn Host,
+    from: Channel,
+    target: Channel,
+    linked: Option<&[String]>,
+    dependents: &[String],
+    stopped: &str,
+) -> Result<()> {
+    let state = || where_it_stopped(host, from, target, target);
+    match first_step(target, linked) {
+        First::Unreadable => bail!(
+            "{stopped}: whose bin/sopen is could not be read, so nothing was unlinked or \
+             removed — {}",
+            state()
+        ),
+        First::Retire => {}
+        First::RelinkThenRetire => relink_checked(host, target)
+            .map_err(|e| anyhow!("{e:#}, so {} was not removed — {}", from.formula(), state()))?,
+    }
+    host.run_brew(&retire(from.formula(), dependents).args())
+        .map_err(|failed| anyhow!("{failed}; it stopped part way — {}", state()))?;
+    Ok(())
+}
+
+/// [`relink`], then `bin/sopen` read again: an error unless it is now the target's.
+fn relink_checked(host: &dyn Host, target: Channel) -> Result<()> {
+    run_plan(host, &relink(target.formula()))?;
+    if host.linked().as_deref().and_then(sole_linked) != Some(target) {
+        bail!(
+            "`brew link --overwrite {f}` exited 0 but bin/sopen is not {f}'s",
+            f = target.formula()
+        );
+    }
+    Ok(())
+}
+
+/// What is installed and whose `bin/sopen` is, read from brew as it is now — the end of the
+/// error line when a switch (or a convergence on the same channel) stopped — and the way back to
+/// `hint_for` on PATH: `brew unlink <f> && brew link --overwrite <f>` (a bare `link` answers
+/// "Already linked" and does nothing while the formula's link record survives), left out when
+/// `bin/sopen` is that formula's already or it is not installed.
+fn where_it_stopped(host: &dyn Host, from: Channel, to: Channel, hint_for: Channel) -> String {
     let installed: Vec<String> = [to, from]
         .into_iter()
         .filter_map(|c| {
@@ -568,26 +622,16 @@ fn where_it_stopped(host: &dyn Host, from: Channel, to: Channel, past_install: b
         (Some(_), None) => "nothing is linked as bin/sopen".to_string(),
         (None, None) => "bin/sopen could not be read".to_string(),
     };
-    let link_back = |c: Channel| {
-        format!(
-            "; to make bin/sopen the {} one: brew link --overwrite {}",
-            c.label(),
-            c.formula()
-        )
-    };
-    if past_install {
-        format!(
-            "it stopped part way — installed: {installed}; {bin}{}",
-            link_back(to)
-        )
-    } else if owner == Some(from) || host.installed_version(from.formula()).is_none() {
-        format!("nothing was removed — installed: {installed}; {bin}")
+    let hint = if owner == Some(hint_for) || host.installed_version(hint_for.formula()).is_none() {
+        String::new()
     } else {
         format!(
-            "nothing was removed — installed: {installed}; {bin}{}",
-            link_back(from)
+            "; to make bin/sopen the {} one: brew unlink {f} && brew link --overwrite {f}",
+            hint_for.label(),
+            f = hint_for.formula()
         )
-    }
+    };
+    format!("installed: {installed}; {bin}{hint}")
 }
 
 /// A formula a plan only unlinked, because installed formulas depend on it.
@@ -626,7 +670,7 @@ pub enum SameChannel {
     Relink,
     /// Both installed, the other kept for its dependents, already unlinked: converged.
     KeptUnlinked(KeptFormula),
-    /// Both installed: [`converge_plan`]; `kept` when the other only gets unlinked.
+    /// Both installed: [`converge`]; `kept` when the other only gets unlinked.
     Consolidate { kept: Option<KeptFormula> },
 }
 
@@ -813,15 +857,21 @@ pub fn switch(
     )?;
     let install = install_step(target, target_installed);
     host.run_brew(&install.args()).map_err(|failed| {
-        anyhow!(
-            "{failed}; {}",
-            where_it_stopped(host, current, target, false)
-        )
+        // The way back is to the old channel, unless `bin/sopen` is still its.
+        let state = where_it_stopped(host, current, target, current);
+        anyhow!("{failed}; nothing was removed — {state}")
     })?;
     // Whose `bin/sopen` is now decides whether the target needs relinking.
     let linked = host.linked();
-    run_plan(host, &converge_plan(target, linked.as_deref(), &dependents))
-        .map_err(|e| anyhow!("{e:#}; {}", where_it_stopped(host, current, target, true)))?;
+    let stopped = format!("stopped after installing {}", target.formula());
+    converge(
+        host,
+        current,
+        target,
+        linked.as_deref(),
+        &dependents,
+        &stopped,
+    )?;
     if let Some(kept) = KeptFormula::from_dependents(current.formula(), &dependents) {
         writeln!(out, "{}", kept.summary())?;
     }
@@ -859,14 +909,28 @@ fn same_channel(host: &dyn Host, target: Channel, out: &mut dyn Write) -> Result
         &dependents,
         linked.as_deref(),
     );
-    let cmds = match &action {
-        SameChannel::NothingToDo | SameChannel::KeptUnlinked(_) => Vec::new(),
-        SameChannel::Relink => relink(target.formula()).to_vec(),
-        SameChannel::Consolidate { .. } => converge_plan(target, linked.as_deref(), &dependents),
-    };
+    let state = || where_it_stopped(host, other, target, target);
+    // An unreadable link is refused before the headline: nothing is about to happen.
+    if matches!(action, SameChannel::Consolidate { .. }) && linked.is_none() {
+        bail!(
+            "whose bin/sopen is could not be read, so nothing was changed — {}",
+            state()
+        );
+    }
     writeln!(out, "{}", action.headline(target))?;
-    run_plan(host, &cmds)
-        .map_err(|e| anyhow!("{e:#}; {}", where_it_stopped(host, other, target, true)))?;
+    match &action {
+        SameChannel::NothingToDo | SameChannel::KeptUnlinked(_) => {}
+        SameChannel::Relink => relink_checked(host, target)
+            .map_err(|e| anyhow!("{e:#}; it stopped part way — {}", state()))?,
+        SameChannel::Consolidate { .. } => converge(
+            host,
+            other,
+            target,
+            linked.as_deref(),
+            &dependents,
+            "stopped",
+        )?,
+    }
     if let Some(outcome) = action.outcome(target) {
         writeln!(out, "{outcome}")?;
     }
@@ -1067,7 +1131,8 @@ impl Host for RealHost {
 /// `git -C <repo> <args>` for the tap's own checkout: git never asks for a password (a prompt
 /// would go to the terminal past sopen's output; `GIT_TERMINAL_PROMPT=0` fails instead), and
 /// never looks above the tap for a repository (`GIT_CEILING_DIRECTORIES`): a tap folder that is
-/// no repository must not let `fetch` and `merge` run in Homebrew's own.
+/// no repository must not let `fetch` and `merge` run in Homebrew's own. An inherited `GIT_DIR`
+/// or `GIT_WORK_TREE` would override both `-C`'s discovery and the ceiling: removed.
 fn git_command(repo: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
     command
@@ -1075,6 +1140,8 @@ fn git_command(repo: &Path, args: &[&str]) -> Command {
         .arg(repo)
         .args(args)
         .stdin(Stdio::null())
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .env("GIT_TERMINAL_PROMPT", "0");
     if let Some(parent) = resolved(repo).parent() {
         command.env("GIT_CEILING_DIRECTORIES", parent);
@@ -1118,15 +1185,19 @@ fn run_passing_stderr(
                 match pipe.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        // Kept first: a copy that blocks (a paused terminal) past the drain
+                        // must not cost the failure its last line.
+                        {
+                            let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+                            tail.extend_from_slice(&buf[..n]);
+                            if tail.len() > STDERR_TAIL {
+                                let excess = tail.len() - STDERR_TAIL;
+                                tail.drain(..excess);
+                            }
+                        }
                         // A standard error whose reader is gone loses the copy, not the run.
                         let _ = copy.write_all(&buf[..n]);
                         let _ = copy.flush();
-                        let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
-                        tail.extend_from_slice(&buf[..n]);
-                        if tail.len() > STDERR_TAIL {
-                            let excess = tail.len() - STDERR_TAIL;
-                            tail.drain(..excess);
-                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
