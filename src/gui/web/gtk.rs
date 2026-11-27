@@ -8,16 +8,22 @@
 //!   (`bwrap`, `xdg-dbus-proxy`), or where `bwrap` cannot make a sandbox ([`sandbox_runs`]:
 //!   WebKit would abort the process there), the engine's reason is §4's (`no web engine here
 //!   (…)`).
-//! - **The GTK thread**, one per process, starts with the first view (`gtk_init_check` there; a
-//!   failure is the view's reason) and blocks in `g_main_context_iteration`, woken by
-//!   `g_main_context_wakeup` when a view sends it something. Every GTK, GLib and WebKit call is
-//!   made there. It is not joined when the last view closes: WebKit binds its main thread to the
-//!   first thread that uses it, and a view made on a second one aborts the process (measured:
-//!   SIGABRT in `webkit_web_context_new_ephemeral` on a restarted thread), so it stays, parked in
-//!   that wait, for the process — the views' widgets destroyed and its loop drained.
+//! - **The GTK thread** is spawned at most once per process, by the first view ([`Life`]), and the
+//!   windows' thread never waits for it: views opened while it starts are queued, and told
+//!   should it not start — `gtk_init_check` false, no seat, the default main context another
+//!   thread's, or nothing within [`START_WAIT`] — after which every view gets that reason (§4).
+//!   Every check comes before WebKit's first use, which binds WebKit to the thread. It blocks in
+//!   `g_main_context_iteration` (the default context its own for good), woken by
+//!   `g_main_context_wakeup` when a view sends it something; every GTK, GLib and WebKit call is
+//!   made there. It is not joined when the last view closes: a view made on a second thread
+//!   aborts the process (measured: SIGABRT in `webkit_web_context_new_ephemeral` on a restarted
+//!   thread), so it stays, parked in that wait, for the process. GTK is not let set the
+//!   process's locale (`gtk_disable_setlocale`).
 //! - **A view** ([`GtkView`]): a never-mapped `GtkOffscreenWindow` holding the `WebKitWebView`, on
 //!   an ephemeral `WebKitWebContext` of its own — its own web and network processes, sandboxed
-//!   (WebKit's bubblewrap sandbox, off by default in 4.1: turned on), nothing kept, no cookie,
+//!   (WebKit's bubblewrap sandbox, off by default in 4.1: turned on and read back — a context
+//!   that says it is off makes no view and loads nothing, its view told why), nothing kept, no
+//!   cookie,
 //!   cache or storage shared with another view (§2.5); hardware acceleration
 //!   off (the default aborts offscreen), no devtools, no file URL access, no WebRTC, no DNS
 //!   prefetching, scripts as the view says ([`settings`]); no input method (keys are typed as
@@ -50,11 +56,13 @@
 //!   policy refuses it, and the filter does not see that connection. Each holds a page's
 //!   outside requests alone (measured).
 //! - **Navigation** (§3.4, §7): WebKitGTK's policy decision does not say which frame a navigation
-//!   is for. A file view's every frame keeps to its scheme host — `data:`, `blob:` and `about:`
-//!   documents (a frame's content) allowed unless clicked — and anything else is refused and said
-//!   ([`Event::Refused`]). An address window's frames load as in a browser; its main frame is held
-//!   to its origin as its main resource starts or is redirected ([`hold_main`]); a click out and
-//!   a new window out are refused at the policy. A load sopen asks for outside the scope is
+//!   is for. A file view's every frame keeps to its scheme host — a frame's `data:` and `blob:`
+//!   documents and `about:srcdoc` allowed unless clicked, any other `about:` page refused in
+//!   every frame (fail closed: it loads no resource, so a main frame going there cannot be told
+//!   apart) — and anything else is refused and said ([`Event::Refused`]). The main frame is held
+//!   to the view's scope as its main resource starts or is redirected ([`hold_main`]): a file
+//!   view's `data:` or `blob:` document, an address window's other origin. An address window's
+//!   frames load as in a browser; a click out and a new window out are refused at the policy. A load sopen asks for outside the scope is
 //!   refused before WebKit sees it. A response the engine cannot show is refused, never
 //!   downloaded, and a download that starts anyway is cancelled.
 
@@ -113,6 +121,12 @@ const FINISH_WAIT: Duration = Duration::from_millis(150);
 /// A new view's size in device pixels until it is placed.
 const FIRST_SIZE: (i32, i32) = (64, 64);
 
+/// The longest the sandbox probe may take ([`sandbox_runs`]).
+const PROBE_WAIT: Duration = Duration::from_secs(2);
+
+/// The largest side of a view in device pixels, whatever the renderer allows.
+const MAX_SIDE: usize = 16384;
+
 /// The most a GTK thread waits for GTK to start.
 const START_WAIT: Duration = Duration::from_secs(20);
 
@@ -145,7 +159,7 @@ fn checked() -> Result<&'static Api, String> {
     SANDBOX
         .get_or_init(|| {
             sandbox_tools(&SANDBOX_TOOLS)?;
-            sandbox_runs(SANDBOX_TOOLS[0])
+            sandbox_runs(SANDBOX_TOOLS[0], PROBE_WAIT)
         })
         .clone()?;
     Ok(api)
@@ -155,15 +169,33 @@ fn checked() -> Result<&'static Api, String> {
 /// namespace — here; why not. Where it cannot (unprivileged user namespaces denied), WebKit
 /// would abort the process at its first web process (measured: `g_error` "Failed to fully launch
 /// dbus-proxy", SIGABRT, with nested user namespaces disabled), so there is no engine instead.
-pub(super) fn sandbox_runs(bwrap: &str) -> Result<(), String> {
+pub(super) fn sandbox_runs(bwrap: &str, wait: Duration) -> Result<(), String> {
     let at = Instant::now();
-    let ran = std::process::Command::new(bwrap)
+    let mut child = std::process::Command::new(bwrap)
         .args(["--ro-bind", "/", "/", "--unshare-all", "--die-with-parent"])
         .args(["--", "/bin/sh", "-c", ":"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .output()
+        .spawn()
+        .map_err(|e| format!("WebKitGTK's web process sandbox: {bwrap}: {e}"))?;
+    // On the windows' thread: never longer than `wait`.
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if at.elapsed() < wait => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "WebKitGTK's web process sandbox: {bwrap} did not end within {wait:?}"
+                ));
+            }
+            Err(e) => return Err(format!("WebKitGTK's web process sandbox: {bwrap}: {e}")),
+        }
+    }
+    let ran = child
+        .wait_with_output()
         .map_err(|e| format!("WebKitGTK's web process sandbox: {bwrap}: {e}"))?;
     crate::debug!(
         "page view: the sandbox probe took {:.1} ms",
@@ -216,21 +248,18 @@ impl WebKitGtk {
     /// A new view; a file view contained as `contain` says (both, but in the tests' controls).
     pub(super) fn open_view(&self, opening: Opening, contain: Contain) -> Result<GtkView, String> {
         let api = self.api;
-        let mut running = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
-        if running.is_none() {
-            *running = Some(start(api)?);
-        }
-        let Some(thread) = running.as_mut() else {
-            return Err("the GTK thread is gone".to_string());
-        };
-        thread.views += 1;
+        let tx = sender(&LIFE, &opening.events, START_WAIT, move |rx, tx| {
+            std::thread::Builder::new()
+                .name("sopen-gtk".into())
+                .spawn(move || gtk_main(api, rx, tx))
+                .map(|_| ())
+        })?;
         let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed) + 1;
         let shared = Arc::new(Shared::default());
         let scope = match &opening.content {
             Opened::Page { host, .. } => Scope::Page(host.clone()),
             Opened::Address { origin: address } => Scope::Address(origin(address)),
         };
-        let tx = thread.tx.clone();
         let open = Open {
             key,
             content: opening.content,
@@ -251,6 +280,7 @@ impl WebKitGtk {
             seq: 0,
             forward: Forward::default(),
             told: None,
+            max_side: MAX_SIDE,
             closed: false,
         })
     }
@@ -302,7 +332,25 @@ enum Cmd {
     /// The tests' look inside: run on the GTK thread with the view's web view.
     #[cfg(test)]
     Probe(u64, Probe),
+    /// The tests' count of what the GTK thread holds.
+    #[cfg(test)]
+    Count(mpsc::Sender<Counts>),
 }
+
+/// What the GTK thread holds (the tests'): its views, the reads WebKit waits on, and every
+/// view's requests by number.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Counts {
+    pub(super) views: usize,
+    pub(super) reads: usize,
+    pub(super) ids: usize,
+}
+
+/// The tests' hook: a new context is not asked for the sandbox, so its read-back says off.
+#[cfg(test)]
+pub(super) static SKIP_SANDBOX: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// A look at a view on the GTK thread (the tests').
 #[cfg(test)]
@@ -332,14 +380,92 @@ impl Contain {
     };
 }
 
-/// The running GTK thread: how to reach it and how many views it has. It is never joined: it
-/// lives for the process (see the module's "GTK thread").
-struct Running {
-    tx: mpsc::Sender<Cmd>,
-    views: usize,
+/// The GTK thread's life (the module's "GTK thread"): spawned at most once per process, from the
+/// first view; never joined.
+enum Life {
+    Unstarted,
+    /// Spawned, GTK not up yet: the views opened meanwhile, each told should it not start.
+    Starting {
+        tx: mpsc::Sender<Cmd>,
+        waiting: Vec<Events>,
+    },
+    Running {
+        tx: mpsc::Sender<Cmd>,
+    },
+    /// It did not start: why, for every later view (§4).
+    Failed(String),
 }
 
-static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
+static LIFE: Mutex<Life> = Mutex::new(Life::Unstarted);
+
+/// The GTK thread's sender for a new view whose events are `events`, at once: the first time the
+/// thread is spawned (`spawn`), with a watchdog that fails its start after `deadline`; never
+/// again — a view opened while it starts is queued, and told by `events` should the start fail;
+/// once it failed, every view gets why.
+fn sender(
+    life: &'static Mutex<Life>,
+    events: &Events,
+    deadline: Duration,
+    spawn: impl FnOnce(mpsc::Receiver<Cmd>, mpsc::Sender<Cmd>) -> std::io::Result<()>,
+) -> Result<mpsc::Sender<Cmd>, String> {
+    let mut state = life.lock().unwrap_or_else(PoisonError::into_inner);
+    match &mut *state {
+        Life::Running { tx } => Ok(tx.clone()),
+        Life::Starting { tx, waiting } => {
+            waiting.push(events.clone());
+            Ok(tx.clone())
+        }
+        Life::Failed(why) => Err(why.clone()),
+        Life::Unstarted => {
+            let (tx, rx) = mpsc::channel();
+            if let Err(e) = spawn(rx, tx.clone()) {
+                let why = format!("no GTK thread: {e}");
+                *state = Life::Failed(why.clone());
+                return Err(why);
+            }
+            *state = Life::Starting {
+                tx: tx.clone(),
+                waiting: vec![events.clone()],
+            };
+            drop(state);
+            let watchdog = std::thread::Builder::new()
+                .name("sopen-gtk-start".into())
+                .spawn(move || {
+                    std::thread::sleep(deadline);
+                    fail(life, &format!("GTK did not start within {deadline:?}"));
+                });
+            if let Err(e) = watchdog {
+                fail(life, &format!("no watch on GTK's start: {e}"));
+            }
+            Ok(tx)
+        }
+    }
+}
+
+/// GTK is up: the thread runs, unless its start was given up already (then it serves nothing).
+fn started(life: &Mutex<Life>) -> bool {
+    let mut state = life.lock().unwrap_or_else(PoisonError::into_inner);
+    let Life::Starting { tx, .. } = &*state else {
+        return false;
+    };
+    *state = Life::Running { tx: tx.clone() };
+    true
+}
+
+/// The start failed (`why`): the views waiting for it are told (§4's line), and every later one
+/// gets it. Nothing once the thread runs.
+fn fail(life: &Mutex<Life>, why: &str) {
+    let mut state = life.lock().unwrap_or_else(PoisonError::into_inner);
+    let Life::Starting { waiting, .. } = &mut *state else {
+        return;
+    };
+    let line = super::Unavailable::NoEngine(why.to_string()).line();
+    for events in waiting.drain(..) {
+        events.send(Event::Failed(line.clone()));
+    }
+    crate::debug!("page view: {line}");
+    *state = Life::Failed(why.to_string());
+}
 
 static NEXT_KEY: AtomicU64 = AtomicU64::new(0);
 
@@ -349,45 +475,6 @@ fn post(api: &Api, tx: &mpsc::Sender<Cmd>, cmd: Cmd) {
         // SAFETY: documented as callable from any thread; NULL is the default context.
         unsafe { (api.g_main_context_wakeup)(std::ptr::null_mut()) };
     }
-}
-
-/// A GTK thread, once GTK has started on it; why not.
-fn start(api: &'static Api) -> Result<Running, String> {
-    let (tx, rx) = mpsc::channel();
-    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    let wakes = tx.clone();
-    let join = std::thread::Builder::new()
-        .name("sopen-gtk".into())
-        .spawn(move || gtk_main(api, rx, wakes, ready_tx))
-        .map_err(|e| format!("no GTK thread: {e}"))?;
-    match ready_rx.recv_timeout(START_WAIT) {
-        // Never joined: the thread lives for the process.
-        Ok(Ok(())) => Ok(Running { tx, views: 0 }),
-        Ok(Err(why)) => {
-            let _ = join.join();
-            Err(why)
-        }
-        Err(_) => Err(format!("GTK did not start within {START_WAIT:?}")),
-    }
-}
-
-/// View `key` closed: the GTK thread closes it.
-fn close_view(api: &Api, key: u64) {
-    let mut running = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(thread) = running.as_mut() {
-        post(api, &thread.tx, Cmd::Close(key));
-        thread.views = thread.views.saturating_sub(1);
-    }
-}
-
-/// The views the GTK thread has open (the tests').
-#[cfg(test)]
-pub(super) fn open_views() -> usize {
-    RUNNING
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .as_ref()
-        .map_or(0, |thread| thread.views)
 }
 
 /// The GTK thread's state.
@@ -415,7 +502,8 @@ struct Gview {
     table: Option<Table>,
     /// The requests whose head has not gone yet: sopen's reference on each.
     requests: HashMap<u64, P>,
-    /// Every request's id by its number (the page stream carries the number).
+    /// Each live request's id by its number (the page stream carries the number); forgotten at
+    /// its end, failure or stop.
     ids: HashMap<u64, RequestId>,
     needs_rules: bool,
     ruled: bool,
@@ -458,21 +546,19 @@ fn with_view<R>(key: u64, f: impl FnOnce(&mut Gview) -> R) -> Option<R> {
     with(|gtk| gtk.views.get_mut(&key).map(f)).flatten()
 }
 
-fn gtk_main(
-    api: &'static Api,
-    rx: mpsc::Receiver<Cmd>,
-    tx: mpsc::Sender<Cmd>,
-    ready: mpsc::SyncSender<Result<(), String>>,
-) {
+fn gtk_main(api: &'static Api, rx: mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) {
     // SAFETY: GTK starts on this thread, which makes every later GTK call.
-    let started = unsafe { init(api) };
-    let devices = match started {
+    let devices = match unsafe { init(api) } {
         Ok(devices) => devices,
         Err(why) => {
-            let _ = ready.send(Err(why));
+            fail(&LIFE, &why);
             return;
         }
     };
+    if !started(&LIFE) {
+        // Given up on by the watchdog: no view is ever made here.
+        return;
+    }
     GTK.with(|gtk| {
         *gtk.borrow_mut() = Some(Gtk {
             tx,
@@ -482,7 +568,6 @@ fn gtk_main(
             keyboard: devices.1,
         })
     });
-    let _ = ready.send(Ok(()));
     loop {
         // SAFETY: this thread owns the default context.
         unsafe { (api.g_main_context_iteration)(std::ptr::null_mut(), 1) };
@@ -495,22 +580,31 @@ fn gtk_main(
     }
 }
 
-/// GTK started, the page stream's class registered and the filter compiling; the seat's pointer
-/// and keyboard.
+/// GTK started, its display's seat found, the default main context this thread's for good, the
+/// page stream's class registered and then — WebKit's first use, which binds it to this thread —
+/// the filter compiling; the seat's pointer and keyboard. Every check comes before WebKit is
+/// touched, so a start that fails leaves WebKit unbound.
 ///
 /// SAFETY: on the thread that becomes the GTK thread.
 unsafe fn init(api: &'static Api) -> Result<(P, P), String> {
     // SAFETY (this function's calls): GTK's start and getters on its own thread.
     unsafe {
+        // GTK would set the whole process's locale from its thread; sopen's is left as it is.
+        (api.gtk_disable_setlocale)();
         if (api.gtk_init_check)(std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
             return Err("GTK did not start (gtk_init_check: no display)".to_string());
         }
-        stream_type(api)?;
-        compile(api);
         let seat = (api.gdk_display_get_default_seat)((api.gdk_display_get_default)());
         if seat.is_null() {
             return Err("GTK's display has no seat".to_string());
         }
+        // Owned here for the process: `g_main_context_invoke` from any other thread then never
+        // runs its function there, inline.
+        if (api.g_main_context_acquire)(std::ptr::null_mut()) == 0 {
+            return Err("GLib's default main context is another thread's".to_string());
+        }
+        stream_type(api)?;
+        compile(api);
         Ok((
             (api.gdk_seat_get_pointer)(seat),
             (api.gdk_seat_get_keyboard)(seat),
@@ -553,6 +647,15 @@ unsafe fn handle(api: &'static Api, cmd: Cmd) {
             Cmd::Probe(key, probe) => {
                 let web = with_view(key, |v| v.web).unwrap_or(std::ptr::null_mut());
                 probe(api, web);
+            }
+            #[cfg(test)]
+            Cmd::Count(tx) => {
+                let counts = with(|gtk| Counts {
+                    views: gtk.views.len(),
+                    reads: gtk.reads.len(),
+                    ids: gtk.views.values().map(|v| v.ids.len()).sum(),
+                });
+                let _ = tx.send(counts.unwrap_or_default());
             }
         }
     }
@@ -621,7 +724,20 @@ unsafe fn open(api: &'static Api, open: Open) {
     unsafe {
         let context = (api.webkit_web_context_new_ephemeral)();
         // Before any process of the context is spawned (WebKit refuses it later).
-        (api.webkit_web_context_set_sandbox_enabled)(context, 1);
+        #[cfg(test)]
+        let ask = !SKIP_SANDBOX.load(Ordering::SeqCst);
+        #[cfg(not(test))]
+        let ask = true;
+        if ask {
+            (api.webkit_web_context_set_sandbox_enabled)(context, 1);
+        }
+        if (api.webkit_web_context_get_sandbox_enabled)(context) == 0 {
+            // Asked for, not on: no view, nothing loaded (§3.2).
+            (api.g_object_unref)(context);
+            let why = "WebKit's web process sandbox did not turn on".to_string();
+            events.send(Event::Failed(super::Unavailable::NoEngine(why).line()));
+            return;
+        }
         (api.webkit_web_context_set_cache_model)(context, api::WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER);
         connect(api, context, c"download-started", on_download as P, key);
         let (scope, table) = match content {
@@ -854,12 +970,15 @@ pub(super) fn zoom(scale: f32, factor: i32) -> f64 {
     }
 }
 
-/// A rect of `rect` points at `scale` pixels a point, in device pixels (at least one).
-pub(super) fn device_size(rect: egui::Rect, scale: f32) -> (i32, i32) {
+/// A rect of `rect` points at `scale` pixels a point, in device pixels: at least one, at most
+/// `max_side` (the renderer's largest texture side; egui refuses a larger picture), at most
+/// [`MAX_SIDE`].
+pub(super) fn device_size(rect: egui::Rect, scale: f32, max_side: usize) -> (i32, i32) {
+    let most = max_side.clamp(1, MAX_SIDE) as f32;
     let px = |points: f32| {
         let n = (points * scale).round();
         if n.is_finite() && n >= 1.0 {
-            n.min(16384.0) as i32
+            n.min(most) as i32
         } else {
             1
         }
@@ -1257,15 +1376,18 @@ pub(super) enum Nav {
 /// The policy of a navigation to `url` in a view keeping to `scope` (§3.4, §7). WebKitGTK does
 /// not say which frame a navigation is for (measured: not even its request's `Sec-Fetch-Dest`).
 /// A file view's every frame keeps to its scheme host — containment comes first — but for a
-/// frame's `data:`, `blob:` or `about:` document. An address window's frames load as in a
-/// browser, and its main frame is held to its origin as its main resource starts
-/// ([`hold_main`]): there only a click out and a new window are refused here.
+/// frame's `data:` or `blob:` document, whose main-frame load is held as its main resource
+/// starts ([`hold_main`]), and `about:srcdoc`. Any other `about:` page is refused here, every
+/// frame alike: it loads no resource, so a main frame going there cannot be told apart (measured:
+/// a meta refresh to `about:blank` reached the screen) — fail closed. An address window's frames
+/// load as in a browser, and its main frame is held to its origin as its main resource starts:
+/// there only a click out and a new window are refused here.
 pub(super) fn navigation(scope: &Scope, url: &str, clicked: bool, new_window: bool) -> Nav {
     if scope.keeps(url) {
         return if new_window { Nav::InView } else { Nav::Allow };
     }
     let other = match scope {
-        Scope::Page(_) => in_process(url),
+        Scope::Page(_) => in_process(url) && (!scheme_is(url, "about") || srcdoc(url)),
         Scope::Address(_) => true,
     };
     if other && !clicked && !new_window {
@@ -1274,18 +1396,32 @@ pub(super) fn navigation(scope: &Scope, url: &str, clicked: bool, new_window: bo
     Nav::Refuse { clicked }
 }
 
-/// An address window's main frame started loading `url` (or was redirected there) outside its
-/// origin: it is stopped there and said (§7, [`hold_main`]); a frame's load is not held.
+/// A main frame started loading `url` (or was redirected there) outside its view's scope — a
+/// file view's `data:` or `blob:` document, an address window's other origin: it is stopped
+/// there and said ([`hold_main`]); a frame's load is not held.
 pub(super) fn main_out(scope: &Scope, url: &str) -> bool {
-    matches!(scope, Scope::Address(_)) && !url.is_empty() && !scope.keeps(url)
+    !url.is_empty() && !scope.keeps(url)
 }
 
 /// `data:`, `blob:` and `about:`.
 pub(super) fn in_process(url: &str) -> bool {
-    let scheme = url.split_once(':').map_or("", |(s, _)| s);
     ["data", "blob", "about"]
         .iter()
-        .any(|s| scheme.eq_ignore_ascii_case(s))
+        .any(|scheme| scheme_is(url, scheme))
+}
+
+/// Whether `url`'s scheme is `scheme` (any case).
+fn scheme_is(url: &str, scheme: &str) -> bool {
+    url.split_once(':')
+        .is_some_and(|(s, _)| s.eq_ignore_ascii_case(scheme))
+}
+
+/// `about:srcdoc`: an `<iframe srcdoc>`'s document, a frame's only.
+fn srcdoc(url: &str) -> bool {
+    url.get(6..).is_some_and(|rest| {
+        let rest = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+        rest.eq_ignore_ascii_case("srcdoc")
+    })
 }
 
 /// `path` percent-decoded (bytes that are not UTF-8 shown as U+FFFD).
@@ -1545,7 +1681,7 @@ unsafe extern "C" fn on_resource(web: P, resource: P, request: P, data: P) {
         let range = header((api.webkit_uri_request_get_http_headers)(request), "Range");
         let key = key_of(data);
         let main = (api.webkit_web_view_get_main_resource)(web) == resource;
-        if main && with_view(key, |v| matches!(v.scope, Scope::Address(_))) == Some(true) {
+        if main {
             connect(api, resource, c"sent-request", on_main_request as P, key);
             hold_main(api, key, web, &url);
         }
@@ -1579,10 +1715,11 @@ unsafe extern "C" fn on_main_request(resource: P, request: P, redirected: P, dat
     }
 }
 
-/// An address window's main frame loading `url` out of its origin is stopped at once and said
-/// (§7): its document never reaches the screen. WebKitGTK's policy decision does not say which
-/// frame it is for, its view's address changes only at the commit, so this is where the main
-/// frame is told apart: the view's main resource as it starts (measured: a frame's is not).
+/// A main frame loading `url` out of its view's scope ([`main_out`]: a file view's `data:` or
+/// `blob:` document, an address window's other origin) is stopped at once and said (§3.4, §7):
+/// its document never reaches the screen. WebKitGTK's policy decision does not say which frame
+/// it is for, its view's address changes only at the commit, so this is where the main frame is
+/// told apart: the view's main resource as it starts (measured: a frame's is not).
 ///
 /// SAFETY: on the GTK thread; `web` is view `key`'s.
 unsafe fn hold_main(api: &Api, key: u64, web: P, url: &str) {
@@ -1629,6 +1766,7 @@ unsafe extern "C" fn on_resource_failed(_resource: P, error: *const GError, data
         let range = watched.range.clone();
         let request = with_view(key, |v| {
             let id = v.table.as_mut()?.stop_headless(&url, range.as_deref())?;
+            v.ids.remove(&id.get());
             v.requests.remove(&id.get())
         })
         .flatten();
@@ -1819,7 +1957,11 @@ unsafe fn drain_table(api: &Api, key: u64) {
             match call {
                 Call::Head(head) => answer(api, key, id, &head),
                 Call::Fail(why) => {
-                    let request = with_view(key, |v| v.requests.remove(&id.get())).flatten();
+                    let request = with_view(key, |v| {
+                        v.ids.remove(&id.get());
+                        v.requests.remove(&id.get())
+                    })
+                    .flatten();
                     if let Some(request) = request {
                         let why = c_string(&why);
                         let error = (api.g_error_new_literal)(
@@ -1975,11 +2117,14 @@ unsafe extern "C" fn read_fn(
 fn stream_closed(stream: P) {
     // SAFETY: GIO's page stream.
     let (key, raw) = unsafe { stream_ids(stream) };
-    with_view(key, |v| {
-        if let (Some(id), Some(table)) = (v.ids.get(&raw).copied(), v.table.as_mut()) {
-            table.stop(id);
-        }
-    });
+    with_view(key, |v| stop_request(v, raw));
+}
+
+/// Request `raw` of view `v` stopped (a no-op at the table once it ended) and forgotten.
+fn stop_request(v: &mut Gview, raw: u64) {
+    if let (Some(id), Some(table)) = (v.ids.remove(&raw), v.table.as_mut()) {
+        table.stop(id);
+    }
 }
 
 unsafe extern "C" fn close_fn(stream: P, _cancellable: P, _error: *mut *mut GError) -> GBoolean {
@@ -2095,11 +2240,7 @@ unsafe extern "C" fn cancel_read(data: P) -> GBoolean {
     };
     // SAFETY: the idle's box.
     let (key, raw) = unsafe { *data.cast::<(u64, u64)>() };
-    with_view(key, |v| {
-        if let (Some(id), Some(table)) = (v.ids.get(&raw).copied(), v.table.as_mut()) {
-            table.stop(id);
-        }
-    });
+    with_view(key, |v| stop_request(v, raw));
     let read = with(|gtk| gtk.reads.remove(&(key, raw))).flatten();
     if let Some(read) = read {
         // SAFETY: a read WebKit waits on, completed once.
@@ -2123,10 +2264,15 @@ unsafe fn fulfil(api: &Api, key: u64, raw: u64) {
         return;
     };
     let got = with_view(key, |v| {
-        match (v.ids.get(&raw).copied(), v.table.as_mut()) {
+        let got = match (v.ids.get(&raw).copied(), v.table.as_mut()) {
             (Some(id), Some(table)) => table.read(id, read.count),
             _ => Read::Gone,
+        };
+        // Its end, failure or stop is the request's last word: forgotten.
+        if !matches!(got, Read::Pending | Read::Bytes(_)) {
+            v.ids.remove(&raw);
         }
+        got
     })
     .unwrap_or(Read::Gone);
     let result = match got {
@@ -2325,6 +2471,51 @@ pub(super) enum Input {
         state: c_uint,
     },
     Focus(bool),
+}
+
+impl Input {
+    /// The input with its position divided by `factor` (GTK's own scale).
+    pub(super) fn over(self, factor: f64) -> Input {
+        let factor = if factor.is_finite() && factor > 0.0 {
+            factor
+        } else {
+            1.0
+        };
+        match self {
+            Input::Motion { x, y, state } => Input::Motion {
+                x: x / factor,
+                y: y / factor,
+                state,
+            },
+            Input::Button {
+                x,
+                y,
+                button,
+                pressed,
+                state,
+            } => Input::Button {
+                x: x / factor,
+                y: y / factor,
+                button,
+                pressed,
+                state,
+            },
+            Input::Scroll {
+                x,
+                y,
+                dx,
+                dy,
+                state,
+            } => Input::Scroll {
+                x: x / factor,
+                y: y / factor,
+                dx,
+                dy,
+                state,
+            },
+            other => other,
+        }
+    }
 }
 
 /// The window side's input state of a view: its scale, the pointer, the buttons held, whether
@@ -2600,6 +2791,10 @@ unsafe fn synthesize(api: &Api, key: u64, input: Input) {
             return;
         }
         let time = event_time();
+        // Positions come in device pixels; the widget's own are those over GTK's factor, as its
+        // size is (`place`).
+        let factor = f64::from((api.gtk_widget_get_scale_factor)(web).max(1));
+        let input = input.over(factor);
         let (event, device) = match input {
             Input::Motion { x, y, state } => {
                 let event = (api.gdk_event_new)(api::GDK_MOTION_NOTIFY);
@@ -2708,6 +2903,8 @@ pub(super) struct GtkView {
     forward: Forward,
     /// The size and scale last told.
     told: Option<(i32, i32, f32)>,
+    /// The renderer's largest texture side, as the last pass said.
+    max_side: usize,
     closed: bool,
 }
 
@@ -2745,6 +2942,14 @@ impl GtkView {
             .expect("the GTK thread answers")
     }
 
+    /// What the GTK thread holds, once it has run every command sent before.
+    fn counts(&self) -> Counts {
+        let (tx, rx) = mpsc::channel();
+        post(self.api, &self.tx, Cmd::Count(tx));
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the GTK thread answers")
+    }
+
     /// The page's title (the tests' look).
     fn title(&self) -> String {
         // SAFETY: on the GTK thread, the view's web view.
@@ -2758,7 +2963,7 @@ impl View for GtkView {
     fn place(&mut self, rect: egui::Rect, scale: f32) {
         self.forward.scale = scale;
         self.forward.height = rect.height();
-        let (w, h) = device_size(rect, scale);
+        let (w, h) = device_size(rect, scale, self.max_side);
         if self.told != Some((w, h, scale)) {
             self.told = Some((w, h, scale));
             self.send(Cmd::Place(self.key, w, h, scale));
@@ -2775,6 +2980,8 @@ impl View for GtkView {
 
     fn paint(&mut self, painter: &egui::Painter, rect: egui::Rect) {
         let ctx = painter.ctx();
+        // Before the frame's placement (the shell's after-frame step) uses it.
+        self.max_side = ctx.input(|i| i.max_texture_side);
         let fresh = {
             let mut state = self.shared.lock();
             if state.ctx.is_none() {
@@ -2871,9 +3078,10 @@ impl View for GtkView {
     }
 
     fn close(&mut self) {
-        if !std::mem::replace(&mut self.closed, true) {
+        if !self.closed {
+            self.send(Cmd::Close(self.key));
+            self.closed = true;
             self.texture = None;
-            close_view(self.api, self.key);
         }
     }
 }

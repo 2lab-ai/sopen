@@ -116,13 +116,19 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   (`g_error` "Failed to fully launch dbus-proxy", SIGABRT), and with the probe the same run gets
   `no web engine here (WebKitGTK's web process sandbox cannot start here (…))` instead
   **[decision]**.
-- **Thread**: one GTK thread per process, from the first view: `gtk_init_check` there, blocking in
-  `g_main_context_iteration`, woken by `g_main_context_wakeup`. **It is never joined**: WebKit binds
-  its main thread to the first thread that uses it, and a view made on a second GTK thread after the
-  first ended aborted the process (WV-B: SIGABRT inside `webkit_web_context_new_ephemeral`, gdb
-  backtrace); so when the last view closes the thread stays, parked in that wait, for the process.
-  Measured working beside winit's Wayland connection (*web* §1.4), though GTK off the main thread is
-  not GTK's documented model — a risk.
+- **Thread**: one GTK thread per process, **spawned at most once**, by the first view; the windows'
+  thread never waits for it — views opened while it starts are queued and told (`Failed`, §4's line)
+  should it not start: `gtk_init_check` false, no seat, GLib's default main context another
+  thread's, or nothing within 20 s; every later view then gets that reason synchronously (§4's
+  fallback). Those checks come before WebKit's first use, which binds WebKit to the thread. There it
+  blocks in `g_main_context_iteration`, the default context acquired for good (so no
+  `g_main_context_invoke` from another thread runs inline), woken by `g_main_context_wakeup`. GTK is
+  not let set the process's locale (`gtk_disable_setlocale` first). **It is never joined**: WebKit
+  binds its main thread to the first thread that uses it, and a view made on a second GTK thread
+  after the first ended aborted the process (WV-B: SIGABRT inside
+  `webkit_web_context_new_ephemeral`, gdb backtrace); so when the last view closes the thread stays,
+  parked in that wait, for the process. Measured working beside winit's Wayland connection (*web*
+  §1.4), though GTK off the main thread is not GTK's documented model — a risk.
 - **Drawing**: a never-mapped `GtkOffscreenWindow`; on `damage-event` its surface is mapped
   (`cairo_surface_map_to_image`, BGRA premultiplied) into an egui texture painted at the rect, clipped,
   one device pixel a pixel — at most one copy per pass of the GTK loop. WV-B, release build, private
@@ -135,7 +141,8 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   cross-client child; wry takes only Xlib, *web* §1.2).
 - **HiDPI**: an offscreen window ignores `GDK_SCALE` (measured). The view is rect × scale in device
   pixels with `webkit_web_view_set_zoom_level(scale)`; scale = winit's `pixels_per_point` (divided by
-  GTK's own factor should it ever exceed 1); pointer positions are scaled alike. Measured at 2× on a
+  GTK's own factor should it ever exceed 1); pointer positions are scaled alike, over the same factor;
+  a side never exceeds the renderer's largest texture (egui's `max_texture_side`). Measured at 2× on a
   headless compositor only (WV-B: a 200×120-point view is a 400×240 picture, its layout 1×'s); a
   fractional scale is rendered at exactly rect × scale with that zoom, never at the ceiling and
   resampled **[decision; not seen on a real scaled output]**.
@@ -158,8 +165,12 @@ today's egui windows (the same rect, given by egui) when it has not; WV-F binds 
   script dialogs, printing, HTTP authentication, tooltips and full screen are refused, each a
   window of GTK's own outside the texture **[decision]** — so a `<select>` does not open by mouse.
 - **Sandbox and network**: each view's ephemeral context runs its web process in WebKit's bubblewrap
-  sandbox (off by default in the 4.1 API: turned on before any process of the context starts; WV-B:
-  `bwrap` and `xdg-dbus-proxy` in the view's process tree). A file view's context sends every
+  sandbox (off by default in the 4.1 API: turned on before any process of the context starts, and
+  read back — a context that reads off makes no view, loads nothing and says `no web engine here
+  (WebKit's web process sandbox did not turn on)`). WV-B measured, under the private compositor:
+  the view's process tree is its network process, four `bwrap`s, `xdg-dbus-proxy` and the web
+  process, whose parents are `bwrap`, `bwrap`, sopen and whose `/proc/<pid>/status` says
+  `NSpid: <pid> 2` — a PID namespace of its own. A file view's context sends every
   connection to a dead proxy, `http://127.0.0.1:0` — nothing can listen on port 0: a click, or
   Enter, on a link out made WebKit open a bare TCP connection to the link's host before the
   navigation policy refused it (measured with the filter alone: one, no request), which no
@@ -484,10 +495,11 @@ one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it has one (Linux
   stylesheet instruction — and in the preview without any click (*web* §5: both engines run XSLT). The
   view's row says `N outside requests blocked`; outside CSS, images and fonts therefore do not load,
   and a page that needs them looks unstyled. The lists were prototyped only as `^https?:` blocks
-  **[미측정]**; WV-S2 goes through the channels. **On Linux the row has no count**: WebKitGTK says
-  nothing of a load its filter blocks — no `resource-load-started` for it (measured, WV-B), and no
-  public word like macOS's — so `Blocked` is never said there; the blocking is the filter's (and the
-  dead proxy's, §2.3) all the same.
+  **[미측정]**; WV-S2 goes through the channels. **On Linux the count is unavailable**, never 0:
+  WebKitGTK says nothing of a load its filter blocks — no `resource-load-started` for it (measured,
+  WV-B), and no public word like macOS's — so `Blocked` is never said there and the row shows no
+  count at all, not "0 blocked"; the blocking is the filter's (and the dead proxy's, §2.3) all the
+  same.
 - **Scripts off has non-URL channels too.** An XSLT can build host names from a file it read into
   `<link rel=dns-prefetch|preconnect>` or an `<a href>`: a DNS lookup, or a TCP connect with no
   request, would carry them. The rule list is what contains them, and WV-S2's logging resolver and
@@ -541,8 +553,15 @@ one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it has one (Linux
   is cancelled; the row says where it went, redacted the same way. On Linux WebKitGTK's policy
   decision does not say which frame a navigation is for (WV-B: not even its request's
   `Sec-Fetch-Dest`), so in a file view a frame's navigation out (an outside `<iframe src>`) is
-  refused and said as the main frame's is, where macOS leaves it to the rule list; a frame's
-  `data:`, `blob:` or `about:` document goes unless clicked **[decision]**.
+  refused and said as the main frame's is, where macOS leaves it to the rule list **[decision]**.
+  A frame's `data:` or `blob:` document goes unless clicked; the main frame going there is told
+  apart as the view's main resource starts and is stopped and said, the page staying on screen
+  (WV-B measured: a meta refresh to `data:`, a script's `location` to `data:` and to a `blob:`).
+  **`about:` fails closed**: an `about:` page loads no resource, so a main frame going there cannot
+  be told apart (measured: a meta refresh to `about:blank` reached the screen), and every frame's
+  `about:` navigation is refused but `about:srcdoc`'s. **Frame limit**: with scripts off WebKitGTK
+  asks for an `<iframe srcdoc>` as `about:blank` (measured), so a file view shows srcdoc frames only
+  with scripts on, where it asks for `about:srcdoc` **[decision]**.
 - **Only through the view's policy.** WebKit's ways of following a link outside the view's own
   navigation policy are closed on macOS: the link preview (off, §3.2) and the context menu's Open
   … in New Window (gone, §3.2); its Open Link is a click like any other (refused out of the

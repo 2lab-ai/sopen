@@ -52,8 +52,9 @@ fn a_test_build_starts_no_gtk_unless_asked() {
     assert_eq!(why, UNGATED);
 }
 
-/// `GInputStream`'s layout as declared: GLib's `g_type_query` must agree before the page stream
-/// is registered on it (checked at the engine's start; here the declaration itself).
+/// `GInputStream`'s layout as declared here, on a 64-bit machine. This only pins the declaration:
+/// the check that matters runs at the engine's start, against GLib's own `g_type_query`, and
+/// refuses the engine on a mismatch (`stream_type`; the engine tests see it pass).
 #[test]
 fn the_stream_layout_is_glibs_on_a_64_bit_machine() {
     assert_eq!(api::stream_layout(), (248, 32));
@@ -140,10 +141,34 @@ fn the_filter_folder_is_new_private_and_swept_when_its_process_is_gone() {
 #[test]
 fn the_view_is_its_rect_times_the_scale() {
     let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(714.0, 579.5));
-    assert_eq!(device_size(rect, 1.0), (714, 580));
-    assert_eq!(device_size(rect, 2.0), (1428, 1159));
-    assert_eq!(device_size(rect, 1.25), (893, 724));
-    assert_eq!(device_size(egui::Rect::NOTHING, 2.0), (1, 1));
+    assert_eq!(device_size(rect, 1.0, MAX_SIDE), (714, 580));
+    assert_eq!(device_size(rect, 2.0, MAX_SIDE), (1428, 1159));
+    assert_eq!(device_size(rect, 1.25, MAX_SIDE), (893, 724));
+    assert_eq!(device_size(egui::Rect::NOTHING, 2.0, MAX_SIDE), (1, 1));
+    // Never past the renderer's largest texture side (egui refuses a larger picture).
+    let wide = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(9000.0, 300.0));
+    assert_eq!(device_size(wide, 1.0, 8192), (8192, 300));
+    assert_eq!(device_size(wide, 2.0, 99_999), (MAX_SIDE as i32, 600));
+    assert_eq!(device_size(wide, 1.0, 0), (1, 1));
+    // Positions over GTK's own factor, as the widget's size is.
+    let at = Input::Button {
+        x: 200.0,
+        y: 922.0,
+        button: 1,
+        pressed: true,
+        state: 0,
+    };
+    assert_eq!(at.clone().over(1.0), at);
+    assert_eq!(
+        at.over(2.0),
+        Input::Button {
+            x: 100.0,
+            y: 461.0,
+            button: 1,
+            pressed: true,
+            state: 0
+        }
+    );
     assert_eq!(zoom(2.0, 1), 2.0);
     assert_eq!(zoom(1.5, 1), 1.5);
     assert_eq!(zoom(2.0, 2), 1.0);
@@ -369,9 +394,25 @@ fn a_view_keeps_to_its_scope() {
     );
     assert!(main_out(&address, "http://127.0.0.1:8081/"));
     assert!(!main_out(&address, "http://127.0.0.1:8080/x"));
-    assert!(
-        !main_out(&page, "https://example.com/"),
-        "a file view's policy holds it"
+    // A file view's main frame: held at its main resource for `data:` and `blob:`; its own
+    // documents go.
+    assert!(main_out(&page, "data:text/html,<p>x"));
+    assert!(main_out(&page, "blob:sopen-page://h/1"));
+    assert!(!main_out(&page, &own));
+    assert!(!main_out(&page, ""), "no address yet: nothing to hold");
+    // `about:` fails closed in a file view, every frame — but `about:srcdoc` (a frame's only).
+    assert_eq!(
+        navigation(&page, "about:blank", false, false),
+        Nav::Refuse { clicked: false }
+    );
+    assert_eq!(navigation(&page, "ABOUT:srcdoc", false, false), Nav::Allow);
+    assert_eq!(
+        navigation(&page, "about:srcdocx", false, false),
+        Nav::Refuse { clicked: false }
+    );
+    assert_eq!(
+        navigation(&address, "about:blank", false, false),
+        Nav::Allow
     );
     assert_eq!(
         navigation(&address, "http://127.0.0.1:8081/", false, true),
@@ -426,12 +467,12 @@ fn without_the_sandboxs_tools_there_is_no_engine() {
         "not executable"
     );
     assert_eq!(sandbox_tools(&["/bin/sh"]), Ok(()));
-    let why = sandbox_runs(missing).unwrap_err();
+    let why = sandbox_runs(missing, PROBE_WAIT).unwrap_err();
     assert!(
         why.starts_with("WebKitGTK's web process sandbox: "),
         "{why}"
     );
-    let why = sandbox_runs("/usr/bin/false").unwrap_err();
+    let why = sandbox_runs("/usr/bin/false", PROBE_WAIT).unwrap_err();
     assert_eq!(
         why,
         "WebKitGTK's web process sandbox cannot start here (/usr/bin/false: failed)"
@@ -439,6 +480,105 @@ fn without_the_sandboxs_tools_there_is_no_engine() {
     assert_eq!(
         DEAD_PROXY, "http://127.0.0.1:0",
         "port 0: nothing can listen there"
+    );
+    // A probe that does not end is given up on, on time.
+    let stuck = temp.path().join("stuck-bwrap");
+    std::fs::write(&stuck, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let at = Instant::now();
+    let why = sandbox_runs(stuck.to_str().unwrap(), Duration::from_millis(300)).unwrap_err();
+    assert!(why.ends_with("did not end within 300ms"), "{why}");
+    assert!(at.elapsed() < Duration::from_secs(2), "{:?}", at.elapsed());
+}
+
+/// The GTK thread starts at most once per process: the first view spawns it and returns at
+/// once; a view opened while it starts does not spawn another and is queued; a start that never
+/// ends is given up on at its deadline — every waiting view told §4's line — and every later
+/// view gets the same reason, still with no second spawn.
+#[test]
+fn the_gtk_thread_starts_once_and_a_stuck_start_fails_its_views() {
+    let life: &'static Mutex<Life> = Box::leak(Box::new(Mutex::new(Life::Unstarted)));
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let spawn = |spawns: Arc<AtomicUsize>| {
+        move |rx: mpsc::Receiver<Cmd>, _tx: mpsc::Sender<Cmd>| {
+            spawns.fetch_add(1, Ordering::SeqCst);
+            // A start that never ends: the receiver kept, nothing ever said.
+            std::mem::forget(rx);
+            Ok(())
+        }
+    };
+    let deadline = Duration::from_millis(300);
+    let (first, first_rx) = Events::new();
+    let at = Instant::now();
+    assert!(sender(life, &first, deadline, spawn(spawns.clone())).is_ok());
+    let (second, second_rx) = Events::new();
+    assert!(sender(life, &second, deadline, spawn(spawns.clone())).is_ok());
+    assert!(
+        at.elapsed() < Duration::from_millis(100),
+        "the windows' thread is not held: {:?}",
+        at.elapsed()
+    );
+    assert_eq!(spawns.load(Ordering::SeqCst), 1, "one spawn");
+    let line = "no web engine here (GTK did not start within 300ms)";
+    for rx in [&first_rx, &second_rx] {
+        let said = rx.recv_timeout(Duration::from_secs(5)).expect("told");
+        assert_eq!(said, Event::Failed(line.to_string()));
+    }
+    let (third, _) = Events::new();
+    assert_eq!(
+        sender(life, &third, deadline, spawn(spawns.clone())).err(),
+        Some("GTK did not start within 300ms".to_string())
+    );
+    assert_eq!(spawns.load(Ordering::SeqCst), 1, "never a second spawn");
+    // The thread coming up after all serves nothing.
+    assert!(!started(life));
+}
+
+/// A start that fails (GTK's own word) fails the views waiting for it and every later one; one
+/// that comes up runs, later views get its sender with no spawn, and its watchdog says nothing.
+#[test]
+fn a_failed_start_fails_every_later_view_and_a_good_one_runs() {
+    let why = "GTK did not start (gtk_init_check: no display)";
+    let never = |_: mpsc::Receiver<Cmd>, _: mpsc::Sender<Cmd>| -> std::io::Result<()> {
+        panic!("no second spawn")
+    };
+    let life: &'static Mutex<Life> = Box::leak(Box::new(Mutex::new(Life::Unstarted)));
+    let (first, first_rx) = Events::new();
+    let failing = move |_rx: mpsc::Receiver<Cmd>, _tx: mpsc::Sender<Cmd>| {
+        std::thread::spawn(move || fail(life, why));
+        Ok(())
+    };
+    assert!(sender(life, &first, Duration::from_secs(30), failing).is_ok());
+    let said = first_rx.recv_timeout(Duration::from_secs(5)).expect("told");
+    assert_eq!(said, Event::Failed(format!("no web engine here ({why})")));
+    let (later, _) = Events::new();
+    assert_eq!(
+        sender(life, &later, Duration::from_secs(30), never).err(),
+        Some(why.to_string())
+    );
+
+    let life: &'static Mutex<Life> = Box::leak(Box::new(Mutex::new(Life::Unstarted)));
+    let (first, first_rx) = Events::new();
+    // `started` takes the lock the spawn is called under: from a thread of its own.
+    let up = move |rx: mpsc::Receiver<Cmd>, _tx: mpsc::Sender<Cmd>| {
+        std::thread::spawn(move || {
+            let _rx = rx;
+            assert!(started(life), "runs");
+        });
+        Ok(())
+    };
+    assert!(sender(life, &first, Duration::from_millis(300), up).is_ok());
+    let ran = spin(5.0, || {
+        matches!(*life.lock().unwrap(), Life::Running { .. })
+    });
+    assert!(ran, "it runs");
+    let (later, _) = Events::new();
+    assert!(sender(life, &later, Duration::from_millis(300), never).is_ok());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        first_rx.try_recv().is_err(),
+        "the watchdog says nothing of a thread that runs"
     );
 }
 
@@ -713,6 +853,12 @@ fn wv_b_a_page_served_through_the_scheme_renders() {
         (api.webkit_web_context_get_sandbox_enabled)((api.webkit_web_view_get_context)(web)) != 0
     });
     assert!(sandbox, "the view's context is sandboxed");
+    // The page stream's class was registered: GLib's `g_type_query` agreed with its layout.
+    assert!(
+        matches!(STREAM_TYPE.get(), Some(Ok(_))),
+        "{:?}",
+        STREAM_TYPE.get()
+    );
 }
 
 /// §2.3's input: a forwarded click toggles a checkbox — its `:checked` style shows it, no
@@ -1160,6 +1306,192 @@ fn wv_b_an_address_window_keeps_to_its_origin() {
     file.shows("the file view beside it", 50.0, 30.0, "red");
 }
 
+/// §3.4: a file view's main frame never leaves its scheme host for an in-process document — a
+/// meta refresh to `about:blank` or to a `data:` page, a script's `location` to `data:`,
+/// `about:blank` or a `blob:` — the page stays on screen (its red), the navigation is refused
+/// and said, and nothing reaches an outside server; a `data:` frame still shows (its green), a
+/// `srcdoc` frame only with scripts on.
+#[test]
+fn wv_b_a_file_views_main_frame_keeps_to_its_scheme() {
+    let Some((_turn, engine)) = turn("wv_b_a_file_views_main_frame_keeps_to_its_scheme") else {
+        return;
+    };
+    let outside = Http::start();
+    let data = format!(
+        "data:text/html,<body style='background:%2300f'><img src='http://127.0.0.1:{}/d.png'>",
+        outside.port
+    );
+    // A green page as a frame's document.
+    let green = "data:text/html,<body style='margin:0;background:%230f0'>";
+    let frames = format!(
+        "<iframe src=\"{green}\" style='position:fixed;left:0;top:150px;width:90px;height:40px;\
+         border:0'></iframe><iframe srcdoc=\"<body style='margin:0;background:#0f0'>\" \
+         style='position:fixed;left:100px;top:150px;width:90px;height:40px;border:0'></iframe>"
+    );
+    let blob = "<script>setTimeout(() => location = URL.createObjectURL(new Blob(\
+        ['<body style=\"background:#00f\">'], {type: 'text/html'})), 50)</script>";
+    for (name, scripts, head) in [
+        (
+            "about",
+            false,
+            "<meta http-equiv=refresh content='0;url=about:blank'>".to_string(),
+        ),
+        (
+            "data",
+            false,
+            format!("<meta http-equiv=refresh content=\"0;url={data}\">"),
+        ),
+        (
+            "script data",
+            true,
+            format!("<script>setTimeout(() => location = \"{data}\", 50)</script>"),
+        ),
+        (
+            "script about",
+            true,
+            "<script>setTimeout(() => location = 'about:blank', 50)</script>".to_string(),
+        ),
+        ("script blob", true, blob.to_string()),
+    ] {
+        let page =
+            format!("<!doctype html>{head}<style>body{{margin:0;background:#f00}}</style>{frames}");
+        let site = Site::with(&[("/p.html", "text/html", page.into_bytes().leak())]);
+        let mut shown = Shown::page(&engine, &site, scripts, Contain::ALL);
+        shown.place(200.0, 200.0, 1.0);
+        shown.load("p.html");
+        shown.until(&format!("{name}: refused"), 10.0, |e| {
+            e.iter()
+                .any(|e| matches!(e, Event::Refused { clicked: false, .. }))
+        });
+        std::thread::sleep(Duration::from_millis(700));
+        shown.drain();
+        println!("main frame {name}: said {:?}", shown.seen);
+        shown.shows(&format!("{name}: the page stays"), 100.0, 60.0, "red");
+        shown.shows(&format!("{name}: the data: frame"), 45.0, 170.0, "green");
+        // With scripts off WebKitGTK asks for an `<iframe srcdoc>` as `about:blank` (measured),
+        // which a file view refuses in every frame: the frame shows nothing, the page's red
+        // through it. With scripts on it asks for `about:srcdoc`, which goes.
+        let srcdoc = if scripts { "green" } else { "red" };
+        shown.shows(&format!("{name}: the srcdoc frame"), 145.0, 170.0, srcdoc);
+        assert!(
+            !shown
+                .seen
+                .iter()
+                .any(|e| matches!(e, Event::Document(d) if !d.ends_with("p.html"))),
+            "{name}: no other document: {:?}",
+            shown.seen
+        );
+        assert_eq!(outside.accepted(), 0, "{name}: {:?}", outside.log());
+    }
+}
+
+/// §2.3, §3.2: a context whose sandbox reads back off is refused — the view says why and loads
+/// nothing (the tests' hook skips the request); the next view, asked as always, is sandboxed and
+/// loads.
+#[test]
+fn wv_b_a_view_without_its_sandbox_loads_nothing() {
+    let Some((_turn, engine)) = turn("wv_b_a_view_without_its_sandbox_loads_nothing") else {
+        return;
+    };
+    let site = Site::with(&[("/index.html", "text/html", QUADRANTS)]);
+    /// The hook off again however the test ends.
+    struct Asked;
+    impl Drop for Asked {
+        fn drop(&mut self) {
+            SKIP_SANDBOX.store(false, Ordering::SeqCst);
+        }
+    }
+    let asked = Asked;
+    SKIP_SANDBOX.store(true, Ordering::SeqCst);
+    let mut shown = Shown::page(&engine, &site, false, Contain::ALL);
+    shown.place(200.0, 120.0, 1.0);
+    shown.load("index.html");
+    shown.until("the view says why", 10.0, |e| {
+        e.iter()
+            .any(|e| matches!(e, Event::Failed(why) if why.contains("sandbox")))
+    });
+    drop(asked);
+    std::thread::sleep(Duration::from_millis(500));
+    shown.drain();
+    println!(
+        "no sandbox: said {:?}; the server was asked {:?}",
+        shown.seen,
+        site.said()
+    );
+    assert!(site.said().is_empty(), "nothing loaded: {:?}", site.said());
+    assert!(
+        !shown.seen.iter().any(|e| matches!(e, Event::Document(_))),
+        "{:?}",
+        shown.seen
+    );
+    drop(shown);
+    let mut again = Shown::page(&engine, &site, false, Contain::ALL);
+    again.place(200.0, 120.0, 1.0);
+    again.load("index.html");
+    again.finished();
+    again.shows("the next view", 50.0, 30.0, "red");
+}
+
+/// A view's requests are forgotten as they end: a page that reloads itself every 200 ms keeps
+/// the GTK thread's bookkeeping bounded.
+#[test]
+fn wv_b_ended_requests_are_forgotten() {
+    let Some((_turn, engine)) = turn("wv_b_ended_requests_are_forgotten") else {
+        return;
+    };
+    let page = b"<!doctype html><meta http-equiv=refresh content='0.2'>\
+        <link rel=stylesheet href=s.css><title>again</title>";
+    let site = Site::with(&[
+        ("/again.html", "text/html", page),
+        ("/s.css", "text/css", b"body { background: #f00 }"),
+    ]);
+    let mut shown = Shown::page(&engine, &site, false, Contain::ALL);
+    shown.place(100.0, 100.0, 1.0);
+    shown.load("again.html");
+    std::thread::sleep(Duration::from_secs(3));
+    let starts = site.said().len();
+    let counts = shown.view.counts();
+    println!("after 3 s of reloads: {starts} things said to the server, {counts:?}");
+    assert!(starts >= 10, "it reloaded: {starts}");
+    assert!(counts.ids <= 4, "{counts:?}");
+}
+
+/// A view closed while WebKit waits on a read and the server still holds the request: the read
+/// is completed, the view gone, and the server's late bytes reach nothing.
+#[test]
+fn wv_b_a_view_closed_mid_read_leaves_nothing() {
+    let Some((_turn, engine)) = turn("wv_b_a_view_closed_mid_read_leaves_nothing") else {
+        return;
+    };
+    let site = Site::default();
+    site.hold("/b.html");
+    let mut shown = Shown::page(&engine, &site, false, Contain::ALL);
+    shown.place(100.0, 100.0, 1.0);
+    shown.load("b.html");
+    let (b, reply) = site.take_held("/b.html");
+    let html = vec![b'x'; 256 * 1024];
+    let mut body = reply.head(Head::whole("text/html", html.len() as u64));
+    body.data(html[..64 * 1024].to_vec()).unwrap();
+    let waiting = spin(5.0, || shown.view.counts().reads == 1);
+    assert!(waiting, "WebKit waits on a read: {:?}", shown.view.counts());
+    let probe = shown.view.tx.clone();
+    let api = shown.view.api;
+    drop(shown);
+    let told = spin(5.0, || site.stopped(b));
+    assert!(told, "the server is told at the close: {:?}", site.said());
+    let late = body.data(html[64 * 1024..].to_vec());
+    assert_eq!(
+        late,
+        Err(crate::scheme::Refused::Stopped),
+        "its late bytes go nowhere"
+    );
+    let (tx, rx) = mpsc::channel();
+    post(api, &probe, Cmd::Count(tx));
+    let counts = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    println!("closed mid-read: {counts:?}");
+    assert_eq!(counts.reads, 0, "{counts:?}");
+}
+
 /// X-W1's stops on Linux: a request stopped before its head (the view's resource failing names
 /// it) and one stopped mid-body (its read's cancel) are both stopped at the server.
 #[test]
@@ -1219,9 +1551,32 @@ fn wv_b_teardown_leaves_no_web_process() {
             .any(|(_, name, _)| name.starts_with("WebKitWebProces")),
         "a web process of the view's: {during:?}"
     );
+    // §2.3: the web process runs under bwrap, in a PID namespace of its own.
+    for (pid, _, _) in during.iter().filter(|d| d.1.starts_with("WebKitWebProces")) {
+        let chain = ancestors(*pid);
+        let nspid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .unwrap_or_default()
+            .lines()
+            .find(|l| l.starts_with("NSpid:"))
+            .unwrap_or("")
+            .to_string();
+        println!("web process {pid}: parents {chain:?}; {nspid}");
+        assert!(chain.iter().any(|n| n == "bwrap"), "under bwrap: {chain:?}");
+        assert!(
+            nspid.split_whitespace().count() >= 3,
+            "a PID namespace of its own: {nspid}"
+        );
+    }
+    let probe = shown.view.tx.clone();
     let at = Instant::now();
     drop(shown);
-    assert_eq!(open_views(), 0, "the GTK thread has no view left");
+    let (tx, rx) = mpsc::channel();
+    post(engine.api, &probe, Cmd::Count(tx));
+    let counts = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        counts.views, 0,
+        "the GTK thread has no view left: {counts:?}"
+    );
     let gone = spin(2.0, || {
         descendants()
             .iter()
@@ -1242,6 +1597,27 @@ fn wv_b_teardown_leaves_no_web_process() {
     again.load("index.html");
     again.finished();
     again.shows("after a restart", 50.0, 30.0, "red");
+}
+
+/// The names of `pid`'s parents, up to this process.
+fn ancestors(pid: i32) -> Vec<String> {
+    let me = std::process::id() as i32;
+    let mut out = vec![];
+    let mut at = pid;
+    while at > 1 && at != me {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{at}/stat")) else {
+            break;
+        };
+        let close = stat.rfind(')').unwrap_or(0);
+        at = stat[close + 1..]
+            .split_whitespace()
+            .nth(1)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        let name = std::fs::read_to_string(format!("/proc/{at}/comm")).unwrap_or_default();
+        out.push(name.trim().to_string());
+    }
+    out
 }
 
 /// Every process below this one: pid, name, state.

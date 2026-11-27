@@ -54,6 +54,7 @@ api! {
     // GLib, GObject, GIO.
     g_main_context_iteration: unsafe extern "C" fn(P, GBoolean) -> GBoolean;
     g_main_context_wakeup: unsafe extern "C" fn(P);
+    g_main_context_acquire: unsafe extern "C" fn(P) -> GBoolean;
     g_idle_add_full: unsafe extern "C" fn(c_int, P, P, P) -> c_uint;
     g_timeout_add_full: unsafe extern "C" fn(c_int, c_uint, P, P, P) -> c_uint;
     g_signal_connect_data: unsafe extern "C" fn(P, *const c_char, P, P, P, c_uint) -> c_ulong;
@@ -79,6 +80,7 @@ api! {
     g_bytes_new: unsafe extern "C" fn(*const c_void, usize) -> P;
     g_bytes_unref: unsafe extern "C" fn(P);
     // GTK, GDK.
+    gtk_disable_setlocale: unsafe extern "C" fn();
     gtk_init_check: unsafe extern "C" fn(*mut c_int, P) -> GBoolean;
     gtk_offscreen_window_new: unsafe extern "C" fn() -> P;
     gtk_offscreen_window_get_surface: unsafe extern "C" fn(P) -> P;
@@ -119,8 +121,6 @@ api! {
     webkit_web_context_register_uri_scheme: unsafe extern "C" fn(P, *const c_char, P, P, P);
     webkit_web_context_set_cache_model: unsafe extern "C" fn(P, c_int);
     webkit_web_context_set_sandbox_enabled: unsafe extern "C" fn(P, GBoolean);
-    /// The tests' look at a context.
-    #[cfg_attr(not(test), allow(dead_code))]
     webkit_web_context_get_sandbox_enabled: unsafe extern "C" fn(P) -> GBoolean;
     webkit_web_context_get_website_data_manager: unsafe extern "C" fn(P) -> P;
     webkit_website_data_manager_set_network_proxy_settings: unsafe extern "C" fn(P, c_int, P);
@@ -373,7 +373,8 @@ pub(super) struct EventScroll {
     pub(super) is_stop: c_uint,
 }
 
-/// `GdkEventKey`.
+/// `GdkEventKey`, up to `group`: its last field, `is_modifier`, is a one-bit field packed into
+/// the byte after `group`, never written here (`gdk_event_new` zeroes the event).
 #[repr(C)]
 pub(super) struct EventKey {
     pub(super) ty: c_int,
@@ -386,7 +387,6 @@ pub(super) struct EventKey {
     pub(super) string: *mut c_char,
     pub(super) hardware_keycode: u16,
     pub(super) group: u8,
-    pub(super) is_modifier: c_uint,
 }
 
 /// `GdkEventFocus`.
