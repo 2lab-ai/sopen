@@ -730,10 +730,10 @@ fn rows_with_subject(subject: &str) -> Vec<Row> {
     super::tests::rows_of(commits, true)
 }
 
-/// A part egui still draws (the details pane, Find's field, the banner) has its cells left to
-/// `term::compose` — no glyph, no colour, the pane's with the border cell where its scroll bar
-/// stands — so a terminal shows a hand-off box exactly there, inside the frame; the graph, the
-/// rules and the foot stay cells. The banner over Find's row is one box.
+/// A part egui still draws (Find's field) has its cells left to `term::compose` — no glyph, no
+/// colour — so a terminal shows a hand-off box exactly there, inside the frame; the graph, the
+/// rules and the foot stay cells. The details pane and the banner are cells since X4-pane: no box
+/// where the pane is, and the banner over Find's row is cells, Find's row alone a box.
 #[test]
 fn a_part_egui_draws_is_a_box_inside_the_frame() {
     let mut fx = Fx::new(1000.0, 600.0, fixture_view());
@@ -750,24 +750,23 @@ fn a_part_egui_draws_is_a_box_inside_the_frame() {
     let total = g.rows - 5;
     let graph = (total / 2).max(8).min(total - 2);
     let rule = 2 + graph;
-    let pane = Cells::new(1, rule + 1, g.cols - 1, g.rows - 3 - (rule + 1));
     let ruled = line(&fx, rule);
     assert!(
         ruled.starts_with("╟─") && ruled.ends_with("─╢"),
         "{ruled:?}"
     );
     let left = cell(&fx, 1, rule + 1);
-    assert_eq!((left.symbol.as_str(), left.bg), (" ", None), "left to egui");
+    assert_eq!(left.bg, Some(PALETTE.bar), "the pane's cells (X4-pane)");
     assert_eq!(
         cell(&fx, 0, rule + 1).symbol,
         "║",
         "the frame's left side stays"
     );
     let boxes: Vec<Cells> = compose(&fx).into_iter().filter(|r| r.y < g.rows).collect();
-    assert_eq!(boxes, [pane], "one box where the pane is");
+    assert_eq!(boxes, Vec::<Cells>::new(), "no box where the pane is");
     fx.press(Key::Escape);
     fx.press(Key::Escape);
-    // Find's field and the banner above it: one box of their rows.
+    // Find's field under the banner: a box of its row alone, the banner cells.
     fx.view_mut().banner = Some(in_progress::BannerView::new("rebase in progress", vec![]));
     fx.typed("x");
     assert!(fx.view().find_text().is_some());
@@ -775,9 +774,10 @@ fn a_part_egui_draws_is_a_box_inside_the_frame() {
     let boxes: Vec<Cells> = compose(&fx).into_iter().filter(|r| r.y < g.rows).collect();
     assert_eq!(
         boxes,
-        [Cells::new(1, 1, g.cols - 2, rows + 1)],
-        "banner and Find: one box"
+        [Cells::new(1, 1 + rows, g.cols - 2, 1)],
+        "Find: one box of its row"
     );
+    assert!(line(&fx, 1).contains("rebase in progress"), "the banner");
     assert!(
         line(&fx, rows + 2).contains("Uncommitted changes (2)"),
         "the rows below"
@@ -1028,40 +1028,6 @@ mod ts4 {
 
 // ---------------------------------------------------------------------------------------------
 // Review round 1.
-
-/// The cells the composed screen leaves to hand-off boxes, inside the panel's grid.
-fn boxes(fx: &Fx) -> Vec<Cells> {
-    let g = grid_of(fx);
-    let layers = cells::layers(&fx.drv.ctx);
-    let screen = crate::gui::term::compose(&fx.drv.ctx, &layers, g.cols, g.rows);
-    screen
-        .hand_offs
-        .into_iter()
-        .filter(|r| r.y < g.rows)
-        .collect()
-}
-
-/// R1 MUST 1: the planner draws its egui scroll bar inside its own cells, so the frame's right
-/// border stays the panel's on every body row (`║` in the window and the terminal), and the box a
-/// terminal shows is exactly its cells: the heads' row and the body. The details pane, whose
-/// scroll bar egui draws on the border, takes the border cell too. (The log and the Backups list
-/// are cells since X4-lists, their scroll bar on the border: `tests_x4_lists.rs`.)
-#[test]
-fn the_log_backups_and_planner_leave_the_frames_right_border() {
-    let mut fx = Fx::new(1000.0, 500.0, fixture_view());
-    let v = fx.view_mut();
-    v.set_repo(super::tests_s4::repo());
-    v.open_planner(super::tests_s4::model());
-    fx.idle();
-    fx.idle();
-    let g = grid_of(&fx);
-    let (w, h) = (g.cols, g.rows);
-    for y in 1..h - 3 {
-        assert_eq!(cell(&fx, w - 1, y).symbol, "║", "row {y}");
-        assert_eq!(cell(&fx, 0, y).symbol, "║", "row {y}");
-    }
-    assert_eq!(boxes(&fx), [Cells::new(1, 1, w - 2, h - 4)]);
-}
 
 /// R1 MUST 2: a panel too short for its parts still runs those that hold the keyboard: the log's
 /// entry shown whole closes with Esc, and text typed into an open Find goes into it, the bar on

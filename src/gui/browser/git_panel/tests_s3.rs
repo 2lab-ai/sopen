@@ -1463,9 +1463,10 @@ fn the_banner_shows_its_state_and_its_keys_and_buttons_proceed() {
     });
     fx.assert_shows(text);
     assert_eq!(fx.drv.colors_of(text), Some(vec![PALETTE.warn]));
-    fx.assert_shows("Continue");
-    fx.assert_shows("Abort");
-    assert!(!fx.shows("Skip"), "a merge has no Skip");
+    // The buttons in cells, `[ Continue ]`-style (X4-pane).
+    fx.assert_shows("[ Continue ]");
+    fx.assert_shows("[ Abort ]");
+    assert!(!fx.shows("[ Skip ]"), "a merge has no Skip");
     fx.key(Key::C, testkit::command(true));
     assert_eq!(
         fx.host.pressed,
@@ -1479,7 +1480,7 @@ fn the_banner_shows_its_state_and_its_keys_and_buttons_proceed() {
         fx.host.pressed
     );
     fx.host.pressed.clear();
-    fx.click("Abort");
+    fx.click("[ Abort ]");
     assert_eq!(
         fx.host.pressed,
         [Pressed::Proceed(Action::Proceed(Proceed::Abort))]
