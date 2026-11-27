@@ -352,6 +352,9 @@ impl Window for Host {
                 } else if let Some(v) = &mut self.log {
                     log_view::draw(ui, &grid, body, &mut buf, v, !modal);
                 }
+                // What the parts wrote in cells, as the panel paints its buffer.
+                let painter = ui.painter_at(grid.rect(all));
+                crate::gui::cells::paint(&painter, grid.origin, &buf, None);
             });
         let grid = crate::gui::cells::Grid::over(ctx.content_rect());
         if let Some(m) = &mut self.menu {
@@ -1354,8 +1357,8 @@ fn the_backups_list_shows_groups_and_its_keys_and_buttons_act() {
             stamp: "20261123T102405Z".into()
         }))
     );
-    // The buttons do what the keys do.
-    fx.click("Restore");
+    // The buttons do what the keys do (in cells, `[ Restore ]`-style: X4-lists).
+    fx.click("[ Restore ]");
     assert_eq!(
         fx.host.backups_ends.pop(),
         Some(BackupsEnd::Restore {
@@ -1363,7 +1366,7 @@ fn the_backups_list_shows_groups_and_its_keys_and_buttons_act() {
             only: Some(refs[0].clone())
         })
     );
-    fx.click("Show");
+    fx.click("[ Show ]");
     assert_eq!(
         fx.host.backups_ends.pop(),
         Some(BackupsEnd::Show(vec![refs[0].clone()]))
@@ -1371,7 +1374,7 @@ fn the_backups_list_shows_groups_and_its_keys_and_buttons_act() {
     // The bar to the second group: Restore is the group.
     fx.press(Key::End);
     fx.press(Key::ArrowUp);
-    fx.click("Restore");
+    fx.click("[ Restore ]");
     assert_eq!(
         fx.host.backups_ends.pop(),
         Some(BackupsEnd::Restore {
@@ -1426,7 +1429,9 @@ fn the_command_log_lists_newest_first_and_enter_shows_an_entry_whole() {
     fx.press(Key::Enter);
     fx.idle();
     assert!(fx.host.log.as_ref().unwrap().whole().is_some());
-    fx.assert_shows("error: failed to push some refs\nhint: fetch first");
+    // In cells each line of stderr is a row of its own (X4-lists).
+    fx.assert_shows("error: failed to push some refs");
+    fx.assert_shows("hint: fetch first");
     fx.assert_shows("message, 3 lines");
     fx.assert_shows("/srv/sopen");
     fx.press(Key::Escape);
