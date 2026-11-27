@@ -574,9 +574,19 @@ one (Linux `enable-webrtc = FALSE`); DNS prefetching off where it has one (Linux
   URL replaces the page's content with its result in place — the page's own script, as
   `document.write` would, the document still the scheme's at its address. A scheme response cannot
   redirect: the page server's heads are 200, 206, 403, 404 and 416 only. **Behind all of it**, the
-  commit is checked: a main-frame document committed outside the view's scope is stopped, said, and
-  the view's own page loaded back (no input of the tests reached it; with the `about:` refusal taken
-  away by a test hook, a script's `about:blank` was sent home so).
+  commit is checked (`gtk::Home`): a main-frame document committed outside the view's scope is
+  stopped — the view's page loaded back the first time per load sopen asked for (the view's load,
+  a user's reload), only stopped and said after that, so a page that leaves at every load cannot
+  loop; Cmd/Ctrl+R then loads the view's own page, not the outside one. Nothing is copied to the
+  screen while such a document is committed, nor after a document of the view's own commits again
+  until the web view draws again (a damage after that commit; a resize or a show alone redraws the
+  surface, which still holds the outside document's last frame) or 150 ms after the load's
+  end — the screen keeps the last picture of the view's own. No input of the tests reached it; with
+  the `about:` refusal taken away by a test hook, a page whose script leaves at every load was sent
+  home once and then stopped, and after a Cmd/Ctrl+R the same again, every picture copied after the
+  page's first being the page's red (five runs; without the redraw wait an outside `about:blank`
+  frame reached the screen after the page came back). An address window whose page leaves for
+  `about:blank` at every load (no hook) does the same.
 - **Only through the view's policy.** WebKit's ways of following a link outside the view's own
   navigation policy are closed on macOS: the link preview (off, §3.2) and the context menu's Open
   … in New Window (gone, §3.2); its Open Link is a click like any other (refused out of the
@@ -777,7 +787,34 @@ within 2 s, else 1 with `… ended while ssh stayed for the browser's connection
   <code>)`): -1201…-1204 the certificate line, -1205 and -1206 the client-certificate line, -1012 and
   -1013 and a 401 or 407 with nothing to show the login line; anything else `cannot load …`.
   **Open**: a 401 whose body the engine shows is shown as the page — `Event` carries no status, so
-  the login line needs the engine to say it (WV-A's file); WebKitGTK's errors are WV-B's to map.
+  the login line needs the engine to say it (WV-A's file).
+- **WebKitGTK's failures** (fix/wv-linux-failures, measured under a private compositor): both
+  engines end a failure with `(<domain> <code>)`, and `address::failure` reads Linux's too — GLib's
+  `g-tls-error-quark` 2 (a bad certificate: a self-signed server gave `Unacceptable TLS certificate
+  (g-tls-error-quark 2)`) the certificate line, 5 (a certificate required) the client-certificate
+  line; an authentication request, which WebKitGTK asks through its `authenticate` signal and the
+  engine answers with none, is said with WebKit's scheme as the code (`… (WebKitAuthenticationScheme
+  <n>)`, `gtk::asks`): 7 and 9 (measured: a TLS server asking for a client certificate is 7, its own
+  certificate ignored for the measurement) the client-certificate line, 8 the certificate line, any
+  other (measured: HTTP Basic is 2) the login line; anything else (`Could not connect to 127.0.0.1:
+  Connection refused (g-io-error-quark 39)`) `cannot load …`. **A restricted port**: WebKitGTK says
+  nothing of one — it commits `about:blank` and fails nothing (measured on all 83 of the Fetch
+  standard's bad ports, 0 and 9 and 6000 among them; 2, 8, 80, 443, 3000, 8080 and others connect) —
+  and the commit's check sent that view home again and again (1,691 times in 2 s). Now a load sopen
+  asked for that shows a document outside its scope before reaching its page has failed: stopped,
+  never sent home, said once — `port <n> is one WebKit never connects to (a restricted port)`, or
+  `WebKit showed <address> instead of the page` for any other port — so the window says `cannot load
+  <shown>: port 9 is one WebKit never connects to (a restricted port) — Cmd/Ctrl+R tries again`; after
+  that load's own failure a document outside is only stopped; a navigation away from a page on
+  screen is sent home once per load sopen asked for (the view's load, an address again, a user's
+  reload), then only stopped and said; a failure of the page's own (one of its reads, its own
+  reload) never silences the check — a user's Cmd/Ctrl+R that fails with the old page on screen is
+  a load sopen asked for, so that page's next document outside is only stopped (never copied, not
+  said) until a page of the view's commits again; nothing of an outside document reaches the
+  screen, nor its last frame after the view's own page commits again until the web view draws
+  again (`gtk::Home`, rounds 1–2, §3.4). WebKit's own failure after an authentication request's
+  line would say over it — none followed one in the measured cases (HTTP Basic, a client
+  certificate).
 - **Open**: Cmd/Ctrl+R while the page holds the keyboard on macOS reaches the page, not sopen: R is
   not among §2.4's always-sopen keys (`route`, `mod.rs`). Esc takes the keyboard back first.
 

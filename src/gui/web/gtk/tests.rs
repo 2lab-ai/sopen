@@ -1518,11 +1518,13 @@ fn wv_b_a_file_views_main_frame_keeps_to_its_scheme() {
 }
 
 /// The commit's check, the last line: with the policy's `about:` refusal taken away (the tests'
-/// hook), a script sending the main frame to `about:blank` commits there — and the view stops,
-/// says it, and loads its own page back.
+/// hook), a page whose script leaves for `about:blank` at every load is sent home once — its page
+/// loaded back — and the second time only stopped and said: no loop, and the screen never shows
+/// the outside document (the copied picture stays the page's red). A user's reload (the real
+/// reload command) starts over: home once more, then stopped again.
 #[test]
-fn wv_b_a_document_outside_the_scheme_is_sent_home() {
-    let Some((_turn, engine)) = turn("wv_b_a_document_outside_the_scheme_is_sent_home") else {
+fn wv_b_a_document_outside_the_scheme_is_sent_home_once() {
+    let Some((_turn, engine)) = turn("wv_b_a_document_outside_the_scheme_is_sent_home_once") else {
         return;
     };
     /// The hook off again however the test ends.
@@ -1535,8 +1537,7 @@ fn wv_b_a_document_outside_the_scheme_is_sent_home() {
     let held = Held;
     ALLOW_ABOUT.store(true, Ordering::SeqCst);
     let page = b"<!doctype html><style>body{margin:0;background:#f00}</style>\
-        <script>setTimeout(() => { if (!sessionStorage.gone) { sessionStorage.gone = 1; \
-        location = 'about:blank' } }, 50)</script>";
+        <script>setTimeout(() => { location = 'about:blank' }, 300)</script>";
     let site = Site::with(&[("/p.html", "text/html", page)]);
     let before = COMMITS_SENT_HOME.load(Ordering::SeqCst);
     let mut shown = Shown::page(&engine, &site, true, Contain::ALL);
@@ -1546,22 +1547,97 @@ fn wv_b_a_document_outside_the_scheme_is_sent_home() {
         target: "about:blank".to_string(),
         clicked: false,
     };
-    shown.until("the commit sent home", 10.0, |e| e.contains(&out));
-    shown.until("its page loaded back", 10.0, |e| {
-        e.iter()
-            .filter(|e| **e == Event::Document("p.html".into()))
-            .count()
-            >= 2
-    });
-    drop(held);
-    shown.shows("its page again", 50.0, 50.0, "red");
+    let outs = |e: &[Event]| e.iter().filter(|e| **e == out).count();
+    shown.until("sent home, then stopped", 10.0, |e| outs(e) >= 2);
+    std::thread::sleep(Duration::from_millis(1500));
     shown.drain();
-    println!("sent home: said {:?}", shown.seen);
-    assert_eq!(COMMITS_SENT_HOME.load(Ordering::SeqCst), before + 1);
+    println!("first load: said {:?}", shown.seen);
+    assert_eq!(
+        COMMITS_SENT_HOME.load(Ordering::SeqCst),
+        before + 1,
+        "home once"
+    );
+    assert_eq!(outs(&shown.seen), 2, "no loop: {:?}", shown.seen);
+    assert_eq!(
+        shown.colour(50.0, 50.0),
+        "red",
+        "the outside document never reaches the screen"
+    );
+    only_red_after_red(&shown.view.posted(), "sent home, then stopped");
+    // A user's reload: the check starts over.
+    shown.seen.clear();
+    shown.view.reload();
+    shown.until("after the reload: home, then stopped", 10.0, |e| {
+        outs(e) >= 2
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    shown.drain();
+    drop(held);
+    println!("after the reload: said {:?}", shown.seen);
+    assert_eq!(
+        COMMITS_SENT_HOME.load(Ordering::SeqCst),
+        before + 2,
+        "home once more"
+    );
+    assert_eq!(outs(&shown.seen), 2, "no loop: {:?}", shown.seen);
+    assert_eq!(shown.colour(50.0, 50.0), "red");
+    only_red_after_red(&shown.view.posted(), "stopped, then Cmd/Ctrl+R");
     assert!(
         !shown.seen.contains(&Event::Document("about:blank".into())),
         "never said as the document: {:?}",
         shown.seen
+    );
+}
+
+/// The same in an address window, no hook needed: a page whose script leaves for `about:blank`
+/// at every load is sent home once, then stopped; Cmd/Ctrl+R starts over; no picture but the
+/// page's reaches the screen.
+#[test]
+fn wv_b_an_address_window_leaving_for_about_blank_never_shows_it() {
+    let Some((_turn, engine)) =
+        turn("wv_b_an_address_window_leaving_for_about_blank_never_shows_it")
+    else {
+        return;
+    };
+    let server = Http::serving(|_, _| {
+        "<!doctype html><style>body{margin:0;background:#f00}</style>\
+         <script>setTimeout(() => { location = 'about:blank' }, 300)</script>"
+            .to_string()
+    });
+    let origin = format!("http://127.0.0.1:{}", server.port);
+    let mut shown = Shown::address(&engine, &origin);
+    shown.place(100.0, 100.0, 1.0);
+    shown.view.load(&format!("{origin}/"));
+    let out = Event::Refused {
+        target: "about:blank".to_string(),
+        clicked: false,
+    };
+    let outs = |e: &[Event]| e.iter().filter(|e| **e == out).count();
+    shown.until("sent home, then stopped", 10.0, |e| outs(e) >= 2);
+    std::thread::sleep(Duration::from_millis(1500));
+    shown.drain();
+    assert_eq!(outs(&shown.seen), 2, "no loop: {:?}", shown.seen);
+    only_red_after_red(&shown.view.posted(), "address: sent home, then stopped");
+    shown.seen.clear();
+    shown.view.reload();
+    shown.until("after Cmd/Ctrl+R: home, then stopped", 10.0, |e| {
+        outs(e) >= 2
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    shown.drain();
+    assert_eq!(outs(&shown.seen), 2, "no loop: {:?}", shown.seen);
+    only_red_after_red(&shown.view.posted(), "address: stopped, then Cmd/Ctrl+R");
+}
+
+/// Every picture posted after the first red one is red: nothing else reached the screen.
+fn only_red_after_red(posted: &[egui::Color32], what: &str) {
+    let names: Vec<&str> = posted.iter().map(|c| colour_of(*c)).collect();
+    let first = names.iter().position(|c| *c == "red");
+    println!("{what}: posted {names:?}");
+    let first = first.unwrap_or_else(|| panic!("{what}: never red: {names:?}"));
+    assert!(
+        names[first..].iter().all(|c| *c == "red"),
+        "{what}: a picture not the page's reached the screen: {names:?}"
     );
 }
 
@@ -1577,6 +1653,192 @@ fn the_sandbox_off_variable_refuses_the_engine() {
             "{value:?}: {why}"
         );
     }
+}
+
+/// The commit's check: a load sopen asked for that shows a document out of the view's scope
+/// before any of its own failed (WebKit's `about:blank` for a refused port); after a load failed,
+/// a document out is only stopped; a navigation away from a page on screen is sent home once per
+/// load sopen asked for, then only stopped — never a loop.
+#[test]
+fn the_commit_check_fails_once_and_sends_home_once() {
+    let mut home = Home::default();
+    home.asked();
+    assert_eq!(home.commit_out(), Out::Failed, "never reached its page");
+    assert_eq!(home.commit_out(), Out::Quiet, "after that, only stopped");
+    home.asked();
+    home.failed();
+    assert_eq!(
+        home.commit_out(),
+        Out::Quiet,
+        "WebKit's failure said it already"
+    );
+    home.asked();
+    home.reached();
+    assert_eq!(
+        home.commit_out(),
+        Out::Home,
+        "away from a page on screen: home"
+    );
+    home.reached();
+    assert_eq!(
+        home.commit_out(),
+        Out::Stop,
+        "away again: stopped, not loaded back"
+    );
+    assert_eq!(home.commit_out(), Out::Stop);
+    home.asked();
+    home.reached();
+    assert_eq!(
+        home.commit_out(),
+        Out::Home,
+        "a new load asked: home once again"
+    );
+    // A failure that is not a load sopen asked for (one of the page's reads, its own reload)
+    // never silences the check; a page reached clears it. (A user's reload is one sopen asked
+    // for: the engine test below drives it through the real reload command.)
+    let mut home = Home::default();
+    home.asked();
+    home.reached();
+    home.failed();
+    home.reached();
+    assert_eq!(
+        home.commit_out(),
+        Out::Home,
+        "failed, then reached again: home"
+    );
+    let mut home = Home::default();
+    home.asked();
+    home.reached();
+    home.failed();
+    assert_eq!(
+        home.commit_out(),
+        Out::Home,
+        "a failure after the page was reached: home"
+    );
+    // What the line shows of the address is redacted where it is made.
+    let why = not_reached(None, "http://user:pw@127.0.0.1:8080/x?token=SECRET");
+    assert!(!why.contains("pw@") && !why.contains("SECRET"), "{why}");
+    // The reason a load that never reached its page gives.
+    assert_eq!(
+        not_reached(Some("http://127.0.0.1:9/"), "about:blank"),
+        "port 9 is one WebKit never connects to (a restricted port)"
+    );
+    assert_eq!(
+        not_reached(Some("http://user:pw@127.0.0.1:6000/x?t=1"), "about:blank"),
+        "port 6000 is one WebKit never connects to (a restricted port)"
+    );
+    assert_eq!(
+        not_reached(Some("http://127.0.0.1:8080/"), "about:blank"),
+        "WebKit showed about:blank instead of the page"
+    );
+    assert_eq!(
+        not_reached(None, "data:x"),
+        "WebKit showed data:x instead of the page"
+    );
+    // An authentication request, as the address window reads it.
+    use crate::gui::web::address::{failure, Failure};
+    for (scheme, kind) in [
+        (2, Failure::Login),
+        (1, Failure::Login),
+        (6, Failure::Login),
+        (100, Failure::Login),
+        (7, Failure::ClientCertificate),
+        (9, Failure::ClientCertificate),
+        (8, Failure::Untrusted),
+    ] {
+        assert_eq!(failure(&asks(scheme)), kind, "{}", asks(scheme));
+    }
+}
+
+/// §7 on Linux: an address on one of WebKit's restricted ports (9, the discard port) fails once,
+/// said as its failure line's text; WebKit commits `about:blank` after refusing it, which is not
+/// sent home again and again — at most two loads in two seconds.
+#[test]
+fn wv_b_a_restricted_port_fails_once() {
+    let Some((_turn, engine)) = turn("wv_b_a_restricted_port_fails_once") else {
+        return;
+    };
+    let before = COMMITS_SENT_HOME.load(Ordering::SeqCst);
+    let mut shown = Shown::address(&engine, "http://127.0.0.1:9");
+    shown.place(300.0, 200.0, 1.0);
+    shown.view.load("http://127.0.0.1:9/");
+    std::thread::sleep(Duration::from_secs(2));
+    shown.drain();
+    let sent = COMMITS_SENT_HOME.load(Ordering::SeqCst) - before;
+    let loads = shown.seen.iter().filter(|e| **e == Event::Loading).count();
+    let failed: Vec<&String> = shown
+        .seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::Failed(why) => Some(why),
+            _ => None,
+        })
+        .collect();
+    let said: Vec<&Event> = shown.seen.iter().take(12).collect();
+    println!("restricted port: {loads} loads, {sent} sent home, failed {failed:?}; said {said:?}");
+    assert!(loads <= 2, "{loads} loads: {said:?}");
+    assert!(sent <= 1, "{sent} sent home");
+    assert_eq!(failed.len(), 1, "one failure: {said:?}");
+    assert!(
+        !shown
+            .seen
+            .iter()
+            .any(|e| matches!(e, Event::Refused { .. })),
+        "the failure is not hidden by a refusal: {said:?}"
+    );
+    assert_eq!(
+        failed[0], "port 9 is one WebKit never connects to (a restricted port)",
+        "WebKit says nothing of it: the engine names the port"
+    );
+}
+
+/// §7 on Linux: a page asking for an HTTP login (Basic) is answered with none and said once, as a
+/// login the address window names.
+#[test]
+fn wv_b_a_login_is_said_as_one() {
+    let Some((_turn, engine)) = turn("wv_b_a_login_is_said_as_one") else {
+        return;
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "<title>login</title>login please";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"sopen\"\r\n\
+                 Content-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n\
+                 {body}",
+                body.len()
+            );
+        }
+    });
+    let origin = format!("http://127.0.0.1:{port}");
+    let mut shown = Shown::address(&engine, &origin);
+    shown.place(300.0, 200.0, 1.0);
+    shown.view.load(&format!("{origin}/"));
+    shown.until("the login said", 10.0, |e| {
+        e.iter().any(|e| matches!(e, Event::Failed(_)))
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    shown.drain();
+    println!("login: said {:?}", shown.seen);
+    let failed: Vec<&String> = shown
+        .seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::Failed(why) => Some(why),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failed, [&asks(2)], "{:?}", shown.seen);
+    use crate::gui::web::address::{failure, Failure};
+    assert_eq!(failure(failed[0]), Failure::Login);
 }
 
 /// §2.3, §3.2: a context whose sandbox reads back off is refused — the view says why and loads
