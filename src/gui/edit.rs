@@ -3,7 +3,7 @@
 //! the top border and `* line:col` in the bottom one, the gutter, the rows in syntect's colours,
 //! the caret, the block and the scroll bar — and the rows around it: the title row's menu names,
 //! the status row's fields and armings, the F-key row. Nothing opens it yet: F4 and the layout
-//! are ED-layout's, the dialogs and the menus' bodies ED-dialogs'.
+//! are ED-layout's; the dialogs and the menus are [`dialogs`]' (ED-dialogs).
 //!
 //! - **Highlighting is the viewer's** (E18): its [`Highlight`], on a worker of the viewer's pool,
 //!   reads a [`LineSource`] over a snapshot of the buffer ([`Snap`]: the original shared, the
@@ -33,8 +33,13 @@
 //!   away — whenever the editor has the keyboard, but not while an arming waits for a letter,
 //!   which then matches the physical key (`edit::arm`'s rule).
 //! - **Keys** go through `edit::arm::Keys` ([`EditView::press`]): edits are made here, the rest
-//!   (Save, leaving, the menus, the switch) handed back to the binding (ED-layout), as are the
-//!   frame's `[↕]` and the `^S` prompt's `[Save]` clicked ([`EditView::take_commands`]).
+//!   (Save, leaving, the switch) handed back to the binding (ED-layout), as are the frame's `[↕]`
+//!   and the `^S` prompt's `[Save]` clicked ([`EditView::take_commands`]). F10's menus, Find, Go
+//!   to and the prompts are [`dialogs`]' (ED-dialogs): while one is up the keys go to it alone.
+//!   **The binding's contract**: each pass, the binding gives the pass's inputs to `press` in
+//!   their order until [`EditView::asking`] says a dialog is up, removes from the pass every
+//!   event it gave, then calls [`EditView::dialogs_ui`] — so the dialogs see only the events
+//!   after those, and no event is acted on twice.
 
 use super::cells::{self, Buffer, Cells, Grid, Pen, Position};
 use super::chrome::{self, cga, FKey, Strip};
@@ -54,6 +59,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use syntect::parsing::SyntaxReference;
 use unicode_width::UnicodeWidthChar;
+
+mod dialogs;
+pub use dialogs::{Chosen, Exit, FileState};
 
 /// The editor's kept highlighting states stand every this many lines (E19): at most about 5 ms
 /// of parsing a keystroke. EH-3 holds their heap over a 16 MiB Rust file to 32 MiB at it.
@@ -743,6 +751,33 @@ fn walk(
     }
 }
 
+/// Whether `command` changes the document: what no key makes while a Save runs (E24). A move,
+/// Copy, the modes, the block's markers and everything handed to the binding do not.
+fn changes(command: &Command) -> bool {
+    use crate::edit::arm::BlockOp;
+    match command {
+        Command::Type(_)
+        | Command::NewLine
+        | Command::Tab
+        | Command::Unindent
+        | Command::DeleteRight
+        | Command::DeleteLeft
+        | Command::DeleteLine
+        | Command::DeleteWord
+        | Command::InsertLine
+        | Command::DeleteBlock
+        | Command::Cut
+        | Command::Paste(_)
+        | Command::Undo { .. }
+        | Command::Redo => true,
+        Command::Block(op) => matches!(
+            op,
+            BlockOp::Copy | BlockOp::Move | BlockOp::Delete | BlockOp::Indent | BlockOp::Unindent
+        ),
+        _ => false,
+    }
+}
+
 /// A character of a row: where it starts, what it is, its column and width, and its index in
 /// its line (for its colour).
 struct Ch {
@@ -796,6 +831,8 @@ pub struct EditView {
     preedit: String,
     commands: Vec<Command>,
     column_clicked: bool,
+    /// The menus, Find, Go to and the prompts (ED-dialogs).
+    dialogs: dialogs::Dialogs,
     #[cfg(test)]
     hook: Option<text::ParseHook>,
 }
@@ -842,6 +879,7 @@ impl EditView {
             preedit: String::new(),
             commands: Vec::new(),
             column_clicked: false,
+            dialogs: dialogs::Dialogs::new(name, backend),
             #[cfg(test)]
             hook: None,
         };
@@ -855,6 +893,20 @@ impl EditView {
 
     pub fn editor(&self) -> &Editor {
         &self.ed
+    }
+
+    /// The editor for what changes it outside its keys — a Save (`Session::save` marks it
+    /// saved), a re-read (`Session::reload`, `reread`): what the view keeps of the document
+    /// (the walked lines, the page asked of the highlighter) is made again at the next pass.
+    pub fn editor_mut(&mut self) -> &mut Editor {
+        self.version += 1;
+        self.walked = Checkpoints::default();
+        self.follow = true;
+        self.hl.gen += 1;
+        if let Some(worker) = &self.hl.worker {
+            worker.latest.store(self.hl.gen, Ordering::Relaxed);
+        }
+        &mut self.ed
     }
 
     /// The editor has the keyboard (`true`), or the column has it (ED-layout).
@@ -882,8 +934,12 @@ impl EditView {
         self.said = Some(said);
     }
 
-    /// What the binding is to do that a click here asked for: Save from the `^S` prompt's
-    /// `[Save]`, F3 from `[■]` (oldest first).
+    /// What the binding is to do that a click, a menu or a prompt here asked for: Save from the
+    /// `^S` prompt's `[Save]`; a menu's Save, Save as…, Save copy, Reload, VS Code / Zed, Exit
+    /// and Paste; the close prompt's and the conflict dialog's Save, Save copy and Save As…
+    /// (oldest first). A menu's Copy and Cut come back already done here — the clip taken, a
+    /// Cut's text deleted — for the binding to put on the clipboard only. What else a prompt
+    /// chose is [`EditView::take_chosen`]'s.
     pub fn take_commands(&mut self) -> Vec<Command> {
         std::mem::take(&mut self.commands)
     }
@@ -894,27 +950,57 @@ impl EditView {
     }
 
     /// One input (`edit::arm`'s [`Press`]): the arming and Shift known kept, an edit made, the
-    /// status row's line set. The command is handed back: Save, leaving, the menus and the rest
-    /// are the binding's.
+    /// status row's line set, F10's menu bar, Find's or Go to's field opened. The command is
+    /// handed back: Save, leaving and the rest are the binding's. While a menu, a field or a
+    /// prompt is up ([`EditView::asking`]) it takes every key, so this takes none — but a focus
+    /// report or a resize still tells the keys, which forget Shift known then (E31).
+    ///
+    /// The contract (the module's "Keys"): the binding stops giving a pass's inputs here once
+    /// [`EditView::asking`] is true, and removes from the pass each event it gave before it
+    /// calls [`EditView::dialogs_ui`], which reads only the rest.
     pub fn press(&mut self, press: &Press) -> Command {
+        if self.asking() {
+            if matches!(press, Press::Focus | Press::Resize) {
+                self.keys.press(press);
+            }
+            return Command::Nothing;
+        }
         let command = self.keys.press(press);
         if !matches!(command, Command::Nothing | Command::Typing) {
             self.said = command.line(&self.name).map(Said::Warned);
         }
-        let caret = self.ed.sel();
-        let before: Vec<Piece> = self.ed.buffer().pieces().to_vec();
-        let lines = self.ed.buffer().lines();
-        let out = self.ed.apply(&command, &mut self.clip);
+        if changes(&command) && self.dialogs.running() {
+            // No edits while a Save runs (E24): moves, Find and the rest still work.
+            self.said = Some(Said::Refused(dialogs::SAVING.to_string()));
+            return Command::Nothing;
+        }
+        self.run(&command);
+        self.open(&command);
+        command
+    }
+
+    /// An editing command made, and what it says on the status row.
+    fn run(&mut self, command: &Command) {
+        let out = self.edit(|ed, clip| ed.apply(command, clip));
         if out.is_some() {
             self.said = out;
         } else if let Some(question) = self.ed.question() {
             self.said = Some(Said::Asked(question));
         }
+    }
+
+    /// `f` on the editor (and the last clip), the view following what it changed: the kept
+    /// highlighting and walked lines from the first changed byte on, the caret into view.
+    fn edit<R>(&mut self, f: impl FnOnce(&mut Editor, &mut Option<Clip>) -> R) -> R {
+        let caret = self.ed.sel();
+        let before: Vec<Piece> = self.ed.buffer().pieces().to_vec();
+        let lines = self.ed.buffer().lines();
+        let out = f(&mut self.ed, &mut self.clip);
         if self.ed.buffer().pieces() != before.as_slice() {
             self.changed(&before, lines);
         }
         self.follow |= self.ed.sel() != caret;
-        command
+        out
     }
 
     /// The document changed from `before` (its pieces) with `lines` lines: from the first byte
@@ -1268,7 +1354,9 @@ impl EditView {
         let max_top = lines.saturating_sub(self.rows);
         let thumb = (max_top > 0).then(|| self.top.min(max_top) as f32 / max_top as f32);
         cells::scroll_bar(buf, inner.right(), inner.y, inner.height, thumb);
-        if !self.focused || text.width == 0 || text.height == 0 {
+        // While a menu, a field or a prompt has the keys, no caret here and no input method at
+        // it: a menu's letter matches the physical key (E10), a field sets its own.
+        if !self.focused || self.asking() || text.width == 0 || text.height == 0 {
             return None;
         }
         // The caret's cell — else its place held to the text's edges, where the input method
@@ -1300,7 +1388,9 @@ impl EditView {
     pub fn paint(&self, ui: &egui::Ui, grid: &Grid, buf: &Buffer, caret: Option<Position>) {
         let painter = ui.painter_at(grid.rect(grid.all()));
         cells::paint(&painter, grid.origin, buf, caret);
-        let Some(at) = caret.filter(|_| self.ed.overwrite() && self.preedit.is_empty()) else {
+        // (A field's caret, while one has the keys, is the two scan lines.)
+        let overwrite = self.ed.overwrite() && self.preedit.is_empty() && !self.asking();
+        let Some(at) = caret.filter(|_| overwrite) else {
             return;
         };
         if let ratatui_core::style::Color::Rgb(r, g, b) = buf[(at.x, at.y)].bg {
@@ -1621,52 +1711,90 @@ impl EditView {
         let all = usize::from(cols);
         let block = format!(" {} ", chrome::PROGRAM);
         let block_pen = Pen::new(p.program_text, p.program_back);
-        let mut x = cells::put(buf, 0, y, &block, all, block_pen);
+        cells::put(buf, 0, y, &block, all, block_pen);
+        let clock = Self::clock();
+        let end = all.saturating_sub(cells::width(&clock) + 1);
+        cells::put(buf, end as u16, y, &clock, all, pen);
+        if let Some((mut at, entries)) = self.strip_place(cols, wide) {
+            let dot = if wide { "." } else { "·" };
+            let strip = self.strip.as_ref().expect("a strip placed");
+            for (i, entry) in entries.iter().enumerate() {
+                if i > 0 {
+                    at += cells::put(buf, at, y, dot, 1, pen) as u16;
+                }
+                let on = (strip.on).is_some_and(|on| entry.ends_with(&format!(" {on}")));
+                let entry_pen = if on { Pen::new(p.bar_text, p.bar) } else { pen };
+                at += cells::put(buf, at, y, entry, all, entry_pen) as u16;
+            }
+        }
+        // The menus, F10's bar on the one it is on (ED-dialogs).
+        let red = Pen::new(cga::RED, p.title_back);
+        let bar = Pen::new(p.bar_text, p.bar);
+        for (i, x) in self.menu_places(cols, wide).into_iter().enumerate() {
+            let name = MENUS[i];
+            let (first, rest) = name.split_at(1);
+            let (first_pen, rest_pen) = match self.dialogs.bar_on() == Some(i) {
+                true => (bar, bar),
+                false => (red, pen),
+            };
+            cells::put(buf, x, y, first, 1, first_pen);
+            cells::put(buf, x + 1, y, rest, all, rest_pen);
+        }
+    }
+
+    /// The title row's clock: `│12:34`, or nothing where the local time is not known.
+    fn clock() -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
-        let clock = chrome::local_tm(now).map_or(String::new(), |tm| {
+        chrome::local_tm(now).map_or(String::new(), |tm| {
             format!("│{}", chrome::clock_text(tm.tm_hour, tm.tm_min))
-        });
-        let mut end = all.saturating_sub(cells::width(&clock) + 1);
-        cells::put(buf, end as u16, y, &clock, all, pen);
-        if let Some(strip) = &self.strip {
-            let dot = if wide { "." } else { "·" };
-            let entries: Vec<String> = (strip.entries().into_iter())
-                .map(|(_, t)| t.replace('·', dot))
-                .collect();
-            let w = cells::width(&entries.join(dot)) + 1;
-            if end > x + w {
-                end -= w;
-                let mut at = end as u16;
-                for (i, entry) in entries.iter().enumerate() {
-                    if i > 0 {
-                        at += cells::put(buf, at, y, dot, 1, pen) as u16;
-                    }
-                    let on = (strip.on).is_some_and(|on| entry.ends_with(&format!(" {on}")));
-                    let entry_pen = if on { Pen::new(p.bar_text, p.bar) } else { pen };
-                    at += cells::put(buf, at, y, entry, all, entry_pen) as u16;
-                }
-            }
+        })
+    }
+
+    /// Where the views stand on a title row `cols` wide, and their texts: before the clock,
+    /// where they fit after the program's block.
+    fn strip_place(&self, cols: u16, wide: bool) -> Option<(u16, Vec<String>)> {
+        let strip = self.strip.as_ref()?;
+        let all = usize::from(cols);
+        let x = cells::width(&format!(" {} ", chrome::PROGRAM));
+        let end = all.saturating_sub(cells::width(&Self::clock()) + 1);
+        let dot = if wide { "." } else { "·" };
+        let entries: Vec<String> = (strip.entries().into_iter())
+            .map(|(_, t)| t.replace('·', dot))
+            .collect();
+        let w = cells::width(&entries.join(dot)) + 1;
+        (end > x + w).then(|| ((end - w) as u16, entries))
+    }
+
+    /// Where each of the title row's menus that fits starts, on a row `cols` wide: after the
+    /// program's block, a blank either side of each name, before the views and the clock.
+    fn menu_places(&self, cols: u16, wide: bool) -> Vec<u16> {
+        let all = usize::from(cols);
+        let mut end = all.saturating_sub(cells::width(&Self::clock()) + 1);
+        if let Some((at, _)) = self.strip_place(cols, wide) {
+            end = usize::from(at);
         }
-        let red = Pen::new(cga::RED, p.title_back);
+        let mut x = cells::width(&format!(" {} ", chrome::PROGRAM));
+        let mut out = Vec::new();
         for name in MENUS {
             x += 1;
             if x + cells::width(name) + 1 > end {
                 break;
             }
-            let (first, rest) = name.split_at(1);
-            x += cells::put(buf, x as u16, y, first, 1, red);
-            x += cells::put(buf, x as u16, y, rest, all, pen);
-            x += 1;
+            out.push(x as u16);
+            x += cells::width(name) + 1;
         }
+        out
     }
 }
 
 impl Window for EditView {
     /// The editor as a screen of its own (its tests; ED-layout puts its parts in the browser's
     /// rows and beside the column): the title row, the edit window, the status row and the F-key
-    /// row, a grid of cells painted once.
+    /// row, a grid of cells painted once. It gives no input to [`EditView::press`] itself: a host
+    /// keeps the contract (the module's "Keys") — the pass's inputs to `press` until a dialog is
+    /// up, those events removed — before this runs [`EditView::dialogs_ui`] on what is left.
     fn ui(&mut self, ui: &mut egui::Ui) {
         chrome::key_panel_cells(ui, "sopen-edit-keys", KEYS);
         egui::CentralPanel::default()
@@ -1684,7 +1812,8 @@ impl Window for EditView {
                 let frame = Cells::new(0, 1, grid.cols, grid.rows - 2);
                 let caret = self.window_cells(ui, &grid, &mut buf, frame);
                 let save = self.status_cells(&mut buf, grid.rows - 1, grid.cols, wide);
-                if let Some(save) = save {
+                let caret = self.dialogs_ui(ui, &grid, &mut buf, (0, grid.rows - 1), caret);
+                if let Some(save) = save.filter(|_| !self.asking()) {
                     let id = ui.scope_id().with("sopen-edit-save");
                     if ui
                         .interact(grid.rect(save), id, egui::Sense::CLICK)
