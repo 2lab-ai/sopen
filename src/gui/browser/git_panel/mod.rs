@@ -2667,7 +2667,7 @@ fn menu_hint(history: &menu::HistoryMenu) -> String {
         },
         Target::Repository => "the repository".to_string(),
     };
-    match menu.items().len() + history.history().len() {
+    match history.lines() {
         0 => format!("Menu of {of}: nothing to do · Esc closes"),
         n => format!("Menu of {of}: {n} items · ↑ ↓ choose · Enter runs · Esc closes"),
     }
@@ -2876,7 +2876,7 @@ pub fn draw(
         if view.planner.is_some() {
             // The planner over the body (03 §7.8.2): its keys first while it has the keyboard and
             // no other dialog is up, then the pane, then its own dialog.
-            let pane_active = active && !view.other_dialog_up();
+            let pane_active = active && !view.other_dialog_up() && !view.dialog_elsewhere;
             let end = view.planner.as_mut().and_then(|p| {
                 planner::draw(
                     ui,
@@ -2927,7 +2927,7 @@ pub fn draw(
                 if !details::PAINTS_CELLS {
                     eguis.push(with_border(pane_cells));
                 }
-                if let Some((line, twice)) = clicked {
+                if let Some((line, twice)) = clicked.filter(|_| !dialog) {
                     pane.keyboard = true;
                     pane.scroll.to(line);
                     if twice {
@@ -2992,7 +2992,7 @@ pub fn draw(
         ui.set_clip_rect(grid.rect(none));
         let ui = &mut ui;
         if view.planner.is_some() {
-            let pane_active = active && !view.other_dialog_up();
+            let pane_active = active && !view.other_dialog_up() && !view.dialog_elsewhere;
             let end = view.planner.as_mut().and_then(|p| {
                 planner::draw(ui, grid, none, &mut buf, p, pane_active, &planner::SEAMS)
             });
@@ -3026,7 +3026,10 @@ pub fn draw(
         cells::fill(&mut buf, r, body);
     }
     cells::paint(&painter, grid.origin, &buf, caret);
-    // The dialogs, over everything, on the panels' grid.
+    // The dialogs, over everything, on the panels' grid. While another dialog has the keyboard —
+    // another panel's, the list's question — they read no key or text this pass (X4-menu
+    // fix-check): those are that dialog's.
+    let kept = view.dialog_elsewhere.then(|| take_keys(&ctx));
     if let Some(dialog) = &mut view.filters_dialog {
         match dialog.ui(&ctx, *grid) {
             Some(filters::DialogEnd::Apply(f)) => {
@@ -3054,7 +3057,29 @@ pub fn draw(
         }
     }
     asked.extend(view.modals(&ctx, *grid));
+    if let Some(kept) = kept {
+        ctx.input_mut(|i| i.events.extend(kept));
+    }
     asked
+}
+
+/// The pass's keys and typed text, taken out of its input to be put back after the dialogs.
+fn take_keys(ctx: &egui::Context) -> Vec<egui::Event> {
+    ctx.input_mut(|i| {
+        let (keys, rest) = std::mem::take(&mut i.events).into_iter().partition(|e| {
+            matches!(
+                e,
+                egui::Event::Key { .. }
+                    | egui::Event::Text(_)
+                    | egui::Event::Ime(_)
+                    | egui::Event::Copy
+                    | egui::Event::Cut
+                    | egui::Event::Paste(_)
+            )
+        });
+        i.events = rest;
+        keys
+    })
 }
 
 /// The graph's part of a pass ([`draw`]): Find's field in the heads' row (its text changed, the

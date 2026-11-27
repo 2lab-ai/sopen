@@ -1545,7 +1545,11 @@ fn paint(
         let resp = ui.interact(
             row,
             ui.scope_id().with(("sopen-git-planner-row", k)),
-            Sense::click(),
+            if active && view.inner.is_none() {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
         );
         if resp.clicked() {
             view.scroll.to(k);
@@ -1578,7 +1582,7 @@ fn paint(
     for (word, foot) in [("Run…", Foot::Run), ("Close", Foot::Close)] {
         let w = cw * (word.chars().count() + 2) as f32;
         let at = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, row_h));
-        if at.right() <= rect.right() && ui.put(at, egui::Button::new(word)).clicked() {
+        if at.right() <= rect.right() && ui.put(at, egui::Button::new(word)).clicked() && active {
             clicked = Some(foot);
         }
         x += w + cw;

@@ -1847,17 +1847,10 @@ fn undo_takes_the_newest_stamp_whatever_order_the_runs_end_in() {
     );
 }
 
-/// One git dialog at a time across two panels (X4-menu round 1): `a`'s panel pinned on the
+/// Two repositories' panels side by side (X4-menu): `a`'s (the test's `g.repo`) pinned on the
 /// right, the right list in `b` and active, so `b`'s own panel stands on the left (02 §3.1 O6)
-/// with the keyboard in it. F10 opens `b`'s menu; a click on the right half under its box moves
-/// the keyboard nowhere; a right click in `a`'s rows opens no menu there; Enter runs `b`'s item.
-#[test]
-fn x4_menu_one_dialog_at_a_time_across_two_panels() {
-    let git = git_or_skip!();
-    let b = Repo::new(&git);
-    b.write("b.txt", "b\n");
-    b.commit("only in b");
-    let mut g = Gx::new(small(&git));
+/// with the keyboard in it. Their indexes, `a`'s then `b`'s.
+fn two_panels(g: &mut Gx, b: &Repo) -> (usize, usize) {
     g.wait_for_the_panel();
     g.cmd(Key::G);
     g.settle();
@@ -1885,14 +1878,62 @@ fn x4_menu_one_dialog_at_a_time_across_two_panels() {
     );
     assert_eq!(g.b().git_focused(), Some(ib), "the keyboard in b's panel");
     assert_eq!(g.shown(), both);
+    (ia, ib)
+}
+
+/// A second repository for [`two_panels`]: one commit.
+fn other_repo(git: &Path) -> Repo {
+    let b = Repo::new(git);
+    b.write("b.txt", "b\n");
+    b.commit("only in b");
+    b
+}
+
+/// The panels' grid of the browser's 1000×700 window: between the title row and the F-key and
+/// status rows.
+fn panels_grid() -> Grid {
+    Grid::over(Rect::from_min_max(
+        Pos2::new(0.0, 16.0),
+        Pos2::new(1000.0, 700.0 - 32.0),
+    ))
+}
+
+/// A press and a release of `button` at `p`, as one pass's events.
+fn clicked_at(p: Pos2, button: egui::PointerButton) -> Vec<egui::Event> {
+    let mut all = vec![egui::Event::PointerMoved(p)];
+    all.extend([true, false].map(|pressed| egui::Event::PointerButton {
+        pos: p,
+        button,
+        pressed,
+        modifiers: Modifiers::NONE,
+    }));
+    all
+}
+
+/// The centre of the row on the right that shows `subject`: `a`'s.
+fn row_on_the_right(g: &Gx, subject: &str) -> Pos2 {
+    (g.fx.drv.texts_starting_with(subject).into_iter())
+        .find(|(r, _)| r.left() >= 500.0)
+        .unwrap_or_else(|| panic!("{subject} on the right"))
+        .0
+        .center()
+}
+
+/// One git dialog at a time across two panels (X4-menu round 1): F10 opens `b`'s menu; a click
+/// on the right half under its box moves the keyboard nowhere; a right click in `a`'s rows opens
+/// no menu there; Enter runs `b`'s item. Once `b`'s dialog closes (fix-check), `a` is used as
+/// ever: a click gives it the keyboard and its bar, a right click its menu, a letter its Find.
+#[test]
+fn x4_menu_one_dialog_at_a_time_across_two_panels() {
+    let git = git_or_skip!();
+    let b = other_repo(&git);
+    let mut g = Gx::new(small(&git));
+    let (ia, ib) = two_panels(&mut g, &b);
     g.key(Key::F10);
     g.idle(2);
     assert!(g.b().git.panels[ib].view.dialog_up(), "b's menu");
     // A click on the right half, inside b's box (its margin under the last line).
-    let gr = Grid::over(Rect::from_min_max(
-        Pos2::new(0.0, 16.0),
-        Pos2::new(1000.0, 700.0 - 32.0),
-    ));
+    let gr = panels_grid();
     let frame = g.b().git.panels[ib].view.covered(&gr)[0];
     let right_half = cells::halves(gr.all())[1];
     let x = frame.right().saturating_sub(4).max(right_half.x);
@@ -1908,20 +1949,12 @@ fn x4_menu_one_dialog_at_a_time_across_two_panels() {
     );
     assert!(g.b().git.panels[ib].view.dialog_up(), "b's menu stays");
     // A right click on a's rows, on the right: no menu there.
-    let row = (g.fx.drv.texts_starting_with("third").into_iter())
-        .find(|(r, _)| r.left() >= 500.0)
-        .expect("a's row on the right")
-        .0;
-    let p = row.center();
-    let events = [true, false].map(|pressed| egui::Event::PointerButton {
-        pos: p,
-        button: egui::PointerButton::Secondary,
-        pressed,
-        modifiers: Modifiers::NONE,
-    });
-    let mut all = vec![egui::Event::PointerMoved(p)];
-    all.extend(events);
-    g.fx.drv.frame(&mut g.fx.b, all, Modifiers::NONE);
+    let p = row_on_the_right(&g, "third");
+    g.fx.drv.frame(
+        &mut g.fx.b,
+        clicked_at(p, egui::PointerButton::Secondary),
+        Modifiers::NONE,
+    );
     g.idle(2);
     assert!(
         !g.b().git.panels[ia].view.dialog_up(),
@@ -1936,4 +1969,191 @@ fn x4_menu_one_dialog_at_a_time_across_two_panels() {
         Some(ActionId::Tag)
     );
     assert!(g.b().git.panels[ia].view.draft().is_none());
+    // b's dialog closes: a is used as ever.
+    g.key(Key::Escape);
+    g.idle(2);
+    assert!(!g.b().git.panels[ib].view.dialog_up());
+    let p = row_on_the_right(&g, "third");
+    g.fx.drv.click(&mut g.fx.b, p);
+    g.idle(2);
+    assert_eq!(
+        g.b().git_focused(),
+        Some(ia),
+        "a click gives a the keyboard"
+    );
+    let view = &g.b().git.panels[ia].view;
+    let third =
+        (0..view.rows().len()).find(|&k| view.line(k).is_some_and(|l| l.subject == "third"));
+    assert_eq!(Some(view.bar_place().0), third, "the bar on a's row");
+    g.fx.drv.frame(
+        &mut g.fx.b,
+        clicked_at(p, egui::PointerButton::Secondary),
+        Modifiers::NONE,
+    );
+    g.idle(2);
+    assert!(
+        g.b().git.panels[ia].view.dialog_up(),
+        "a right click: a's menu"
+    );
+    g.key(Key::Escape);
+    g.idle(2);
+    g.fx.typed("x");
+    g.idle(2);
+    assert_eq!(
+        g.b().git.panels[ia].view.find_text(),
+        Some("x"),
+        "a letter: a's Find"
+    );
+}
+
+/// A dialog the integration opens waits while another panel's is up (X4-menu fix-check, rule 2):
+/// a's result — here a tag's details, read on a worker — comes while b's menu is open, and stays
+/// in its channel; once b's menu closes it opens, with the keyboard (rule 1), and Esc closes it.
+#[test]
+fn x4_menu_a_result_waits_for_the_other_panels_dialog() {
+    let git = git_or_skip!();
+    let b = other_repo(&git);
+    let mut g = Gx::new(small(&git));
+    let (ia, ib) = two_panels(&mut g, &b);
+    g.key(Key::F10);
+    g.idle(2);
+    assert!(g.b().git.panels[ib].view.dialog_up(), "b's menu");
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(("Tag v1.0".to_string(), Ok("tagged by Ann".to_string())))
+        .unwrap();
+    g.fx.b.git.panels[ia].text_read = Some(git_host::Pending {
+        rx,
+        handle: crate::git::runner::Handle::new(),
+    });
+    g.idle(3);
+    assert!(!g.b().git.panels[ia].view.dialog_up(), "a's result waits");
+    assert!(g.b().git.panels[ia].text_read.is_some(), "in its channel");
+    assert!(g.b().git.panels[ib].view.dialog_up(), "b's menu stays");
+    g.key(Key::Escape);
+    g.idle(3);
+    assert!(!g.b().git.panels[ib].view.dialog_up(), "b's menu closed");
+    assert!(g.b().git.panels[ia].view.dialog_up(), "a's result opened");
+    assert_eq!(g.b().git_focused(), Some(ia), "with the keyboard");
+    g.key(Key::Escape);
+    g.idle(2);
+    assert!(!g.b().git.panels[ia].view.dialog_up(), "Esc closed it");
+    assert!(!g.b().git.panels[ib].view.dialog_up());
+}
+
+/// A dialog that opens in a while the keyboard is in b takes the keyboard (X4-menu fix-check,
+/// rule 1), and what is typed goes into it, not into b (whose typed letter would start Find).
+#[test]
+fn x4_menu_a_dialog_opening_elsewhere_takes_the_keyboard() {
+    let git = git_or_skip!();
+    let b = other_repo(&git);
+    let mut g = Gx::new(small(&git));
+    let (ia, ib) = two_panels(&mut g, &b);
+    g.bar_to("third");
+    let asked = g.fx.b.git.panels[ia]
+        .view
+        .open_by_id(crate::gui::DialogId::Action(ActionId::Tag));
+    assert!(asked.is_empty(), "{asked:?}");
+    g.idle(3);
+    assert_eq!(
+        g.b().git_focused(),
+        Some(ia),
+        "the keyboard follows the dialog"
+    );
+    g.fx.typed("v9");
+    g.idle(2);
+    let draft = g.b().git.panels[ia].view.draft().cloned();
+    assert!(
+        matches!(&draft, Some(Action::Tag { name, .. }) if name == "v9"),
+        "{draft:?}"
+    );
+    assert_eq!(g.b().git.panels[ib].view.find_text(), None, "no Find in b");
+    g.key(Key::Escape);
+    g.idle(2);
+    assert!(!g.b().git.panels[ia].view.dialog_up());
+}
+
+/// The panels' dialogs as the pass began are what each panel's draw holds to (X4-menu fix-check):
+/// a click on `a`'s rows, on the right, outside `b`'s menu on the left, closes that menu during
+/// `b`'s draw — which comes first — and acts on nothing of `a` in that pass: no keyboard, no bar.
+#[test]
+fn x4_menu_the_click_that_closes_the_left_dialog_acts_on_nothing_right() {
+    let git = git_or_skip!();
+    let b = other_repo(&git);
+    let mut g = Gx::new(small(&git));
+    let (ia, ib) = two_panels(&mut g, &b);
+    g.key(Key::F10);
+    g.idle(2);
+    assert!(g.b().git.panels[ib].view.dialog_up(), "b's menu");
+    let bar = g.b().git.panels[ia].view.bar_place().0;
+    let p = row_on_the_right(&g, "third");
+    g.fx.drv.frame(
+        &mut g.fx.b,
+        clicked_at(p, egui::PointerButton::Primary),
+        Modifiers::NONE,
+    );
+    g.idle(2);
+    assert!(
+        !g.b().git.panels[ib].view.dialog_up(),
+        "the click closed b's menu"
+    );
+    assert_eq!(
+        g.b().git_focused(),
+        Some(ib),
+        "no keyboard to a in that pass"
+    );
+    assert_eq!(
+        g.b().git.panels[ia].view.bar_place().0,
+        bar,
+        "a's bar stays"
+    );
+    // The next click is a's.
+    g.fx.drv.click(&mut g.fx.b, p);
+    g.idle(2);
+    assert_eq!(g.b().git_focused(), Some(ia));
+    assert_ne!(
+        g.b().git.panels[ia].view.bar_place().0,
+        bar,
+        "a's bar on the row"
+    );
+}
+
+/// A run of a's that ends while b's menu is open (X4-menu fix-check, rule 2): its end stays in
+/// its channel — nothing happens in a, and the run reads as running — and once b's menu closes it
+/// is heard: `running` empties and its result shows, with the keyboard.
+#[test]
+fn x4_menu_a_runs_end_waits_for_the_other_panels_dialog_and_is_heard() {
+    let git = git_or_skip!();
+    let b = other_repo(&git);
+    let mut g = Gx::new(small(&git));
+    let (ia, ib) = two_panels(&mut g, &b);
+    g.key(Key::F10);
+    g.idle(2);
+    assert!(g.b().git.panels[ib].view.dialog_up(), "b's menu");
+    let (tx, rx) = std::sync::mpsc::channel();
+    g.fx.b.git.panels[ia].running.push(git_host::Running {
+        title: "Push".into(),
+        handle: crate::git::runner::Handle::new(),
+        rx,
+        started: Default::default(),
+        since: std::time::Instant::now(),
+        network: Vec::new(),
+        worker: None,
+    });
+    // Its worker ends: the end is sent while b's menu is open.
+    tx.send(git_host::RunEnd::NotRun {
+        title: "Push".into(),
+        why: "the remote refused it".into(),
+        line: None,
+    })
+    .unwrap();
+    g.idle(3);
+    assert_eq!(g.b().git.panels[ia].running.len(), 1, "still running");
+    assert!(!g.b().git.panels[ia].view.dialog_up(), "nothing in a yet");
+    g.key(Key::Escape);
+    g.idle(3);
+    assert!(!g.b().git.panels[ib].view.dialog_up(), "b's menu closed");
+    assert!(g.b().git.panels[ia].running.is_empty(), "its end heard");
+    assert!(g.b().git.panels[ia].view.dialog_up(), "its result shows");
+    assert_eq!(g.b().git_focused(), Some(ia), "with the keyboard");
+    drop(tx);
 }

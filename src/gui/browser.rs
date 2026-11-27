@@ -2664,6 +2664,10 @@ impl Browser {
     fn panels_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let area = ui.max_rect();
+        // The keyboard follows an open git dialog; the panels' dialogs as the pass begins, for
+        // each panel's draw (X4-menu fix-check).
+        self.git_follow_dialog();
+        let ups = self.git_dialogs_up();
         // The list holds the keyboard: Tab, the arrows and Esc are its keys, not focus moves.
         // A dialog or the rename field holds it instead while it is open.
         let resp = ui.interact(area, list_id(), Sense::click());
@@ -2692,7 +2696,7 @@ impl Browser {
         // Wide (Cmd/Ctrl+Shift+G): the git panel over both sides.
         if let Some([view::Content::Git(a), view::Content::Git(b)]) = self.shown.clone() {
             if a == b {
-                self.git_ui(ui, 1 - self.active, &grid, grid.all(), &a);
+                self.git_ui(ui, 1 - self.active, &grid, grid.all(), &a, &ups);
                 return;
             }
         }
@@ -2711,7 +2715,7 @@ impl Browser {
                     }
                 }
                 Some(view::Content::Tree) if self.tree.is_some() => self.tree_ui(ui, &grid, side),
-                Some(view::Content::Git(top)) => self.git_ui(ui, i, &grid, side, &top),
+                Some(view::Content::Git(top)) => self.git_ui(ui, i, &grid, side, &top, &ups),
                 _ => self.panel_cells(ui, i, &grid, side),
             }
         }

@@ -285,7 +285,11 @@ pub fn draw(
         let resp = ui.interact(
             row,
             ui.scope_id().with(("sopen-git-log", k)),
-            Sense::click(),
+            if active {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
         );
         if resp.clicked() || resp.double_clicked() {
             view.scroll.to(k);

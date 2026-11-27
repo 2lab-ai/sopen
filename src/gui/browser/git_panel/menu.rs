@@ -703,8 +703,10 @@ fn set_aside(ctx: &egui::Context) -> Vec<egui::Event> {
 }
 
 /// The events [`set_aside`] took, back in the pass after the menu's own: in their order for the
-/// dialog a choice opened (it is shown in the same pass, as if they were typed once it was open:
-/// 10 §17, X4-menu) — but no Enter, which would run a dialog never shown (only what showed
+/// dialog a choice opened — an action's (`GitView::dialog`) or a quick edit's (`quick`), which
+/// `GitView::modals` shows in the same pass, as if they were typed once it was open (10 §17,
+/// X4-menu); a dialog that opens after the integration's reads (a prefilled one, a history edit's
+/// range), the result, the log's entry or the filters gets none of them — but no Enter, which would run a dialog never shown (only what showed
 /// runs); with no choice, without the pass's Enters and Spaces, which would have been the menu's
 /// and come after a choice it dropped — the first Enter's too, when the list did not take it
 /// (after a Tab). The menu's keyboard goes with a choice, so the dialog's field
@@ -845,10 +847,6 @@ impl Menu {
 
     pub fn target(&self) -> &Target {
         &self.target
-    }
-
-    pub fn items(&self) -> &[Item] {
-        &self.items
     }
 
     /// The line under the bar chosen: its id, a key line's command, or the repository's menu in
@@ -1051,10 +1049,6 @@ impl HistoryMenu {
         &self.menu
     }
 
-    pub fn history(&self) -> &[HistoryItem] {
-        &self.history
-    }
-
     /// The line `at` chosen.
     fn choose(&mut self, at: usize) -> Option<HistoryMenuEnd> {
         let n = self.menu.len();
@@ -1076,6 +1070,12 @@ impl HistoryMenu {
             return self.menu.choose(n).map(HistoryMenuEnd::Menu);
         }
         None
+    }
+
+    /// How many lines it offers to choose: the key lines, the items and the history row
+    /// (`Repository…` aside), as the status row counts them.
+    pub fn lines(&self) -> usize {
+        self.menu.len() + self.history.len()
     }
 
     /// Whether it has no item to choose (only `Repository…`, if anything).

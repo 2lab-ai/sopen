@@ -1127,7 +1127,8 @@ fn the_repositorys_menu_holds_every_cmd_shift_action() {
     };
     let cmd_shift = Mods::CommandShift.prefix();
     let wide = "The git panel over both sides, and back";
-    let cases: [Case; 4] = [
+    let cases: [Case; 5] = [
+        ("nothing in progress", InProgress::default(), &[]),
         (
             "edit stop",
             stop,
@@ -1150,7 +1151,8 @@ fn the_repositorys_menu_holds_every_cmd_shift_action() {
         let repo = in_state(state);
         let fx = repository_menu(&repo);
         let rows = menu_rows(&fx);
-        // Its key lines first, in their keys' order, each with its key at the right.
+        // Its key lines first, in their keys' order, each with its key at the right; its first
+        // item right after them (none with nothing in progress).
         for (k, (label, key)) in steps.iter().enumerate() {
             let row = &rows[2 + k];
             assert!(row.starts_with(&format!("║  {label}")), "{name}: {rows:#?}");
@@ -1159,6 +1161,15 @@ fn the_repositorys_menu_holds_every_cmd_shift_action() {
                 "{name}: {rows:#?}"
             );
         }
+        let first = &rows[2 + steps.len()];
+        assert!(
+            first.starts_with("║  Fetch all remotes…"),
+            "{name}: the first item after the key lines: {rows:#?}"
+        );
+        // The status row counts every line: the key lines, the items, the panel over both sides.
+        let lines = rows.len() - 4;
+        let said = fx.view().status_line().text;
+        assert!(said.contains(&format!(": {lines} items")), "{name}: {said}");
         assert!(
             row_with(&rows, wide).ends_with(&format!(" {cmd_shift}G  ║")),
             "{name}: {rows:#?}"
@@ -1271,6 +1282,148 @@ fn space_then_tab_on_apply_applies() {
         matches!(&asked[..], [GitAction::FiltersChanged(f)] if !f.tags),
         "{asked:?}"
     );
+}
+
+/// While another dialog has the keyboard — another panel's, the list's question
+/// (`set_dialog_elsewhere`) — an open menu reads no key: Esc and Enter are left for that dialog.
+#[test]
+fn an_open_menu_reads_no_key_while_another_dialog_has_it() {
+    let mut fx = panel();
+    fx.press(Key::ArrowDown);
+    fx.press(Key::F10);
+    fx.view_mut().set_dialog_elsewhere(true);
+    fx.idle();
+    let asked = fx.press(Key::Enter);
+    assert_eq!(chose(&fx, &asked), None, "{asked:?}");
+    fx.press(Key::Escape);
+    assert!(fx.view().menu.is_some(), "Esc was not the menu's");
+    fx.view_mut().set_dialog_elsewhere(false);
+    fx.idle();
+    fx.press(Key::Escape);
+    assert!(fx.view().menu.is_none(), "the control: Esc closes it");
+}
+
+/// A double click at `at`: two clicks a pass apart; what they asked for.
+fn twice(fx: &mut Fx, at: Pos2) -> Vec<GitAction> {
+    fx.drv.click(&mut fx.host, at);
+    fx.drv.click(&mut fx.host, at);
+    fx.take()
+}
+
+/// A click on the details pane, a command log row or the planner acts on nothing while another
+/// panel's dialog is up — not only where egui's modal lies over it.
+#[test]
+fn clicks_on_the_pane_the_log_and_the_planner_wait_for_the_other_dialog() {
+    use super::tests::{day, oid};
+    // The details pane, the keyboard back on the graph: a double click on a file row.
+    let mut fx = Fx::new(1000.0, 800.0, fixture_view());
+    fx.press(Key::ArrowDown);
+    fx.press(Key::Enter);
+    let subject = Subject::Row(RowKey::Commit(oid(9)));
+    fx.view_mut().set_details(Details {
+        subject,
+        summary: Some(Summary {
+            oid: oid(9),
+            parents: vec![oid(7), oid(8)],
+            author_name: "Ann".into(),
+            author_email: "ann@example.com".into(),
+            author_time: day(9),
+            committer_name: "Ann".into(),
+            committer_email: "ann@example.com".into(),
+            commit_time: day(9),
+            message: "Merge\n".into(),
+        }),
+        contains: None,
+        groups: vec![FileGroup {
+            group: Group::Files,
+            files: vec![FileRow {
+                letter: 'M',
+                path: "src/lib.rs".into(),
+                old_path: None,
+                lines: Some((1, 1)),
+                lossy: false,
+            }],
+        }],
+        error: None,
+    });
+    fx.idle();
+    fx.press(Key::Escape);
+    let at = fx
+        .drv
+        .find_text("src/lib.rs")
+        .expect("the file row")
+        .center();
+    fx.view_mut().set_dialog_elsewhere(true);
+    fx.idle();
+    let asked = twice(&mut fx, at);
+    fx.idle();
+    assert!(asked.is_empty(), "{asked:?}");
+    assert!(
+        !fx.view().pane.as_ref().is_some_and(|p| p.keyboard),
+        "no keyboard"
+    );
+    fx.view_mut().set_dialog_elsewhere(false);
+    // Past egui's double-click time since the clicks above.
+    fx.drv.idle(&mut fx.host, 30);
+    let asked = twice(&mut fx, at);
+    assert!(
+        asked.iter().any(|a| matches!(a, GitAction::Diff { .. })),
+        "the control: {asked:?}"
+    );
+    // The command log: a double click shows an entry whole.
+    let mut fx = Fx::new(1000.0, 600.0, fixture_view());
+    fx.view_mut().open_log(vec![super::tests_s3::entry(
+        "git fetch origin",
+        crate::git::runner::Ending::Exit(0),
+        "",
+        0,
+    )]);
+    fx.idle();
+    let at = (fx.drv.texts_starting_with("").into_iter())
+        .find(|(_, t)| t.contains("git fetch origin"))
+        .expect("the log's row")
+        .0
+        .center();
+    fx.view_mut().set_dialog_elsewhere(true);
+    fx.idle();
+    twice(&mut fx, at);
+    fx.idle();
+    assert!(!fx.view().dialog_up(), "no entry shown whole");
+    fx.view_mut().set_dialog_elsewhere(false);
+    fx.drv.idle(&mut fx.host, 30);
+    twice(&mut fx, at);
+    fx.idle();
+    assert!(fx.view().dialog_up(), "the control: the entry whole");
+    // The planner: a click on a row moves its bar, Run… opens its confirmation.
+    let mut fx = Fx::new(1000.0, 600.0, fixture_view());
+    fx.view_mut().set_repo(super::tests_s4::repo());
+    fx.view_mut().open_planner(super::tests_s4::model());
+    fx.idle();
+    fx.idle();
+    let bar = |fx: &Fx| fx.view().planner.as_ref().and_then(|p| p.bar().cloned());
+    let before = bar(&fx);
+    let row = fx
+        .drv
+        .find_text("third")
+        .expect("the planner's row")
+        .center();
+    let run = fx.drv.find_text("Run…").expect("Run…").center();
+    fx.view_mut().set_dialog_elsewhere(true);
+    fx.idle();
+    pass(&mut fx, click_events(row, PointerButton::Primary));
+    fx.idle();
+    assert_eq!(bar(&fx), before, "the bar stays");
+    pass(&mut fx, click_events(run, PointerButton::Primary));
+    fx.idle();
+    assert!(!fx.view().dialog_up(), "no run's confirmation");
+    // Its keys wait too.
+    fx.press(Key::ArrowDown);
+    assert_eq!(bar(&fx), before, "no key moved it");
+    fx.view_mut().set_dialog_elsewhere(false);
+    fx.idle();
+    pass(&mut fx, click_events(row, PointerButton::Primary));
+    fx.idle();
+    assert_ne!(bar(&fx), before, "the control: the click moves it");
 }
 
 /// While the filters are open the status row says their keys, not the panel's.
