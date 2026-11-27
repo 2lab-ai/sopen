@@ -944,8 +944,10 @@ cut).**
   them an octopus's or a criss-cross's shared row reads as lines ending) and `┼` where one crosses;
   the uncommitted row's line `:` a cell, dim (CP437 has it, and it stays one cell, apart from
   `|`, in an ambiguous-wide terminal); and a cell where lines meet takes the colour of the piece
-  drawn last in egui's order, lines passing by, then lane changes longest first, then the node, so
-  a line's colour changes where it turns (03 §4.3–§4.4, §6).
+  drawn last — in egui's order (lines passing by, then lane changes, then the node), lane changes
+  among themselves longest first, as egui's diagonals share no stretch — so a line's colour changes
+  where it turns; a join a longer lane change goes on past is told from a crossing by colour alone,
+  which two lanes five apart share (03 §4.3–§4.4, §6).
 - **03 §10.2's frame-title hover vs §6** (found cutting X4, 2026-11-27). 03 §10.2 put the host's
   git version "on the frame title's hover"; a frame in cells has no hover (§6: nothing changes
   under the pointer), and the panel drew none (no hover on its frame in `git_panel/`). 03 §10.2

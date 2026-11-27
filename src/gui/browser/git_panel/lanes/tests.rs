@@ -5,7 +5,7 @@
 //! whole, paging never redrawing the rows above.
 
 use super::super::graph_view::Columns;
-use super::{rows, stand_in, Cell};
+use super::{rows, stand_in, Cell, WORK};
 use crate::git::graph::{layout, End, Graph, Row, RowStream};
 use crate::git::model::{CommitRow, Oid, StashRow};
 use crate::gui::chrome::git::{self as look, LOOK};
@@ -68,7 +68,8 @@ fn stash(name: &str, base: &str) -> StashRow {
 
 /// Columns that show every lane of `graph`: no cut.
 fn every_lane(graph: &Graph) -> Columns {
-    let cols = Columns::new(300, graph.width().max(1));
+    let lanes = graph.width().max(1);
+    let cols = Columns::new(6 * (lanes as usize + 1), lanes);
     assert!(!cols.cut);
     cols
 }
@@ -192,6 +193,78 @@ fn a_merge_joining_two_lanes_to_its_left() {
         &["■     ", "│ ■   ", "├─┼─■ ", "│ │ ■ ", "■─┼─┘ ", "■─┘   "],
         Some(&["c     ", "c y   ", "ccyyg ", "c y g ", "cgggg ", "cyy   "]),
     );
+}
+
+/// A merge whose other parent a lane passing by on its right already awaits: its line goes down
+/// into that lane, `┤`, in that lane's colour.
+#[test]
+fn a_merge_goes_down_into_a_lane_passing_on_its_right() {
+    check(
+        &commits("a:b y:p b:c,p c:p p:"),
+        false,
+        &["■   ", "│ ■ ", "■─┤ ", "■ │ ", "■─┘ "],
+        Some(&["c   ", "c y ", "cyy ", "c y ", "cyy "]),
+    );
+}
+
+/// A join a longer lane change goes on past is `┼`, as a crossing is; only its colour, the
+/// joined lane's, tells them apart (03 §4.3), so where the two lanes share one — five apart, the
+/// lane colours' cycle — the rows read the same. `m`'s line to `a` crosses lanes 1–5; with `f` as
+/// a parent too it also joins lane 5, whose colour is lane 0's, and every row is drawn as before.
+/// With `e` instead (lane 4, white) the stretch from the join to the node is white.
+#[test]
+fn a_join_a_line_goes_on_past_is_told_from_a_crossing_by_colour_alone() {
+    let lines = "x0:a x1:b x2:c x3:d x4:e x5:f m:z,a z:a a: b: c: d: e: f:";
+    let crossing = check(
+        &commits(lines),
+        false,
+        &[
+            "■             ",
+            "│ ■           ",
+            "│ │ ■         ",
+            "│ │ │ ■       ",
+            "│ │ │ │ ■     ",
+            "│ │ │ │ │ ■   ",
+            "├─┼─┼─┼─┼─┼─■ ",
+            "│ │ │ │ │ │ ■ ",
+            "■─┼─┼─┼─┼─┼─┘ ",
+            "  ■ │ │ │ │   ",
+            "    ■ │ │ │   ",
+            "      ■ │ │   ",
+            "        ■ │   ",
+            "          ■   ",
+        ],
+        Some(&[
+            "c             ",
+            "c y           ",
+            "c y g         ",
+            "c y g m       ",
+            "c y g m w     ",
+            "c y g m w c   ",
+            "ccccccccccccy ",
+            "c y g m w c y ",
+            "cyyyyyyyyyyyy ",
+            "  y g m w c   ",
+            "    g m w c   ",
+            "      m w c   ",
+            "        w c   ",
+            "          c   ",
+        ]),
+    );
+    let cols = every_lane(&crossing);
+    let joining = layout(&commits(&lines.replace("m:z,a ", "m:z,a,f ")), false);
+    assert_eq!(joining.segments(6).len(), crossing.segments(6).len() + 1);
+    assert_eq!(
+        drawn(&joining, &cols, false),
+        drawn(&crossing, &cols, false)
+    );
+    assert_eq!(
+        coloured(&joining, &cols, false),
+        coloured(&crossing, &cols, false)
+    );
+    let white = layout(&commits(&lines.replace("m:z,a ", "m:z,a,e ")), false);
+    assert_eq!(drawn(&white, &cols, false)[6], "├─┼─┼─┼─┼─┼─■ ");
+    assert_eq!(coloured(&white, &cols, false)[6], "ccccccccwwwwy ");
 }
 
 /// A parent not loaded: its lane runs to the bottom of the loaded rows.
@@ -346,6 +419,49 @@ fn lanes_past_the_room_are_cut_with_the_cut_glyph() {
     let cols = Columns::new(3, graph.width());
     assert_eq!((cols.graph, cols.cut), (0, true));
     assert_eq!(drawn(&graph, &cols, false), [""; 6]);
+}
+
+/// A call works only on the cells the column shows: a history 2 000 lanes wide (lanes passing
+/// by) and an octopus of 500 parents (its lines crossing them), asked for a 20-cell column,
+/// allocate and draw no more than those cells, the lanes they show and, for each of a row's
+/// segments, the cells it can cross — never the history's width — and give what the whole width
+/// gives, cut.
+#[test]
+fn a_call_works_only_on_the_cells_the_column_shows() {
+    let n = 2_000;
+    let tips = (0..n).map(|i| format!("t{i}:b{i}"));
+    let bases = (0..n).map(|i| format!("b{i}:"));
+    let wide = layout(
+        &commits(&tips.chain(bases).collect::<Vec<_>>().join(" ")),
+        false,
+    );
+    let parents: Vec<String> = (0..500).map(|i| format!("p{i}")).collect();
+    let roots: Vec<String> = parents.iter().map(|p| format!("{p}:")).collect();
+    let spec = format!("o:{} {}", parents.join(","), roots.join(" "));
+    let octopus = layout(&commits(&spec), false);
+    assert_eq!((wide.width(), octopus.width()), (2_000, 500));
+    for (graph, window) in [(&wide, n..n + 10), (&octopus, 0..10)] {
+        let cols = Columns::new(60, graph.width());
+        assert_eq!((cols.graph, cols.lanes, cols.cut), (20, 9, true));
+        let shown = 2 * cols.lanes as usize;
+        let bound: usize = (window.clone())
+            .map(|i| cols.graph + cols.lanes as usize + graph.segments(i).len() * (shown + 1))
+            .sum();
+        WORK.with(|work| work.set(0));
+        let cut = rows(graph, window.clone(), &cols, false);
+        let work = WORK.with(|work| work.get());
+        assert!(work <= bound, "{work} cells of work, bound {bound}");
+
+        let whole = rows(graph, window.clone(), &every_lane(graph), false);
+        for (i, (row, whole)) in window.zip(cut.iter().zip(&whole)) {
+            assert_eq!(row[..shown], whole[..shown], "row {i}");
+            let mark = past(graph, i, cols.lanes).then_some(Cell {
+                glyph: look::CUT,
+                colour: LOOK.cut,
+            });
+            assert_eq!((row[shown], row[shown + 1]), (mark, None), "row {i}");
+        }
+    }
 }
 
 /// The rows asked for are clamped to the rows laid out, as `Graph::pass_throughs` clamps them.
@@ -555,7 +671,8 @@ fn past(graph: &Graph, i: usize, lanes: u32) -> bool {
 /// ambiguous-wide terminal, none of ambiguous width; a lane's second cell holds only a lane
 /// change's line; lines meet across cells and rows; the visible rows' cells are those of the
 /// whole, and the first rows' those of all rows (paging never redraws the rows above); a narrower
-/// column only cuts, with `»` exactly where `lanes_of` puts it.
+/// column only cuts, with `»` where `lanes_of` puts it — in the column: one of no cells has none,
+/// where `lanes_of` paints it over the description.
 #[test]
 fn properties_over_a_thousand_graphs() {
     let mut rng = Lcg(0x5eed_1a9e);

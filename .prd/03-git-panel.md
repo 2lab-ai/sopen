@@ -407,10 +407,15 @@ leaves no row between for a diagonal, and a cell holds none. Where pieces meet, 
 `├ ┤ ┬ ┴` where lines join (an octopus's lines share its row; a line to a lane left of its node ends on
 the line passing by there, `├`), `┼` where a lane change crosses a line passing by. A cell takes the
 colour of the piece drawn last, in the window's egui order — lines passing by, then the row's lane
-changes, then the node — the lane changes longest first (on a tie the one coming in, then the one going
-down): a crossing is the crossing line's colour and a stretch two lane changes share the nearer lane's,
-so a line's colour changes where it turns. Until X4-graph draws these cells, the window's egui graph
-still draws a lane change as one diagonal across half a row, and the uncommitted row's line dashed.
+changes, then the node — and the lane changes among themselves longest first (on a tie the one coming
+in, then the one going down; egui's diagonals share no stretch, so it has no such order): a crossing
+is the crossing line's colour and a stretch two lane changes share the nearer lane's, so a line's
+colour changes where it turns. **A limit**: where a longer lane change goes on past a join onto a lane
+passing by (a merge whose parents two lanes on one side await), the join is `┼`, as a crossing is,
+told apart only by its colour, the joined lane's; where the two lanes share a colour (five apart, the
+cycle's length) the row reads as a crossing. One row a commit has no room to show more; the details
+pane lists the parents (§6.1). Until X4-graph draws these cells, the window's egui graph still draws a
+lane change as one diagonal across half a row, and the uncommitted row's line dashed.
 
 - **Measured** with these rules (a script over `git log --parents`, 2026-11-20): the 100 000-commit
   fixture of §4.5 has at most 2 slots, 2.0 node segments per row; a wide fixture (60 branches committed
