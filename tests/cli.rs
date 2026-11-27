@@ -4747,6 +4747,50 @@ fn without_a_web_engine_an_address_opens_in_the_system_browser_after_a_line() {
     );
 }
 
+/// An output nobody reads (`| head -0`, a session gone) does not end the system browser's route
+/// in a panic: `--browser` and §4's fallback open the address and exit 0, their lines written
+/// ignoring the error. The output's reader is closed before sopen starts, so its first write
+/// fails.
+#[test]
+fn an_address_with_its_output_closed_ends_0_without_a_panic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (browser, calls) = stand_in_browser(tmp.path());
+    for (args, web) in [
+        (vec!["--here", "--browser", SECRET_URL], None),
+        (vec!["--here", SECRET_URL], Some(("SOPEN_WEB", "off"))),
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let mut cmd = sopen_command(tmp.path());
+        cmd.args(&args)
+            .env("SOPEN_BROWSER", &browser)
+            .env("SOPEN_EDITOR_WAIT", "60")
+            .env("DISPLAY", ":77")
+            .stdin(std::process::Stdio::null())
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped());
+        if let Some((k, v)) = web {
+            cmd.env(k, v);
+        }
+        let mut guard = Reaped(Some(cmd.spawn().unwrap()));
+        let stderr = collected(guard.0.as_mut().unwrap().stderr.take());
+        drop(cmd);
+        let deadline = std::time::Instant::now() + RUN_LIMIT;
+        let status = loop {
+            if let Some(status) = guard.0.as_mut().unwrap().try_wait().unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "{args:?}: no end");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        guard.0 = None;
+        let err = text(&stderr.recv_timeout(RUN_LIMIT).unwrap());
+        assert_eq!(status.code(), Some(0), "{args:?}: {err}");
+        assert!(!err.contains("panicked"), "{args:?}: {err}");
+    }
+    assert_eq!(browser_calls(&calls), [[SECRET_URL], [SECRET_URL]]);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The cues of 09 §7 on this side. HOST's half is the stand-in sopen playing a HOST of any
 // version (`FAKE_SOPEN_SAY`, `FAKE_SOPEN_HOLD`): an older one, or one that opened the system

@@ -37,12 +37,13 @@ const EXIT_CONFLICT: u8 = 3;
         present, otherwise Zed; images, video and audio in an xtools window. Any other file (a \
         zip, a binary) asks first: open it in the xtools hex editor (the default) or save it to a \
         path you choose. --hex opens any file in \
-        the hex editor. An http:// or https:// address opens in the default browser.\n\n\
+        the hex editor. An http:// or https:// address opens in an xtools window (--browser: the \
+        default browser).\n\n\
         It opens on this machine, or with --target HOST on HOST's screen (sopen runs there, \
         started over ssh). SOPEN_TARGET or `sopen config target HOST` make a HOST the default; \
         --here opens on this machine anyway. A loopback address (localhost, 127.0.0.1, [::1]) \
         opens on HOST through an ssh tunnel from this machine that closes when sopen ends \
-        (Ctrl-C).",
+        (Ctrl-C) or its window there is closed.",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true
 )]
@@ -651,11 +652,7 @@ fn run_url(
 ) -> Result<u8> {
     for (given, flag_name) in [(app_name.is_some(), "--app"), (hex, "--hex")] {
         if given {
-            return Err(Usage(format!(
-                "{flag_name} opens a file; {} is an address (it opens in an xtools window)",
-                sopen::url::redacted(source)
-            ))
-            .into());
+            return Err(Usage(address_not_a_file(flag_name, source, browser)).into());
         }
     }
     let url = url.map_err(|why| anyhow::anyhow!("not an address sopen can open: {why}"))?;
@@ -685,6 +682,18 @@ fn run_url(
         };
         forward::run(&host, url.as_str(), flags, &dirs.state)
     }
+}
+
+/// `--app` / `--hex` (`flag_name`) given an address: the usage line, saying where it opens.
+fn address_not_a_file(flag_name: &str, source: &str, browser: bool) -> String {
+    let opens = match browser {
+        true => "the system browser",
+        false => "an xtools window",
+    };
+    format!(
+        "{flag_name} opens a file; {} is an address (it opens in {opens})",
+        sopen::url::redacted(source)
+    )
 }
 
 /// Opens `url` on this machine (09 §7): in an xtools window, until it is closed — or, with
@@ -720,7 +729,10 @@ fn open_url(url: &sopen::url::Url, hold: bool, browser: bool, dirs: &Dirs) -> Re
     }
     sopen::url::open(url)?;
     if !hold {
-        println!("{}", sopen::url::opened_line(&url.shown()));
+        // The same line `println!` wrote, a write error ignored: nothing may read the output (a
+        // closed pipe, a session gone), and the address is open all the same.
+        let line = sopen::url::opened_line(&url.shown());
+        sopen::url::write_cue(&mut std::io::stdout(), &line);
         return Ok(());
     }
     // Ignoring a write error: the other side may be gone already — its end is seen below.
@@ -2024,6 +2036,21 @@ mod tests {
         assert!(Cli::try_parse_from(["sopen", "stems", "--work-dir", "/w", "a.mp3"]).is_err());
         assert!(Cli::try_parse_from(["sopen", "stems", "--wait-to-publish", "a.mp3"]).is_err());
         assert!(Cli::try_parse_from(["sopen"]).is_err());
+    }
+
+    /// `--app` / `--hex` with an address (09 §7): the usage line says where the address opens —
+    /// the system browser with `--browser`, else an xtools window — shown without its secrets.
+    #[test]
+    fn an_address_is_not_a_file_said_by_where_it_opens() {
+        let url = "http://me:pw@box/x?t=1";
+        assert_eq!(
+            address_not_a_file("--app", url, false),
+            "--app opens a file; http://me:***@box/x?… is an address (it opens in an xtools window)"
+        );
+        assert_eq!(
+            address_not_a_file("--hex", url, true),
+            "--hex opens a file; http://me:***@box/x?… is an address (it opens in the system browser)"
+        );
     }
 
     /// `--state-stdin` (10 §7.3, X2-host), hidden: as HOST's half of the switch is given it —

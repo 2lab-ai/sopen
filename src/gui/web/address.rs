@@ -21,9 +21,9 @@
 //!   under it, the page at the rest of its cells, and the F-key row `1Help 2JS off 3Exit`. Every
 //!   address it shows goes through [`url::redacted`].
 //! - **Navigation**: a link the owner clicked out of the origin goes to the system browser
-//!   ([`Opener`], on a thread of its own: `url::open` waits for the opener) — only an `http` or
-//!   `https` one, as [`url::parse`] reads it; anything else is said and not opened, since the
-//!   system's opener would start an application for a `file:` link. Any other navigation out
+//!   ([`Opener`], on a thread of its own: `url::open` waits for the opener), one at a time — only
+//!   an `http` or `https` one, as [`url::parse`] reads it; anything else is said and not opened,
+//!   since the system's opener would start an application for a `file:` link. Any other navigation out
 //!   was refused by the engine: a line says where it went.
 //! - **Keys**: Esc while the page has the keyboard takes it back (the component, or the macOS
 //!   key monitor); one that reaches the window closes it. Cmd/Ctrl+R reloads. Before anything
@@ -231,6 +231,15 @@ impl Report {
     pub(crate) fn ended(&self) -> Option<Cue> {
         (self.made && !self.by_input).then_some(Cue::Closed)
     }
+
+    /// What the window's end writes on `out` ([`run`]'s tail): [`Report::ended`]'s cue, as
+    /// [`speak`] writes it on `hold`'s route — the closed cue on HOST's half of a tunnel, nothing
+    /// on another route.
+    pub(crate) fn finish(&self, out: &mut dyn std::io::Write, hold: bool, shown: &str) {
+        if let Some(cue) = self.ended() {
+            speak(out, hold, shown, cue);
+        }
+    }
 }
 
 /// How [`run`] ended.
@@ -277,7 +286,7 @@ pub struct AddressWindow {
     /// The system browser's answers, as they come: the link shown, or why not.
     answered: Sender<Answer>,
     answers: Receiver<Answer>,
-    /// Links on their way to the system browser.
+    /// Links on their way to the system browser: one at a time.
     opening: usize,
     input: Option<Input>,
     scripted: bool,
@@ -334,9 +343,11 @@ impl AddressWindow {
     }
 
     /// The view, at the first pass (the windows' thread's): the window cue, its load, the open
-    /// cue. One the engine refuses closes the window, with no cue.
+    /// cue. One the engine refuses closes the window, with no cue. None once the input has ended
+    /// (the other side gone before the first pass): nothing to load toward a port the tunnel no
+    /// longer forwards, nothing to say.
     fn make(&mut self, ctx: &egui::Context) {
-        if std::mem::replace(&mut self.asked, true) {
+        if self.ending || std::mem::replace(&mut self.asked, true) {
             return;
         }
         let content = Content::Address {
@@ -421,9 +432,16 @@ impl AddressWindow {
     }
 
     /// A link the owner clicked out of the origin: an `http` or `https` one to the system browser
-    /// on a thread of its own; anything else said, not opened.
+    /// on a thread of its own — one at a time: another while one is opening (a script's
+    /// `a.click()` may count as a click) is said and not opened; anything else said, not opened.
     fn outside(&mut self, ctx: &egui::Context, target: &str) {
         let shown = url::redacted(target);
+        if self.opening > 0 {
+            self.line = Some(Line::NotOpened(format!(
+                "{shown}: not opened — a link is still opening in the system browser"
+            )));
+            return;
+        }
         let link = match url::parse(target) {
             Some(Ok(link)) => link,
             Some(Err(why)) => {
@@ -705,8 +723,6 @@ pub fn run(url: &Url, hold: bool, hooks: &Hooks) -> anyhow::Result<Shown> {
         return Ok(Shown::Unavailable(why.clone()));
     }
     ran?;
-    if let Some(cue) = report.ended() {
-        speak(&mut std::io::stdout(), hold, &shown, cue);
-    }
+    report.finish(&mut std::io::stdout(), hold, &shown);
     Ok(Shown::Closed)
 }

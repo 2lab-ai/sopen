@@ -1,6 +1,7 @@
-//! A web address as SOURCE (`sopen http://127.0.0.1:1234/`, spec §4a): it opens in the default
-//! browser of the machine sopen shows things on — through an ssh tunnel ([`crate::forward`])
-//! when that is another machine and the address is loopback. Only `http://` and `https://` (the
+//! A web address as SOURCE (`sopen http://127.0.0.1:1234/`, spec §4a): it opens in an xtools
+//! window ([`crate::gui::web::address`]) — with `--browser`, in the default browser — of the
+//! machine sopen shows things on, through an ssh tunnel ([`crate::forward`]) when that is
+//! another machine and the address is loopback. Only `http://` and `https://` (the
 //! scheme in any case) are addresses; anything else is a path or `host:path`
 //! ([`crate::target`]), so `box:/x` is never read as one and `http://…` never as host `http`.
 //!

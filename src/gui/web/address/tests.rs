@@ -35,14 +35,24 @@ struct Rig {
 }
 
 fn rig_with(address: &str, scripted: bool, answer: Result<(), String>) -> Rig {
-    let cues: Rc<RefCell<Vec<Cue>>> = Rc::default();
-    let said = cues.clone();
     let opened: Arc<Mutex<Vec<String>>> = Arc::default();
     let record = opened.clone();
     let opener: Opener = Arc::new(move |url: &Url| {
         record.lock().unwrap().push(url.as_str().to_string());
         answer.clone()
     });
+    rig_opening(address, scripted, opener, opened)
+}
+
+/// A window whose clicked links out go to `opener` (`opened`: what it recorded, if it does).
+fn rig_opening(
+    address: &str,
+    scripted: bool,
+    opener: Opener,
+    opened: Arc<Mutex<Vec<String>>>,
+) -> Rig {
+    let cues: Rc<RefCell<Vec<Cue>>> = Rc::default();
+    let said = cues.clone();
     let report: Rc<RefCell<Report>> = Rc::default();
     let input = Input::default();
     let win = AddressWindow::new(
@@ -694,4 +704,193 @@ fn wv_e2_cmd_r_reloads_or_tries_again() {
     );
     r.frame(vec![press(Key::R, false, cmd)], cmd);
     assert_eq!(fake.take(0), [Did::Reload, Did::Reload]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1.
+
+/// The input ends while the window is starting (the remote sopen gone before the first pass):
+/// no view is made — nothing loads toward a port the tunnel no longer forwards — no cue is
+/// said, and the window closes.
+#[test]
+fn wv_e2_the_inputs_end_before_the_view_makes_none() {
+    let fake = FakeEngine::native();
+    fake.install();
+    let mut r = rig("http://127.0.0.1:8000/");
+    r.drv.as_shell();
+    r.input.end();
+    r.idle(2);
+    assert_eq!(r.cues(), []);
+    assert_eq!(fake.views(), 0, "no view");
+    assert!(r.drv.window_closed);
+    assert_eq!(r.report.borrow().ended(), None);
+}
+
+/// The input watched as `run` watches stdin — a real pipe, read to its end on a thread of its
+/// own: while it is open the window stays; once its writer is gone the window closes, no closed
+/// cue. (A subprocess would need a real window: a scripted run ignores the input's end.)
+#[test]
+fn wv_e2_the_watched_inputs_end_closes_the_window() {
+    use std::io::Write as _;
+    let fake = FakeEngine::native();
+    fake.install();
+    let mut r = rig("http://127.0.0.1:8000/");
+    r.drv.as_shell();
+    r.idle(1);
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    r.input.watch(reader).unwrap();
+    writer.write_all(b"held\n").unwrap();
+    r.idle(3);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    r.idle(1);
+    assert!(!r.drv.window_closed, "its input is still open");
+    drop(writer);
+    let mut tries = 0;
+    while !r.drv.window_closed {
+        tries += 1;
+        assert!(tries < 1000, "the input's end did not close it");
+        r.idle(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(r.cues(), [Cue::Window, Cue::Open]);
+    assert_eq!(r.report.borrow().ended(), None);
+}
+
+/// What the window's end writes, by how it went: the closed cue on HOST's half of a tunnel after
+/// the owner's close of a view that was made; nothing on another route, after the input's end,
+/// or without a view.
+#[test]
+fn wv_e2_the_windows_end_writes_as_it_went() {
+    let off = Some(Unavailable::NoEngine(OFF.into()));
+    for (made, by_input, failed, hold, want) in [
+        (true, false, None, true, "sopen-tunnel-closed\n"),
+        (true, false, None, false, ""),
+        (true, true, None, true, ""),
+        (false, false, off.clone(), true, ""),
+        (false, false, None, true, ""),
+    ] {
+        let report = Report {
+            made,
+            failed,
+            by_input,
+        };
+        let mut out = Vec::new();
+        report.finish(&mut out, hold, SECRET_SHOWN);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            want,
+            "{made} {by_input} {hold}"
+        );
+    }
+}
+
+/// The cues against the engine's calls: the window cue once the view is open and before its
+/// load, the open cue once the load was asked for.
+#[test]
+fn wv_e2_the_cues_against_the_engines_calls() {
+    let fake = FakeEngine::native();
+    fake.install();
+    // Each cue with the engine's calls so far.
+    type Seen = Vec<(Cue, Vec<Did>)>;
+    let seen: Rc<RefCell<Seen>> = Rc::default();
+    let (record, engine) = (seen.clone(), fake.clone());
+    let opener: Opener = Arc::new(|_: &Url| Ok(()));
+    let mut win = AddressWindow::new(
+        parsed("http://127.0.0.1:8000/a"),
+        Box::new(move |cue| {
+            let calls = match engine.views() {
+                0 => vec![],
+                _ => engine.calls(0),
+            };
+            record.borrow_mut().push((cue, calls));
+        }),
+        opener,
+        None,
+        false,
+        Rc::default(),
+    );
+    Driver::new(800.0, 480.0).idle(&mut win, 1);
+    let open = Did::Open {
+        page: false,
+        preview: false,
+        scripts: true,
+    };
+    let load = Did::Load("http://127.0.0.1:8000/a".into());
+    assert_eq!(
+        *seen.borrow(),
+        [
+            (Cue::Window, vec![open.clone()]),
+            (Cue::Open, vec![open, load])
+        ]
+    );
+}
+
+/// An opener that says when it was called and answers only once released (within 20 s).
+fn held_opener() -> (Opener, mpsc::Receiver<String>, mpsc::Sender<()>) {
+    let (called, calls) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let (called, released) = (Mutex::new(called), Mutex::new(released));
+    let opener: Opener = Arc::new(move |url: &Url| {
+        let _ = called.lock().unwrap().send(url.as_str().to_string());
+        released
+            .lock()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .map_err(|_| "never released".to_string())
+    });
+    (opener, calls, release)
+}
+
+/// The system browser's opener runs off the window's thread — the window goes on drawing while
+/// it waits — and one link opens at a time: another click out meanwhile (a script's `a.click()`
+/// may count as one) is said and not opened; once the first has opened, the next one goes.
+#[test]
+fn wv_e2_one_link_opens_at_a_time_off_the_windows_thread() {
+    let fake = FakeEngine::native();
+    fake.install();
+    let (opener, calls, release) = held_opener();
+    let mut r = rig_opening("http://127.0.0.1:8000/", false, opener, Arc::default());
+    r.idle(1);
+    let events = fake.events(0);
+    let click = |target: &str| Event::Refused {
+        target: target.into(),
+        clicked: true,
+    };
+    let (first, second) = ("https://example.com/a?token=abc", "https://example.com/b");
+    events.send(click(first));
+    r.idle(1);
+    let wait = std::time::Duration::from_secs(10);
+    assert_eq!(calls.recv_timeout(wait).unwrap(), first);
+    r.idle(2);
+    let opening = "https://example.com/a?…: opening in the system browser…";
+    assert!(r.shows(opening), "the window drew on: {:?}", r.texts());
+    events.send(click(second));
+    r.idle(1);
+    assert!(
+        r.shows(
+            "https://example.com/b: not opened — a link is still opening in the system browser"
+        ),
+        "{:?}",
+        r.texts()
+    );
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(calls.try_recv().is_err(), "the second was not opened");
+    release.send(()).unwrap();
+    let opened = "https://example.com/a?…: opened in the system browser";
+    let mut tries = 0;
+    while !r.shows(opened) {
+        tries += 1;
+        assert!(tries < 1000, "{:?}", r.texts());
+        r.idle(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    events.send(click(second));
+    r.idle(1);
+    assert_eq!(
+        calls.recv_timeout(wait).unwrap(),
+        second,
+        "the next one goes"
+    );
+    release.send(()).unwrap();
+    no_secrets(&r.texts());
 }

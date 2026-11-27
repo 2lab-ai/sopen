@@ -657,7 +657,8 @@ within 2 s, else 1 with `… ended while ssh stayed for the browser's connection
   sees it never sends, leaving the other side without its open line. `sopen-tunnel-closed` only after
   the owner closed a view that was made, once the window is gone (the view torn down first) — never
   after the input's end (the other side is gone; the window closes for it), never after a refused
-  view. A scripted run (`SOPEN_SCREENSHOT`, `SOPEN_CELLS`) ends by its hook and ignores the input's
+  view. An input that ends before the first pass makes no view at all and says nothing (review round
+  1). A scripted run (`SOPEN_SCREENSHOT`, `SOPEN_CELLS`) ends by its hook and ignores the input's
   end; its hook's close is a close here, so it says the closed cue. Route 1 and HOST's half of route 3 print `opened <shown> in xtools` once the view is made; all
   of it, and §4's stderr line, written ignoring errors.
 - **The screen**: the title row is the program's block and `<shown>` (the window's title `xtools —
@@ -666,7 +667,10 @@ within 2 s, else 1 with `… ended while ssh stayed for the browser's connection
   or `scripts off`, `loading…` — and whose second row, when there is one, is the line; the page at
   the rest of the frame's cells; the F-key row `1Help 2JS off 3Exit` (`2JS on` while off).
 - **Links out**: only an address `url::parse` takes (`http`, `https`, written plainly) goes to the
-  system browser, on a thread of its own (`url::open` waits for the opener); any other scheme, or an
+  system browser, on a thread of its own (`url::open` waits for the opener), one at a time — another
+  click out while one is opening (route 3 opens any site with scripts on, and a script's `a.click()`
+  may count as a click) says `<target>: not opened — a link is still opening in the system browser`
+  (review round 1); any other scheme, or an
   address sopen refuses, is said — `<target>: not opened — only an http:// or https:// link goes to
   the system browser` — and never opened, since the system's opener starts an application for a
   `file:` link. The line says `<target>: opened in the system browser` (or the opener's error); any
