@@ -1176,7 +1176,7 @@ slot keeps the meaning it has in the file list where git has one, so a mis-press
 | Opening a URL found in a message | the text UI shows it as text, copyable |
 | Regular expressions in Find | Find matches plain text in the loaded rows; History search (§4.7) takes git's own regular expressions over the whole history |
 | Date formats (relative, date only, a choice of author or commit date in the list) | one fixed local format, author date in the list; the details pane shows both dates |
-| Version information command | the host's git version is in the log (§3.7) and on the frame title's hover |
+| Version information command | the host's git version is in the log (§3.7); a frame in cells has no hover (10 §6) |
 
 ### 10.3 Open for the owner
 
