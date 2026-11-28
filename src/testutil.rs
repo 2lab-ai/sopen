@@ -2,10 +2,12 @@
 
 use crate::remote::{LocalFs, RemoteFs};
 use anyhow::Result;
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Set in the child [`rerun_under_umask_022`] starts, to the name of the test it runs.
@@ -56,9 +58,32 @@ pub fn rerun_under_umask_022(test: &str) -> bool {
 /// Runs `cmd` to its end, for a stub executable a test has just written. On Linux such a file can
 /// be "busy" (ETXTBSY) for a moment: a child that another test thread forked meanwhile still holds
 /// its write descriptor until that child execs. A busy start is retried, up to 50 times 20 ms
-/// apart; any other error, or the last busy one, panics.
+/// apart; any other error, or the last busy one, panics. Each busy refusal is counted for the
+/// program ([`busy_refusals`]).
 pub fn run_fresh(cmd: &mut Command) -> Output {
-    retry_busy(|| cmd.output()).unwrap_or_else(|e| panic!("cannot run {cmd:?}: {e}"))
+    let program = PathBuf::from(cmd.get_program());
+    retry_busy(|| {
+        let out = cmd.output();
+        if out
+            .as_ref()
+            .is_err_and(|e| e.kind() == ErrorKind::ExecutableFileBusy)
+        {
+            *BUSY.lock().unwrap().entry(program.clone()).or_default() += 1;
+        }
+        out
+    })
+    .unwrap_or_else(|e| panic!("cannot run {cmd:?}: {e}"))
+}
+
+/// [`run_fresh`]'s busy refusals, per program as its `Command` names it.
+static BUSY: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
+
+/// How many starts of `program` [`run_fresh`] has had refused as busy (ETXTBSY) so far: a test
+/// that keeps a stub busy on purpose waits for a refusal before it lets the stub go. Such tests
+/// are Linux's alone (macOS starts a script still open for writing).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn busy_refusals(program: &Path) -> usize {
+    BUSY.lock().unwrap().get(program).copied().unwrap_or(0)
 }
 
 /// `attempt` until it is not refused as busy (ETXTBSY), at most 50 retries 20 ms apart.
@@ -107,11 +132,15 @@ fn a_busy_start_is_retried_then_given_up() {
 }
 
 /// The real thing (Linux only: macOS starts a script that is still open for writing): a stub
-/// whose write descriptor is still open is busy; it runs once that descriptor is closed.
+/// whose write descriptor is still open is busy; it runs once that descriptor is closed. The
+/// descriptor is closed only after [`run_fresh`]'s start was refused ([`busy_refusals`]; 5 s at
+/// most, so a start that never retries still ends), never on a timer: a stall of this thread
+/// cannot let a start that does not retry pass.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_stub_still_open_for_writing_runs_once_it_is_closed() {
     use std::io::Write as _;
+    use std::time::Instant;
     let tmp = tempfile::tempdir().unwrap();
     let stub = tmp.path().join("stub");
     let mut file = std::fs::File::create(&stub).unwrap();
@@ -119,12 +148,18 @@ fn a_stub_still_open_for_writing_runs_once_it_is_closed() {
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     let err = Command::new(&stub).output().unwrap_err();
     assert_eq!(err.kind(), ErrorKind::ExecutableFileBusy, "{err}");
-    let closer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        drop(file);
+    let refused = || busy_refusals(&stub);
+    let out = std::thread::scope(|s| {
+        s.spawn(move || {
+            let until = Instant::now() + Duration::from_secs(5);
+            while refused() == 0 && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(file);
+        });
+        run_fresh(&mut Command::new(&stub))
     });
-    let out = run_fresh(&mut Command::new(&stub));
-    closer.join().unwrap();
+    assert!(refused() >= 1, "the start was refused, then retried");
     assert_eq!(out.stdout, b"ran\n");
 }
 

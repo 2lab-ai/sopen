@@ -3004,6 +3004,9 @@ mod stop_lane_tests {
         let stand_in = format!("#!/bin/sh\necho 'Mon Nov 23 10:00:00 2026'\nexit {code}\n");
         std::fs::write(&ps, stand_in).unwrap();
         std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Run once now: a just-written stand-in can be "busy" for a moment on Linux (testutil),
+        // and the shell below would fail to start it.
+        crate::testutil::run_fresh(&mut Command::new(&ps));
         let path = format!(
             "{}:{}",
             dir.path().display(),
