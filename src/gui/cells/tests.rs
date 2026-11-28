@@ -1042,27 +1042,149 @@ fn the_skins_colours_in_a_256_colour_terminal() {
     }
 }
 
-/// `OnScreen` gives what the screen shows: the painting of the last pass that reached it — kept
-/// through a pass that did not, and nothing after a printed pass that painted nothing.
+/// One frame of `ctx` in which a screen asks [`OnScreen::start`] what shows and then, if `paints`,
+/// says what it painted: the answer.
+fn turn(ctx: &egui::Context, screen: &mut OnScreen<u32>, paints: Option<u32>) -> Option<u32> {
+    let mut seen = None;
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        seen = screen.start(ui.ctx()).copied();
+        if let Some(p) = paints {
+            screen.painted(p);
+        }
+    });
+    out.textures_delta.clear();
+    seen
+}
+
+/// A frame of `ctx` that does not draw the screen at all (a viewer over a dialog).
+fn without(ctx: &egui::Context) {
+    let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+    out.textures_delta.clear();
+}
+
+/// `OnScreen` gives what the screen shows: the painting of the last frame that reached it — kept
+/// through a frame that did not, and nothing after a printed frame that painted nothing.
 #[test]
 fn on_screen_is_the_last_painting_that_reached_the_screen() {
     let ctx = egui::Context::default();
     let mut screen = OnScreen::default();
-    assert_eq!(screen.start(&ctx), None, "nothing painted yet");
-    screen.painted(1);
-    assert_eq!(screen.start(&ctx), Some(&1), "a window shows every pass");
-    screen.painted(2);
-    set_presented(&ctx, false);
-    assert_eq!(screen.start(&ctx), Some(&1), "2 never reached the screen");
-    screen.painted(3);
-    assert_eq!(screen.start(&ctx), Some(&1), "nor 3");
-    screen.painted(4);
-    set_presented(&ctx, true);
-    assert_eq!(screen.start(&ctx), Some(&4));
     assert_eq!(
-        screen.start(&ctx),
+        turn(&ctx, &mut screen, Some(1)),
         None,
-        "a printed pass that painted nothing"
+        "nothing painted yet"
+    );
+    assert_eq!(
+        turn(&ctx, &mut screen, Some(2)),
+        Some(1),
+        "a window shows every frame"
+    );
+    set_presented(&ctx, false);
+    assert_eq!(
+        turn(&ctx, &mut screen, Some(3)),
+        Some(1),
+        "2 never reached the screen"
+    );
+    assert_eq!(turn(&ctx, &mut screen, Some(4)), Some(1), "nor 3");
+    set_presented(&ctx, true);
+    assert_eq!(turn(&ctx, &mut screen, None), Some(4));
+    assert_eq!(
+        turn(&ctx, &mut screen, None),
+        None,
+        "a printed frame that painted nothing"
     );
     assert!(presented(&ctx));
+}
+
+/// Frames that reached the screen without the screen in them (it was not drawn) showed something
+/// else: after them, nothing shows until a frame paints it again (X4-quick round 1).
+#[test]
+fn on_screen_a_gap_of_frames_that_did_not_draw_it_clears_it() {
+    let ctx = egui::Context::default();
+    let mut screen = OnScreen::default();
+    turn(&ctx, &mut screen, Some(1));
+    assert_eq!(turn(&ctx, &mut screen, Some(2)), Some(1));
+    without(&ctx);
+    without(&ctx);
+    assert_eq!(
+        turn(&ctx, &mut screen, Some(3)),
+        None,
+        "the screen showed another"
+    );
+    assert_eq!(turn(&ctx, &mut screen, None), Some(3));
+}
+
+/// Frames that never reached the screen change nothing on it, drawn or not: what it showed
+/// before them still shows.
+#[test]
+fn on_screen_a_gap_the_terminal_never_printed_keeps_it() {
+    let ctx = egui::Context::default();
+    let mut screen = OnScreen::default();
+    turn(&ctx, &mut screen, Some(1));
+    assert_eq!(turn(&ctx, &mut screen, Some(2)), Some(1));
+    set_presented(&ctx, false);
+    without(&ctx);
+    assert_eq!(turn(&ctx, &mut screen, Some(3)), Some(1), "still on screen");
+    set_presented(&ctx, true);
+    assert_eq!(turn(&ctx, &mut screen, None), Some(3));
+}
+
+/// Frames that did not draw the screen reached it, then one that did not reach it: the screen
+/// still shows what those frames showed, not this screen — nothing shows (review of X4-quick
+/// round 1: a viewer over a dialog, then Esc and Enter in one read of the terminal).
+#[test]
+fn on_screen_a_printed_gap_then_an_unprinted_frame_shows_nothing() {
+    let ctx = egui::Context::default();
+    let mut screen = OnScreen::default();
+    turn(&ctx, &mut screen, Some(1));
+    assert_eq!(turn(&ctx, &mut screen, Some(1)), Some(1));
+    without(&ctx);
+    without(&ctx);
+    set_presented(&ctx, false);
+    without(&ctx);
+    assert_eq!(
+        turn(&ctx, &mut screen, Some(2)),
+        None,
+        "the gap is on screen"
+    );
+    set_presented(&ctx, true);
+    assert_eq!(turn(&ctx, &mut screen, None), Some(2));
+}
+
+/// Two passes of one frame (egui's discarded one first) ask in turn: both get the frame's answer,
+/// and the frame's painting is its last pass's.
+#[test]
+fn on_screen_two_passes_of_one_frame_get_one_answer() {
+    let ctx = egui::Context::default();
+    let mut screen = OnScreen::default();
+    turn(&ctx, &mut screen, Some(1));
+    let mut answers = Vec::new();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        answers.push(screen.start(ui.ctx()).copied());
+        screen.painted(2);
+        answers.push(screen.start(ui.ctx()).copied());
+        screen.painted(3);
+    });
+    out.textures_delta.clear();
+    assert_eq!(answers, [Some(1), Some(1)]);
+    assert_eq!(
+        turn(&ctx, &mut screen, None),
+        Some(3),
+        "the frame's last pass"
+    );
+}
+
+/// Another context's screen is another screen (the window and the terminal, across a switch):
+/// what one painted never shows in the other, whatever their frames' numbers.
+#[test]
+fn on_screen_another_context_shows_nothing_of_this_one() {
+    let (window, terminal) = (egui::Context::default(), egui::Context::default());
+    let mut screen = OnScreen::default();
+    turn(&window, &mut screen, Some(1));
+    without(&terminal);
+    assert_eq!(
+        turn(&terminal, &mut screen, Some(2)),
+        None,
+        "the terminal's frame 1"
+    );
+    assert_eq!(turn(&terminal, &mut screen, None), Some(2));
 }

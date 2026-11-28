@@ -31,6 +31,7 @@ pub use ratatui_core::layout::{Position, Rect as Cells};
 pub use ratatui_core::style::Modifier;
 use ratatui_core::style::{Color, Style};
 use ratatui_core::text::Span;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------------------------
@@ -186,9 +187,12 @@ pub fn ambiguous_wide(ctx: &egui::Context) -> bool {
 // ---------------------------------------------------------------------------------------------
 // What reached the screen.
 
-/// The context's last pass was not put on screen ([`set_presented`]).
+/// The context's last pass was not put on screen ([`set_presented`]): since the frame before
+/// `since`, the context's count of frames when the first of them was said not to have been.
 #[derive(Debug, Clone, Copy, Default)]
-struct Unpresented;
+struct Unpresented {
+    since: u64,
+}
 
 fn unpresented_id() -> egui::Id {
     egui::Id::unique("sopen-unpresented")
@@ -198,11 +202,12 @@ fn unpresented_id() -> egui::Id {
 /// each pass, which it does not print while input is waiting (`term::Backend::serve`); a window
 /// shows every pass and never says.
 pub fn set_presented(ctx: &egui::Context, presented: bool) {
+    let since = ctx.cumulative_frame_nr();
     ctx.data_mut(|d| {
         if presented {
             d.remove_temp::<Unpresented>(unpresented_id());
-        } else {
-            d.insert_temp(unpresented_id(), Unpresented);
+        } else if d.get_temp::<Unpresented>(unpresented_id()).is_none() {
+            d.insert_temp(unpresented_id(), Unpresented { since });
         }
     });
 }
@@ -213,13 +218,44 @@ pub fn presented(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<Unpresented>(unpresented_id()).is_none())
 }
 
+/// The number of the last frame of `ctx` that reached the screen, as a frame in its pass counts
+/// itself (`cumulative_frame_nr`): the one before, else the one before those [`set_presented`]
+/// said did not; none before the first.
+fn last_printed(ctx: &egui::Context) -> Option<u64> {
+    let unpresented = ctx.data(|d| d.get_temp::<Unpresented>(unpresented_id()));
+    match unpresented {
+        None => ctx.cumulative_frame_nr().checked_sub(1),
+        Some(Unpresented { since }) => since.checked_sub(2),
+    }
+}
+
+/// A number of `ctx`'s own, the same in each of its frames and another in any other context: the
+/// window's and the terminal's count their frames apart (a switch between them moves a screen
+/// from one to the other).
+fn context_mark(ctx: &egui::Context) -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let id = egui::Id::unique("sopen-context-mark");
+    ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || NEXT.fetch_add(1, Ordering::Relaxed)))
+}
+
+/// A frame of a context: its context's mark ([`context_mark`]) and its number.
+type Frame = (u64, u64);
+
+fn frame_of(ctx: &egui::Context) -> Frame {
+    (context_mark(ctx), ctx.cumulative_frame_nr())
+}
+
 /// What a screen shows the owner (an action's dialog: what Run would run): the painting of the
-/// last pass that reached the screen ([`presented`]), and that of the pass just run, until the
-/// next pass knows whether it did. A Run or an Enter acts only on what [`OnScreen::start`] gives.
+/// last frame that reached the screen ([`presented`]), and that of the frame just run, until the
+/// next frame knows whether it did. A Run or an Enter acts only on what [`OnScreen::start`] gives.
 #[derive(Debug, Clone)]
 pub struct OnScreen<T> {
-    shown: Option<T>,
-    last: Option<T>,
+    /// What shows and the frame it was painted in.
+    shown: Option<(Frame, T)>,
+    /// The last painting and the frame it was painted in.
+    last: Option<(Frame, T)>,
+    /// The frame [`OnScreen::start`] last answered in.
+    asked: Option<Frame>,
 }
 
 impl<T> Default for OnScreen<T> {
@@ -227,25 +263,40 @@ impl<T> Default for OnScreen<T> {
         Self {
             shown: None,
             last: None,
+            asked: None,
         }
     }
 }
 
 impl<T> OnScreen<T> {
     /// At the start of a pass: what the screen shows now, the owner's view as they pressed this
-    /// pass's keys. The pass before reached the screen: its painting, none if it painted nothing
-    /// (a new modal's unseen first layout); it did not: what was shown before stays.
+    /// pass's keys — the painting of the last frame of this context that reached the screen (the
+    /// one before, or the one before those that did not), if this screen painted in that frame;
+    /// none if it did not: a new modal's unseen first layout, a frame the screen was not drawn in
+    /// at all (a viewer over a dialog), another context's frame, which showed something else
+    /// (X4-quick round 1). A second pass of a frame (egui's discarded one first) gets the
+    /// frame's answer.
     pub fn start(&mut self, ctx: &egui::Context) -> Option<&T> {
-        let last = self.last.take();
-        if presented(ctx) {
-            self.shown = last;
+        let now = frame_of(ctx);
+        if self.asked != Some(now) {
+            self.asked = Some(now);
+            let printed = last_printed(ctx).map(|frame| (now.0, frame));
+            let at = |p: &Option<(Frame, T)>| p.as_ref().map(|(frame, _)| *frame);
+            let last = self.last.take();
+            self.shown = match printed {
+                Some(_) if at(&last) == printed => last,
+                Some(_) if at(&self.shown) == printed => self.shown.take(),
+                _ => None,
+            };
         }
-        self.shown.as_ref()
+        self.shown.as_ref().map(|(_, p)| p)
     }
 
-    /// What this pass painted.
+    /// What this pass painted, after its [`OnScreen::start`]: a frame's last pass's is the frame's.
     pub fn painted(&mut self, painting: T) {
-        self.last = Some(painting);
+        if let Some(at) = self.asked {
+            self.last = Some((at, painting));
+        }
     }
 }
 

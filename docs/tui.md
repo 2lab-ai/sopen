@@ -38,12 +38,16 @@ changes: a folder still opens in a window.
   directory tree (F10: its rows, sizes, bar and scroll bar; clicks and the wheel act on it),
   the git panel's graph (its rows, lanes, labels, bar, scroll bar and paging line; clicks, the
   right click and the wheel act on it), its details pane and its banner (a click on a step's
-  button is the step's key) and its history planner (its rows, bar, scroll bar, note, buttons
-  and keys' hint; clicks and the wheel act on it) are drawn in the terminal as in the window.
-  What the terminal does not draw yet — the preview of a picture, a video or a sound, the other
-  viewers, the git panel's Find field, command log and Backups list, and the dialogs of the
-  viewers and of the git panel (the planner's own among them) — is a box saying `F12 shows it
-  in the window` (inside the git panel's frame for its parts); a click on it is F12. F1's key
+  button is the step's key), its history planner (its rows, bar, scroll bar, note, buttons
+  and keys' hint; clicks and the wheel act on it), an action's dialog (its options, plan and
+  buttons — every one without options, the uncommitted row's, the repository's and its remotes'
+  and a restore's) and a commit's quick edit's dialog (Reword's and Squash's message, Author and
+  date's fields, Drop's and the rest of the history row's: its plan and buttons) are drawn in the
+  terminal as in the window. What the terminal does not draw yet — the preview of a picture, a
+  video or a sound, the other viewers, the git panel's Find field, command log and Backups list,
+  and the dialogs of the viewers and the git panel's other dialogs (its menu, the other actions'
+  forms, a result, the planner's own) — is a box saying `F12 shows it in the window` (inside the
+  git panel's frame for its parts); a click on it is F12. F1's key
   help is drawn in the terminal as in the window.
 - **Keys**: where the terminal offers the kitty keyboard protocol sopen turns it on and every key
   arrives as in the window. Elsewhere Ctrl+digits and some Ctrl+Shift chords cannot arrive, so

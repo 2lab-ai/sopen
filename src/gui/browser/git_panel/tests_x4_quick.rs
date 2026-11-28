@@ -155,6 +155,41 @@ fn versioned(edit: &Edit, repo: &Repo) -> Result<Plan, Refused> {
     Ok(p)
 }
 
+/// [`fake`]'s plan whose title says the git it was planned on, and nothing else does.
+fn titled(edit: &Edit, repo: &Repo) -> Result<Plan, Refused> {
+    let mut p = fake(edit, repo)?;
+    if let Some(c) = &mut p.confirm {
+        c.title = format!("Fake {} on git {}", what(edit), repo.version.text);
+    }
+    Ok(p)
+}
+
+/// [`fake`]'s plan whose line of what is lost says the git it was planned on, and nothing else
+/// does.
+fn lost_on(edit: &Edit, repo: &Repo) -> Result<Plan, Refused> {
+    let mut p = fake(edit, repo)?;
+    if let Some(c) = &mut p.confirm {
+        c.loses = Some(format!(
+            "{} loses this on git {}",
+            what(edit),
+            repo.version.text
+        ));
+    }
+    Ok(p)
+}
+
+/// A plan that holds no message, as the real one's command lines do not (it goes on stdin).
+fn plain(edit: &Edit, _: &Repo) -> Result<Plan, Refused> {
+    Ok(plan(Confirmation {
+        title: format!("Plain {}", what(edit)),
+        loses: None,
+        changes: Vec::new(),
+        backups: vec!["heads/main".into()],
+        commands: vec![format!("git {}", what(edit))],
+        notes: Vec::new(),
+    }))
+}
+
 /// A planner that refuses everything (03 §8.6).
 fn refuse(edit: &Edit, _: &Repo) -> Result<Plan, Refused> {
     EDITS.with(|e| e.borrow_mut().push(edit.clone()));
@@ -202,6 +237,9 @@ struct Host {
     ends: Vec<QuickEnd>,
     /// What the dialog said it covers, last pass.
     covers: Vec<Cells>,
+    /// Passes left in which the dialog is not drawn (a viewer over it, `browser.rs`' Enter
+    /// viewer): the screen shows something else.
+    skip: usize,
 }
 
 impl Window for Host {
@@ -217,11 +255,19 @@ impl Window for Host {
         for y in 0..grid.rows {
             cells::put(&mut under, 0, y, &words, usize::from(grid.cols), body);
         }
-        self.covers = (self.dialog.as_ref()).map_or(Vec::new(), |d| d.covers(&grid));
+        let hidden = self.skip > 0;
+        self.skip = self.skip.saturating_sub(1);
+        self.covers = match (&self.dialog, hidden) {
+            (Some(d), false) => d.covers(&grid),
+            _ => Vec::new(),
+        };
         for c in &self.covers {
             cells::fill(&mut under, *c, body);
         }
         cells::paint(ui.painter(), grid.origin, &under, None);
+        if hidden {
+            return;
+        }
         if let Some(d) = &mut self.dialog {
             if let Some(end) = d.ui(&ctx, grid, self.planner) {
                 self.dialog = None;
@@ -257,6 +303,7 @@ impl Fx {
                 planner,
                 ends: Vec::new(),
                 covers: Vec::new(),
+                skip: 0,
             },
         }
     }
@@ -623,16 +670,20 @@ fn x4q_the_dialog_covers_its_box_and_shadow() {
         Some('╔'),
         "the box's corner"
     );
-    let under = cells::layers(&fx.drv.ctx)[0].clone();
-    let seen = under.seen();
-    for strip in &fx.host.covers[1..] {
-        for y in strip.top()..strip.bottom() {
-            for x in strip.left()..strip.right() {
-                let cell = &seen[usize::from(y)][usize::from(x)].symbol;
-                assert_eq!(cell, " ", "the screen blank under the shadow at {x},{y}");
-            }
-        }
-    }
+    let last = cells::row_text(&l.buf, frame.bottom() - 1).0;
+    assert_eq!(
+        last.trim_end().chars().last(),
+        Some('╝'),
+        "its last corner: {last:?}"
+    );
+    let [right, under] = crate::gui::browser::ops::dialog::shadow_of(frame);
+    assert_eq!(
+        fx.host.covers[1..],
+        [right, under],
+        "the shadow's two strips"
+    );
+    let stood = frame.union(right).union(under);
+    assert_eq!(l.buf.area, stood, "the dialog's layer is what it covers");
 }
 
 /// A box the grid holds less of than all (Author's fields never give way) says so first, in the
@@ -670,6 +721,21 @@ fn x4q_typing_and_enter_in_one_pass_show_the_plan_before_it_runs() {
     assert!(all.contains(super::dialogs::CHANGED), "{all}");
     fx.press(Key::Enter);
     assert_eq!(fx.host.ends, [reword("가\n나third\n\nbody of third\n")]);
+
+    // A plan that does not show the message (the real one's: it goes on stdin): the typed letter
+    // is still not what the screen showed, so that Enter runs nothing either.
+    let d = dialog(QuickDialog::open(
+        EditId::Reword,
+        &third(),
+        None,
+        &repo(),
+        plain,
+    ));
+    let mut fx = Fx::new(d, plain, 100, 30);
+    fx.frame(vec![Event::Text("x".into()), down(Key::Enter)]);
+    assert!(fx.host.ends.is_empty(), "{:?}", fx.host.ends);
+    fx.press(Key::Enter);
+    assert_eq!(fx.host.ends, [reword("xthird\n\nbody of third\n")]);
 }
 
 /// Only what the screen showed runs, each in raw passes with none between: a refresh with another
@@ -945,6 +1011,208 @@ fn x4q_a_dialog_s_fields_open_afresh() {
     assert_eq!(message, "xthird\n\nbody of third\n", "in the next pass");
 }
 
+/// A pass that did not draw the dialog (a viewer over it) showed something else: the first Enter
+/// after such passes runs nothing, though nothing in the dialog changed, and the next one runs
+/// what shows then (X4-quick round 1).
+#[test]
+fn x4q_a_pass_that_did_not_draw_the_dialog_was_never_seen() {
+    let mut fx = Fx::new(open(EditId::Drop, fake), fake, 100, 30);
+    fx.host.skip = 3;
+    fx.idle(3);
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(
+        fx.host.ends.is_empty(),
+        "under the viewer: {:?}",
+        fx.host.ends
+    );
+    fx.raw(vec![down(Key::Enter)]);
+    assert_eq!(fx.host.ends.len(), 1, "what shows now runs");
+
+    // The viewer's last pass (Esc closing it) not printed, Enter in the next: the screen still
+    // shows the viewer.
+    let mut fx = Fx::new(open(EditId::Drop, fake), fake, 100, 30);
+    fx.idle(1);
+    fx.host.skip = 3;
+    fx.idle(3);
+    cells::set_presented(&fx.drv.ctx, false);
+    fx.raw(vec![down(Key::Enter)]);
+    assert!(
+        fx.host.ends.is_empty(),
+        "the viewer showed: {:?}",
+        fx.host.ends
+    );
+    cells::set_presented(&fx.drv.ctx, true);
+    fx.raw(vec![down(Key::Enter)]);
+    assert_eq!(fx.host.ends.len(), 1, "once the dialog was printed");
+}
+
+/// A refresh that changes only the title, or only the line of what is lost, is another plan
+/// shown: Enter in its pass runs nothing; the next runs it.
+#[test]
+fn x4q_a_refresh_of_only_the_title_or_the_lost_line_runs_nothing() {
+    for (planner, says) in [
+        (titled as EditPlanner, "Fake drop on git 2.46.0"),
+        (lost_on, "drop loses this on git 2.46.0"),
+    ] {
+        let mut fx = Fx::new(open(EditId::Drop, planner), planner, 100, 30);
+        fx.dialog_mut().set_repo(refreshed());
+        fx.raw(vec![down(Key::Enter)]);
+        assert!(fx.host.ends.is_empty(), "{says}: {:?}", fx.host.ends);
+        assert!(boxed(&fx.drv, says).is_some(), "{says} shows");
+        fx.raw(vec![down(Key::Enter)]);
+        assert_eq!(fx.host.ends.len(), 1, "{says}");
+    }
+}
+
+/// A pass copies no message: Reword of a 1 MiB message, ten idle passes, copies none of it (what
+/// the screen showed is a revision, not a copy); a typed letter copies it once, into the edit.
+#[test]
+fn x4q_idle_passes_copy_no_message() {
+    let mut big = third();
+    big.message = "0123456789abcde\n".repeat(1 << 16);
+    let len = big.message.len();
+    assert_eq!(len, 1 << 20);
+    let d = dialog(QuickDialog::open(
+        EditId::Reword,
+        &big,
+        Some(&second()),
+        &repo(),
+        plain,
+    ));
+    let mut fx = Fx::new(d, plain, 100, 30);
+    planner::copied();
+    fx.idle(10);
+    assert_eq!(planner::copied(), 0, "ten idle passes");
+    fx.frame(vec![Event::Text("x".into())]);
+    assert_eq!(planner::copied(), len + 1, "one copy into the edit");
+}
+
+/// A dialog's fields open afresh in all of their state, not only the caret: a selection made in
+/// the last dialog under the same ids is gone (Cmd/Ctrl+A, Esc, the next dialog in the very next
+/// pass, `x` typed: the prefill and the `x`), and so is its undo (Cmd/Ctrl+Z in the next dialog
+/// keeps its prefill).
+#[test]
+fn x4q_a_dialog_s_fields_open_afresh_whole() {
+    let all = testkit::command(false);
+    let other = || {
+        dialog(QuickDialog::open(
+            EditId::Reword,
+            &second(),
+            None,
+            &repo(),
+            fake,
+        ))
+    };
+    let message = |fx: &Fx| match fx.draft() {
+        Edit::Quick(Quick::Reword { message, .. }) => message,
+        other => panic!("{other:?}"),
+    };
+    let mut fx = Fx::new(open(EditId::Reword, fake), fake, 100, 30);
+    fx.drv.key(&mut fx.host, Key::A, all);
+    fx.raw(vec![down(Key::Escape)]);
+    fx.host.dialog = Some(other());
+    fx.raw(vec![Event::Text("x".into())]);
+    fx.idle(1);
+    assert_eq!(message(&fx), "xsecond\n\nbody of second\n", "no selection");
+
+    let mut fx = Fx::new(open(EditId::Reword, fake), fake, 100, 30);
+    fx.frame(vec![Event::Text("abc".into())]);
+    fx.raw(vec![down(Key::Escape)]);
+    fx.host.dialog = Some(other());
+    fx.raw(vec![key(Key::Z, true, all)]);
+    fx.idle(1);
+    assert_eq!(
+        message(&fx),
+        "second\n\nbody of second\n",
+        "nothing to undo"
+    );
+
+    let mut fx = Fx::new(open(EditId::Author, fake), fake, 100, 30);
+    fx.frame(vec![Event::Text("x".into())]);
+    fx.press(Key::Escape);
+    let grace = commit_by('c', Some('b'), "third", "Grace Hopper");
+    fx.reopen(dialog(QuickDialog::open(
+        EditId::Author,
+        &grace,
+        None,
+        &repo(),
+        fake,
+    )));
+    fx.drv.key(&mut fx.host, Key::Z, all);
+    let Edit::Quick(Quick::Author { author, .. }) = fx.draft() else {
+        panic!("{:?}", fx.draft());
+    };
+    assert_eq!(author.name, "Grace Hopper", "a one-line field's undo too");
+}
+
+/// Hangul composed through an input method (egui's preedit, then its commit): the message holds
+/// exactly what was committed, and the Enter that commits the composition — in the commit's pass,
+/// or while it is composing — runs nothing; the next Enter runs it.
+#[test]
+fn x4q_an_enter_that_commits_a_composition_runs_nothing() {
+    let preedit = |text: &str| {
+        Event::Ime(egui::ImeEvent::Preedit {
+            text: text.into(),
+            active_range_chars: None,
+        })
+    };
+    let commit = |text: &str| Event::Ime(egui::ImeEvent::Commit(text.into()));
+    let message = |fx: &Fx| match fx.draft() {
+        Edit::Quick(Quick::Reword { message, .. }) => message,
+        other => panic!("{other:?}"),
+    };
+    let mut fx = Fx::new(open(EditId::Reword, fake), fake, 100, 30);
+    for text in ["ㅎ", "하", "한"] {
+        fx.frame(vec![preedit(text)]);
+    }
+    fx.press(Key::Enter);
+    assert!(
+        fx.host.ends.is_empty(),
+        "while composing: {:?}",
+        fx.host.ends
+    );
+    fx.frame(vec![commit("한"), down(Key::Enter)]);
+    assert!(
+        fx.host.ends.is_empty(),
+        "the committing Enter: {:?}",
+        fx.host.ends
+    );
+    let done = "한third\n\nbody of third\n";
+    assert_eq!(message(&fx), done, "exactly what was committed");
+    fx.press(Key::Enter);
+    assert_eq!(fx.host.ends, [reword(done)]);
+
+    // A composition the keyboard left without its commit is over: Enter on Run runs what shows.
+    let mut fx = Fx::new(open(EditId::Reword, fake), fake, 100, 30);
+    fx.frame(vec![preedit("가")]);
+    fx.focus(planner::quick_run_id());
+    fx.press(Key::Enter);
+    assert_eq!(fx.host.ends, [reword("가third\n\nbody of third\n")]);
+
+    // An empty preedit or commit with no composition (Wayland's, as the IME is allowed or its
+    // cursor area set) is no composition: egui ignores it, and Enter runs.
+    for empty in [preedit(""), commit("")] {
+        let mut fx = Fx::new(open(EditId::Reword, fake), fake, 100, 30);
+        fx.frame(vec![empty.clone(), down(Key::Enter)]);
+        assert_eq!(
+            fx.host.ends,
+            [reword("third\n\nbody of third\n")],
+            "{empty:?}"
+        );
+    }
+
+    // Composed and committed in one pass with its Enter: nothing runs, nothing is doubled.
+    let mut fx = Fx::new(open(EditId::Reword, fake), fake, 100, 30);
+    fx.frame(vec![
+        preedit("ㄱ"),
+        preedit("가"),
+        commit("가"),
+        down(Key::Enter),
+    ]);
+    assert!(fx.host.ends.is_empty(), "{:?}", fx.host.ends);
+    assert_eq!(message(&fx), "가third\n\nbody of third\n");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Through the terminal.
 
@@ -1044,6 +1312,7 @@ fn in_a_terminal(
             planner,
             ends: Vec::new(),
             covers: Vec::new(),
+            skip: 0,
         },
         ends,
     };

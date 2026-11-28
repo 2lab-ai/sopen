@@ -27,7 +27,8 @@
 //!   message's caret at its start, a one-line field's at its end. Its keys are an action's
 //!   dialog's: each Enter of a pass goes to what has the keyboard at that point, one egui cannot
 //!   follow is dropped, the buttons take the kit's presses, and only what the screen showed runs
-//!   (`cells::OnScreen`), else `dialogs::CHANGED` says so.
+//!   (`cells::OnScreen`, of a revision of what the box shows, never a copy of the draft), else
+//!   `dialogs::CHANGED` says so; an Enter that commits an input method's composition runs nothing.
 //! - **The planner** ([`PlannerView`], [`draw`]) lists the range newest first — verb, hash,
 //!   subject, author, date, and `A` where the author or a date changed — with a bar of its own,
 //!   in cells over the panel's body (10 §17, X4-planner): the columns two blanks apart, cut by
@@ -484,8 +485,18 @@ pub struct QuickDialog {
     /// Its own refusal no option lifts: a message that is not UTF-8, no commit below.
     refused: Option<String>,
     repo: Repo,
-    /// The draft last planned and its plan.
-    planned: Option<(Edit, Result<Plan, Refused>)>,
+    /// The draft's revision: one more each time its fields change it.
+    drafted: u64,
+    /// The draft's revision last planned and its plan.
+    planned: Option<(u64, Result<Plan, Refused>)>,
+    /// What the box shows besides its fields, as the draft, its plan and its refusal made it
+    /// last ([`QuickDialog::update`]).
+    shows: Shows,
+    /// What the box shows, as a number: one more each time the draft changes or `shows` does, so
+    /// a pass's painting is this, never a copy of the draft (X4-quick round 1: a 1 MiB message).
+    revision: u64,
+    /// The message or a field is in an input method's composition, as the last pass left it.
+    composing: bool,
     /// Its first field took the keyboard last pass (on its first, not yet).
     typing: bool,
     /// The first of the plan's rows shown.
@@ -501,16 +512,54 @@ pub struct QuickDialog {
     laid_once: bool,
 }
 
-/// What a pass of a quick edit's dialog painted: the draft, its title, its line of what is lost,
-/// its plan's rows and whether its Run was on. A Run or an Enter runs only what the screen shows
-/// ([`cells::OnScreen`]), equal to what would run at its pass's end.
-#[derive(Debug, Clone, PartialEq)]
+/// What a pass of a quick edit's dialog painted: the revision of what it shows — the draft, its
+/// title, its line of what is lost, its plan's rows — and whether its Run was on. A Run or an
+/// Enter runs only what the screen shows ([`cells::OnScreen`]), equal to what would run at its
+/// pass's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Painting {
-    draft: Edit,
+    revision: u64,
+    runs: bool,
+}
+
+/// What a quick edit's dialog shows besides its fields: its own refusal (the plan's rows say it),
+/// its title, its line of what is lost and its plan's rows ([`plan_rows`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Shows {
+    own: Option<String>,
     title: String,
     lost: Option<String>,
     plan: Vec<PlanRow>,
-    runs: bool,
+}
+
+/// The bytes of a message a quick edit's dialog copied: counted in a test build ([`copied`]),
+/// whose bound is a pass that copies none (X4-quick round 1: a 1 MiB message).
+#[cfg(not(test))]
+#[inline(always)]
+fn copying(_: usize) {}
+
+#[cfg(test)]
+fn copying(bytes: usize) {
+    COPIED.with(|c| c.set(c.get() + bytes));
+}
+
+#[cfg(test)]
+thread_local! {
+    static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The bytes of messages the quick edits' dialogs copied on this thread since the last call.
+#[cfg(test)]
+pub(super) fn copied() -> usize {
+    COPIED.with(|c| c.replace(0))
+}
+
+/// `edit`, copied: its message's bytes counted ([`copying`]).
+fn copy_of(edit: &Edit) -> Edit {
+    if let Edit::Quick(Quick::Reword { message, .. } | Quick::Squash { message, .. }) = edit {
+        copying(message.len());
+    }
+    edit.clone()
 }
 
 /// A quick edit's dialog's nominal width in cells, as egui's was (10 §6's rule widens it to its
@@ -640,7 +689,11 @@ impl QuickDialog {
             author,
             refused,
             repo: repo.clone(),
+            drafted: 0,
             planned: None,
+            shows: Shows::default(),
+            revision: 0,
+            composing: false,
             typing: false,
             plan_top: 0,
             changed: false,
@@ -650,13 +703,10 @@ impl QuickDialog {
     }
 
     fn start(mut self, planner: EditPlanner) -> QuickOpened {
-        if self.own_refusal().is_none() {
-            let planned = planner(&self.draft, &self.repo);
-            let options = self.message.is_some() || self.author.is_some();
-            if !options && matches!(planned, Ok(Plan { confirm: None, .. })) {
-                return QuickOpened::Run(self.draft);
-            }
-            self.planned = Some((self.draft.clone(), planned));
+        self.update(planner);
+        let options = self.message.is_some() || self.author.is_some();
+        if !options && matches!(&self.planned, Some((_, Ok(Plan { confirm: None, .. })))) {
+            return QuickOpened::Run(self.draft);
         }
         QuickOpened::Dialog(Box::new(self))
     }
@@ -687,62 +737,80 @@ impl QuickDialog {
         })
     }
 
-    /// The draft from the fields (a date that does not read leaves it as it was).
-    fn sync(&mut self) {
-        match &mut self.draft {
+    /// The draft from the fields (a date that does not read leaves it as it was); whether it
+    /// changed, its revision one more. A message is compared, and copied only when it changed.
+    fn sync(&mut self) -> bool {
+        let changed = match &mut self.draft {
             Edit::Quick(Quick::Reword { message, .. } | Quick::Squash { message, .. }) => {
-                if let Some(m) = &self.message {
-                    if m != message {
-                        *message = m.clone();
+                match &self.message {
+                    Some(m) if m != message => {
+                        copying(m.len());
+                        message.clone_from(m);
+                        true
                     }
+                    _ => false,
                 }
             }
             Edit::Quick(Quick::Author { author, .. }) => {
-                if let Some(Ok(a)) = self.author.as_ref().map(AuthorForm::author) {
-                    *author = a;
+                match self.author.as_ref().map(AuthorForm::author) {
+                    Some(Ok(a)) if a != *author => {
+                        *author = a;
+                        true
+                    }
+                    _ => false,
                 }
             }
-            _ => {}
-        }
+            _ => false,
+        };
+        self.drafted += u64::from(changed);
+        changed
     }
 
     /// The draft planned again when it changed since the last plan; whether it was. Never while
     /// the dialog refuses it.
-    fn replan(&mut self, planner: EditPlanner) -> bool {
-        self.sync();
-        if self.own_refusal().is_some() {
+    fn replan(&mut self, planner: EditPlanner, own: bool) -> bool {
+        let stale = self
+            .planned
+            .as_ref()
+            .is_none_or(|(at, _)| *at != self.drafted);
+        if own || !stale {
             return false;
         }
-        let stale = self.planned.as_ref().is_none_or(|(e, _)| *e != self.draft);
-        if stale {
-            let plan = planner(&self.draft, &self.repo);
-            self.planned = Some((self.draft.clone(), plan));
+        let plan = planner(&self.draft, &self.repo);
+        self.planned = Some((self.drafted, plan));
+        true
+    }
+
+    /// The draft from its fields, planned again when it changed, and what the box shows made
+    /// again when either did or the dialog's own refusal changed: its revision one more when the
+    /// draft or what it shows changed — a changed draft always — and whether it did.
+    fn update(&mut self, planner: EditPlanner) -> bool {
+        let drafted = self.sync();
+        let own = self.own_refusal();
+        let planned = self.replan(planner, own.is_some());
+        if !drafted && !planned && own == self.shows.own {
+            return false;
         }
-        stale
+        let shown = match own {
+            Some(_) => None,
+            None => self.planned(),
+        };
+        let shows = Shows {
+            title: plan_title(shown).unwrap_or_else(|| self.label.trim_end_matches('…').into()),
+            lost: loses(shown),
+            plan: plan_rows(own.clone(), shown),
+            own,
+        };
+        let changed = drafted || shows != self.shows;
+        self.shows = shows;
+        self.revision += u64::from(changed);
+        changed
     }
 
     /// The plan shown is the draft's, it is not refused, and the dialog refuses nothing.
     fn ready(&self) -> bool {
-        self.own_refusal().is_none()
-            && matches!(&self.planned, Some((e, Ok(_))) if *e == self.draft)
-    }
-
-    /// The plan to show: none while the dialog refuses.
-    fn shown(&self) -> Option<&Result<Plan, Refused>> {
-        match self.own_refusal() {
-            Some(_) => None,
-            None => self.planned(),
-        }
-    }
-
-    /// The title: the plan's, else the edit's name.
-    fn title(&self) -> String {
-        plan_title(self.shown()).unwrap_or_else(|| self.label.trim_end_matches('…').to_string())
-    }
-
-    /// The plan's rows ([`plan_rows`]): the dialog's own refusal, else the plan's or its refusal.
-    fn plan_lines(&self) -> Vec<PlanRow> {
-        plan_rows(self.own_refusal(), self.shown())
+        self.shows.own.is_none()
+            && matches!(&self.planned, Some((at, Ok(_))) if *at == self.drafted)
     }
 
     /// The ids of its text fields, in order: the message, or author's name, email and date.
@@ -770,19 +838,19 @@ impl QuickDialog {
     /// and the hint; as wide as its widest text by 10 §6's rule. Not `fits`: [`TOO_SHORT`] before
     /// all of it, Run off.
     fn laid(&self, grid: Grid, fits: bool) -> kit::Layout {
-        let title = self.title();
-        let lost = loses(self.shown());
-        let plan = self.plan_lines();
-        let wanted = (plan_wants(&plan))
+        let Shows {
+            title, lost, plan, ..
+        } = &self.shows;
+        let wanted = (plan_wants(plan))
             .max(lost.as_deref().map_or(0, cells::width))
-            .max(cells::width(&title) + 2);
+            .max(cells::width(title) + 2);
         let width = kit::inside_width(grid.cols, QUICK_WIDTH, wanted);
         let mut parts = Vec::new();
         if !fits {
             parts.push(Part::Text(TOO_SHORT.to_string(), Ink::Error));
         }
         if let Some(lost) = lost {
-            parts.extend([Part::Text(lost, Ink::Text), Part::Blank]);
+            parts.extend([Part::Text(lost.clone(), Ink::Text), Part::Blank]);
         }
         let field = |label: &str, n| Part::Field {
             label: label.to_string(),
@@ -805,7 +873,7 @@ impl QuickDialog {
             });
             parts.push(Part::Blank);
         }
-        if let Some(part) = plan_part(plan, grid, width, self.plan_top) {
+        if let Some(part) = plan_part(plan.clone(), grid, width, self.plan_top) {
             parts.extend([part, Part::Blank]);
         }
         let mut run = Button::new("Run", quick_run_id());
@@ -819,16 +887,13 @@ impl QuickDialog {
             true => Part::Text(CHANGED.to_string(), Ink::Text),
             false => Part::Text(RUN_HINT.to_string(), Ink::Weak),
         });
-        kit::layout(grid, &title, QUICK_WIDTH, &parts)
+        kit::layout(grid, title, QUICK_WIDTH, &parts)
     }
 
     /// What a pass paints as the dialog stands now, the box `fits` its grid or not.
     fn painted(&self, fits: bool) -> Painting {
         Painting {
-            draft: self.draft.clone(),
-            title: self.title(),
-            lost: loses(self.shown()),
-            plan: self.plan_lines(),
+            revision: self.revision,
             runs: fits && self.ready(),
         }
     }
@@ -867,7 +932,7 @@ impl QuickDialog {
         grid: Grid,
         planner: EditPlanner,
     ) -> Option<QuickEnd> {
-        if self.replan(planner) {
+        if self.update(planner) {
             ctx.request_repaint();
         }
         let escape = ctx.input_mut(|i| keys::take(i, Key::Escape, Mods::None));
@@ -876,10 +941,22 @@ impl QuickDialog {
         // egui moves the keyboard by an arrow unless a field has it (its caret's).
         let in_field = fields.iter().any(|id| began == Some(*id));
         let enters = take_enters(ctx, began.is_some() && !in_field, in_field);
+        // An Enter that commits an input method's composition — in a pass of its composition, or
+        // while it composes — is the composition's (an integration that passes it on sends it
+        // with the commit), never the dialog's: it runs nothing. A composition is a field's: one
+        // left without its commit (egui-winit drops winit's `Disabled`) ends with the keyboard
+        // leaving the field.
+        let composing = self.composing && in_field;
+        let composed = ctx.input(|i| composition(&i.events, composing));
+        let enters = match composing || composed.is_some() {
+            true => Vec::new(),
+            false => enters,
+        };
+        self.composing = composed.unwrap_or(composing);
         let (layout, fits) = self.layout(grid);
         // What the owner saw — the painting of the last pass that reached the screen (the
         // terminal prints none while input waits) — and what this pass paints.
-        let seen = self.screen.start(ctx).cloned();
+        let seen = self.screen.start(ctx).copied();
         if std::mem::replace(&mut self.laid_once, true) {
             let painting = self.painted(fits);
             self.screen.painted(painting);
@@ -920,7 +997,7 @@ impl QuickDialog {
             f.committer = COMMITTER[k].0;
         }
         // The options as this pass left them, planned: the next pass shows it.
-        if self.replan(planner) {
+        if self.update(planner) {
             ctx.request_repaint();
         }
         let mut cancelled = escape || pass.clicked(cancel) || pass.modal.should_close();
@@ -942,13 +1019,33 @@ impl QuickDialog {
         // now and the next Run or Enter runs it.
         let (_, fits_now) = self.layout(grid);
         let end = self.painted(fits_now);
-        if seen.as_ref() != Some(&end) {
+        if seen != Some(end) {
             self.changed |= seen.is_some();
             ctx.request_repaint();
             return None;
         }
-        end.runs.then(|| QuickEnd::Run(self.draft.clone()))
+        end.runs.then(|| QuickEnd::Run(copy_of(&self.draft)))
     }
+}
+
+/// Whether `events` leave an input method composing (its last preedit not empty), or `None`
+/// when they hold no composition at all (egui's `ImeEvent`: a preedit, then its commit), from
+/// `composing`. An empty preedit or commit with nothing composing is none, as egui ignores it
+/// (Wayland sends them as the IME is allowed or its cursor area set).
+fn composition(events: &[Event], composing: bool) -> Option<bool> {
+    let (mut now, mut seen) = (composing, false);
+    for e in events {
+        let text = match e {
+            Event::Ime(egui::ImeEvent::Preedit { text, .. } | egui::ImeEvent::Commit(text)) => text,
+            _ => continue,
+        };
+        if text.is_empty() && !now {
+            continue;
+        }
+        now = matches!(e, Event::Ime(egui::ImeEvent::Preedit { .. })) && !text.is_empty();
+        seen = true;
+    }
+    seen.then_some(now)
 }
 
 /// The pass's presses of Enter with no modifiers, taken out of its input in order, each saying
