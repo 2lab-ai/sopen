@@ -7,7 +7,7 @@ use crate::gui::cells::{Layer, Position, Seen};
 use crate::gui::chrome::{cga, git::LOOK, PALETTE};
 use crate::gui::testkit::Driver;
 use crate::gui::Window;
-use eframe::egui::{Event, ImeEvent, Modifiers, PointerButton, Pos2, Rect};
+use eframe::egui::{Event, ImeEvent, Modifiers, PointerButton, Pos2, Rect, Vec2};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------------------------
@@ -350,8 +350,79 @@ fn the_aa_toggle_is_its_mark_and_the_pointers() {
     assert_eq!(case(fx.view()), Some(true));
 }
 
-/// A click inside Find's field puts its caret there (the row's own rect under it takes no click
-/// from it), and what is typed next lands there.
+/// F-click-slop: with no rect of the row's under Find's field and toggle, a click on a blank of
+/// the row changes nothing — on `Find`, on the blank after it and a point into it from the
+/// field, on the blank before the toggle and a point into it from each side — what is typed,
+/// the case, the bar, the field's keyboard and its caret, put mid-text before each click so that
+/// a click reaching the field at either end would move it, stay; nothing is asked for; in a host
+/// alone and over the browser's background.
+#[test]
+fn a_click_on_a_blank_of_finds_row_changes_nothing() {
+    use super::tests_x4_lists::{click_once, Behind};
+    for behind in [false, true] {
+        let mut fx = Fx::new(1000.0, 500.0, fixture_view());
+        fx.typed("x: one");
+        let g = grid_of(&fx);
+        // The caret between `x: ` and `one`: the left half of `o`'s cell.
+        let mid = g.rect(Cells::new(9, HEAD, 1, 1)).left_center() + Vec2::new(2.0, 0.0);
+        let toggle = g.cols - 1 - 6;
+        let field = 1 + 5;
+        let cell_rect = |x: u16| g.rect(Cells::new(x, HEAD, 1, 1));
+        let points = [
+            ("Find", cell_rect(2).center()),
+            ("the blank after Find", cell_rect(field - 1).center()),
+            (
+                "a point before the field",
+                cell_rect(field).left_center() - Vec2::new(1.0, 0.0),
+            ),
+            (
+                "the blank before the toggle",
+                cell_rect(toggle - 1).center(),
+            ),
+            (
+                "a point after the field",
+                cell_rect(toggle - 1).left_center() + Vec2::new(1.0, 0.0),
+            ),
+            (
+                "a point before the toggle",
+                cell_rect(toggle).left_center() - Vec2::new(1.0, 0.0),
+            ),
+        ];
+        let state = |fx: &Fx| {
+            let v = fx.view();
+            let focus = fx.drv.ctx.memory(|m| m.focused());
+            let text = v.find_text().map(str::to_string);
+            (text, case(v), v.bar_place().0, focus, panel(fx).caret)
+        };
+        let mut wrong = vec![];
+        for (what, at) in points {
+            for one_pass in [true, false] {
+                match behind {
+                    true => click_once(&mut fx.drv, &mut Behind(&mut fx.host), mid, true),
+                    false => click_once(&mut fx.drv, &mut fx.host, mid, true),
+                }
+                let before = state(&fx);
+                assert!(before.3.is_some(), "the field has the keyboard");
+                assert_eq!(before.4, Some(Position::new(9, HEAD)), "mid-text");
+                match behind {
+                    true => click_once(&mut fx.drv, &mut Behind(&mut fx.host), at, one_pass),
+                    false => click_once(&mut fx.drv, &mut fx.host, at, one_pass),
+                }
+                let asked = fx.take();
+                let after = state(&fx);
+                if after != before || !asked.is_empty() {
+                    let how = if one_pass { "one pass" } else { "three passes" };
+                    wrong.push(format!(
+                        "{what} ({how}, behind {behind}): {before:?} → {after:?}, {asked:?}"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+}
+
+/// A click inside Find's field puts its caret there, and what is typed next lands there.
 #[test]
 fn a_click_in_finds_field_puts_its_caret_there() {
     let mut fx = Fx::new(1000.0, 500.0, fixture_view());

@@ -68,6 +68,10 @@ fn installed_visuals_are_the_palette() {
     let light = drv.ctx.style_of(egui::Theme::Light);
     assert_eq!(light.visuals, style.visuals);
     assert_eq!(light.text_styles, style.text_styles);
+    // egui's hit test reaches no point past a widget's rect, in either theme (F-click-slop): it
+    // reads the context's style (`context.rs:527`), never a `Ui`'s.
+    assert_eq!(style.interaction.interact_radius, 0.0);
+    assert_eq!(light.interaction.interact_radius, 0.0);
 }
 
 /// The font is the VGA font on its 8×16 grid: every glyph a cell wide, a row a cell tall.
@@ -334,6 +338,181 @@ fn a_click_on_a_slot_presses_its_key() {
     want[5] = 1;
     want[8] = 1;
     assert_eq!(win.presses, want, "nothing else was pressed");
+}
+
+/// F-click-slop: an empty slot is nothing up to its last point — a click two points into slot
+/// 9's digit, right after `8Asc/hx`, or two points before `5Save`, in slot 4's empty label,
+/// presses no key; a click on the first and last point of a slot with a label is its key.
+#[test]
+fn an_empty_slot_beside_a_key_presses_nothing() {
+    let mut drv = Driver::new(800.0, 300.0);
+    let mut win = Row {
+        keys: HEX_KEYS,
+        presses: [0; 11],
+    };
+    drv.idle(&mut win, 2);
+    let y = 300.0 - CELL.y / 2.0;
+    let (nine, _) = key_slot(0.0, 800.0, 9);
+    let (five, _) = key_slot(0.0, 800.0, 5);
+    let (_, eight) = key_slot(0.0, 800.0, 8);
+    for x in [nine.left() + 2.0, five.left() - 2.0] {
+        let events = click_events(Pos2::new(x, y));
+        drv.frame(&mut win, events, egui::Modifiers::NONE);
+        drv.idle(&mut win, 2);
+        assert_eq!(win.presses, [0; 11], "a click at x {x}");
+    }
+    // The control: a slot with a label takes a click at its first point and its last.
+    drv.click(&mut win, Pos2::new(five.left() + 0.5, y));
+    drv.click(&mut win, Pos2::new(eight.right() - 0.5, y));
+    drv.idle(&mut win, 2);
+    let mut want = [0; 11];
+    want[5] = 1;
+    want[8] = 1;
+    assert_eq!(win.presses, want);
+}
+
+/// A press and a release of the primary button at `p`, with the move there, as one pass's
+/// events.
+fn click_events(p: Pos2) -> Vec<egui::Event> {
+    let button = |pressed| egui::Event::PointerButton {
+        pos: p,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    vec![egui::Event::PointerMoved(p), button(true), button(false)]
+}
+
+/// A stand-in screen's controls, at their cells, nothing under any of them: two buttons one
+/// blank cell apart on row 1 (`[ A ]` at cells 2–6, `[ B ]` at 8–12); a scroll bar's ↑, thumb
+/// and ↓ down column 20; three one-cell marks side by side on row 6. Each senses clicks alone,
+/// as sopen's controls do.
+fn slop_targets() -> [(&'static str, cells::Cells); 8] {
+    let at = cells::Cells::new;
+    [
+        ("A", at(2, 1, 5, 1)),
+        ("B", at(8, 1, 5, 1)),
+        ("up", at(20, 1, 1, 1)),
+        ("thumb", at(20, 2, 1, 1)),
+        ("down", at(20, 3, 1, 1)),
+        ("mark 1", at(2, 6, 1, 1)),
+        ("mark 2", at(3, 6, 1, 1)),
+        ("mark 3", at(4, 6, 1, 1)),
+    ]
+}
+
+/// [`slop_targets`] on a grid over the whole window; what each pass's clicks landed on, by name.
+#[derive(Default)]
+struct Targets {
+    clicked: Vec<&'static str>,
+    /// The grid the last pass laid.
+    grid: Option<cells::Grid>,
+}
+
+impl Window for Targets {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let grid = cells::Grid::over(ui.max_rect());
+        self.grid = Some(grid);
+        let mut buf = cells::Buffer::empty(grid.all());
+        let pen = cells::Pen::new(PALETTE.dialog_text, PALETTE.dialog_back);
+        for (name, at) in slop_targets() {
+            let label = if at.width > 1 {
+                format!("[ {name} ]")
+            } else {
+                name[..1].to_string()
+            };
+            cells::put(&mut buf, at.x, at.y, &label, usize::from(at.width), pen);
+            let id = ui.scope_id().with(("sopen-slop-target", name));
+            if ui.interact(grid.rect(at), id, egui::Sense::CLICK).clicked() {
+                self.clicked.push(name);
+            }
+        }
+        cells::paint(ui.painter(), grid.origin, &buf, None);
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// F-click-slop: in the skin a click lands only on the control whose cells hold the point —
+/// egui's hit test gives none to a widget a point or a few away, in the next cell (its
+/// `interact_radius`, 5 points by default, reached across half a cell): the blank cell between
+/// two buttons presses neither, at its centre and from half a point in from either side, nor do
+/// the cells beside, above and below them; each one-cell target — a scroll bar's ↑, thumb and ↓,
+/// three marks side by side — takes a click anywhere in its cell, its corners included, and only
+/// its own; a point beside the scroll bar's column is none of it. A point on a rect's edge is
+/// the rect's (egui's `Rect::contains` holds both ends): the edge of `[ A ]` and the blank is
+/// A's, and the edge two marks share is both's, so the one laid last takes it — a line of no
+/// width, never a reach into a neighbour. Each click once as one pass's move, press and release,
+/// once as three passes.
+#[test]
+fn a_click_lands_only_on_the_control_whose_cells_hold_it() {
+    let mut drv = Driver::new(320.0, 160.0);
+    let mut win = Targets::default();
+    drv.idle(&mut win, 2);
+    let grid = win.grid.expect("a pass laid the grid");
+    let p = |x: f32, y: f32| grid.origin + Vec2::new(x, y);
+    let mut cases: Vec<(String, Pos2, Vec<&str>)> = vec![];
+    // The buttons' row is y 16–32; `[ A ]` x 16–56, the blank cell 56–64, `[ B ]` 64–104.
+    for (what, at) in [
+        ("half a point into the gap", p(56.5, 24.0)),
+        ("a point into the gap", p(57.0, 24.0)),
+        ("the gap's centre", p(60.0, 24.0)),
+        ("a point before B", p(63.0, 24.0)),
+        ("half a point before B", p(63.5, 24.0)),
+        ("two points left of A", p(14.0, 24.0)),
+        ("two points right of B", p(106.0, 24.0)),
+        ("two points above A", p(36.0, 14.0)),
+        ("two points below A", p(36.0, 34.0)),
+        ("a point left of the scroll bar", p(159.0, 40.0)),
+        ("a point right of the scroll bar", p(169.0, 40.0)),
+        ("two points under ↓", p(164.0, 66.0)),
+        ("a point under the marks", p(28.0, 113.0)),
+    ] {
+        cases.push((what.to_string(), at, vec![]));
+    }
+    // The controls themselves: a button at its first and last point; each one-cell target at its
+    // four corners, half a point in.
+    cases.push(("A's first point".into(), p(16.5, 16.5), vec!["A"]));
+    cases.push(("B's last point".into(), p(103.5, 31.5), vec!["B"]));
+    // Edges: A's right edge, on the blank's, is A's; the edge marks 1 and 2 share, laid in that
+    // order, is mark 2's.
+    cases.push(("A's right edge".into(), p(56.0, 24.0), vec!["A"]));
+    cases.push((
+        "the marks' shared edge".into(),
+        p(24.0, 104.0),
+        vec!["mark 2"],
+    ));
+    for (name, at) in slop_targets().into_iter().filter(|(_, c)| c.width == 1) {
+        let r = grid.rect(at);
+        for (corner, q) in [
+            ("top left", r.left_top() + Vec2::new(0.5, 0.5)),
+            ("top right", r.right_top() + Vec2::new(-0.5, 0.5)),
+            ("bottom left", r.left_bottom() + Vec2::new(0.5, -0.5)),
+            ("bottom right", r.right_bottom() - Vec2::new(0.5, 0.5)),
+        ] {
+            cases.push((format!("{name}'s {corner}"), q, vec![name]));
+        }
+    }
+    let mut wrong = vec![];
+    for (what, at, want) in &cases {
+        for one_pass in [true, false] {
+            // Past egui's double-click time since the last click.
+            drv.idle(&mut win, 30);
+            win.clicked.clear();
+            match one_pass {
+                true => drv.frame(&mut win, click_events(*at), egui::Modifiers::NONE),
+                false => drv.click(&mut win, *at),
+            }
+            drv.idle(&mut win, 1);
+            if win.clicked != *want {
+                let how = if one_pass { "one pass" } else { "three passes" };
+                wrong.push(format!("{what} ({how}): {:?}", win.clicked));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// The palette names a selected entry's colour (04 §4: yellow) and the key help's key column.

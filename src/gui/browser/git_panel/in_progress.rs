@@ -164,11 +164,10 @@ pub fn draw(
 /// and released after it;
 /// the one clicked, by its place in `buttons`. They sense clicks alone (`Sense::CLICK`), never the
 /// focus: egui's `Sense::click()` is focusable, and Tab, then Space or Enter, would press a step.
-/// The banner's first row is one more such rect, under the buttons, so a click on the state or on
-/// the blank between two buttons presses none in any host (egui gives a click a few points off a
-/// widget to it when nothing is under the pointer). The buttons have no hover (a cell has no
-/// place for it): the status row names their keys while the banner shows
-/// (`GitView::status_line`).
+/// Nothing lies under them: a click reaches only the rect it falls in (the skin's
+/// `interact_radius` is 0; F-click-slop), so a click on the state or on the blank between two
+/// buttons presses none in any host. The buttons have no hover (a cell has no place for it): the
+/// status row names their keys while the banner shows (`GitView::status_line`).
 fn lay(
     ui: &mut egui::Ui,
     grid: &Grid,
@@ -201,8 +200,6 @@ fn lay(
     }
     let state_end = laid.last().map_or(width, |&(_, at)| at.saturating_sub(1));
     let id = |part: &str| panel.with(("sopen-git-banner", part));
-    let row = grid.rect(Cells::new(area.x, area.y, area.width, 1));
-    ui.interact(row, id(""), Sense::CLICK);
     let mut pressed = None;
     let button = Pen::new(p.dialog_text, p.dialog_back);
     for &(k, at) in &laid {
