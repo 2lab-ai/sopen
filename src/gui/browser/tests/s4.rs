@@ -1249,7 +1249,7 @@ fn a_failing_read_opens_nothing_and_runs_nothing() {
     assert_eq!(g.edit_id(), Some(EditId::Reword), "Enter ran nothing");
     assert_eq!(g.repo.rev("HEAD"), head);
     assert_eq!(tries(&raw_log), 1, "asked once for this snapshot");
-    let edit = g.view().edit_draft().unwrap();
+    let edit = g.view().edit_draft().cloned().unwrap();
     g.esc();
     // Planned on the worker, no plan shown: the read fails there too, and nothing runs.
     let ctx = g.fx.drv.ctx.clone();
@@ -1342,7 +1342,7 @@ fn a_history_edit_whose_shown_plan_was_lost_asks_again() {
     g.fx.b.start_edit(&ctx, i, edit.clone());
     g.until_quiet("the plan made again");
     assert_eq!(g.repo.rev("HEAD"), head, "nothing ran");
-    assert_eq!(g.view().edit_draft(), Some(edit), "its confirmation again");
+    assert_eq!(g.view().edit_draft(), Some(&edit), "its confirmation again");
     assert!(
         g.view()
             .status_line()
@@ -1616,4 +1616,137 @@ fn f_git_covered_a_quick_edit_under_the_lists_question_runs_nothing() {
         "the control: shown with the keyboard, its Enter runs ({})",
         g.status()
     );
+}
+
+/// G-H1's history with a sixth commit on top, `big`, whose message is a mebibyte and more; the
+/// message's length.
+fn five_and_big(git: &std::path::Path) -> (Repo, usize) {
+    let repo = five(git);
+    let message = format!("big\n\n{}", "0123456789abcde\n".repeat(1 << 16));
+    // `-F`: a mebibyte is more than one argument may carry.
+    let file = repo.tmp.path().join("big-message.txt");
+    std::fs::write(&file, &message).unwrap();
+    repo.write("six.txt", "six\n");
+    repo.run(&["add", "-A"]);
+    repo.run(&["commit", "-q", "-F", file.to_str().unwrap()]);
+    (repo, message.len())
+}
+
+/// F-git-drafted: the host checks an open dialog's reads by which dialog it is and its draft's
+/// revision, never by a copy of the draft. With a mebibyte message — Reword of it, and the
+/// planner's run confirmation over it — ten idle passes copy none of it (the quick edits' drafts'
+/// copies, the host's included: it holds them as `git_panel::Draft`) and plan none of it at the
+/// host, the window's settling asked after each (as a receipt's hook asks every pass). A typed
+/// letter is copied once, into the edit, and plans the new draft once; the settling's answer is
+/// kept for it.
+#[test]
+fn f_git_drafted_idle_passes_copy_no_draft_at_the_host() {
+    let git = git_or_skip!();
+    let (repo, len) = five_and_big(&git);
+    assert!(len > 1 << 20);
+    let mut g = Gx::new(repo);
+    g.fx.drv.resize(1000.0, 1400.0);
+    g.ready_in_git();
+    // The bytes of drafts' messages copied, and planned at the host, since the last call.
+    let counts = || (git_panel::quick_copied(), drafts_handled());
+    // Ten idle passes, the settling asked after each.
+    let idle = |g: &mut Gx| {
+        counts();
+        for _ in 0..10 {
+            g.idle(1);
+            assert!(!g.panel().dialog_reading(), "its reads are in");
+        }
+        counts()
+    };
+    // Reword of the mebibyte.
+    g.bar_to("big");
+    g.f(Key::F2);
+    assert_eq!(g.edit_id(), Some(EditId::Reword));
+    g.idle(2);
+    assert!(!g.shows("not read yet"), "{:#?}", g.texts());
+    let reword = idle(&mut g);
+    // A letter typed: copied once into the edit, the new draft planned once, then kept.
+    counts();
+    g.fx.typed("x");
+    g.idle(2);
+    let typed = counts();
+    let now = match g.view().edit_draft() {
+        Some(Edit::Quick(crate::git::rebase::Quick::Reword { message, .. })) => message.len(),
+        other => panic!("{other:?}"),
+    };
+    assert!(now > len, "the letter is in the draft");
+    let kept = idle(&mut g);
+    g.esc();
+    assert!(g.edit_id().is_none());
+    // The planner's run confirmation over it.
+    g.bar_to("base");
+    g.open_planner_here();
+    g.with(Key::Enter, Modifiers::COMMAND);
+    g.idle(2);
+    g.until_quiet("the run's reads");
+    g.idle(2);
+    assert!(
+        matches!(g.view().edit_draft(), Some(Edit::Plan(_))),
+        "the run's confirmation"
+    );
+    assert!(!g.shows("not read yet"), "{:#?}", g.texts());
+    let run = idle(&mut g);
+    assert_eq!(
+        [reword, run],
+        [(0, 0), (0, 0)],
+        "ten idle passes of Reword and of the run's confirmation: (copied, planned)"
+    );
+    assert_eq!(typed, (now, now), "the typed letter: one copy, one plan");
+    assert_eq!(kept, (0, 0), "then kept");
+}
+
+/// F-git-drafted: two dialogs whose drafts stand at the same revision are told apart by which
+/// dialog each is. A quick edit's confirmation put in the place of another, with no pass without
+/// a dialog between (`reconfirm_edit`), gets its own reads: Reword of `four` reads `cat-file
+/// commit <four>`, then Reword of `three` in its place reads `cat-file commit <three>`.
+#[test]
+fn f_git_drafted_a_dialog_in_the_place_of_another_reads_its_own() {
+    let git = git_or_skip!();
+    let mut repo = five(&git);
+    let log = repo.tmp.path().join("raw.log");
+    let wrapper = repo.tmp.path().join("git-logging");
+    script(
+        &wrapper,
+        &format!(
+            "case \" $* \" in *\" cat-file commit \"*) echo \"$*\" >> '{}';; esac\nexec '{}' \"$@\"",
+            log.display(),
+            git.display()
+        ),
+    );
+    repo.git = wrapper;
+    let (four, three) = (repo.rev("HEAD~1"), repo.rev("HEAD~2"));
+    let mut g = Gx::new(repo);
+    g.fx.drv.resize(1000.0, 1400.0);
+    g.ready_in_git();
+    let asked = |oid: &str| {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.ends_with(oid))
+            .count()
+    };
+    g.bar_to("four");
+    g.f(Key::F2);
+    assert_eq!(g.edit_id(), Some(EditId::Reword));
+    g.idle(4);
+    assert!(!g.shows("not read yet"), "{:#?}", g.texts());
+    assert_eq!((asked(&four), asked(&three)), (1, 0));
+    // In its place, at the same revision (neither was typed in), in the same snapshot.
+    let commit = crate::git::model::Oid::parse(&three).unwrap();
+    let edit = Edit::Quick(crate::git::rebase::Quick::Reword {
+        commit,
+        message: "three, again".into(),
+    });
+    g.panel_mut().view.reconfirm_edit(edit.clone());
+    g.idle(2);
+    g.until_quiet("its own reads");
+    g.idle(4);
+    assert_eq!(g.view().edit_draft(), Some(&edit), "the second dialog");
+    assert!(!g.shows("not read yet"), "{:#?}", g.texts());
+    assert_eq!((asked(&four), asked(&three)), (1, 1), "each read once");
 }

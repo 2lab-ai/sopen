@@ -672,6 +672,8 @@ pub struct ActionDialog {
     /// The draft's revision: it moves whenever a pass changes the draft or Check out's "Don't ask
     /// again in this window" (an edit, an option).
     drafted: u64,
+    /// Which dialog it is ([`super::DraftKey`]): another at the same draft revision is not it.
+    serial: u64,
     /// What the screen's painting is compared by ([`Painting`]): it moves with the draft's
     /// revision and whenever a plan's rows change (an option's, a refresh's, reads landing), so
     /// a pass compares and copies no draft.
@@ -847,6 +849,7 @@ impl ActionDialog {
             planned: Some((0, planned)),
             refreshed: false,
             drafted: 0,
+            serial: super::dialog_serial(),
             revision: 0,
             form,
             repo: repo.clone(),
@@ -861,6 +864,12 @@ impl ActionDialog {
     /// The action as the options make it now.
     pub fn draft(&self) -> &Action {
         &self.form.draft
+    }
+
+    /// Which dialog it is and its draft's revision, as `(serial, revision)`: what the integration
+    /// checks the draft's reads by, never a copy of it ([`super::DraftKey`], F-git-drafted).
+    pub fn draft_revision(&self) -> (u64, u64) {
+        (self.serial, self.drafted)
     }
 
     /// The plan of the draft, as last planned.
