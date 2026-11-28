@@ -236,72 +236,6 @@ fn stderr_line(line: &str) -> String {
     out
 }
 
-/// `line` in rows of at most `room` cells, as `dialog::wrap` breaks a text — at its last blank
-/// that fits (the blank dropped), or after its last whole glyph — in one walk of the line:
-/// `dialog::wrap` measures the rest of a line again for each row, and stderr's last 64 KiB can be
-/// one line (03 §3.7). Each row it gives fits, so the kit's wrap keeps it whole.
-pub(super) fn cut(line: &str, room: usize) -> Vec<String> {
-    let room = room.max(1);
-    let mut rows = Vec::new();
-    let mut row = String::new();
-    let mut used = 0;
-    // The row's last blank after a glyph: its byte and the cells before it.
-    let mut blank: Option<(usize, usize)> = None;
-    for g in line.graphemes(true) {
-        #[cfg(test)]
-        counted(&CUT, 1);
-        let w = cells::width(g);
-        if used + w > room && !row.is_empty() {
-            if g == " " {
-                // The row ends at this blank, which goes.
-                rows.push(std::mem::take(&mut row));
-                (used, blank) = (0, None);
-                continue;
-            }
-            match blank.take() {
-                Some((at, before)) => {
-                    let rest = row.split_off(at + 1);
-                    row.truncate(at);
-                    rows.push(std::mem::replace(&mut row, rest));
-                    used -= before + 1;
-                }
-                None => {
-                    rows.push(std::mem::take(&mut row));
-                    used = 0;
-                }
-            }
-        }
-        if g == " " && !row.is_empty() {
-            blank = Some((row.len(), used));
-        }
-        row.push_str(g);
-        used += w;
-    }
-    if !row.trim().is_empty() || rows.is_empty() {
-        rows.push(row);
-    }
-    // A text's own blanks after its last word make no rows, however many (`dialog::wrap` stops
-    // at them).
-    while rows.len() > 1 && rows.last().is_some_and(|r| r.trim().is_empty()) {
-        rows.pop();
-    }
-    rows
-}
-
-/// `text` whole if it holds at most `most` cells, else its longest start within them and `…`, in
-/// one walk that stops there. The `…` keeps a cut in a run of blanks a text's middle, as it was:
-/// the kit's wrap makes no rows of the blanks a text ends in.
-fn head(text: &str, most: usize) -> String {
-    let mut used = 0;
-    for (i, g) in text.grapheme_indices(true) {
-        used += cells::width(g);
-        if used > most {
-            return format!("{}…", &text[..i]);
-        }
-    }
-    text.to_string()
-}
-
 /// Text taken a grapheme at a time, its control characters escaped, until it holds more cells
 /// than `room` ([`row_shown`]).
 struct Walk {
@@ -364,24 +298,11 @@ fn row_shown(entry: &LogEntry, room: usize) -> String {
 /// there by cells (`Part::Named`, egui's grid of two columns; on a dialog with no cell after the
 /// 12th, under its name); then `Stderr`, weak, and its lines in rows that scroll, at most half the
 /// grid's rows and six at least (egui's half the window), `nothing` in the weak ink when there is
-/// none; then `[ OK ]` and the keys' hint. Each value reaches the kit cut to the cells the box can
-/// show — the grid's rows and two more, of its room (`dialog::named_room`) and a cell more —
-/// since the kit's `dialog::wrap` measures the rest of a text again for each row and a command
-/// line can be 64 KiB (the files backup's batches of paths): what the box shows is the same, the
-/// rest being cut with `…` there.
+/// none; then `[ OK ]` and the keys' hint. Every text reaches the kit whole — a command line of
+/// 64 KiB (the files backup's batches of paths), stderr's last 64 KiB on one line — and the kit
+/// wraps each in one walk (F-dialog-wrap), once for the grid ([`LogView`] keeps the layout); a
+/// value taller than the box loses its last rows there, the last it shows cut with `…`.
 pub(super) fn entry_layout(grid: Grid, entry: &LogEntry, panel: egui::Id) -> Layout {
-    let width = dialog::inside_width(grid.cols, WHOLE_WIDTH, 0);
-    let most = (usize::from(grid.rows) + 2) * (dialog::named_room(width, NAME) + 1);
-    entry_layout_in(grid, entry, panel, most)
-}
-
-/// [`entry_layout`] with each value cut to `most` cells (the tests: none, to see it the same).
-pub(super) fn entry_layout_in(
-    grid: Grid,
-    entry: &LogEntry,
-    panel: egui::Id,
-    most: usize,
-) -> Layout {
     let stdin = entry.stdin.as_deref().unwrap_or("nothing");
     let fields = [
         ("Time", date_time_text(entry.time)),
@@ -394,32 +315,25 @@ pub(super) fn entry_layout_in(
         ("Stdout", format!("{} bytes", entry.stdout_bytes)),
     ];
     // The box's inside: egui's 88 cells, or the grid less eight, whatever its texts want (88 is
-    // above the kit's widest, 76), so its rows of stderr are cut to it here, once.
+    // above the kit's widest, 76).
     let width = dialog::inside_width(grid.cols, WHOLE_WIDTH, 0);
     let mut parts: Vec<Part> = (fields.into_iter())
         .map(|(name, value)| Part::Named {
             name: name.to_string(),
-            value: head(&printable(&value), most),
+            value: printable(&value).into_owned(),
             at: NAME,
         })
         .collect();
-    #[cfg(test)]
-    for p in &parts {
-        if let Part::Named { name, value, .. } = p {
-            counted(&HANDED, name.len() + value.len());
-        }
-    }
     let rows: Vec<(String, Ink)> = match entry.stderr.as_str() {
         "" => vec![("nothing".to_string(), Ink::Weak)],
         all => (all.strip_suffix('\n').unwrap_or(all).split('\n'))
-            .flat_map(|line| cut(&stderr_line(line), width))
-            .map(|row| (row, Ink::Text))
+            .map(|line| (stderr_line(line), Ink::Text))
             .collect(),
     };
     parts.extend([
         Part::Text("Stderr".to_string(), Ink::Weak),
-        Part::Scroll {
-            rows,
+        Part::Wrapped {
+            rows: dialog::Wrapped::new(rows),
             most: (grid.rows / 2).max(6),
             top: 0,
         },
@@ -440,10 +354,6 @@ thread_local! {
     /// The characters of entries' texts walked to draw their rows: a pass's work, which the tests
     /// bound by the rows' room, however long a command line.
     pub(super) static ROWS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// The bytes of the fields' texts handed to the kit, which wraps them by `dialog::wrap`.
-    pub(super) static HANDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// The graphemes [`cut`] walked.
-    pub(super) static CUT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `n` more on the counter `key` (the tests' only).

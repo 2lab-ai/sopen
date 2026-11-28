@@ -18,6 +18,7 @@
 use super::graph_view::{date_text, printable};
 use super::{Scroll, Subject};
 use crate::git::model::Oid;
+use crate::gui::browser::ops::dialog;
 use crate::gui::cells::{self, Buffer, Cells, Grid, Pen};
 use crate::gui::chrome;
 use crate::gui::chrome::git::{self as look, LOOK};
@@ -573,7 +574,7 @@ pub(super) fn fitted(s: &str, room: usize) -> String {
     let mut used = 0;
     let mut end = s.len();
     for (i, g) in s.grapheme_indices(true) {
-        walked();
+        walked(1);
         used += cells::width(&printable(g));
         if used > room {
             end = i + g.len();
@@ -658,51 +659,12 @@ fn wrap_line(line: &str, chars: usize) -> Vec<String> {
         .collect()
 }
 
-/// `text` in rows of at most `room` cells as `dialog::wrap` breaks it — whole when it fits; else
-/// at its last blank that fits (the blank dropped), a word longer than the row after its last
-/// whole glyph, a glyph wider than the row alone on a row of its own; after a break, blanks alone
-/// make no row — in one walk over the text: `dialog::wrap` measures what is left at each row,
-/// which a message of a mebibyte on one line (03 §6.1's bound) makes quadratic.
+/// `text` in rows of at most `room` cells: `dialog::wrap`'s, in its one walk over the text (a
+/// message of a mebibyte on one line is 03 §6.1's bound), the graphemes it measured counted
+/// ([`WALKED`]).
 pub(super) fn wrap_cells(text: &str, room: usize) -> Vec<String> {
-    let room = room.max(1);
-    // `text[start..]` is blank (or empty) once `start` is past its last glyph that is not.
-    let end = text.trim_end().len();
-    let mut rows = vec![];
-    let mut start = 0;
-    while rows.is_empty() || start < end {
-        let rest = &text[start..];
-        let (mut used, mut cut, mut blank, mut over) = (0, 0, None, false);
-        for (i, g) in rest.grapheme_indices(true) {
-            walked();
-            let w = cells::width(g);
-            if g == " " && i > 0 {
-                blank = Some(i);
-            }
-            if used + w > room {
-                over = true;
-                break;
-            }
-            used += w;
-            cut = i + g.len();
-        }
-        if !over {
-            break;
-        }
-        let (row, next) = match blank {
-            Some(b) if b <= cut => (&rest[..b], b + 1),
-            // A glyph wider than the row alone: it goes on a row of its own, cut there.
-            _ if cut == 0 => {
-                let first = rest.graphemes(true).next().map_or(rest.len(), str::len);
-                (&rest[..first], first)
-            }
-            _ => (&rest[..cut], cut),
-        };
-        rows.push(row.to_string());
-        start += next;
-    }
-    if start < end || rows.is_empty() {
-        rows.push(text[start..].to_string());
-    }
+    let (rows, measured) = dialog::wrap_measured(text, room);
+    walked(measured);
     rows
 }
 
@@ -713,8 +675,12 @@ thread_local! {
     pub(super) static WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Counts a grapheme measured ([`WALKED`], in the tests only).
-fn walked() {
-    #[cfg(test)]
-    WALKED.with(|c| c.set(c.get() + 1));
+#[cfg(not(test))]
+#[inline(always)]
+fn walked(_: usize) {}
+
+/// Counts `n` graphemes measured ([`WALKED`], in the tests only).
+#[cfg(test)]
+fn walked(n: usize) {
+    WALKED.with(|c| c.set(c.get() + n));
 }

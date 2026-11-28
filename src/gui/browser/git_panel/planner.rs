@@ -21,7 +21,7 @@
 //! - **In cells** (X4-quick, 10 §17): each is `ops::dialog`'s box on the panels' grid, as an
 //!   action's dialog is (`dialogs.rs`) — the lost line, the message field (six rows, Shift+Enter
 //!   a new line) or author's Name, Email and Author date fields and its committer date (a row of
-//!   one of several), the plan in the kit's rows that scroll (`dialogs::plan_part`), `[ Run ]`
+//!   one of several), the plan in the kit's rows that scroll (`dialogs::KeptPlan`), `[ Run ]`
 //!   (off until the plan is in, nothing refuses it and the grid holds all of the box), `[ Cancel ]`
 //!   and the hint — and [`QuickDialog::covers`] says its cells. Its fields open afresh: the
 //!   message's caret at its start, a one-line field's at its end. Its keys are an action's
@@ -49,7 +49,7 @@
 //!   follows goes back to the pane's keys once that closed it, and is dropped where it did not
 //!   (see [`draw`]).
 
-use super::dialogs::{plan_part, plan_rows, plan_wants, take_enters, PlanRow, CHANGED, TOO_SHORT};
+use super::dialogs::{plan_rows, take_enters, KeptPlan, PlanRow, CHANGED, TOO_SHORT};
 use super::graph_view::{self, printable};
 use super::menu;
 use super::Scroll;
@@ -454,6 +454,8 @@ pub struct QuickDialog {
     /// What the box shows, as a number: one more each time the draft changes or `shows` does, so
     /// a pass's painting is this, never a copy of the draft (X4-quick round 1: a 1 MiB message).
     revision: u64,
+    /// The plan's rows of `shows` as the kit's, kept while the revision stays (F-dialog-wrap).
+    kept: KeptPlan<u64>,
     /// The field in an input method's composition, as the last pass left it.
     composing: Option<egui::Id>,
     /// Its first field took the keyboard last pass (on its first, not yet).
@@ -755,6 +757,7 @@ impl QuickDialog {
             planned: None,
             shows: Shows::default(),
             revision: 0,
+            kept: KeptPlan::default(),
             composing: None,
             typing: false,
             plan_top: 0,
@@ -973,8 +976,8 @@ impl QuickDialog {
 
     /// The box on `grid`: the lost line first, then the options — the message, or author's
     /// fields and its committer date, or a planner run's options and the checks that fail — the
-    /// plan in rows that scroll ([`plan_part`]), the buttons and the hint; as wide as its widest
-    /// text by 10 §6's rule. Not `fits`: [`TOO_SHORT`] before all of it, Run off.
+    /// plan in rows that scroll (kept, [`KeptPlan`]), the buttons and the hint; as wide as its
+    /// widest text by 10 §6's rule. Not `fits`: [`TOO_SHORT`] before all of it, Run off.
     fn laid(&self, grid: Grid, fits: bool) -> kit::Layout {
         let Shows {
             title,
@@ -983,11 +986,11 @@ impl QuickDialog {
             checks,
             ..
         } = &self.shows;
-        let wanted = (plan_wants(plan))
-            .max(lost.as_deref().map_or(0, cells::width))
+        let others = (lost.as_deref().map_or(0, cells::width))
             .max(checks.iter().map(|c| cells::width(c)).max().unwrap_or(0))
             .max(cells::width(title) + 2);
-        let width = kit::inside_width(grid.cols, QUICK_WIDTH, wanted);
+        let width_for = |wants: usize| kit::inside_width(grid.cols, QUICK_WIDTH, wants.max(others));
+        let shown = (self.kept).part(self.revision, || plan, width_for, grid, self.plan_top);
         let mut parts = Vec::new();
         if !fits {
             parts.push(Part::Text(TOO_SHORT.to_string(), Ink::Error));
@@ -1027,7 +1030,7 @@ impl QuickDialog {
             parts.extend(checks.iter().map(|c| Part::Text(c.clone(), Ink::Error)));
             parts.push(Part::Blank);
         }
-        if let Some(part) = plan_part(plan.clone(), grid, width, self.plan_top) {
+        if let Some(part) = shown {
             parts.extend([part, Part::Blank]);
         }
         let mut run = Button::new("Run", self.ids.run());

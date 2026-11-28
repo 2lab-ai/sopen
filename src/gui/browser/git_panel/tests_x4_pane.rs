@@ -587,35 +587,13 @@ fn long_values_and_paths_are_cut_by_cells() {
     assert!(path.trim_end().ends_with("+12 -3"), "{path:?}");
 }
 
-/// The message's rows are `dialog::wrap`'s, made in one walk over the line: each grapheme is
-/// measured about once — `dialog::wrap` measures what is left at each row, so a one-line message
-/// near 03 §6.1's bound on the read (1 MiB) took minutes to wrap (more than 90 s for 1.5 MiB in a
-/// debug build, the RED run).
+/// The message's rows are made in one walk over the line: each grapheme is measured about once —
+/// a wrap that measured what is left at each row took minutes on a one-line message near 03
+/// §6.1's bound on the read (1 MiB; more than 90 s for 1.5 MiB in a debug build, the RED run).
+/// The rows are `dialog::wrap`'s (`details::wrap_cells` is it, counted).
 #[test]
 fn the_wrap_is_dialog_wraps_in_one_walk() {
     use unicode_segmentation::UnicodeSegmentation;
-    let texts = [
-        "",
-        " ",
-        "a",
-        "ab cd",
-        "  lead and  two   blanks  ",
-        "longwordwithoutanyblank and more",
-        "한글 낱말과 English 가 섞인 줄",
-        "가나다라마바사아자차카타파하",
-        "x y",
-        "trailing   ",
-        "a\u{3000}b c",
-    ];
-    for t in texts {
-        for room in 0..20 {
-            assert_eq!(
-                details::wrap_cells(t, room),
-                dialog::wrap(t, room),
-                "{t:?} at {room}"
-            );
-        }
-    }
     for (text, room) in [("단어 word ".repeat(1 << 12), 80), ("x".repeat(50_000), 7)] {
         let n = text.graphemes(true).count();
         details::WALKED.with(|c| c.set(0));

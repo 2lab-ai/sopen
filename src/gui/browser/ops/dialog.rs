@@ -33,12 +33,16 @@
 //! ambiguous-wide terminal gets §10's `.` there, at the source (T38). A button its dialog names
 //! there ([`Input::Button`], X4-dialogs) takes the kit's presses as a choice does, so a Tab in the
 //! same pass never hands a Space to the button it reaches (F-kit-tab).
+//!
+//! Rows that scroll ([`Part::Wrapped`], F-dialog-wrap) are the caller's, shared and kept while
+//! they stay: the kit wraps them once a width and keeps them so, so a pass copies, wraps and
+//! measures none of them, as a list's rows. [`wrap`] walks a text once, however long its line.
 
 use crate::gui::browser::keys::Mods;
 use crate::gui::cells::{self, Buffer, Cells, Grid, Pen, Position};
 use crate::gui::chrome::{self, cga, CELL};
 use eframe::egui::{self, Color32, Key, Sense};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// The colour a text of a dialog is in.
@@ -103,9 +107,13 @@ pub enum Part {
     },
     /// Buttons, two blank cells apart.
     Buttons(Vec<Button>),
-    /// Rows that scroll (the report's): at most `most` on screen, from row `top`; each wrapped.
-    Scroll {
-        rows: Vec<(String, Ink)>,
+    /// Rows that scroll (a report's, a plan's, a result's): at most `most` on screen, from row
+    /// `top`; each wrapped at the dialog's width. Shared ([`Wrapped`], F-dialog-wrap): the kit
+    /// wraps them once a width and keeps them so, so a layout copies, wraps and measures none of
+    /// them while the width stays, and a pass draws only those it shows. A dialog has one part of
+    /// rows that scroll (a debug build asserts it).
+    Wrapped {
+        rows: Arc<Wrapped>,
         most: u16,
         top: usize,
     },
@@ -198,6 +206,61 @@ impl Rows {
     }
 }
 
+/// The rows of a [`Part::Wrapped`], each its text and its ink, and how many cells the widest
+/// wants, measured once when they are made; and the rows as last wrapped, at the width they were
+/// wrapped to. The caller keeps them while they stay and gives the same ones to each pass's part;
+/// a layout at a width they all fit takes them as made, at the width they were last wrapped to
+/// those, shared. Not `Clone`: no pass copies them.
+#[derive(Debug, Default)]
+pub struct Wrapped {
+    all: ScrollRows,
+    widest: usize,
+    laid: Mutex<Option<(usize, ScrollRows)>>,
+}
+
+/// Rows that scroll wrapped at a width, shared by the layouts at that width.
+type ScrollRows = Arc<Vec<(String, Ink)>>;
+
+impl Wrapped {
+    pub fn new(all: Vec<(String, Ink)>) -> Arc<Self> {
+        count(Work::Measured, all.len());
+        let widest = all.iter().map(|(t, _)| cells::width(t)).max().unwrap_or(0);
+        Arc::new(Self {
+            all: Arc::new(all),
+            widest,
+            laid: Mutex::default(),
+        })
+    }
+
+    /// The rows as they were made.
+    pub fn rows(&self) -> &[(String, Ink)] {
+        &self.all
+    }
+
+    /// The rows each wrapped at `width` ([`wrap`]): as made where they all fit (`wrap` keeps a text
+    /// that fits whole), else the ones kept for that width, else wrapped — a copy of them, counted
+    /// ([`Work::Copied`]) — and kept.
+    fn at(&self, width: usize) -> ScrollRows {
+        if self.widest <= width {
+            return self.all.clone();
+        }
+        let mut laid = self.laid.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, rows)) = &*laid {
+            if *at == width {
+                return rows.clone();
+            }
+        }
+        let rows: ScrollRows = Arc::new(
+            (self.all.iter())
+                .flat_map(|(text, ink)| wrap(text, width).into_iter().map(|row| (row, *ink)))
+                .inspect(|(row, _)| count(Work::Copied, row.len()))
+                .collect(),
+        );
+        *laid = Some((width, rows.clone()));
+        rows
+    }
+}
+
 /// Where a list stands: the row its bar is on and the first row it shows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Bar {
@@ -220,10 +283,14 @@ enum Work {
     /// Bytes of a message field's text compared to know its kept rows are still its own (the
     /// tests bound these themselves: a few times the text a pass).
     Checked,
-    /// A list's rows measured.
+    /// A list's rows measured, and rows that scroll measured.
     Measured,
-    /// A list's rows drawn.
+    /// A list's rows drawn, and rows that scroll drawn.
     Drawn,
+    /// Graphemes [`wrap`] measured.
+    Wrapped,
+    /// Bytes of rows that scroll wrapped at a width they were not kept for: a copy of them.
+    Copied,
 }
 
 #[cfg(not(test))]
@@ -235,9 +302,9 @@ fn count(kind: Work, n: usize) {
     work::add(kind, n);
 }
 
-/// The work the message field and the list do, counted by kind for the tests' bounds on a pass;
-/// past the budget a test sets it panics before the work, so a pass that would take minutes
-/// fails at once.
+/// The work the message field, the list, the rows that scroll and [`super::wrap`] do, counted by
+/// kind for the tests' bounds on a pass; past the budget a test sets it panics before the work,
+/// so a pass that would take minutes fails at once.
 #[cfg(test)]
 pub(crate) mod work {
     use std::cell::Cell;
@@ -249,6 +316,8 @@ pub(crate) mod work {
         pub checked: usize,
         pub measured: usize,
         pub drawn: usize,
+        pub wrapped: usize,
+        pub copied: usize,
     }
 
     thread_local! {
@@ -275,6 +344,8 @@ pub(crate) mod work {
             super::Work::Checked => &mut done.checked,
             super::Work::Measured => &mut done.measured,
             super::Work::Drawn => &mut done.drawn,
+            super::Work::Wrapped => &mut done.wrapped,
+            super::Work::Copied => &mut done.copied,
         };
         *c += n;
         let now = *c;
@@ -296,7 +367,7 @@ enum Placed {
     Button(Cells, Button),
     Scroll {
         cells: Cells,
-        rows: Vec<(String, Pen)>,
+        rows: ScrollRows,
         top: usize,
     },
     /// Choice `k` of the row of choices `row`: its cells and its word.
@@ -331,41 +402,61 @@ pub fn grid(ctx: &egui::Context) -> Grid {
 }
 
 /// `text` in rows of at most `room` cells: whole when it fits; else broken at its last blank that
-/// fits (the blank dropped), or — a word longer than the row — after its last whole glyph.
+/// fits (the blank dropped), or — a word longer than the row — after its last whole glyph, a glyph
+/// wider than the row alone on a row of its own; after a break, blanks alone make no row. In one
+/// walk over the text ([`wrap_measured`]).
 pub fn wrap(text: &str, room: usize) -> Vec<String> {
+    wrap_measured(text, room).0
+}
+
+/// [`wrap`]'s rows and how many graphemes it measured: each row its own and the first past it,
+/// never what is left of the text — a row broken at a blank measures the glyphs after the blank
+/// again for the next, so at most about twice the text's (F-dialog-wrap: measuring the rest at
+/// each row took minutes on a line of a mebibyte). The count is for a caller that bounds its own
+/// work (the details pane's tests).
+pub fn wrap_measured(text: &str, room: usize) -> (Vec<String>, usize) {
     let room = room.max(1);
-    let mut rows = vec![];
-    let mut rest = text;
-    // After a break, blanks alone — the text's own trailing ones — make no row, however wide.
-    while cells::width(rest) > room && (rows.is_empty() || !rest.trim().is_empty()) {
-        let (mut used, mut cut, mut blank) = (0, 0, None);
+    // `text[start..]` is blank (or empty) once `start` is past its last glyph that is not.
+    let end = text.trim_end().len();
+    let (mut rows, mut start, mut measured) = (vec![], 0, 0);
+    while rows.is_empty() || start < end {
+        let rest = &text[start..];
+        let (mut used, mut cut, mut blank, mut over, mut walked) = (0, 0, None, false, 0);
         for (i, g) in rest.grapheme_indices(true) {
+            walked += 1;
             let w = cells::width(g);
             if g == " " && i > 0 {
                 blank = Some(i);
             }
             if used + w > room {
+                over = true;
                 break;
             }
             used += w;
             cut = i + g.len();
         }
+        count(Work::Wrapped, walked);
+        measured += walked;
+        // What is left fits: it is the last row.
+        if !over {
+            break;
+        }
         let (row, next) = match blank {
-            Some(b) if b <= cut => (&rest[..b], &rest[b + 1..]),
+            Some(b) if b <= cut => (&rest[..b], b + 1),
             // A glyph wider than the row alone: it goes on a row of its own, cut there.
             _ if cut == 0 => {
                 let first = rest.graphemes(true).next().map_or(rest.len(), str::len);
-                (&rest[..first], &rest[first..])
+                (&rest[..first], first)
             }
-            _ => (&rest[..cut], &rest[cut..]),
+            _ => (&rest[..cut], cut),
         };
         rows.push(row.to_string());
-        rest = next;
+        start += next;
     }
-    if !rest.trim().is_empty() || rows.is_empty() {
-        rows.push(rest.to_string());
+    if start < end || rows.is_empty() {
+        rows.push(text[start..].to_string());
     }
-    rows
+    (rows, measured)
 }
 
 /// How many cells a part wants in a row to stand whole.
@@ -382,7 +473,7 @@ fn wants(part: &Part) -> usize {
             let each: usize = all.iter().map(|b| w(&b.label) + 4).sum();
             each + 2 * all.len().saturating_sub(1)
         }
-        Part::Scroll { rows, .. } => rows.iter().map(|(t, _)| w(t)).max().unwrap_or(0),
+        Part::Wrapped { rows, .. } => rows.widest,
         Part::Choices { label, choices, .. } => {
             let each: usize = choices.iter().map(|c| w(c) + 4).sum();
             lead(label) + each + 2 * choices.len().saturating_sub(1)
@@ -517,20 +608,19 @@ pub fn layout(grid: Grid, title: &str, nominal: usize, parts: &[Part]) -> Layout
             _ => vec![],
         })
         .collect();
-    let scrolled: Vec<(String, Ink)> = (parts.iter())
-        .filter_map(|part| match part {
-            Part::Scroll { rows, .. } => Some(rows),
-            _ => None,
-        })
-        .flatten()
-        .flat_map(|(text, ink)| wrap(text, width).into_iter().map(|row| (row, *ink)))
-        .collect();
-    let most = (parts.iter())
+    // The rows that scroll, wrapped at the width (kept by their rows while it stays), and how many
+    // may show. One part of them: a second would need its rows copied after the first's.
+    let wrapped = |part: &&Part| matches!(part, Part::Wrapped { .. });
+    debug_assert!(
+        parts.iter().filter(wrapped).count() <= 1,
+        "two parts of rows that scroll"
+    );
+    let (scrolled, most): (ScrollRows, usize) = (parts.iter())
         .find_map(|part| match part {
-            Part::Scroll { most, .. } => Some(usize::from(*most)),
+            Part::Wrapped { rows, most, .. } => Some((rows.at(width), usize::from(*most))),
             _ => None,
         })
-        .unwrap_or(0);
+        .unwrap_or_default();
     let mut shown = scrolled.len().min(most);
     let places: Vec<Vec<(usize, usize, usize)>> = (parts.iter())
         .map(|part| match part {
@@ -551,7 +641,7 @@ pub fn layout(grid: Grid, title: &str, nominal: usize, parts: &[Part]) -> Layout
             .map(|((part, rows), places)| match part {
                 Part::Text(..) | Part::Held(..) => rows.len(),
                 Part::Named { .. } => rows.len() + usize::from(under(part)),
-                Part::Scroll { .. } | Part::List { .. } => 0,
+                Part::Wrapped { .. } | Part::List { .. } => 0,
                 Part::Message { label, .. } => usize::from(!label.is_empty()),
                 Part::Choices { .. } => places.last().map_or(1, |p| p.0 + 1),
                 _ => 1,
@@ -657,14 +747,11 @@ pub fn layout(grid: Grid, title: &str, nominal: usize, parts: &[Part]) -> Layout
                     at = at.saturating_add(w + 2);
                 }
             }
-            Part::Scroll { top, .. } => {
+            Part::Wrapped { top, .. } => {
                 let max_top = scrolled.len().saturating_sub(shown);
                 placed.push(Placed::Scroll {
                     cells: Cells::new(x0, y, width, shown as u16),
-                    rows: scrolled
-                        .iter()
-                        .map(|(t, ink)| (t.clone(), ink.pen()))
-                        .collect(),
+                    rows: scrolled.clone(),
                     top: (*top).min(max_top),
                 });
                 y += shown as u16;
@@ -743,6 +830,28 @@ impl Layout {
         (self.rects().into_iter())
             .map(|r| r.intersection(all))
             .collect()
+    }
+
+    /// Its texts' rows as laid, in order (the tests).
+    #[cfg(test)]
+    pub fn texts(&self) -> Vec<String> {
+        (self.placed.iter())
+            .filter_map(|p| match p {
+                Placed::Text(_, text, _) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Its rows that scroll as laid, every one of them (the tests).
+    #[cfg(test)]
+    pub fn scroll_rows(&self) -> Vec<String> {
+        (self.placed.iter())
+            .find_map(|p| match p {
+                Placed::Scroll { rows, .. } => Some(rows.iter().map(|(t, _)| t.clone())),
+                _ => None,
+            })
+            .map_or_else(Vec::new, Iterator::collect)
     }
 }
 
@@ -1425,6 +1534,7 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                         rows,
                         top: laid,
                     } => {
+                        let rows: &[(String, Ink)] = rows;
                         let max_top = rows.len().saturating_sub(usize::from(cells.height));
                         let mut first = top.as_deref().copied().unwrap_or(*laid).min(max_top);
                         let theirs =
@@ -1441,10 +1551,13 @@ pub fn show(ctx: &egui::Context, id: egui::Id, layout: &Layout, inputs: Inputs) 
                         if let Some(top) = top.as_deref_mut() {
                             *top = first;
                         }
-                        let shown = rows.iter().skip(first).take(cells.height.into());
-                        for (k, (text, pen)) in shown.enumerate() {
+                        // Only the rows it shows are walked: `first` is at most `max_top`.
+                        let shown = rows[first..].iter().take(cells.height.into());
+                        for (k, (text, ink)) in shown.enumerate() {
+                            count(Work::Drawn, 1);
                             let y = cells.y + k as u16;
-                            cells::put(&mut buf, cells.x, y, text, cells.width.into(), *pen);
+                            let pen = ink.pen();
+                            cells::put(&mut buf, cells.x, y, text, cells.width.into(), pen);
                         }
                         if max_top > 0 {
                             let at = first as f32 / max_top as f32;
