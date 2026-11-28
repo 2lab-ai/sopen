@@ -783,8 +783,9 @@ fn pass(ctx: &egui::Context, grid: Grid, title: &str, list: &mut List, nothing: 
         return Pass::Cancel;
     }
     // The list holds the keyboard; egui drops a focus its layer cannot take yet (a new box's
-    // first pass), so it is asked for again while it is elsewhere.
-    if !ctx.memory(|m| m.has_focus(list_id())) {
+    // first pass), so it is asked for again while it is elsewhere — not while covered: the dialog
+    // in front has the keyboard (F-git-covered).
+    if !cells::covered(ctx) && !ctx.memory(|m| m.has_focus(list_id())) {
         ctx.memory_mut(|m| m.request_focus(list_id()));
     }
     // Space chooses nothing: egui's menu chose on Enter or a click only, and in the panel Space

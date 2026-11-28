@@ -605,6 +605,51 @@ fn query(fx: &Fx) -> SearchQuery {
         .clone()
 }
 
+/// F-git-covered: the history search under a result of its own panel's (`modals` draws it over
+/// it) reads no key and records no painting: typed text does not reach its fields and Esc closes
+/// the result, not the search; once a printed pass shows the search with the keys, Esc cancels it.
+#[test]
+fn f_git_covered_the_search_under_its_panels_result_reads_no_key() {
+    let mut fx = with_search(1000.0, 600.0);
+    fx.view_mut()
+        .show_text("Fetch", "fatal: the remote hung up", None);
+    fx.idle();
+    fx.idle();
+    let mut events = vec![Event::Text("x".into())];
+    events.extend(key_events(Key::Escape, Modifiers::NONE));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    assert!(fx.view().result.is_none(), "the Esc closed the result");
+    assert!(fx.view().search_dialog.is_some(), "not the search under it");
+    assert_eq!(query(&fx).message, "", "nothing typed under the result");
+    fx.idle();
+    fx.press(Key::Escape);
+    assert!(
+        fx.view().search_dialog.is_none(),
+        "with the keys again, Esc cancels it"
+    );
+}
+
+/// F-git-covered review 1: an action's dialog with a field over the history search has the
+/// keyboard — the search, under it, takes none for its own field — so every character typed from
+/// its first passes on goes into the dialog's field, and none into the search's.
+#[test]
+fn f_git_covered_text_typed_over_the_search_goes_into_the_dialog() {
+    let mut fx = with_search(1000.0, 600.0);
+    fx.view_mut().set_repo(super::tests_s3::repo());
+    let asked = (fx.view_mut()).open_action(
+        crate::git::actions::ActionId::Stash,
+        Target::Uncommitted,
+        Default::default(),
+    );
+    assert!(asked.is_empty(), "{asked:?}");
+    let draft = super::tests_x4_menu::typed_from_its_first_passes(&mut fx, "qzwv");
+    assert!(
+        matches!(&draft, Some(crate::git::actions::Action::Stash { message, .. }) if message == "qzwv"),
+        "the dialog's field: {draft:?}"
+    );
+    assert_eq!(query(&fx).message, "", "the search's field stays empty");
+}
+
 /// Cmd/Ctrl+Shift+F: the history search's dialog in cells — its frame titled `History search`,
 /// the six fields under labels of one width, black cells, `[ ] Match case`, the buttons and the
 /// note — over the panel, which blanks the cells under the box and its shadow (`covers`); no

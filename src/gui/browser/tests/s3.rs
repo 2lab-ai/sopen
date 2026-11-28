@@ -1514,6 +1514,77 @@ fn a_failing_read_leaves_the_plan_refused() {
     assert_eq!(tries, 1, "asked once for this snapshot");
 }
 
+/// F-git-drafted: the host asks a dialog's reads once per draft and snapshot, by the draft's
+/// revision, whatever the passes in between: Reset's hard (a changed draft) asks its `ls-tree`
+/// once — `not read yet` until it lands — ten idle passes ask nothing more, nor does going to
+/// mixed and back to hard; a refresh's new snapshot asks it again. A snapshot with as many reads
+/// as the last is told from it by its generation.
+#[test]
+fn f_git_drafted_a_dialogs_read_is_asked_once_per_draft_and_snapshot() {
+    let git = git_or_skip!();
+    let mut repo = small(&git);
+    let log = repo.tmp.path().join("ls-tree.log");
+    let wrapper = repo.tmp.path().join("git-logging");
+    script(
+        &wrapper,
+        &format!(
+            "case \" $* \" in *\" ls-tree -r -z --name-only --full-tree \"*) echo x >> '{}';; esac\nexec '{}' \"$@\"",
+            log.display(),
+            git.display()
+        ),
+    );
+    repo.git = wrapper;
+    let mut g = Gx::new(repo);
+    g.ready_in_git();
+    let tries = || {
+        std::fs::read_to_string(&log)
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    };
+    g.bar_to("second");
+    g.fx.drv.resize(1000.0, 1400.0);
+    g.idle(2);
+    g.menu("Reset the current branch here…");
+    assert_eq!(tries(), 0, "mixed reads no ls-tree");
+    g.click("( ) hard");
+    g.until_quiet("hard's read");
+    g.idle(4);
+    assert!(!g.shows("not read yet"), "{:#?}", g.texts());
+    assert_eq!(tries(), 1, "the changed draft's read");
+    for _ in 0..10 {
+        g.idle(1);
+        assert!(!g.panel().dialog_reading());
+    }
+    g.click("( ) mixed");
+    g.click("( ) hard");
+    g.until_quiet("hard again");
+    assert!(!g.shows("not read yet"), "{:#?}", g.texts());
+    assert_eq!(tries(), 1, "once for this snapshot");
+    // A refresh: the reads are made again for the new snapshot.
+    let ctx = g.fx.drv.ctx.clone();
+    let i = g.b().git.panel(g.repo.top()).unwrap();
+    g.fx.b.start_read(&ctx, i, true, 0);
+    g.until_quiet("the refresh and the read again");
+    g.idle(4);
+    assert_eq!(g.dialog_id(), Some(ActionId::Reset));
+    assert!(!g.shows("not read yet"), "{:#?}", g.texts());
+    assert_eq!(tries(), 2, "once for the new snapshot");
+    // A snapshot that holds as many reads as the one before (here the same ones): the check's key
+    // is the snapshot's own, its generation telling them apart where the count cannot.
+    let before = g.panel().check_key().expect("a dialog and a snapshot");
+    let same = g.view().repo().unwrap().0.clone();
+    g.panel_mut().view.set_repo(same);
+    let after = g.panel().check_key().expect("a dialog and a snapshot");
+    assert_eq!(
+        (before.0, before.2),
+        (after.0, after.2),
+        "the same dialog and draft revision, as many reads"
+    );
+    assert_ne!(before, after, "another snapshot");
+    g.idle(4);
+    assert_eq!(tries(), 2, "its reads were in it");
+}
+
 /// The coordinator's rule for the banner's steps: Continue goes through the same `needs` /
 /// `inspect` loop before `plan` as every action (its dialog is `ActionDialog::confirm`'s, its
 /// run the plan the dialog showed), never steps built directly. S4-A's plan reads
@@ -2350,7 +2421,7 @@ fn a_tree_that_waits(g: &mut Gx) {
 }
 
 /// A press and a release of `key`, as one pass's events.
-fn pressed(key: Key) -> Vec<egui::Event> {
+pub(super) fn pressed(key: Key) -> Vec<egui::Event> {
     [true, false]
         .map(|pressed| egui::Event::Key {
             key,
@@ -3266,4 +3337,198 @@ fn f_git_listq_a_result_over_the_planners_question_takes_no_key_from_it() {
     assert!(g.shows("Enter keeps it"), "the planner's question stays");
     assert_eq!(message(&g), None, "the Enter kept no message");
     drop(tx);
+}
+
+// ---------------------------------------------------------------------------------------------
+// F-git-covered: F12's question before a switch is another dialog to the git panel's, as the
+// list's question and another panel's dialog are: what a git dialog paints under one is not what
+// the screen showed of it, and what the integration would open waits for it. The question comes up
+// over a git dialog when the switch's state does not carry what the dialog holds (10 §7.4, v2; the
+// rule is `GitView::untaken`, said by `Browser::git_dropped`) — what is chosen in a restore's
+// dialog, what is typed in a quick edit's, for two — and over the planner, whose plan goes with
+// the switch. A dialog the state carries, or a confirmation a run's end opens again, switches
+// with no question.
+
+/// The switch's question with `line` in it is up (its box wraps the line: the texts joined).
+fn the_switch_asks(g: &Gx, line: &str) {
+    let texts: Vec<String> = (g.fx.drv.texts().into_iter()).map(|(_, _, t)| t).collect();
+    assert!(
+        g.b().switch_asking() && texts.join(" ").contains(line),
+        "the switch's question with {line:?}: {texts:#?}"
+    );
+}
+
+/// G-S1's start through the window: a hard reset to `second` from its menu, run, then Cmd/Ctrl+Z
+/// — the restore's dialog of the group the reset wrote is up, its reads in. HEAD then (`second`),
+/// and the HEAD the restore puts back.
+fn a_restore_opens(g: &mut Gx) -> (String, String) {
+    g.ready_in_git();
+    let third = g.repo.rev("HEAD");
+    let second = g.repo.rev("light");
+    g.bar_to("second");
+    // Room for the whole confirmation (it scrolls in a 700-point window).
+    g.fx.drv.resize(1000.0, 1400.0);
+    g.idle(2);
+    g.menu("Reset the current branch here…");
+    g.click("( ) hard");
+    g.until_quiet("the hard reset's reads");
+    g.idle(4);
+    g.run();
+    assert_eq!(g.repo.rev("HEAD"), second, "reset");
+    g.cmd(Key::Z);
+    g.until_quiet("the restore's entries");
+    assert_eq!(g.dialog_id(), Some(ActionId::Restore));
+    (second, third)
+}
+
+/// F-git-covered: a restore's dialog under F12's question, which asks first: what is chosen in it
+/// is not carried. `[Esc, Enter]` in one read of the terminal — the Esc cancels the switch in a
+/// pass the terminal does not print, the Enter reaches the restore's dialog, whose last printed
+/// frame stood under the question — runs nothing; once a printed pass showed it with the keyboard,
+/// Enter runs what it shows.
+#[test]
+fn f_git_covered_a_restore_under_the_switchs_question_runs_nothing() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    let (head, back) = a_restore_opens(&mut g);
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    assert_eq!(g.fx.b.before_switch("box"), Before::Held, "it asks first");
+    g.idle(2);
+    the_switch_asks(
+        &g,
+        "What is chosen in the restore's dialog is not carried to box: switching drops it.",
+    );
+    let ctx = g.fx.drv.ctx.clone();
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Escape), Modifiers::NONE);
+    cells::set_presented(&ctx, false);
+    assert!(!g.b().switch_asking(), "the Esc cancelled the switch");
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
+    cells::set_presented(&ctx, true);
+    assert_eq!(
+        after_the_run(&mut g, i),
+        (head, Some(ActionId::Restore)),
+        "the Enter ran nothing ({})",
+        g.status()
+    );
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
+    assert_eq!(
+        after_the_run(&mut g, i),
+        (back, None),
+        "the control: shown with the keyboard, its Enter runs ({})",
+        g.status()
+    );
+}
+
+/// F-git-covered: the twin with a quick edit's dialog — Reword of HEAD, its message typed — under
+/// F12's question, which asks first: what is typed in it is not carried. The same `[Esc, Enter]`
+/// runs nothing; once a printed pass showed it with the keyboard, Enter rewords.
+#[test]
+fn f_git_covered_a_quick_edit_under_the_switchs_question_runs_nothing() {
+    use crate::git::rebase::{Edit, Quick};
+    let git = git_or_skip!();
+    let repo = Repo::new(&git);
+    for (k, name) in ["base", "A", "B"].into_iter().enumerate() {
+        repo.write("c.txt", format!("{k}\n"));
+        repo.commit(name);
+    }
+    let mut g = Gx::new(repo);
+    g.ready_in_git();
+    g.bar_to("B");
+    g.f(Key::F2);
+    let reword = |g: &Gx| {
+        matches!(
+            g.view().edit_draft(),
+            Some(Edit::Quick(Quick::Reword { .. }))
+        )
+    };
+    assert!(
+        reword(&g),
+        "the reword's dialog: {:?}",
+        g.view().edit_draft()
+    );
+    g.cmd(Key::A);
+    g.idle(1);
+    g.fx.typed("B, reworded");
+    g.idle(2);
+    g.until_quiet("the reword's plan");
+    let head = g.repo.rev("HEAD");
+    let subject = |g: &Gx| g.repo.run(&["log", "-1", "--format=%s"]).trim().to_string();
+    assert_eq!(g.fx.b.before_switch("box"), Before::Held, "it asks first");
+    g.idle(2);
+    the_switch_asks(
+        &g,
+        "What is typed in the history edit's dialog is not carried to box: switching drops it.",
+    );
+    let ctx = g.fx.drv.ctx.clone();
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Escape), Modifiers::NONE);
+    cells::set_presented(&ctx, false);
+    assert!(!g.b().switch_asking(), "the Esc cancelled the switch");
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
+    cells::set_presented(&ctx, true);
+    g.idle(2);
+    g.until_quiet("anything the Enter ran");
+    assert_eq!(
+        (g.repo.rev("HEAD"), reword(&g)),
+        (head, true),
+        "the Enter ran nothing ({})",
+        g.status()
+    );
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
+    g.idle(2);
+    g.until_quiet("the reword's run");
+    assert_eq!(
+        subject(&g),
+        "B, reworded",
+        "the control: shown with the keyboard, its Enter runs ({})",
+        g.status()
+    );
+}
+
+/// F-git-covered: what the integration would open waits for F12's question (`Browser::git_waits`),
+/// as for the list's: a tag's details read while the question is up over the planner stay in
+/// their channel — no result opens under the question — and open once Cancel closes it.
+#[test]
+fn f_git_covered_a_result_waits_for_the_switchs_question() {
+    let git = git_or_skip!();
+    let repo = Repo::new(&git);
+    for (k, name) in ["base", "A", "B"].into_iter().enumerate() {
+        repo.write("c.txt", format!("{k}\n"));
+        repo.commit(name);
+    }
+    let mut g = Gx::new(repo);
+    g.ready_in_git();
+    g.bar_to("base");
+    g.cmd(Key::E);
+    g.idle(2);
+    g.until_quiet("the planner's range");
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    assert!(!g.view().dialog_up(), "the planner, no dialog of it");
+    assert_eq!(g.fx.b.before_switch("box"), Before::Held);
+    g.idle(2);
+    assert!(g.b().switch_asking(), "the switch's question");
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(("Tag v1.0".to_string(), Ok("tagged by Ann".to_string())))
+        .unwrap();
+    g.fx.b.git.panels[i].text_read = Some(git_host::Pending {
+        rx,
+        handle: crate::git::runner::Handle::new(),
+    });
+    g.idle(3);
+    assert!(g.b().git.panels[i].text_read.is_some(), "in its channel");
+    assert!(!g.view().dialog_up(), "no result under the question");
+    g.fx.drv.click_text_on_top(&mut g.fx.b, "[ Cancel ]");
+    g.idle(3);
+    assert!(!g.b().switch_asking(), "Cancel closed the question");
+    assert!(
+        g.b().git.panels[i].text_read.is_none(),
+        "heard once the question closed"
+    );
+    assert!(g.view().dialog_up(), "the result opened");
+    assert!(g.shows("tagged by Ann"), "{:#?}", g.texts());
 }

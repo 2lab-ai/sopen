@@ -166,8 +166,9 @@ pub(super) struct RepoPanel {
     /// The reads that failed for the snapshot of that generation: never recorded, never asked
     /// again for it — the plan stays "not read yet" and the dialog says so.
     pub(super) failed_reads: Option<(u64, Vec<actions::Need>)>,
-    /// The draft, snapshot generation and number of reads `needs` was last asked about.
-    pub(super) checked: Option<(Drafted, u64, usize)>,
+    /// What `needs` last answered for the open dialog, and for which draft, snapshot generation and
+    /// number of reads ([`Checked`]).
+    pub(super) checked: Option<Checked>,
     /// The Backups list being read.
     pub(super) backups_read: Option<Pending<std::result::Result<Vec<Record>, backup::Failed>>>,
     /// A restore's entries being read: the group's stamp, the one ref asked for.
@@ -359,15 +360,34 @@ impl RepoPanel {
 
     /// The open dialog still lacks a read its plan needs (`actions::needs`, or `rebase::needs`
     /// for a history edit's) that has not failed: it says `not read yet` until the next pass
-    /// asks for it.
+    /// asks for it. What the last check answered while its key holds ([`Checked`]), else planned
+    /// now.
     pub(super) fn dialog_reading(&self) -> bool {
-        match (Drafted::of(&self.view), self.view.repo()) {
-            (Some(draft), Some((repo, generation))) => draft
-                .needs(repo)
-                .iter()
-                .any(|n| !self.read_failed(generation, n)),
-            _ => false,
+        match (self.checked, self.check_key()) {
+            (_, None) => false,
+            (Some(c), Some(key)) if c.key == key => c.lacks,
+            _ => !self.missing_reads().is_empty(),
         }
+    }
+
+    /// The key the open dialog's reads are checked by: its draft's ([`git_panel::DraftKey`]), the
+    /// snapshot's generation and how many reads it holds. `None` with no dialog that plans, or no
+    /// snapshot.
+    pub(super) fn check_key(&self) -> Option<(git_panel::DraftKey, u64, usize)> {
+        let (repo, generation) = self.view.repo()?;
+        Some((self.view.draft_key()?, generation, repo.seen.reads.len()))
+    }
+
+    /// The reads the open dialog's plan lacks, less those that failed for the snapshot: its
+    /// draft planned where it stands, never copied.
+    fn missing_reads(&self) -> Vec<actions::Need> {
+        let (Some(draft), Some((repo, generation))) = (Drafted::of(&self.view), self.view.repo())
+        else {
+            return Vec::new();
+        };
+        (draft.needs(repo).into_iter())
+            .filter(|n| !self.read_failed(generation, n))
+            .collect()
     }
 
     /// `need` failed for the snapshot of `generation` (it is not asked again for it).
@@ -403,29 +423,92 @@ pub(super) fn edit_token(in_progress: &InProgress) -> Option<String> {
 }
 
 /// What an open dialog plans, for its reads beyond the refresh: S3's action, or a history
-/// edit (a quick edit's draft, the planner's run).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Drafted {
-    Action(Action),
-    Edit(Edit),
+/// edit (a quick edit's draft, the planner's run's) — where it stands in its dialog, never a copy
+/// (F-git-drafted: the planner's run's is its whole model, messages included). A history edit is
+/// held as its dialog's [`git_panel::Draft`], whose copies count in a test build.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Drafted<'a> {
+    Action(&'a Action),
+    Edit(&'a git_panel::Draft),
 }
 
-impl Drafted {
+impl<'a> Drafted<'a> {
     /// The open dialog's draft: S3's action dialog first, else S4's.
-    pub(super) fn of(view: &GitView) -> Option<Drafted> {
+    pub(super) fn of(view: &'a GitView) -> Option<Drafted<'a>> {
         match view.draft() {
-            Some(action) => Some(Drafted::Action(action.clone())),
-            None => view.edit_draft().map(Drafted::Edit),
+            Some(action) => Some(Drafted::Action(action)),
+            None => view.held_edit().map(Drafted::Edit),
         }
     }
 
-    /// The reads its plan lacks (`actions::needs`, `rebase::needs`).
-    pub(super) fn needs(&self, repo: &Repo) -> Vec<actions::Need> {
+    /// The reads its plan lacks (`actions::needs`, `rebase::needs`). It plans the draft, and a
+    /// plan copies its messages into its commands: asked once per [`Checked`] key.
+    pub(super) fn needs(self, repo: &Repo) -> Vec<actions::Need> {
+        #[cfg(test)]
+        handling(self.bytes());
         match self {
             Drafted::Action(action) => actions::needs(action, repo),
             Drafted::Edit(edit) => rebase::needs(edit, repo),
         }
     }
+
+    /// The bytes of the messages it holds (a test's measure, [`drafts_handled`]).
+    #[cfg(test)]
+    fn bytes(self) -> usize {
+        let some = |m: &Option<String>| m.as_ref().map_or(0, String::len);
+        match self {
+            Drafted::Action(Action::Commit { message, .. } | Action::Stash { message, .. }) => {
+                message.len()
+            }
+            Drafted::Action(
+                Action::Amend { message }
+                | Action::Tag { message, .. }
+                | Action::MoveTag { message, .. },
+            ) => some(message),
+            Drafted::Action(_) => 0,
+            Drafted::Edit(draft) => match &**draft {
+                Edit::Quick(
+                    rebase::Quick::Reword { message, .. } | rebase::Quick::Squash { message, .. },
+                ) => message.len(),
+                Edit::Plan(model) => (model.rows.iter())
+                    .map(|r| r.commit.message.len() + some(&r.message))
+                    .sum(),
+                _ => 0,
+            },
+        }
+    }
+}
+
+/// What `needs` last answered for the open dialog ([`RepoPanel::checked`]): for which draft —
+/// the dialog and its draft's revision ([`git_panel::DraftKey`]) — snapshot generation and number
+/// of reads, and whether it lacked a read that had not failed. A pass whose key is this one plans
+/// nothing and copies nothing (F-git-drafted); the reads that failed change only with `checked`
+/// cleared, and the snapshot only with its generation or its reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Checked {
+    key: (git_panel::DraftKey, u64, usize),
+    lacks: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bytes of drafts' messages the host planned on this thread.
+    static HANDLED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts the host planning a draft that holds `bytes` of messages ([`drafts_handled`]).
+#[cfg(test)]
+fn handling(bytes: usize) {
+    HANDLED.with(|c| c.set(c.get() + bytes));
+}
+
+/// The bytes of drafts' messages the host planned (`needs` plans a draft, and a plan copies its
+/// messages into its commands) on this thread since the last call; it holds no copy of one. An
+/// idle pass plans none (F-git-drafted: before it, each pass copied the draft once, and a pass
+/// whose settling was asked — a receipt's hook asks every pass — copied it twice and planned it).
+#[cfg(test)]
+pub(super) fn drafts_handled() -> usize {
+    HANDLED.with(|c| c.replace(0))
 }
 
 /// HEAD as the panel's labels take it.
@@ -2342,8 +2425,10 @@ impl Browser {
         };
         let rect = grid.rect(cells);
         // The list's question or the tree has the keyboard: read once, for each use below, so
-        // what the panel reads and what it carries out agree (F-git-listq).
+        // what the panel reads and what it carries out agree (F-git-listq). F12's question before
+        // a switch has it as well, over everything (F-git-covered).
         let (list_holds, tree) = (self.ops.holds_keyboard(), self.tree.is_some());
+        let switch = self.switch_asking();
         let pressed = ui.input(|inp| {
             inp.pointer.any_pressed()
                 && inp
@@ -2355,7 +2440,7 @@ impl Browser {
         // pass began or now; its box may lie over this half — a press here moves the keyboard
         // nowhere. A press on the panel whose dialog it is keeps the keyboard there.
         let held = ups.iter().any(|&j| j != i) || self.git_dialog_up(Some(i));
-        if pressed && !held && !list_holds && !tree && self.listing.is_empty() {
+        if pressed && !held && !list_holds && !tree && !switch && self.listing.is_empty() {
             if side != 1 - self.active {
                 // The other side's list had the keyboard: it is the origin list now.
                 self.active = 1 - side;
@@ -2368,10 +2453,10 @@ impl Browser {
         // after this pass's dialogs have opened or closed (`GitView::covered`).
         let mut under = self.ops.covered(grid);
         under.extend(self.git_covered(grid, Some(i)));
-        // Another panel's dialog up, the list's question, or the tree, whose other side stays as
-        // it was until it closes (05 §1): this one opens none, takes no click and its dialogs
-        // read no key.
-        let elsewhere = held || list_holds || tree;
+        // Another panel's dialog up, the list's question, the tree, whose other side stays as it
+        // was until it closes (05 §1), or F12's question: this one opens none, takes no click,
+        // its dialogs read no key and record no painting (`git_panel::draw`).
+        let elsewhere = held || list_holds || tree || switch;
         let view = &mut self.git.panels[i].view;
         view.set_dialog_elsewhere(elsewhere);
         // The keyboard is the panel's as `git_keys` gives it: not while a dialog of the list's or
@@ -2475,12 +2560,16 @@ impl Browser {
     }
 
     /// Whether what the integration would open in panel `i` waits in its channel (X4-menu
-    /// fix-check, rule 2): while another shown panel's dialog is up, or the list's question or
-    /// the tree has the keyboard — each another dialog to this panel, as `git_ui`'s `elsewhere`
-    /// (F-git-listq) — so no git dialog opens in front of the list's question, where it would take
-    /// the pointer while an Enter answered the question behind it, or beside the tree.
+    /// fix-check, rule 2): while another shown panel's dialog is up, or the list's question, the
+    /// tree or F12's question has the keyboard — each another dialog to this panel, as `git_ui`'s
+    /// `elsewhere` (F-git-listq, F-git-covered) — so no git dialog opens in front of the list's
+    /// question, where it would take the pointer while an Enter answered the question behind it,
+    /// beside the tree, or under F12's question.
     pub(super) fn git_waits(&self, i: usize) -> bool {
-        self.git_dialog_up(Some(i)) || self.ops.holds_keyboard() || self.tree.is_some()
+        self.git_dialog_up(Some(i))
+            || self.ops.holds_keyboard()
+            || self.tree.is_some()
+            || self.switch_asking()
     }
 }
 
@@ -3375,7 +3464,8 @@ impl Browser {
 
     /// The reads the open dialog's plan needs beyond the refresh (S3-A's `needs` / `inspect`; a
     /// history edit's `rebase::needs`, S4), on a worker, once per draft and snapshot; the dialog
-    /// plans again with them.
+    /// plans again with them. The draft is known by its dialog and revision ([`Checked`]), so an
+    /// idle pass compares three numbers and copies nothing (F-git-drafted).
     fn dialog_reads(&mut self, ctx: &egui::Context, i: usize) {
         let Some(runner) = self.git_runner() else {
             return;
@@ -3384,22 +3474,20 @@ impl Browser {
         if p.inspect.is_some() {
             return;
         }
-        let (Some(draft), Some((repo, generation))) = (Drafted::of(&p.view), p.view.repo()) else {
+        let (Some(key), Some((repo, generation))) = (p.check_key(), p.view.repo()) else {
             p.checked = None;
             return;
         };
-        let key = (draft, generation, repo.seen.reads.len());
-        if p.checked.as_ref() == Some(&key) {
+        // The same dialog, draft revision and snapshot: nothing planned, nothing copied.
+        if p.checked.is_some_and(|c| c.key == key) {
             return;
         }
         // A read that failed for this snapshot is not asked again (no loop of failing reads).
-        let missing: Vec<actions::Need> = key
-            .0
-            .needs(repo)
-            .into_iter()
-            .filter(|n| !p.read_failed(generation, n))
-            .collect();
-        p.checked = Some(key);
+        let missing = p.missing_reads();
+        p.checked = Some(Checked {
+            key,
+            lacks: !missing.is_empty(),
+        });
         if missing.is_empty() {
             return;
         }

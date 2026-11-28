@@ -630,8 +630,9 @@ impl Dialog {
     }
 
     /// One pass on `grid` (the panels'), in cells (see the module's notes): Esc and Enter are
-    /// taken before its controls see them.
-    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> Option<DialogEnd> {
+    /// taken before its controls see them. `keyboard`: no other dialog stands over it with the
+    /// keyboard (F-git-covered) — without it, it takes none for its field.
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid, keyboard: bool) -> Option<DialogEnd> {
         // What the screen shows as the owner pressed this pass's keys: the last paintings that
         // reached it.
         let seen_rows = self.rows_screen.start(ctx).cloned();
@@ -646,8 +647,8 @@ impl Dialog {
         }
         let began = ctx.memory(|m| m.focused());
         let enters = take_enters(ctx, began);
-        // The field has the keyboard while nothing of the dialog has it.
-        if !began.is_some_and(|id| self.controls.contains(&id)) {
+        // The field has the keyboard while nothing of the dialog has it, the dialog having it.
+        if keyboard && !began.is_some_and(|id| self.controls.contains(&id)) {
             ctx.memory_mut(|m| m.request_focus(typed_id()));
         }
         let laid_revision = self.revision;

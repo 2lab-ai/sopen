@@ -1198,6 +1198,91 @@ fn on_screen_two_passes_of_one_frame_get_one_answer() {
     );
 }
 
+/// A pass that stands covered by another dialog ([`set_covered`], F-git-covered) still answers
+/// what showed before it, and records no painting: after one reached the screen nothing shows
+/// until a pass paints uncovered. A covered later pass of a frame drops what an earlier pass of
+/// it painted: a frame's last pass is the frame's.
+#[test]
+fn on_screen_a_covered_pass_records_no_painting() {
+    let ctx = egui::Context::default();
+    let mut screen = OnScreen::default();
+    turn(&ctx, &mut screen, Some(1));
+    assert_eq!(turn(&ctx, &mut screen, Some(1)), Some(1));
+    set_covered(&ctx, true);
+    assert_eq!(
+        turn(&ctx, &mut screen, Some(2)),
+        Some(1),
+        "what showed before it"
+    );
+    set_covered(&ctx, false);
+    assert_eq!(
+        turn(&ctx, &mut screen, Some(3)),
+        None,
+        "the screen showed it covered"
+    );
+    assert_eq!(turn(&ctx, &mut screen, Some(4)), Some(3));
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        assert_eq!(screen.start(ui.ctx()).copied(), Some(4));
+        screen.painted(5);
+        set_covered(ui.ctx(), true);
+        assert_eq!(
+            screen.start(ui.ctx()).copied(),
+            Some(4),
+            "the frame's answer"
+        );
+        screen.painted(6);
+        set_covered(ui.ctx(), false);
+    });
+    out.textures_delta.clear();
+    assert_eq!(
+        turn(&ctx, &mut screen, None),
+        None,
+        "the frame's last pass stood covered"
+    );
+}
+
+/// A frame of two real passes — egui's first discarded (`request_discard`) — the first covered
+/// or not as `covered[0]`, the second as `covered[1]`, each painting its pass index: the passes
+/// run.
+fn two_passes(ctx: &egui::Context, screen: &mut OnScreen<u32>, covered: [bool; 2]) -> Vec<usize> {
+    let mut ran = Vec::new();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let pass = ui.ctx().current_pass_index();
+        ran.push(pass);
+        set_covered(ui.ctx(), covered[pass.min(1)]);
+        screen.start(ui.ctx());
+        screen.painted(10 + pass as u32);
+        set_covered(ui.ctx(), false);
+        if pass == 0 {
+            ui.ctx().request_discard("the test's second pass");
+        }
+    });
+    out.textures_delta.clear();
+    ran
+}
+
+/// GPT's review of F-git-covered: in a frame of two passes the frame's painting is its last
+/// pass's — an uncovered first pass, then a covered one: nothing shows after it; a covered first
+/// pass, then an uncovered one: the last pass's painting shows.
+#[test]
+fn on_screen_a_frames_last_pass_decides_whether_it_was_covered() {
+    let ctx = egui::Context::default();
+    let mut screen = OnScreen::default();
+    turn(&ctx, &mut screen, Some(1));
+    assert_eq!(two_passes(&ctx, &mut screen, [false, true]), [0, 1]);
+    assert_eq!(
+        turn(&ctx, &mut screen, Some(2)),
+        None,
+        "the last pass stood covered"
+    );
+    assert_eq!(two_passes(&ctx, &mut screen, [true, false]), [0, 1]);
+    assert_eq!(
+        turn(&ctx, &mut screen, None),
+        Some(11),
+        "the last pass's painting"
+    );
+}
+
 /// Another context's screen is another screen (the window and the terminal, across a switch):
 /// what one painted never shows in the other, whatever their frames' numbers.
 #[test]
