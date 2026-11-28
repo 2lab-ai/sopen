@@ -950,8 +950,9 @@ fn x4d2_a_refresh_that_changes_only_the_title_runs_nothing() {
 
 /// Move tag keeps the chosen tag's own message (03 §7.4): switching from annotated `alpha` to
 /// annotated `beta` loads beta's, never alpha's; an annotated tag whose message is not loaded is
-/// refused; a lightweight tag moves lightweight; an edit stays with its tag — also when it is
-/// typed in the pass that chooses another tag (moved from `tests_s3.rs`, in cells).
+/// refused; a lightweight tag moves lightweight; an edit stays with its tag; and text typed in
+/// the pass that chooses another tag lands nowhere, never under the tag chosen (moved from
+/// `tests_s3.rs`, in cells).
 #[test]
 fn x4d2_move_tag_keeps_the_chosen_tag_s_own_message() {
     let (r, prefill) = tags();
@@ -1369,7 +1370,7 @@ fn x4d2_the_panel_blanks_under_the_result_and_the_stop_question() {
         view.set_repo(dirty());
         let mut fx = super::tests::Fx::new(1000.0, 600.0, view);
         if stop {
-            fx.host.view.ask_stop("Commit".into());
+            fx.host.view.ask_stop("Commit".into(), 7);
         } else {
             (fx.host.view).show_text("Backups", "fatal: not a git repository", None);
         }
@@ -1406,7 +1407,7 @@ fn x4d2_the_stop_question_is_cells_and_its_answers() {
         let mut view = super::tests::fixture_view();
         view.set_repo(dirty());
         let mut fx = super::tests::Fx::new(1000.0, 600.0, view);
-        fx.host.view.ask_stop("Commit".into());
+        fx.host.view.ask_stop("Commit".into(), 7);
         fx.idle();
         fx.idle();
         fx
@@ -1424,7 +1425,7 @@ fn x4d2_the_stop_question_is_cells_and_its_answers() {
         assert!(all.contains(text), "{text:?} not in\n{all}");
     }
     assert_eq!(pen_of(&l, dialogs::STOP_HINT), weak_pen());
-    assert_eq!(fx.press(Key::Enter), [GitAction::StopWrite]);
+    assert_eq!(fx.press(Key::Enter), [GitAction::StopWrite(7)]);
     assert!(!fx.host.view.dialog_up());
 
     let mut fx = question();
@@ -1434,7 +1435,7 @@ fn x4d2_the_stop_question_is_cells_and_its_answers() {
     let mut fx = question();
     fx.drv.click_text_on_top(&mut fx.host, "[ Yes, stop it ]");
     fx.idle();
-    assert_eq!(fx.take(), [GitAction::StopWrite]);
+    assert_eq!(fx.take(), [GitAction::StopWrite(7)]);
 
     let mut fx = question();
     fx.drv.click_text_on_top(&mut fx.host, "[ No ]");
@@ -1459,7 +1460,7 @@ fn x4d2_an_enter_before_the_question_showed_stops_nothing() {
     let mut view = super::tests::fixture_view();
     view.set_repo(dirty());
     let mut fx = super::tests::Fx::new(1000.0, 600.0, view);
-    fx.host.view.ask_stop("Commit".into());
+    fx.host.view.ask_stop("Commit".into(), 7);
     for _ in 0..2 {
         fx.drv
             .frame(&mut fx.host, vec![down(Key::Enter)], Modifiers::NONE);
@@ -1468,7 +1469,7 @@ fn x4d2_an_enter_before_the_question_showed_stops_nothing() {
     assert!(fx.host.view.dialog_up());
     fx.drv
         .frame(&mut fx.host, vec![down(Key::Enter)], Modifiers::NONE);
-    assert_eq!(fx.take(), [GitAction::StopWrite]);
+    assert_eq!(fx.take(), [GitAction::StopWrite(7)]);
 }
 
 /// Review of X4-dialogs2: a question answered and asked again in the very next pass over the same
@@ -1478,12 +1479,12 @@ fn x4d2_a_stop_question_asked_again_at_once_starts_afresh() {
     let mut view = super::tests::fixture_view();
     view.set_repo(dirty());
     let mut fx = super::tests::Fx::new(1000.0, 600.0, view);
-    fx.host.view.ask_stop("Commit".into());
+    fx.host.view.ask_stop("Commit".into(), 7);
     fx.drv.idle(&mut fx.host, 3);
     fx.drv
         .frame(&mut fx.host, vec![down(Key::Escape)], Modifiers::NONE);
     assert!(!fx.host.view.dialog_up(), "answered No");
-    fx.host.view.ask_stop("Commit".into());
+    fx.host.view.ask_stop("Commit".into(), 7);
     fx.drv
         .frame(&mut fx.host, vec![down(Key::Enter)], Modifiers::NONE);
     assert!(fx.take().is_empty(), "stopped what it had not shown yet");
@@ -1553,7 +1554,7 @@ impl Window for InTerminal {
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.host.ui(ui);
         let stops = (self.host.actions.iter())
-            .filter(|a| matches!(a, GitAction::StopWrite))
+            .filter(|a| matches!(a, GitAction::StopWrite(7)))
             .count();
         self.stops.set(stops);
     }
@@ -1584,7 +1585,7 @@ fn x4d2_a_stop_the_terminal_never_printed_was_never_asked() {
     let mut b = term::Backend::new(tty, std::io::sink(), ctx, true);
     let mut view = super::tests::fixture_view();
     view.set_repo(dirty());
-    view.ask_stop("Commit".into());
+    view.ask_stop("Commit".into(), 7);
     let mut win = InTerminal {
         host: super::tests::Host {
             view,
@@ -1602,7 +1603,7 @@ fn x4d2_a_stop_the_terminal_never_printed_was_never_asked() {
     assert_eq!(end, term::End::Signal(libc::SIGTERM));
     assert_eq!(*sent_at.borrow(), [0, 0], "nothing stopped before the last");
     let stopped = (win.host.actions.iter())
-        .filter(|a| matches!(a, GitAction::StopWrite))
+        .filter(|a| matches!(a, GitAction::StopWrite(7)))
         .count();
     assert_eq!(stopped, 1, "{:?}", win.host.actions);
 }
@@ -1838,6 +1839,17 @@ fn x4d2_the_result_wraps_once_a_width() {
     assert_eq!(resized, once, "the resize wrapped once");
     fx.idle(5);
     assert_eq!(walked(), 0);
+}
+
+/// Two results of the same run are equal whatever either has wrapped: the rows it keeps are no
+/// part of it (the fix-check).
+#[test]
+fn x4d2_a_result_s_kept_rows_are_no_part_of_it() {
+    let a = ResultDialog::error("Backups", "fatal: not a git repository", None);
+    let b = a.clone();
+    let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 480.0));
+    assert!(!a.covers(&Grid::over(screen)).is_empty());
+    assert_eq!(a, b);
 }
 
 // ---------------------------------------------------------------------------------------------

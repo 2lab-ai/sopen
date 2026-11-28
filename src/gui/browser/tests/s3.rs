@@ -794,7 +794,7 @@ fn a_second_write_waits_for_the_first() {
 /// "Stop git?" goes with the write it asks about (X4-dialogs2, round 1): Esc over a commit A whose
 /// hook waits asks; A ends without its answer (stopped by its handle) and a checkout B, waiting in
 /// line behind it, starts (its hook waits too) — the question is gone, and the Enter that would
-/// have been its Yes stops nothing (`StopWrite` stops every running write).
+/// have been its Yes stops nothing.
 #[test]
 fn the_stop_question_goes_with_its_write() {
     let git = git_or_skip!();
@@ -842,6 +842,118 @@ fn the_stop_question_goes_with_its_write() {
     g.idle(3);
     assert!(!gone_within(b, Duration::from_millis(500)), "B was stopped");
     assert_eq!(g.panel().running.len(), 1, "B still runs");
+    g.panel().running[0].handle.stop();
+    assert!(gone_within(b, Duration::from_secs(6)));
+    g.until_quiet("B's stop");
+}
+
+/// Two commits of the same words, A behind a hook that waits and B in line behind it (the
+/// fix-check of X4-dialogs2): A from its dialog, B from the same dialog opened while A runs; then
+/// Esc's question over A. A's pid (the hook writes each one's in order).
+fn two_commits(g: &mut Gx, pids: &Path) -> i32 {
+    g.f(Key::F7);
+    g.fx.typed("first");
+    g.idle(2);
+    g.key(Key::Enter);
+    let a = pid_in(pids);
+    // B: Commit's dialog again (its prefill read would wait behind A's write lock: opened with
+    // the read the integration gives an empty message), run from it, in line.
+    let opened = (g.panel_mut().view).open_action(
+        ActionId::Commit,
+        git_panel::Target::Uncommitted,
+        git_panel::Prefill::default(),
+    );
+    assert!(opened.is_empty(), "{opened:?}");
+    g.idle(3);
+    assert_eq!(g.dialog_id(), Some(ActionId::Commit));
+    g.fx.typed("second");
+    g.idle(2);
+    g.key(Key::Enter);
+    g.until("B in line", |b| b.git.panels[0].running.len() == 2);
+    let titles: Vec<&str> = (g.panel().running.iter())
+        .map(|r| r.title.as_str())
+        .collect();
+    assert_eq!(titles[0], titles[1], "the same words");
+    g.until("the status row's warning", |b| {
+        b.status_line()
+            .text
+            .contains("a hook, a signer or a credential helper may be waiting for you")
+    });
+    g.esc();
+    assert!(g.painted("Stop git?"), "{:#?}", g.texts());
+    a
+}
+
+/// The second pid the hook wrote: B's, once it runs.
+fn second_pid(pids: &Path) -> i32 {
+    let t = Instant::now();
+    loop {
+        let all = std::fs::read_to_string(pids).unwrap_or_default();
+        if let Some(pid) = all.lines().nth(1).and_then(|l| l.trim().parse().ok()) {
+            return pid;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "B never ran: {all:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A repository whose pre-commit hook writes its pid to `pids` and waits; `a.txt` staged.
+fn hanging_commits(git: &Path) -> (Gx, std::path::PathBuf) {
+    let repo = small(git);
+    let pids = repo.tmp.path().join("pids");
+    let body = format!("echo $$ >> '{}'\nexec sleep 30", pids.display());
+    script(&repo.top.join(".git/hooks/pre-commit"), &body);
+    repo.write("a.txt", "changed\n");
+    repo.run(&["add", "a.txt"]);
+    let mut g = Gx::new(repo);
+    g.fx.b.git.quiet_after = Duration::from_millis(300);
+    g.fx.b.git.stop_after = Duration::from_millis(300);
+    g.ready_in_git();
+    (g, pids)
+}
+
+/// "Stop git?" asks about one write, not about its words (the fix-check): two commits of the same
+/// title, A running and B in line. A ends without the question's answer and B starts: the
+/// question goes with A, and the Enter that would have been its Yes stops nothing.
+#[test]
+fn the_stop_question_over_a_commit_goes_with_it_not_its_twin() {
+    let git = git_or_skip!();
+    let (mut g, pids) = hanging_commits(&git);
+    two_commits(&mut g, &pids);
+    g.panel().running[0].handle.stop();
+    let b = second_pid(&pids);
+    g.until("A's end", |b| b.git.panels[0].running.len() == 1);
+    g.idle(3);
+    if g.painted("[ OK ]") {
+        g.esc();
+    }
+    assert!(!g.painted("Stop git?"), "asked over B: {:#?}", g.texts());
+    g.key(Key::Enter);
+    g.idle(3);
+    assert!(!gone_within(b, Duration::from_millis(500)), "B was stopped");
+    g.panel().running[0].handle.stop();
+    assert!(gone_within(b, Duration::from_secs(6)));
+    g.until_quiet("B's stop");
+}
+
+/// Yes stops the write it asked about alone (the fix-check, 03 §3.4: "Yes stops it"): A stops,
+/// and B, in line behind it with the same words, runs.
+#[test]
+fn yes_stops_the_write_it_asked_about_alone() {
+    let git = git_or_skip!();
+    let (mut g, pids) = hanging_commits(&git);
+    let a = two_commits(&mut g, &pids);
+    g.key(Key::Enter);
+    assert!(gone_within(a, Duration::from_secs(6)), "A stopped");
+    let b = second_pid(&pids);
+    g.until("A's end", |b| b.git.panels[0].running.len() == 1);
+    assert!(
+        !gone_within(b, Duration::from_millis(500)),
+        "B was stopped too"
+    );
     g.panel().running[0].handle.stop();
     assert!(gone_within(b, Duration::from_secs(6)));
     g.until_quiet("B's stop");

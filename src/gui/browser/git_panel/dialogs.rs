@@ -2276,7 +2276,7 @@ pub fn status_text(what: &str, outcome: &Outcome) -> String {
 /// whole, a row a line, its tabs at every eighth cell and its control characters escaped; under
 /// them the command line in the weak colour, the warning in the error colour or the backup line,
 /// `[ OK ]` and the hint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ResultDialog {
     /// The action.
     title: String,
@@ -2296,6 +2296,33 @@ pub struct ResultDialog {
     /// each pass wrap nothing again until the width changes (X4-dialogs2, round 1).
     wrapped: std::cell::RefCell<Option<(usize, Wrapped)>>,
 }
+
+/// Two results are equal by what they say and where they scroll, the rows either keeps wrapped
+/// left out: they are its cache, not the result.
+impl PartialEq for ResultDialog {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            title,
+            steps,
+            error,
+            backup,
+            warning,
+            top,
+            wrapped: _,
+        } = self;
+        (title, steps, error, backup, warning, top)
+            == (
+                &other.title,
+                &other.steps,
+                &other.error,
+                &other.backup,
+                &other.warning,
+                &other.top,
+            )
+    }
+}
+
+impl Eq for ResultDialog {}
 
 /// A result's rows that scroll, wrapped to a width: each its text and its ink.
 type Wrapped = Arc<Vec<(String, Ink)>>;

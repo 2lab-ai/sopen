@@ -241,8 +241,8 @@ pub enum GitAction {
     ShowBackup(Vec<BackupRef>),
     /// `tag-details` (03 §7.4): `cat-file -p <t>` read, then [`GitView::show_text`].
     TagDetails(String),
-    /// Yes to "Stop git?" (03 §3.4): the write running in this panel is stopped.
-    StopWrite,
+    /// Yes to "Stop git?" (03 §3.4): the write it asked about — the run of this id — is stopped.
+    StopWrite(u64),
     // S4 (03 §7.8; S4-C).
     /// A quick edit's dialog (03 §7.8.1), once its commit is read: the range above `base` up to
     /// HEAD (`rebase::open_needs`, `actions::inspect`, `rebase::open`), whose rows hold `commit`
@@ -444,8 +444,9 @@ pub struct GitView {
     confirmed: Option<(Action, Plan)>,
     /// A run's error dialog, a read's failure, a tag's details (03 §3.8, §7.4).
     result: Option<dialogs::ResultDialog>,
-    /// "Stop git?" over a write running for 10 s (03 §3.4): the action's words.
-    stop_question: Option<String>,
+    /// "Stop git?" over a write running for 10 s (03 §3.4): the action's words, and the id of the
+    /// run it asks about.
+    stop_question: Option<(String, u64)>,
     /// The Backups list in the body (Cmd/Ctrl+B, 03 §8.2).
     backups: Option<backups::BackupsView>,
     /// The command log in the body (Cmd/Ctrl+L, 03 §3.7).
@@ -1344,7 +1345,7 @@ impl GitView {
             out.extend(d.covers(grid));
         } else if let Some(r) = &self.result {
             out.extend(r.covers(grid));
-        } else if let Some(what) = &self.stop_question {
+        } else if let Some((what, _)) = &self.stop_question {
             out.extend(stop_covers(grid, what));
         }
         if let Some(log) = &self.log {
@@ -1538,18 +1539,18 @@ impl GitView {
         self.result = Some(dialogs::ResultDialog::error(title, text, command_line));
     }
 
-    /// "Stop git?" (03 §3.4) over the write `what`, running for 10 s.
-    pub fn ask_stop(&mut self, what: String) {
-        self.stop_question = Some(what);
+    /// "Stop git?" (03 §3.4) over the write `what`, the run of id `run`, running for 10 s.
+    pub fn ask_stop(&mut self, what: String, run: u64) {
+        self.stop_question = Some((what, run));
     }
 
-    /// "Stop git?" goes once the write it asks about no longer runs — `runs` says whether a write
-    /// of those words still does — since its Yes stops every running write (X4-dialogs2, round 1).
-    pub fn forget_stop_unless(&mut self, runs: impl Fn(&str) -> bool) {
+    /// "Stop git?" goes once the run it asks about no longer runs — `runs` says whether the run of
+    /// that id still does — whatever another run's words are (X4-dialogs2, round 1, fix-check).
+    pub fn forget_stop_unless(&mut self, runs: impl Fn(u64) -> bool) {
         if self
             .stop_question
-            .as_deref()
-            .is_some_and(|what| !runs(what))
+            .as_ref()
+            .is_some_and(|(_, id)| !runs(*id))
         {
             self.stop_question = None;
         }
@@ -2207,11 +2208,11 @@ impl GitView {
             }
             return Vec::new();
         }
-        if let Some(what) = self.stop_question.clone() {
+        if let Some((what, run)) = self.stop_question.clone() {
             return match stop_question(ctx, grid, &what) {
                 Some(true) => {
                     self.stop_question = None;
-                    vec![GitAction::StopWrite]
+                    vec![GitAction::StopWrite(run)]
                 }
                 Some(false) => {
                     self.stop_question = None;
