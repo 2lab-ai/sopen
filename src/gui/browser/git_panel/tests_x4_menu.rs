@@ -1185,7 +1185,7 @@ fn the_repositorys_menu_holds_every_cmd_shift_action() {
             by_key.idle();
             let letter = Key::from_name(&key.to_string()).expect("a letter");
             let key_asked = by_key.key(letter, Modifiers::COMMAND | Modifiers::SHIFT);
-            let seen = |fx: &Fx| (fx.view().draft().cloned(), fx.view().edit_draft());
+            let seen = |fx: &Fx| (fx.view().draft().cloned(), fx.view().edit_draft().cloned());
             assert_eq!(seen(&by_menu), seen(&by_key), "{name}: {label}");
             assert_eq!(menu_asked, key_asked, "{name}: {label}");
             assert!(

@@ -75,6 +75,7 @@ pub use dialogs::Prefill;
 pub use filters::{BranchChoice, Filters, Order};
 pub use find::SearchQuery;
 pub use menu::{history_label, label as action_label, Target};
+pub use planner::Draft;
 #[cfg(test)]
 pub use {dialogs::PLAN_FIRST, planner::UPDATE_REFS};
 
@@ -515,6 +516,32 @@ pub enum Front {
 impl Front {
     /// How many slots there are.
     pub const KINDS: usize = 9;
+}
+
+/// The open dialog's draft as the integration checks its reads by (F-git-drafted): which dialog
+/// it is — its own serial, which no other dialog of any kind shares ([`dialog_serial`]), so two
+/// dialogs whose drafts stand at the same revision are told apart — and its draft's revision,
+/// which moves whenever a pass changes the draft ([`GitView::draft_key`]). Never a copy of the
+/// draft: a planner run's is its whole model, messages included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraftKey {
+    pub serial: u64,
+    pub revision: u64,
+}
+
+/// A serial for a dialog that opens ([`DraftKey::serial`]): no two in the process share one.
+fn dialog_serial() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The bytes of messages the quick edits' dialogs' drafts were copied with on this thread since
+/// the last call ([`planner::Draft`]'s copies, the integration's included): the browser's tests'
+/// bound on a pass (F-git-drafted).
+#[cfg(test)]
+pub(super) fn quick_copied() -> usize {
+    planner::copied()
 }
 
 /// The results that wait behind the one up (F-git-outcome). While a result is up it has the
@@ -2770,13 +2797,34 @@ impl GitView {
     }
 
     /// The history edit an open dialog plans now, what `rebase::needs` reads for: the quick
-    /// edit's draft, or the planner's model while its run dialog is up (03 §7.8.2: the run's
-    /// reads on Cmd/Ctrl+Enter).
-    pub fn edit_draft(&self) -> Option<Edit> {
+    /// edit's draft, or the planner's run's while its dialog is up — the model with the run's
+    /// options (03 §7.8.2: the run's reads on Cmd/Ctrl+Enter). Borrowed, as [`planner::Draft`]:
+    /// a copy of it counts in a test build (F-git-drafted).
+    pub fn held_edit(&self) -> Option<&planner::Draft> {
         if let Some(quick) = &self.quick {
-            return Some(quick.draft().clone());
+            return Some(quick.held_draft());
         }
         self.planner.as_ref().and_then(|p| p.run_draft())
+    }
+
+    /// [`GitView::held_edit`] as the edit itself (the tests).
+    #[cfg(test)]
+    pub fn edit_draft(&self) -> Option<&Edit> {
+        self.held_edit().map(|d| &**d)
+    }
+
+    /// The key of the draft [`GitView::draft`] or else [`GitView::held_edit`] gives, in their
+    /// order — S3's action dialog first, then the quick edit's, then the planner's run: which
+    /// dialog and its draft's revision (F-git-drafted). `None` with none of them up.
+    pub fn draft_key(&self) -> Option<DraftKey> {
+        let key = |(serial, revision)| DraftKey { serial, revision };
+        if let Some(dialog) = &self.dialog {
+            return Some(key(dialog.draft_revision()));
+        }
+        if let Some(quick) = &self.quick {
+            return Some(key(quick.draft_revision()));
+        }
+        (self.planner.as_ref()).and_then(|p| p.run_revision().map(key))
     }
 
     /// The split this window keeps for this repository (03 §7.8.1 `split`), from the refresh.

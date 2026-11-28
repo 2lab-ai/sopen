@@ -1514,6 +1514,77 @@ fn a_failing_read_leaves_the_plan_refused() {
     assert_eq!(tries, 1, "asked once for this snapshot");
 }
 
+/// F-git-drafted: the host asks a dialog's reads once per draft and snapshot, by the draft's
+/// revision, whatever the passes in between: Reset's hard (a changed draft) asks its `ls-tree`
+/// once — `not read yet` until it lands — ten idle passes ask nothing more, nor does going to
+/// mixed and back to hard; a refresh's new snapshot asks it again. A snapshot with as many reads
+/// as the last is told from it by its generation.
+#[test]
+fn f_git_drafted_a_dialogs_read_is_asked_once_per_draft_and_snapshot() {
+    let git = git_or_skip!();
+    let mut repo = small(&git);
+    let log = repo.tmp.path().join("ls-tree.log");
+    let wrapper = repo.tmp.path().join("git-logging");
+    script(
+        &wrapper,
+        &format!(
+            "case \" $* \" in *\" ls-tree -r -z --name-only --full-tree \"*) echo x >> '{}';; esac\nexec '{}' \"$@\"",
+            log.display(),
+            git.display()
+        ),
+    );
+    repo.git = wrapper;
+    let mut g = Gx::new(repo);
+    g.ready_in_git();
+    let tries = || {
+        std::fs::read_to_string(&log)
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    };
+    g.bar_to("second");
+    g.fx.drv.resize(1000.0, 1400.0);
+    g.idle(2);
+    g.menu("Reset the current branch here…");
+    assert_eq!(tries(), 0, "mixed reads no ls-tree");
+    g.click("( ) hard");
+    g.until_quiet("hard's read");
+    g.idle(4);
+    assert!(!g.shows("not read yet"), "{:#?}", g.texts());
+    assert_eq!(tries(), 1, "the changed draft's read");
+    for _ in 0..10 {
+        g.idle(1);
+        assert!(!g.panel().dialog_reading());
+    }
+    g.click("( ) mixed");
+    g.click("( ) hard");
+    g.until_quiet("hard again");
+    assert!(!g.shows("not read yet"), "{:#?}", g.texts());
+    assert_eq!(tries(), 1, "once for this snapshot");
+    // A refresh: the reads are made again for the new snapshot.
+    let ctx = g.fx.drv.ctx.clone();
+    let i = g.b().git.panel(g.repo.top()).unwrap();
+    g.fx.b.start_read(&ctx, i, true, 0);
+    g.until_quiet("the refresh and the read again");
+    g.idle(4);
+    assert_eq!(g.dialog_id(), Some(ActionId::Reset));
+    assert!(!g.shows("not read yet"), "{:#?}", g.texts());
+    assert_eq!(tries(), 2, "once for the new snapshot");
+    // A snapshot that holds as many reads as the one before (here the same ones): the check's key
+    // is the snapshot's own, its generation telling them apart where the count cannot.
+    let before = g.panel().check_key().expect("a dialog and a snapshot");
+    let same = g.view().repo().unwrap().0.clone();
+    g.panel_mut().view.set_repo(same);
+    let after = g.panel().check_key().expect("a dialog and a snapshot");
+    assert_eq!(
+        (before.0, before.2),
+        (after.0, after.2),
+        "the same dialog and draft revision, as many reads"
+    );
+    assert_ne!(before, after, "another snapshot");
+    g.idle(4);
+    assert_eq!(tries(), 2, "its reads were in it");
+}
+
 /// The coordinator's rule for the banner's steps: Continue goes through the same `needs` /
 /// `inspect` loop before `plan` as every action (its dialog is `ActionDialog::confirm`'s, its
 /// run the plan the dialog showed), never steps built directly. S4-A's plan reads
