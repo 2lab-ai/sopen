@@ -2514,6 +2514,20 @@ impl Browser {
             .collect()
     }
 
+    /// Whether the git panel on the right side may open a box in its draw this pass
+    /// (`GitView::may_open_in_draw`: a choice in its menu, a right click, a key after Find's
+    /// typing), over the left side painted before it (F-menu-own). A panel on the left is drawn
+    /// first, and the side after it reads its covers with that box in them; one over both sides
+    /// has no side beside it.
+    pub(super) fn git_may_open_on_the_right(&self, ctx: &egui::Context) -> bool {
+        match self.shown.as_ref().map(|s| &s[1]) {
+            Some(view::Content::Git(top)) => {
+                (self.git.panel(top)).is_some_and(|i| self.git.panels[i].view.may_open_in_draw(ctx))
+            }
+            _ => false,
+        }
+    }
+
     /// The keyboard follows an open git dialog (X4-menu fix-check, rule 1): while a shown panel's
     /// dialog is up, that panel has the keyboard, as a click on it gives it — so its dialog reads
     /// the keys, Esc is its (`git_stop_on_esc`), and no other panel's or list's key acts. A dialog

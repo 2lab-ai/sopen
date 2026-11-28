@@ -1897,6 +1897,70 @@ mod on_screen {
         assert!(win.host.actions.is_empty(), "{:?}", win.host.actions);
         assert!(win.host.view.filters().is_default());
     }
+
+    /// The panel in the terminal, keeping what it held under the dialog a menu choice opened in
+    /// the first pass that painted that dialog (F-menu-own): the cells with a glyph under its box
+    /// and its shadow, in its own painting and as the pass left them (`Under`).
+    struct Watched {
+        host: Host,
+        first: Option<Under>,
+    }
+
+    impl Window for Watched {
+        fn ui(&mut self, ui: &mut egui::Ui) {
+            self.host.ui(ui);
+            if self.first.is_some() {
+                return;
+            }
+            let grid = Grid::over(self.host.rect);
+            let ctx = ui.ctx().clone();
+            let covers = opened_on(&self.host.view, &grid).filter(|c| painted_over(&ctx, c));
+            if let Some(covers) = covers {
+                let (own, left) = panel_cells(&ctx, &grid);
+                self.first = Some((left_under(&own, &covers), left_under(&left, &covers)));
+            }
+        }
+
+        fn ready(&self) -> bool {
+            true
+        }
+    }
+
+    /// F-menu-own under `term::Backend`, recording on: F10 printed, then Enter on Tag…: in the
+    /// first pass that paints the Tag dialog, the panel's recorded cells — what the backend's
+    /// screen is composed from — are blank under its box and its shadow. The screen itself
+    /// (`term::compose`) shows the dialog's cells in its box whatever lies under them, and these
+    /// graph rows hold no wide glyph for its edge to cut, so the record is what this proves.
+    #[test]
+    fn f_menu_own_the_recorded_panel_is_blank_under_the_dialog_in_the_backend() {
+        let mut all = vec![vec![CEvent::FocusGained], vec![CEvent::FocusGained]];
+        all.extend([vec![press(KeyCode::F(10))], vec![press(KeyCode::Enter)]]);
+        let tty = Bursts {
+            bursts: all.into(),
+            now: VecDeque::new(),
+            asked: 0,
+            state: Rc::new(Cell::new(State::default())),
+            sent_at: Rc::new(RefCell::new(Vec::new())),
+        };
+        let ctx = egui::Context::default();
+        chrome::install(&ctx);
+        let mut b = term::Backend::new(tty, std::io::sink(), ctx, true);
+        let mut win = Watched {
+            host: host(),
+            first: None,
+        };
+        let mut no_switch =
+            |_: &mut term::Backend<Bursts, std::io::Sink>| panic!("no switch in this test");
+        let end = b.run(&mut win, &mut no_switch).expect("the run");
+        assert_eq!(end, term::End::Signal(libc::SIGTERM));
+        assert_eq!(win.host.view.draft().map(Action::id), Some(ActionId::Tag));
+        let (painted, left) = win.first.expect("the Tag dialog painted");
+        assert!(
+            !painted.is_empty(),
+            "the control: graph text under the box in the panel's own painting"
+        );
+        assert_eq!(left, [], "left under the Tag dialog");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2285,4 +2349,229 @@ fn f_git_covered_a_covered_menu_takes_no_keyboard() {
         assert!(win.host.view.menu.is_some(), "the menu");
     });
     assert_eq!(front, "qzwv", "the front dialog's field");
+}
+
+// ---------------------------------------------------------------------------------------------
+// F-menu-own (X4-dialogs2's review of X4-menu): a menu choice that opens an action's dialog or a
+// quick edit's draws it in the pass that chose it (`GitView::modals`), after the panel took its
+// covers for the menu. In the pass that dialog first shows, the panel is blank under its box and
+// its shadow, as under every dialog of its own (cells.rs, one buffer over another).
+
+/// The box and the shadow of the dialog a choice of `modals`' opened — a quick edit's or an
+/// action's — as it stands on the panels' grid now.
+fn opened_covers(fx: &Fx) -> Option<Vec<Cells>> {
+    opened_on(fx.view(), &grid_of(fx))
+}
+
+/// [`opened_covers`] of `view` on `grid`.
+fn opened_on(view: &GitView, grid: &Grid) -> Option<Vec<Cells>> {
+    (view.quick.as_ref().map(|d| d.covers(grid)))
+        .or_else(|| view.dialog.as_ref().map(|d| d.covers(grid)))
+}
+
+/// The panel's own layer of cells in the pass just run in `ctx`, as it painted it, and that layer
+/// as the pass left it ([`cells::with_later`]; the terminal's run has no `Fx` for
+/// `tests_x4_graph::panel`).
+fn panel_cells(ctx: &egui::Context, grid: &Grid) -> (Arc<Layer>, Layer) {
+    let layers = cells::layers(ctx);
+    let at = (layers.iter())
+        .position(|l| l.buf.area == grid.all() && l.origin == grid.origin)
+        .expect("the panel's cells over its side");
+    (layers[at].clone(), cells::with_later(&layers, at))
+}
+
+/// The cells of `panel` under `covers` that hold a glyph, each as (x, y, glyph).
+fn left_under(panel: &Layer, covers: &[Cells]) -> Vec<(u16, u16, String)> {
+    let seen = panel.seen();
+    let a = panel.buf.area;
+    let mut left = Vec::new();
+    for c in covers.iter().map(|c| c.intersection(a)) {
+        for y in c.top()..c.bottom() {
+            for x in c.left()..c.right() {
+                let s = &seen[usize::from(y - a.y)][usize::from(x - a.x)];
+                if !s.symbol.trim().is_empty() {
+                    left.push((x, y, s.symbol.clone()));
+                }
+            }
+        }
+    }
+    left
+}
+
+/// Whether the pass just run in `ctx` painted a layer of cells over exactly `covers`.
+fn painted_over(ctx: &egui::Context, covers: &[Cells]) -> bool {
+    let area = covers.iter().fold(covers[0], |a, c| a.union(*c));
+    cells::layers(ctx).iter().any(|l| l.buf.area == area)
+}
+
+/// The box and the shadow of the last dialog the pass just run in `ctx` painted — a modal's layer
+/// of cells (egui's `Foreground` order) — but the one over `except` (the menu's box and shadow),
+/// from that layer: as it stood on screen, whatever the pass typed into it since it was laid out.
+fn painted_box(ctx: &egui::Context, except: &[Cells]) -> Option<Vec<Cells>> {
+    let menu = except.iter().fold(except[0], |a, c| a.union(*c));
+    let layers = cells::layers(ctx);
+    let l = (layers.iter().rev())
+        .find(|l| l.layer.order == egui::Order::Foreground && l.buf.area != menu)?;
+    let a = l.buf.area;
+    let frame = Cells::new(a.x, a.y, a.width.checked_sub(2)?, a.height.checked_sub(1)?);
+    let [right, under] = kit::shadow_of(frame);
+    Some(vec![frame, right, under])
+}
+
+/// The cells with a glyph under a dialog's box and shadow: in the panel's own painting of the
+/// pass (the premise — graph text there to blank), and as the pass left them.
+type Under = (Vec<(u16, u16, String)>, Vec<(u16, u16, String)>);
+
+/// `events` as one pass with the menu open, then passes with nothing, one at a time, until the
+/// pass the dialog its choice opened first shows in: that pass's number (0, the choosing one) and
+/// what the panel held under that dialog's box and shadow there ([`Under`]).
+fn under_its_first_pass(fx: &mut Fx, events: Vec<Event>) -> (usize, Under) {
+    let menu = menu_covers(fx);
+    let mut events = events;
+    for k in 0..4 {
+        let now = std::mem::take(&mut events);
+        fx.drv.frame(&mut fx.host, now, Modifiers::NONE);
+        let shown = opened_covers(fx).and(painted_box(&fx.drv.ctx, &menu));
+        if let Some(covers) = shown {
+            let (own, _) = panel_cells(&fx.drv.ctx, &grid_of(fx));
+            let left = left_under(&super::tests_x4_graph::panel(fx), &covers);
+            return (k, (left_under(&own, &covers), left));
+        }
+    }
+    panic!("no dialog showed: {:?}", fx.take())
+}
+
+/// A screen of Hangul in cells, painted, then `covers` blanked over it as the panel blanks under
+/// a dialog a choice opened ([`super::blank_over`]).
+struct Patched {
+    covers: Vec<Cells>,
+}
+
+impl crate::gui::Window for Patched {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let grid = Grid::over(ui.ctx().content_rect());
+        let body = Pen::new(PALETTE.text, PALETTE.back);
+        let mut buf = cells::Buffer::empty(grid.all());
+        cells::fill(&mut buf, grid.all(), body);
+        for y in 0..grid.rows {
+            cells::put(&mut buf, 0, y, &"한글".repeat(40), 80, body);
+        }
+        let painter = ui.painter().clone();
+        cells::paint(&painter, grid.origin, &buf, None);
+        super::blank_over(&painter, &grid, &mut buf, &self.covers, body);
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// What the blanking paints over the panel's painting, at a box's edges in a Hangul row: the
+/// glyph whose second cell the box's left column is goes whole, and so does one whose first cell
+/// is the box's last column — its second cell, outside the box, gets the body under it too, so
+/// no half of a glyph painted before shows in the window (a terminal erases it whole).
+#[test]
+fn f_menu_own_the_blanking_takes_whole_glyphs_at_the_edges() {
+    // Each glyph two cells, from column 0: column 5 a second cell, column 10 a first.
+    let covers = vec![Cells::new(5, 2, 6, 3)];
+    let mut drv = Driver::new(80.0 * chrome::CELL.x, 8.0 * chrome::CELL.y);
+    let mut win = Patched { covers };
+    drv.idle(&mut win, 1);
+    let grid = Grid::over(drv.ctx.content_rect());
+    let patch = (cells::layers(&drv.ctx).into_iter())
+        .find(|l| l.buf.area != grid.all())
+        .expect("the blanked cells, a layer of their own");
+    assert_eq!(patch.buf.area, Cells::new(4, 2, 8, 3), "columns 4 to 11");
+    let (_, panel) = panel_cells(&drv.ctx, &grid);
+    let rows = |y: u16| cells::row_text(&panel.buf, y).0;
+    assert_eq!(rows(1), "한글".repeat(20), "the row above as it was");
+    for y in 2..5 {
+        let blanked = format!("한글{}{}", " ".repeat(8), "한글".repeat(17));
+        assert_eq!(rows(y), blanked, "row {y}");
+    }
+    for y in 2..5 {
+        let run = grid.rect(Cells::new(4, y, 8, 1));
+        assert!(
+            (drv.rects().iter()).any(|&(r, fill, _)| r == run && fill == PALETTE.back),
+            "the body under columns 4 to 11 of row {y}"
+        );
+    }
+}
+
+/// F10's menu on a commit, then Enter on its first item, Tag…, in one pass — alone, and with
+/// text typed after it: the Tag dialog shows in that pass (X4-menu), no graph row stands under
+/// its box or its shadow in the panel's cells there, and the text is the dialog's.
+#[test]
+fn f_menu_own_an_action_dialog_a_choice_opens_stands_over_blank_cells() {
+    for typed in ["", "v9"] {
+        let mut fx = Fx::new(1000.0, 400.0, fixture_view());
+        fx.view_mut().set_repo(super::tests_s3::repo());
+        fx.idle();
+        fx.press(Key::ArrowDown);
+        fx.press(Key::F10);
+        let mut events = key_events(Key::Enter, Modifiers::NONE);
+        if !typed.is_empty() {
+            events.push(Event::Text(typed.into()));
+        }
+        let (pass, (painted, left)) = under_its_first_pass(&mut fx, events);
+        assert!(
+            !painted.is_empty(),
+            "{typed:?}: the control: graph text under the box in the panel's own painting"
+        );
+        assert!(
+            matches!(fx.view().draft(), Some(Action::Tag { name, .. }) if name == typed),
+            "{typed:?}: {:?}",
+            fx.view().draft()
+        );
+        assert_eq!(pass, 0, "{typed:?}: shown in the pass that chose it");
+        assert_eq!(left, [], "{typed:?}: left under the Tag dialog");
+    }
+}
+
+/// The repository's menu at an edit stop, then Enter on its key line "Split the stopped
+/// commit…" in one pass: its quick edit's confirmation opens and shows in that pass
+/// (`confirm_edit`, not the integration's reads), the panel blank under its box and its shadow.
+#[test]
+fn f_menu_own_a_quick_edit_a_choice_opens_stands_over_blank_cells() {
+    use crate::git::model::{InProgress, Operation, RebaseProgress};
+    use crate::git::rebase::Edit;
+    let a = "a".repeat(40);
+    let repo = in_state(InProgress {
+        operation: Some(Operation::Rebase),
+        rebase: Some(RebaseProgress {
+            stopped_sha: Some(a.clone()),
+            done_last: Some(format!("edit {a} third")),
+            ..RebaseProgress::default()
+        }),
+        ..InProgress::default()
+    });
+    let mut fx = Fx::new(1000.0, 400.0, fixture_view());
+    fx.view_mut().set_repo(repo);
+    fx.idle();
+    fx.press(Key::F10);
+    fx.press(Key::End);
+    fx.press(Key::Enter);
+    fx.idle();
+    let rows = menu_rows(&fx);
+    let lines: Vec<&String> = rows.iter().skip(2).collect();
+    let at = (lines.iter())
+        .position(|r| r.contains("Split the stopped commit…"))
+        .unwrap_or_else(|| panic!("no Split line: {rows:#?}"));
+    for _ in 0..at {
+        fx.press(Key::ArrowDown);
+    }
+    let (pass, (painted, left)) =
+        under_its_first_pass(&mut fx, key_events(Key::Enter, Modifiers::NONE));
+    assert!(
+        !painted.is_empty(),
+        "the control: graph text under the box in the panel's own painting"
+    );
+    assert!(
+        matches!(fx.view().edit_draft(), Some(Edit::SplitStop { .. })),
+        "{:?}",
+        fx.view().edit_draft()
+    );
+    assert!(fx.view().quick.is_some(), "a quick edit's dialog");
+    assert_eq!(pass, 0, "shown in the pass that chose it");
+    assert_eq!(left, [], "left under the Split dialog");
 }

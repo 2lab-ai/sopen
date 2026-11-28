@@ -22,13 +22,16 @@ fn grid_of(fx: &Fx) -> Grid {
     Grid::over(fx.host.rect)
 }
 
-/// The panel's layer of cells: the one over all of its side.
+/// The panel's layer of cells — the one over all of its side — as the pass left it: with what
+/// was blanked over it later in the pass, under a dialog a menu choice opened (F-menu-own,
+/// [`cells::with_later`]).
 pub(super) fn panel(fx: &Fx) -> Arc<Layer> {
     let grid = grid_of(fx);
-    cells::layers(&fx.drv.ctx)
-        .into_iter()
-        .find(|l| l.buf.area == grid.all() && l.origin == grid.origin)
-        .expect("the panel's cells over its side")
+    let layers = cells::layers(&fx.drv.ctx);
+    let at = (layers.iter())
+        .position(|l| l.buf.area == grid.all() && l.origin == grid.origin)
+        .expect("the panel's cells over its side");
+    Arc::new(cells::with_later(&layers, at))
 }
 
 /// Every cell of the panel, a row at a time (a wide glyph's second cell shows nothing).
