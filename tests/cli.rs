@@ -2201,8 +2201,8 @@ fn hosts_half_of_the_switch_refuses_before_any_window() {
     for (source, input, line) in [
         (
             dir.clone(),
-            state(3, ""),
-            "sopen: the sender sent switch state v3; this sopen reads up to v2 — update one of \
+            state(4, ""),
+            "sopen: the sender sent switch state v4; this sopen reads up to v3 — update one of \
              them\n"
                 .to_string(),
         ),

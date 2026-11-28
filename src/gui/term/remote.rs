@@ -7,12 +7,12 @@
 //!   writes makes it wait (`waiting for <it>…`), unsaved edits in the viewer ask `Save the
 //!   changes to host:/abs before switching to HOST?`, the planner's plan — which goes with the
 //!   switch from v2 (X4-state), as the git panel's bar, marks, details, filters, Find and an
-//!   action's, the filters' or the history search's dialog with what is typed in it do — asks
-//!   first, its line saying it goes, and what is typed in a history edit's own dialog, which the
-//!   state does not carry yet, asks whether to switch without it — and
-//!   asks for the switch again once what held it is over ([`Browser::switch_due`], heard by the
-//!   loop), which decides anew: only the question's answer lets what it asked about go, never the
-//!   end of a job waited for (a viewer closed while its save or export still writes among the
+//!   action's, the filters' or the history search's dialog with what is typed in it do, and from
+//!   v3 (X4-state2) a history edit's own dialog — asks first, its line saying it goes, and what
+//!   is chosen in a restore's, which the state does not carry, asks whether to switch without it
+//!   — and asks for the switch again once what held it is over ([`Browser::switch_due`], heard by
+//!   the loop), which decides anew: only the question's answer lets what it asked about go, never
+//!   the end of a job waited for (a viewer closed while its save or export still writes among the
 //!   jobs). Save and Save As… press the viewer's own F5 and F7; with Discard HOST opens the file
 //!   as stored, and the viewer's edits stay through the run — dropped only once HOST's state has
 //!   come back and been given ([`Browser::discard_viewer`], `Window::discard`: the viewer's own
