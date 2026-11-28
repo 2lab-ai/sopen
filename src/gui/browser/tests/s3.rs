@@ -791,6 +791,62 @@ fn a_second_write_waits_for_the_first() {
         .contains("u.txt"));
 }
 
+/// "Stop git?" goes with the write it asks about (X4-dialogs2, round 1): Esc over a commit A whose
+/// hook waits asks; A ends without its answer (stopped by its handle) and a checkout B, waiting in
+/// line behind it, starts (its hook waits too) — the question is gone, and the Enter that would
+/// have been its Yes stops nothing (`StopWrite` stops every running write).
+#[test]
+fn the_stop_question_goes_with_its_write() {
+    let git = git_or_skip!();
+    let repo = small(&git);
+    let (a_pid, b_pid) = (repo.tmp.path().join("a.pid"), repo.tmp.path().join("b.pid"));
+    for (hook, pid) in [("pre-commit", &a_pid), ("post-checkout", &b_pid)] {
+        let body = format!("echo $$ > '{}'\nexec sleep 30", pid.display());
+        script(&repo.top.join(".git/hooks").join(hook), &body);
+    }
+    repo.run(&["add", "a.txt"]);
+    repo.run(&["branch", "side"]);
+    let mut g = Gx::new(repo);
+    g.fx.b.git.quiet_after = Duration::from_millis(300);
+    g.fx.b.git.stop_after = Duration::from_millis(300);
+    g.ready_in_git();
+    g.f(Key::F7);
+    g.fx.typed("held");
+    g.idle(2);
+    g.key(Key::Enter);
+    pid_in(&a_pid);
+    let ctx = g.fx.drv.ctx.clone();
+    let i = g.b().git.panel(g.repo.top()).unwrap();
+    let side = Action::CheckoutBranch {
+        branch: "side".into(),
+    };
+    g.fx.b.start_action(&ctx, i, side);
+    g.until("the status row's warning", |b| {
+        b.status_line()
+            .text
+            .contains("a hook, a signer or a credential helper may be waiting for you")
+    });
+    g.esc();
+    assert!(g.painted("Stop git?"), "{:#?}", g.texts());
+    // A ends; B runs.
+    g.panel().running[0].handle.stop();
+    let b = pid_in(&b_pid);
+    g.until("A's end", |b| b.git.panels[0].running.len() == 1);
+    g.idle(3);
+    // A's result, if its end shows one, first.
+    if g.painted("[ OK ]") {
+        g.esc();
+    }
+    assert!(!g.painted("Stop git?"), "asked over B: {:#?}", g.texts());
+    g.key(Key::Enter);
+    g.idle(3);
+    assert!(!gone_within(b, Duration::from_millis(500)), "B was stopped");
+    assert_eq!(g.panel().running.len(), 1, "B still runs");
+    g.panel().running[0].handle.stop();
+    assert!(gone_within(b, Duration::from_secs(6)));
+    g.until_quiet("B's stop");
+}
+
 /// G-K1: each slot of 03 §9.1 does its row's action on each kind of row, and the F-key row
 /// shows the slots that act there — F7 says Commit on the uncommitted row; a commit's F2 and F8
 /// (reword, drop: the history edits) are empty and say so.

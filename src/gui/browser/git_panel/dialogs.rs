@@ -55,6 +55,7 @@ use crate::gui::chrome;
 use eframe::egui::{self, Key};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// What plans an action for a dialog: `git::actions::plan`, pure (it reads and runs nothing).
 pub type Planner = fn(&Action, &Repo) -> Result<Plan, Refused>;
@@ -1076,6 +1077,12 @@ impl ActionDialog {
         if let Some((draft, dont_ask)) = before {
             apply(&mut self.form, &controls);
             copying(&draft);
+            // A choice swapped a field's text for another's (Move tag's tag, Edit a remote's
+            // remote): its fields start afresh, nothing of the text before to undo (round 1).
+            if swapped(&draft, &self.form.draft) {
+                let now = self::controls(&self.form, cells::ambiguous_wide(ctx));
+                fresh_fields(ctx, &now, &mut self.form);
+            }
             if draft != self.form.draft || dont_ask != self.form.dont_ask {
                 self.drafted += 1;
                 self.revision += 1;
@@ -1449,10 +1456,21 @@ fn texts(form: &mut Form) -> Vec<(usize, &mut String)> {
     }
 }
 
-/// The dialog has just opened: each of its fields starts afresh — caret, selection and undo —
-/// whatever an earlier dialog left under the same ids (the git dialogs reuse their fields' ids
-/// across actions): a message with its caret at its start (the kit's rule for a message field), a
-/// one-line field with its caret at its end, as egui puts a new one's (found by X4-quick).
+/// Whether a pass's choice swapped the texts of `before`'s fields for others': Move tag's tag (its
+/// message), Edit a remote's remote (its name and URLs).
+fn swapped(before: &Action, now: &Action) -> bool {
+    match (before, now) {
+        (Action::MoveTag { tag: a, .. }, Action::MoveTag { tag: b, .. }) => a != b,
+        (Action::EditRemote { was: a, .. }, Action::EditRemote { was: b, .. }) => a.name != b.name,
+        _ => false,
+    }
+}
+
+/// The dialog has just opened, or a choice swapped its fields' texts ([`swapped`]): each of its
+/// fields starts afresh — caret, selection and undo — whatever an earlier dialog, or the text
+/// before, left under the same ids (the git dialogs reuse their fields' ids across actions): a
+/// message with its caret at its start (the kit's rule for a message field), a one-line field
+/// with its caret at its end, as egui puts a new one's (found by X4-quick).
 fn fresh_fields(ctx: &egui::Context, controls: &[Control], form: &mut Form) {
     use egui::text::{CCursor, CCursorRange};
     use egui::text_edit::TextEditState;
@@ -2274,7 +2292,13 @@ pub struct ResultDialog {
     warning: Option<String>,
     /// The first of its rows that scroll shown.
     top: usize,
+    /// Its rows that scroll as last wrapped, and the width they were wrapped to: `covers` and
+    /// each pass wrap nothing again until the width changes (X4-dialogs2, round 1).
+    wrapped: std::cell::RefCell<Option<(usize, Wrapped)>>,
 }
+
+/// A result's rows that scroll, wrapped to a width: each its text and its ink.
+type Wrapped = Arc<Vec<(String, Ink)>>;
 
 fn result_id() -> egui::Id {
     egui::Id::unique("sopen-git-result")
@@ -2352,6 +2376,7 @@ impl ResultDialog {
             backup: outcome.backup.clone(),
             warning,
             top: 0,
+            wrapped: Default::default(),
         })
     }
 
@@ -2368,6 +2393,7 @@ impl ResultDialog {
             backup: None,
             warning: None,
             top: 0,
+            wrapped: Default::default(),
         }
     }
 
@@ -2376,9 +2402,21 @@ impl ResultDialog {
         text.trim_end().split('\n').map(shown_line).collect()
     }
 
-    /// The box on `grid` (see the type's notes).
-    fn layout(&self, grid: Grid) -> kit::Layout {
-        let width = kit::inside_width(grid.cols, RESULT_NOMINAL, RESULT_NOMINAL);
+    /// The rows that scroll in a box `width` cells inside: the ones kept for that width, else
+    /// wrapped and kept.
+    fn rows(&self, width: usize) -> Wrapped {
+        if let Some((at, rows)) = &*self.wrapped.borrow() {
+            if *at == width {
+                return rows.clone();
+            }
+        }
+        let rows = Arc::new(self.wrap(width));
+        *self.wrapped.borrow_mut() = Some((width, rows.clone()));
+        rows
+    }
+
+    /// The rows that scroll, wrapped to `width` (see the type's notes).
+    fn wrap(&self, width: usize) -> Vec<(String, Ink)> {
         let mut rows = Vec::new();
         for (outcome, line) in &self.steps {
             let ink = match outcome {
@@ -2409,11 +2447,18 @@ impl ResultDialog {
                 );
             }
         }
+        rows
+    }
+
+    /// The box on `grid` (see the type's notes).
+    fn layout(&self, grid: Grid) -> kit::Layout {
+        let width = kit::inside_width(grid.cols, RESULT_NOMINAL, RESULT_NOMINAL);
+        let rows = self.rows(width);
         let mut parts = Vec::new();
         if !rows.is_empty() {
             let most = plan_most(grid.rows);
             parts.push(Part::Scroll {
-                rows,
+                rows: rows.to_vec(),
                 most,
                 top: self.top,
             });

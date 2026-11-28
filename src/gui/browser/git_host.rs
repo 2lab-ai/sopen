@@ -3102,6 +3102,10 @@ impl Browser {
     /// refresh.
     pub(super) fn run_ended(&mut self, ctx: &egui::Context, i: usize, end: RunEnd) {
         let top = self.git.panels[i].top.clone();
+        // "Stop git?" goes with the write it asked about: its Yes would stop the next one.
+        let p = &mut self.git.panels[i];
+        let (view, running) = (&mut p.view, &p.running);
+        view.forget_stop_unless(|what| running.iter().any(|r| r.title == what));
         // What Esc said while it ran ("stopping") gives way to the run's own words.
         self.status = Status::default();
         if let RunEnd::Confirm { title, action } = end {

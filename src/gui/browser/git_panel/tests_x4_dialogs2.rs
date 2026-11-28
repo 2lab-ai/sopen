@@ -417,6 +417,16 @@ fn key(key: Key, pressed: bool, modifiers: Modifiers) -> Event {
     }
 }
 
+/// The primary button pressed or let go at `at`.
+fn pointer(at: Pos2, pressed: bool) -> Event {
+    Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    }
+}
+
 fn down(k: Key) -> Event {
     key(k, true, Modifiers::NONE)
 }
@@ -944,33 +954,7 @@ fn x4d2_a_refresh_that_changes_only_the_title_runs_nothing() {
 /// typed in the pass that chooses another tag (moved from `tests_s3.rs`, in cells).
 #[test]
 fn x4d2_move_tag_keeps_the_chosen_tag_s_own_message() {
-    let mut r = repo();
-    let tag = |name: &str, annotated: bool| {
-        let mut t = label("refs/tags/v2");
-        t.refname = format!("refs/tags/{name}");
-        if !annotated {
-            t.object = oid('a');
-            t.object_type = crate::git::model::ObjectType::Commit;
-            t.peeled = None;
-        }
-        t
-    };
-    r.refs.retain(|l| l.kind != crate::git::model::RefKind::Tag);
-    r.refs.extend([
-        tag("alpha", true),
-        tag("beta", true),
-        tag("gamma", true),
-        tag("light", false),
-    ]);
-    let prefill = Prefill {
-        tag_messages: [("alpha", "release alpha"), ("beta", "release beta")]
-            .into_iter()
-            .map(|(t, m)| (t.to_string(), m.to_string()))
-            .collect(),
-        // A commit message meant for another dialog is never a tag's.
-        message: Some("a commit message".into()),
-        ..Prefill::default()
-    };
+    let (r, prefill) = tags();
     let bar = Target::Commit {
         commit: commit('c', &['b'], "c"),
         marked: Vec::new(),
@@ -1016,9 +1000,65 @@ fn x4d2_move_tag_keeps_the_chosen_tag_s_own_message() {
     fx.press(Key::Enter);
     assert_eq!(fx.ran(), Some(move_tag("alpha", Some("release alpha v2"))));
 
+    // Typed in the very pass whose click chooses another tag (one frame: the text, then the press
+    // and the release on `( ) light`). egui gives the choice the keyboard before the message reads
+    // the pass, so the text lands nowhere — never under the tag chosen.
+    let mut fx = Fx::new(open());
+    let light = place(&fx.boxed(), "( ) light");
+    let at = at_cell(light.x, light.y);
+    fx.drv.move_to(&mut fx.host, at);
+    fx.frame(vec![
+        down(Key::End),
+        Event::Text(" v2".into()),
+        pointer(at, true),
+        pointer(at, false),
+    ]);
+    assert_eq!(fx.draft(), move_tag("light", None));
+    fx.click("[ ] Keep it annotated with its message");
+    assert_eq!(
+        fx.draft(),
+        move_tag("light", Some("")),
+        "light's own: none read"
+    );
+    fx.click("( ) alpha");
+    assert_eq!(fx.draft(), move_tag("alpha", Some("release alpha")));
+
     // A new tag starts with an empty message, not the prefill's commit message.
     let d = open_with(A::Tag, bar.clone(), &r, &prefill);
     assert!(matches!(d.draft(), Action::Tag { message: Some(m), .. } if m.is_empty()));
+}
+
+/// Move tag's fixture: annotated `alpha` and `beta` with their messages read, annotated `gamma`
+/// whose message is not, lightweight `light`; the prefill's commit message is another dialog's.
+fn tags() -> (Repo, Prefill) {
+    let mut r = repo();
+    let tag = |name: &str, annotated: bool| {
+        let mut t = label("refs/tags/v2");
+        t.refname = format!("refs/tags/{name}");
+        if !annotated {
+            t.object = oid('a');
+            t.object_type = crate::git::model::ObjectType::Commit;
+            t.peeled = None;
+        }
+        t
+    };
+    r.refs.retain(|l| l.kind != crate::git::model::RefKind::Tag);
+    r.refs.extend([
+        tag("alpha", true),
+        tag("beta", true),
+        tag("gamma", true),
+        tag("light", false),
+    ]);
+    let prefill = Prefill {
+        tag_messages: [("alpha", "release alpha"), ("beta", "release beta")]
+            .into_iter()
+            .map(|(t, m)| (t.to_string(), m.to_string()))
+            .collect(),
+        // A commit message meant for another dialog is never a tag's.
+        message: Some("a commit message".into()),
+        ..Prefill::default()
+    };
+    (r, prefill)
 }
 
 /// The painting the dialog compares what would run with is a revision, not a copy (the
@@ -1565,6 +1605,239 @@ fn x4d2_a_stop_the_terminal_never_printed_was_never_asked() {
         .filter(|a| matches!(a, GitAction::StopWrite))
         .count();
     assert_eq!(stopped, 1, "{:?}", win.host.actions);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1.
+
+/// Edit a remote's dialog over `origin`, and over `백업` when the repository lists it first; both
+/// remotes' URLs read.
+fn remotes() -> (Prefill, Repo) {
+    let remote = |name: &str, url: &str| Remote {
+        name: name.into(),
+        url: url.into(),
+        push_url: None,
+    };
+    let prefill = Prefill {
+        remotes: vec![
+            remote("origin", "https://example.com/x.git"),
+            remote("백업", "/srv/백업.git"),
+        ],
+        ..Prefill::default()
+    };
+    let mut other = dirty();
+    other.remotes = vec!["백업".into(), "origin".into()];
+    (prefill, other)
+}
+
+fn remote_name(fx: &Fx) -> String {
+    match fx.draft() {
+        Action::EditRemote { now, .. } => now.name,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A field reopened keeps no undo of the one before under its id: Cmd/Ctrl+Z in the reopened
+/// name leaves `백업`.
+#[test]
+fn x4d2_a_reopened_field_has_nothing_to_undo() {
+    let (prefill, other) = remotes();
+    let edit = |repo: &Repo| open_with(A::EditRemote, Target::Repository, repo, &prefill);
+    let mut fx = Fx::new(edit(&dirty()));
+    fx.frame(vec![Event::Text("x".into())]);
+    assert_eq!(remote_name(&fx), "originx");
+    fx.press(Key::Escape);
+    fx.host.over = Some(Over::Action(Box::new(edit(&other))));
+    fx.idle(2);
+    fx.drv.key(&mut fx.host, Key::Z, testkit::command(false));
+    assert_eq!(remote_name(&fx), "백업", "nothing to undo");
+}
+
+/// A field reopened keeps no selection of the one before: all of the name selected and the
+/// dialog cancelled, a letter typed in the reopened one is added, not typed over it.
+#[test]
+fn x4d2_a_reopened_field_has_nothing_selected() {
+    let (prefill, other) = remotes();
+    let edit = |repo: &Repo| open_with(A::EditRemote, Target::Repository, repo, &prefill);
+    let mut fx = Fx::new(edit(&dirty()));
+    fx.drv.key(&mut fx.host, Key::A, testkit::command(false));
+    fx.press(Key::Escape);
+    fx.host.over = Some(Over::Action(Box::new(edit(&other))));
+    fx.idle(2);
+    fx.frame(vec![Event::Text("y".into())]);
+    assert_eq!(remote_name(&fx), "백업y", "nothing selected");
+}
+
+/// A message field reopened in the very next pass — which the kit's own reset of a field not laid
+/// out the pass before does not reach — has its caret at its start (`fresh_fields`' message).
+#[test]
+fn x4d2_a_message_reopened_at_once_starts_afresh() {
+    let commit = |message: Option<&str>| {
+        let prefill = Prefill {
+            message: message.map(String::from),
+            ..Prefill::default()
+        };
+        open_with(A::Commit, Target::Uncommitted, &dirty(), &prefill)
+    };
+    let mut fx = Fx::new(commit(None));
+    fx.frame(vec![Event::Text("abc".into())]);
+    fx.raw(vec![down(Key::Escape)]);
+    assert_eq!(fx.host.ends, [DialogEnd::Cancel]);
+    fx.host.over = Some(Over::Action(Box::new(commit(Some("msg")))));
+    fx.raw(vec![]);
+    fx.raw(vec![]);
+    fx.frame(vec![Event::Text("X".into())]);
+    assert!(
+        matches!(fx.draft(), Action::Commit { message, .. } if message == "Xmsg"),
+        "{:?}",
+        fx.draft()
+    );
+}
+
+/// A field that shows after the dialog opened (Amend's message once "edit it" is chosen) starts
+/// afresh too, whatever an earlier dialog's field under its id left: the kit resets a field not
+/// laid out the pass before (a pin: it held before round 1).
+#[test]
+fn x4d2_a_field_shown_after_opening_starts_afresh() {
+    let mut fx = Fx::new(open(A::Stash, Target::Uncommitted, &dirty()));
+    fx.frame(vec![Event::Text("abc".into())]);
+    fx.press(Key::Home);
+    fx.press(Key::Escape);
+    let prefill = Prefill {
+        message: Some("old".into()),
+        ..Prefill::default()
+    };
+    let amend = open_with(A::Amend, Target::Uncommitted, &dirty(), &prefill);
+    fx.host.over = Some(Over::Action(Box::new(amend)));
+    fx.idle(2);
+    fx.click("( ) edit it");
+    assert_eq!(fx.focused(), Some(dialogs::field_id(0)));
+    fx.drv.key(&mut fx.host, Key::Z, testkit::command(false));
+    fx.frame(vec![Event::Text("X".into())]);
+    assert_eq!(
+        fx.draft(),
+        Action::Amend {
+            message: Some("Xold".into())
+        }
+    );
+}
+
+/// A field whose text a choice swaps — Move tag's message for another tag's, Edit a remote's name
+/// for another remote's — has nothing to undo: Cmd/Ctrl+Z there never brings back the tag's or the
+/// remote's before.
+#[test]
+fn x4d2_a_swapped_field_has_nothing_to_undo() {
+    let (r, prefill) = tags();
+    let bar = Target::Commit {
+        commit: commit('c', &['b'], "c"),
+        marked: Vec::new(),
+    };
+    let mut fx = Fx::new(open_with(A::MoveTag, bar, &r, &prefill));
+    fx.frame(vec![down(Key::End), Event::Text(" v2".into())]);
+    fx.click("( ) beta");
+    fx.focus(dialogs::field_id(0));
+    fx.drv.key(&mut fx.host, Key::Z, testkit::command(false));
+    assert!(
+        matches!(fx.draft(), Action::MoveTag { message: Some(m), .. } if m == "release beta"),
+        "{:?}",
+        fx.draft()
+    );
+    let (prefill, _) = remotes();
+    let edit = open_with(A::EditRemote, Target::Repository, &dirty(), &prefill);
+    let mut fx = Fx::new(edit);
+    fx.frame(vec![Event::Text("x".into())]);
+    fx.click("( ) 백업");
+    fx.focus(dialogs::field_id(0));
+    fx.drv.key(&mut fx.host, Key::Z, testkit::command(false));
+    assert_eq!(remote_name(&fx), "백업");
+}
+
+/// A run whose backup is incomplete (`Outcome::warning`) has its result too: the warning in the
+/// error colour in place of the backup's undo line.
+#[test]
+fn x4d2_a_result_s_warning_replaces_its_backup_line() {
+    let mut warned = outcome(false);
+    let why = "backup 20261123T102405Z incomplete: refs/heads/b was not written";
+    warned.steps[0].ran[0].ending = Ending::NotSent(why.into());
+    let fx = Fx::result(ResultDialog::of("Delete branch b", &warned).expect("its warning"));
+    let l = fx.boxed();
+    assert_eq!(pen_of(&l, why), error_pen());
+    let all = fx.shown();
+    assert!(!all.contains("undoes"), "no backup line: {all}");
+    same_in_a_terminal(&fx.drv);
+}
+
+/// The panel covers only the dialog it draws: `modals` draws the first of the menu, a quick edit,
+/// the action's dialog, the result and "Stop git?", so a result that waits behind the menu (a run
+/// failed while the menu was open) blanks nothing — `covered` is the menu's box and shadow alone
+/// (none while the menu is egui's), and the graph beside the menu shows as it did.
+#[test]
+fn x4d2_a_result_behind_the_menu_blanks_nothing() {
+    let mut view = super::tests::fixture_view();
+    view.set_repo(dirty());
+    let mut fx = super::tests::Fx::new(1000.0, 600.0, view);
+    fx.host.view.open_menu();
+    assert!(fx.host.view.menu.is_some(), "the menu");
+    fx.idle();
+    fx.idle();
+    let alone = super::tests_x4_graph::panel(&fx).seen();
+    (fx.host.view).show_text("Push", "error: failed to push some refs to 'origin'", None);
+    fx.idle();
+    fx.idle();
+    let grid = Grid::over(fx.host.rect);
+    let menu = (fx.host.view.menu.as_ref())
+        .expect("still up")
+        .covers(&grid);
+    assert_eq!(fx.host.view.covered(&grid), menu, "the menu's box alone");
+    assert!(
+        super::tests_x4_graph::panel(&fx).seen() == alone,
+        "the panel blanked cells for the result behind the menu"
+    );
+}
+
+/// The result wraps its rows once a width, for its covers and its painting alike: with a 64 KiB
+/// stderr and forty steps, ten idle passes wrap nothing; a narrower window wraps once — what a
+/// result never laid out wraps for one look at that width — and the passes after it nothing.
+#[test]
+fn x4d2_the_result_wraps_once_a_width() {
+    let stderr: String = (0..1024)
+        .map(|k| format!("remote: line {k:04} of a long refusal\twith words that wrap\n"))
+        .collect();
+    assert!(stderr.len() >= 50 << 10, "{}", stderr.len());
+    let push = |k: usize| format!("git push --progress origin refs/heads/b{k}:refs/heads/b{k}");
+    let mut steps: Vec<StepResult> = (0..39)
+        .map(|k| StepResult {
+            line: push(k),
+            outcome: StepOutcome::Done,
+            ran: vec![done(&push(k), 0, "")],
+        })
+        .collect();
+    steps.push(StepResult {
+        line: push(39),
+        outcome: StepOutcome::Failed,
+        ran: vec![done(&push(39), 1, &stderr)],
+    });
+    let failed = Outcome {
+        steps,
+        backup: None,
+    };
+    let walked = || super::details::WALKED.with(|w| w.replace(0));
+    let mut fx = Fx::result(ResultDialog::of("Push", &failed).expect("a step failed"));
+    walked();
+    fx.idle(10);
+    assert_eq!(walked(), 0, "ten idle passes wrapped");
+    fx.drv.resize(70.0 * CELL.x, 30.0 * CELL.y);
+    fx.raw(vec![]);
+    let resized = walked();
+    let narrow = Grid::over(fx.drv.ctx.content_rect());
+    let fresh = ResultDialog::of("Push", &failed).expect("a step failed");
+    walked();
+    fresh.covers(&narrow);
+    let once = walked();
+    assert!(once > 0);
+    assert_eq!(resized, once, "the resize wrapped once");
+    fx.idle(5);
+    assert_eq!(walked(), 0);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -1334,19 +1334,17 @@ impl GitView {
         if let Some(d) = &self.search_dialog {
             out.extend(d.covers(grid));
         }
+        // `modals` draws the first of these alone, in this order: the others wait behind it and
+        // cover nothing (X4-dialogs2, round 1).
         if let Some(m) = &self.menu {
             out.extend(m.covers(grid));
-        }
-        if let Some(d) = &self.dialog {
+        } else if let Some(d) = &self.quick {
             out.extend(d.covers(grid));
-        }
-        if let Some(d) = &self.quick {
+        } else if let Some(d) = &self.dialog {
             out.extend(d.covers(grid));
-        }
-        if let Some(r) = &self.result {
+        } else if let Some(r) = &self.result {
             out.extend(r.covers(grid));
-        }
-        if let Some(what) = &self.stop_question {
+        } else if let Some(what) = &self.stop_question {
             out.extend(stop_covers(grid, what));
         }
         if let Some(log) = &self.log {
@@ -1543,6 +1541,18 @@ impl GitView {
     /// "Stop git?" (03 §3.4) over the write `what`, running for 10 s.
     pub fn ask_stop(&mut self, what: String) {
         self.stop_question = Some(what);
+    }
+
+    /// "Stop git?" goes once the write it asks about no longer runs — `runs` says whether a write
+    /// of those words still does — since its Yes stops every running write (X4-dialogs2, round 1).
+    pub fn forget_stop_unless(&mut self, runs: impl Fn(&str) -> bool) {
+        if self
+            .stop_question
+            .as_deref()
+            .is_some_and(|what| !runs(what))
+        {
+            self.stop_question = None;
+        }
     }
 
     /// The confirmation of `action` again, as a dialog (review 1: a run whose shown plan was lost
