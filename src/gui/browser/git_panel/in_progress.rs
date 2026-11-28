@@ -130,16 +130,18 @@ pub(super) const PAINTS_CELLS: bool = true;
 /// The banner at cells `area` of `grid` (the panel's top rows, [`BannerView::rows`] of them),
 /// written into `buf`, the panel's buffer (10 §4, X4-pane): its lines in the warning colour, the
 /// offered steps as `[ Continue ]`-style buttons at the right of the first row ([`lay`]) — a
-/// click is the step's key.
+/// click is the step's key. `panel`: the panel's key (`GitView::find_key`) the buttons' ids are
+/// made from (a banner is made again at each refresh, so the panel holds the key).
 pub fn draw(
     ui: &mut egui::Ui,
     grid: &Grid,
     area: Cells,
     buf: &mut Buffer,
     banner: &BannerView,
+    panel: egui::Id,
 ) -> Option<Pressed> {
     let words: Vec<&str> = banner.offers.iter().map(|&p| word(p)).collect();
-    let k = lay(ui, grid, area, buf, &banner.lines, &words)?;
+    let k = lay(ui, grid, area, buf, &banner.lines, &words, panel)?;
     Some(banner.press(banner.offers[k]))
 }
 
@@ -153,12 +155,13 @@ pub fn draw(
 /// id cut there, shown on HEAD's row of the graph). The buttons
 /// come first, as egui's did: each that fits whole is laid, from the right, those that do not
 /// going from the left (Amend first), and the state is cut to what is left before them. Each is
-/// an `interact` rect at its cells, its id salted with the banner's first column, since two
+/// an `interact` rect at its cells, its id made from `panel`, the panel's key, since two
 /// repositories' panels draw into one `ui` side by side (review round 1: with one id egui kept
 /// the right panel's rects for both, so the left buttons were dead and a click was both panels') —
-/// the column alone: the two sides always differ in it (`cells::halves`), and an id that moved
-/// with a row would lose a click pressed before a layout change and released after it (egui gives
-/// the release to the id it pressed);
+/// the panel's, not its column, nor a row: egui gives the release to the id it pressed, so an id of
+/// the column let another repository's panel drawn where this one stood take a click pressed here
+/// (F-git-ids), and an id that moved with a row would lose a click pressed before a layout change
+/// and released after it;
 /// the one clicked, by its place in `buttons`. They sense clicks alone (`Sense::CLICK`), never the
 /// focus: egui's `Sense::click()` is focusable, and Tab, then Space or Enter, would press a step.
 /// The banner's first row is one more such rect, under the buttons, so a click on the state or on
@@ -173,6 +176,7 @@ fn lay(
     buf: &mut Buffer,
     lines: &[String],
     buttons: &[&str],
+    panel: egui::Id,
 ) -> Option<usize> {
     let p = PALETTE;
     let warn = Pen::new(p.warn, p.back);
@@ -196,7 +200,7 @@ fn lay(
         right = at;
     }
     let state_end = laid.last().map_or(width, |&(_, at)| at.saturating_sub(1));
-    let id = |part: &str| ui.scope_id().with(("sopen-git-banner", area.x, part));
+    let id = |part: &str| panel.with(("sopen-git-banner", part));
     let row = grid.rect(Cells::new(area.x, area.y, area.width, 1));
     ui.interact(row, id(""), Sense::CLICK);
     let mut pressed = None;
@@ -394,7 +398,7 @@ pub fn stop_keys(
 
 /// The banner of an edit stop at cells `area` of `grid`, as [`draw`] draws a banner, with Amend
 /// and Split before S3-B's steps at the right of its first row (03 §8.5's order: Amend, Split,
-/// Continue, Abort); a click is the step's key.
+/// Continue, Abort); a click is the step's key; its ids made from `panel`, as [`draw`]'s.
 pub fn draw_stop(
     ui: &mut egui::Ui,
     grid: &Grid,
@@ -402,12 +406,13 @@ pub fn draw_stop(
     buf: &mut Buffer,
     banner: &BannerView,
     stop: &EditStop,
+    panel: egui::Id,
 ) -> Option<StopEnd> {
     let steps = stop.offers();
     let words: Vec<&str> = (steps.iter().map(|&s| stop_word(s)))
         .chain(banner.offers.iter().map(|&p| word(p)))
         .collect();
-    let k = lay(ui, grid, area, buf, &banner.lines, &words)?;
+    let k = lay(ui, grid, area, buf, &banner.lines, &words, panel)?;
     Some(match steps.get(k) {
         Some(&s) => StopEnd::Stop(stop.press(s)),
         None => StopEnd::Banner(banner.press(banner.offers[k - steps.len()])),

@@ -443,7 +443,8 @@ impl GitView {
                 }
                 Subject::Row(_) => Vec::new(),
             };
-            self.pane = Some(details::Pane::new(subject.clone(), keyboard, header));
+            let pane = details::Pane::new(subject.clone(), keyboard, header);
+            self.pane = Some(pane.in_panel(self.find_key));
             asked.push(GitAction::Details(subject));
         }
         if let Some(f) = &part.find {

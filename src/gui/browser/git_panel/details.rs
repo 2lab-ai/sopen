@@ -178,6 +178,10 @@ pub(super) struct Pane {
     wrapped_for: Option<usize>,
     /// For each line, the line of the unwrapped list it is part of.
     origin: Vec<usize>,
+    /// The key its lines' ids and their double clicks' pairs are made from: its panel's
+    /// (`GitView::find_key`, [`Pane::in_panel`]), which panel it is whatever its column, so another
+    /// repository's panel drawn where this one stood takes none of its clicks (F-git-ids).
+    panel: egui::Id,
 }
 
 /// Where the pane's bar is, in terms that survive the lines being made again (details delivered
@@ -192,6 +196,7 @@ enum Spot {
 
 impl Pane {
     /// A pane for `subject`, its read under way; `header` its first lines (a comparison's ends).
+    /// Its key is its own until [`Pane::in_panel`] gives it its panel's.
     pub fn new(subject: Subject, keyboard: bool, header: Vec<(&'static str, String)>) -> Pane {
         let mut pane = Pane {
             subject,
@@ -203,9 +208,17 @@ impl Pane {
             placed: false,
             wrapped_for: None,
             origin: Vec::new(),
+            panel: super::find::panel_key(),
         };
         pane.build();
         pane
+    }
+
+    /// The pane, its ids made from `panel`, its panel's key (`GitView::find_key`): the same for
+    /// every pane the panel opens, so a click pressed before the pane follows the bar is not lost.
+    pub fn in_panel(mut self, panel: egui::Id) -> Pane {
+        self.panel = panel;
+        self
     }
 
     /// `details`, when they are for what the pane shows; whether they were taken.
@@ -420,7 +433,7 @@ const RENAMED: char = '→';
 /// opened (`√`). The wheel scrolls the lines by cells; each line is an `interact` rect at its
 /// cells: returns the line clicked, and whether the click is the second of a double click on it
 /// (the browser's `second_click`: egui alone misses a double click right after a click on another
-/// line).
+/// line); the lines' ids and the pair are the pane's panel's ([`Pane::in_panel`]).
 pub(super) fn draw(
     ui: &mut egui::Ui,
     grid: &Grid,
@@ -519,25 +532,27 @@ pub(super) fn draw(
                 file_row(buf, x, y, chars, f, wide, &pen);
             }
         }
-        // Its id salted with the pane's first column: two repositories' panels draw into one
-        // `ui` side by side (review round 1), always in two columns (`cells::halves`); never with
-        // its row, which moves when the banner's rows change (`Layout::of`), and egui gives a
-        // release to the id it pressed, so a click across that change would be lost. It senses
-        // clicks alone (`Sense::CLICK`): the pane's keys are the panel's, and egui's focusable
-        // `Sense::click()` would make Space or Enter a click.
-        let id = ui.scope_id().with(("sopen-git-pane", area.x, k));
+        // Its id the pane's panel's: two repositories' panels draw into one `ui` side by side
+        // (review round 1), and egui gives a release to the id it pressed, so with their column
+        // in it another repository's panel drawn where this one stood took a click pressed here
+        // (F-git-ids); never with its row, which moves when the banner's rows change
+        // (`Layout::of`), so a click across that change would be lost. It senses clicks alone
+        // (`Sense::CLICK`): the pane's keys are the panel's, and egui's focusable `Sense::click()`
+        // would make Space or Enter a click.
+        let id = pane.panel.with(("sopen-git-pane", k));
         let resp = ui.interact(grid.rect(row), id, Sense::CLICK);
         if resp.clicked() {
             // The line by what it shows — a file by its group and path, as the graph's rows by
             // what they draw, so a refresh that moves the files between two clicks starts a pair
-            // of its own (review round 1) — for this subject. No panel in it: egui counts no
-            // double click across more than 6 points (`max_click_dist`), and two panels' lines
-            // are a side apart.
+            // of its own (review round 1) — for this subject, in this panel: side by side egui
+            // counts no double click across more than 6 points (`max_click_dist`), but another
+            // repository's panel drawn where this one stood, between two clicks, shows the same
+            // subject at the same cells when both are on the uncommitted row (F-git-ids).
             let shows = match line {
                 Line::File { group, file } => pane.file(*group, *file).map(|(g, f)| (g, &f.path)),
                 _ => None,
             };
-            let pair = egui::Id::unique(("sopen-git-pane-line", &pane.subject, shows.ok_or(k)));
+            let pair = (pane.panel).with(("sopen-git-pane-line", &pane.subject, shows.ok_or(k)));
             clicked = Some((k, super::super::second_click(&resp, pair)));
         }
     }

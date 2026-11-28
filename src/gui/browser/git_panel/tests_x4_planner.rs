@@ -997,33 +997,24 @@ fn a_dialog_opens_with_its_carets_at_the_end() {
     assert_eq!(kept, Some(format!("{}x", message(6))));
 }
 
-/// A focused button is in the bar's colours (10 §6): Tab moves egui's focus through the pane's
-/// rows to `[ Run… ]`, which then shows the bar's text on the bar.
+/// The pane's buttons never take the keyboard (F-git-ids): its keys are its own (Cmd/Ctrl+Enter
+/// runs, Esc closes) and Tab is the git panel's way back to the list, so Tab moves egui's focus
+/// to no row and no button — `[ Run… ]` and `[ Close ]` stay black on cyan however many come.
 #[test]
-fn a_focused_button_is_in_the_bars_colours() {
+fn tab_gives_no_button_the_focus() {
     let mut fx = with_planner(1000.0, 500.0, plain(3));
     let y = 26;
-    let run = |fx: &Fx| {
-        let c = cell(fx, 3, y);
+    let colours = |fx: &Fx, x: u16| {
+        let c = cell(fx, x, y);
         (c.fg, c.bg)
     };
     let idle = (Some(PALETTE.dialog_text), Some(PALETTE.dialog_back));
-    assert_eq!(run(&fx), idle, "the control: no focus");
-    let mut tabs = 0;
-    while run(&fx) == idle && tabs < 12 {
+    for tabs in 0..12 {
+        assert_eq!(colours(&fx, 3), idle, "Run after {tabs} tabs");
+        assert_eq!(colours(&fx, 13), idle, "Close after {tabs} tabs");
+        assert_eq!(fx.drv.ctx.memory(|m| m.focused()), None, "{tabs} tabs");
         fx.press(Key::Tab);
-        tabs += 1;
     }
-    assert_eq!(
-        run(&fx),
-        (Some(PALETTE.bar_text), Some(PALETTE.bar)),
-        "{tabs} tabs"
-    );
-    assert_eq!(
-        cell(&fx, 13, y).bg,
-        Some(PALETTE.dialog_back),
-        "Close not focused"
-    );
 }
 
 /// The S4 stand-in host (its fake seams): two ↓ in one pass move the bar two rows and leave no ↓

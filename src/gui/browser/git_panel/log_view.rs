@@ -44,15 +44,18 @@ pub struct LogView {
     /// The entry shown whole as last laid out ([`Laid`]): its texts are wrapped once, not on each
     /// pass nor on each question of what it covers.
     laid: Option<Laid>,
+    /// The key its rows' ids, their double click's pair and the entry shown whole's dialog are
+    /// made from: its panel's (`GitView::find_key`, [`LogView::in_panel`]), which panel it is
+    /// whatever its column — so another repository's panel drawn where this one stood takes none
+    /// of its clicks, and the dialog keeps its keyboard when the panel's column moves (F-git-ids).
+    panel: egui::Id,
 }
 
-/// The dialog of the entry shown whole, laid out on `grid` for entry `at` in the panel at column
-/// `column` (its button's id).
+/// The dialog of the entry shown whole, laid out on `grid` for entry `at`.
 #[derive(Debug, Clone)]
 struct Laid {
     grid: Grid,
     at: usize,
-    column: u16,
     layout: Layout,
 }
 
@@ -107,7 +110,15 @@ impl LogView {
             whole: None,
             top: 0,
             laid: None,
+            panel: super::find::panel_key(),
         }
+    }
+
+    /// The log, its ids made from `panel`, its panel's key (`GitView::find_key`); until then its
+    /// key is its own.
+    pub fn in_panel(mut self, panel: egui::Id) -> LogView {
+        self.panel = panel;
+        self
     }
 
     /// The entries again (commands ran meanwhile): the bar, and the entry shown whole, stay on
@@ -145,22 +156,16 @@ impl LogView {
         // Where the box stands is the grid's and the entry's alone, whatever the panel's column.
         match &self.laid {
             Some(l) if l.grid == *grid && l.at == at => l.layout.covers(),
-            _ => entry_layout(*grid, &self.entries[at], 0).covers(),
+            _ => entry_layout(*grid, &self.entries[at], self.panel).covers(),
         }
     }
 
-    /// The entry shown whole, `at`, laid out on `grid` for the panel at column `column`, once for
-    /// all three ([`Laid`]).
-    fn lay_out(&mut self, grid: Grid, at: usize, column: u16) {
-        let kept = matches!(&self.laid, Some(l) if (l.grid, l.at, l.column) == (grid, at, column));
+    /// The entry shown whole, `at`, laid out on `grid`, once for all three ([`Laid`]).
+    fn lay_out(&mut self, grid: Grid, at: usize) {
+        let kept = matches!(&self.laid, Some(l) if (l.grid, l.at) == (grid, at));
         if !kept {
-            let layout = entry_layout(grid, &self.entries[at], column);
-            self.laid = Some(Laid {
-                grid,
-                at,
-                column,
-                layout,
-            });
+            let layout = entry_layout(grid, &self.entries[at], self.panel);
+            self.laid = Some(Laid { grid, at, layout });
         }
     }
 
@@ -199,15 +204,16 @@ const WHOLE_WIDTH: usize = 88;
 /// `Repository`, and two blank cells (10 §6's two between two texts).
 const NAME: usize = 12;
 
-/// The modal of the entry shown whole, in the panel at column `column`: two repositories' panels
-/// stand side by side in one `ui`, each with its own.
-fn whole_id(column: u16) -> egui::Id {
-    egui::Id::unique("sopen-git-log-entry").with(column)
+/// The modal of the entry shown whole, in the panel keyed `panel` (`GitView::find_key`): two
+/// repositories' panels stand side by side in one `ui`, each with its own, and a width change that
+/// moves the panel's column keeps it — its `[ OK ]` keeps the keyboard (F-git-ids).
+fn whole_id(panel: egui::Id) -> egui::Id {
+    panel.with("sopen-git-log-entry")
 }
 
 /// Its OK button.
-fn ok_id(column: u16) -> egui::Id {
-    whole_id(column).with("ok")
+fn ok_id(panel: egui::Id) -> egui::Id {
+    whole_id(panel).with("ok")
 }
 
 /// A line of stderr as the dialog shows it: tabs to the next multiple of eight cells, a carriage
@@ -353,8 +359,8 @@ fn row_shown(entry: &LogEntry, room: usize) -> String {
     }
 }
 
-/// The dialog of `entry` shown whole (03 §3.7) on `grid`, its OK button the one of the panel at
-/// column `column`: each field its name in the weak ink and its value from the 13th cell, wrapped
+/// The dialog of `entry` shown whole (03 §3.7) on `grid`, its OK button the one of the panel keyed
+/// `panel`: each field its name in the weak ink and its value from the 13th cell, wrapped
 /// there by cells (`Part::Named`, egui's grid of two columns; on a dialog with no cell after the
 /// 12th, under its name); then `Stderr`, weak, and its lines in rows that scroll, at most half the
 /// grid's rows and six at least (egui's half the window), `nothing` in the weak ink when there is
@@ -363,14 +369,19 @@ fn row_shown(entry: &LogEntry, room: usize) -> String {
 /// since the kit's `dialog::wrap` measures the rest of a text again for each row and a command
 /// line can be 64 KiB (the files backup's batches of paths): what the box shows is the same, the
 /// rest being cut with `…` there.
-pub(super) fn entry_layout(grid: Grid, entry: &LogEntry, column: u16) -> Layout {
+pub(super) fn entry_layout(grid: Grid, entry: &LogEntry, panel: egui::Id) -> Layout {
     let width = dialog::inside_width(grid.cols, WHOLE_WIDTH, 0);
     let most = (usize::from(grid.rows) + 2) * (dialog::named_room(width, NAME) + 1);
-    entry_layout_in(grid, entry, column, most)
+    entry_layout_in(grid, entry, panel, most)
 }
 
 /// [`entry_layout`] with each value cut to `most` cells (the tests: none, to see it the same).
-pub(super) fn entry_layout_in(grid: Grid, entry: &LogEntry, column: u16, most: usize) -> Layout {
+pub(super) fn entry_layout_in(
+    grid: Grid,
+    entry: &LogEntry,
+    panel: egui::Id,
+    most: usize,
+) -> Layout {
     let stdin = entry.stdin.as_deref().unwrap_or("nothing");
     let fields = [
         ("Time", date_time_text(entry.time)),
@@ -413,7 +424,7 @@ pub(super) fn entry_layout_in(grid: Grid, entry: &LogEntry, column: u16, most: u
             top: 0,
         },
         Part::Blank,
-        Part::Buttons(vec![Button::new("OK", ok_id(column))]),
+        Part::Buttons(vec![Button::new("OK", ok_id(panel))]),
         Part::Text("Enter or Esc closes".to_string(), Ink::Weak),
     ]);
     #[cfg(test)]
@@ -441,17 +452,17 @@ fn counted(key: &'static std::thread::LocalKey<std::cell::Cell<usize>>, n: usize
     key.with(|c| c.set(c.get() + n));
 }
 
-/// The entry shown whole (03 §3.7) on `grid` (the panels'), in the panel at column `column`: an
+/// The entry shown whole (03 §3.7) on `grid` (the panels'), in the log's panel: an
 /// `ops::dialog` dialog ([`entry_layout`]), its stderr scrolled by the wheel and the box's scroll
 /// bar. Enter, Esc, OK or a click outside closes it: true then.
-fn whole_ui(ctx: &egui::Context, grid: Grid, view: &mut LogView, column: u16) -> bool {
+fn whole_ui(ctx: &egui::Context, grid: Grid, view: &mut LogView) -> bool {
     let Some(at) = view.whole.filter(|&k| k < view.entries.len()) else {
         return false;
     };
     let close = ctx.input_mut(|i| {
         keys::take(i, Key::Enter, Mods::None) | keys::take(i, Key::Escape, Mods::None)
     });
-    view.lay_out(grid, at, column);
+    view.lay_out(grid, at);
     let (Some(laid), top) = (&view.laid, &mut view.top) else {
         return close;
     };
@@ -459,8 +470,9 @@ fn whole_ui(ctx: &egui::Context, grid: Grid, view: &mut LogView, column: u16) ->
         top: Some(top),
         ..Inputs::default()
     };
-    let shown = dialog::show(ctx, whole_id(column), &laid.layout, inputs);
-    close || shown.clicked(ok_id(column)) || shown.modal.should_close()
+    let panel = view.panel;
+    let shown = dialog::show(ctx, whole_id(panel), &laid.layout, inputs);
+    close || shown.clicked(ok_id(panel)) || shown.modal.should_close()
 }
 
 /// Whether [`draw`] paints the log's cells (10 §17, X4-graph's seam): it does (X4-lists), so the
@@ -472,13 +484,14 @@ pub(super) const PAINTS_CELLS: bool = true;
 /// one in the error colour — the bar on its entry, cut by cells in one walk ([`row_shown`]), and
 /// the scroll bar on the border right of `area`; and the entry shown whole, over everything, on
 /// `grid`. Only the rows on screen are drawn; the wheel scrolls them by `CELL.y`, the bar stays.
-/// Each row is an `interact` rect at its cells, its id salted with the panel's column (two
-/// repositories' panels draw into one `ui`), sensing clicks alone (`Sense::CLICK`, never the
+/// Each row is an `interact` rect at its cells, its id the log's panel's ([`LogView::in_panel`]:
+/// two repositories' panels draw into one `ui`), sensing clicks alone (`Sense::CLICK`, never the
 /// keyboard's focus), over one more under them all (`backups::blank_clicks`): a click on a blank
 /// moves no bar; a click puts the bar on its entry, a double click on one entry shows it whole (the browser's
-/// `second_click`, the pair the entry itself, never its place: an entry logged between the two
-/// clicks moves the rows). At no cells (a panel too short for its parts) only the entry shown
-/// whole is drawn, so its keys still reach it.
+/// `second_click`, the pair the entry itself, in the log's panel, never its place: an entry logged
+/// between the two clicks moves the rows, and another repository's panel drawn where this one
+/// stood shows the same entries at the same cells). At no cells (a panel too short for its parts)
+/// only the entry shown whole is drawn, so its keys still reach it.
 pub fn draw(
     ui: &mut egui::Ui,
     grid: &Grid,
@@ -535,7 +548,10 @@ pub fn draw(
     // Under the rows, the log's cells, the frame's border either side and egui's reach below them
     // (the frame's rule): a click on a blank of them moves no bar (egui gives a click a few points
     // off a widget to it where nothing is under the pointer).
-    let under = ui.scope_id().with(("sopen-git-log-under", area.x));
+    // The log's panel's ids, never its column's: egui gives a release to the id it pressed, so
+    // another repository's panel drawn where this one stood took a click pressed here (F-git-ids).
+    let panel = view.panel;
+    let under = panel.with("sopen-git-log-under");
     let blank = super::backups::blank_clicks(ui, grid, area);
     ui.interact(blank, under, Sense::CLICK);
     for (n, k) in shown.enumerate() {
@@ -558,10 +574,10 @@ pub fn draw(
         cells::fill(buf, row, pen);
         let text = row_shown(entry, width);
         cells::put(buf, list.x, y, &text, width, pen);
-        let id = ui.scope_id().with(("sopen-git-log", area.x, k));
+        let id = panel.with(("sopen-git-log", k));
         let resp = ui.interact(grid.rect(row), id, Sense::CLICK);
         if resp.clicked() {
-            let pair = egui::Id::unique(("sopen-git-log-click", area.x, entry.time, &entry.line));
+            let pair = panel.with(("sopen-git-log-click", entry.time, &entry.line));
             clicked = Some((k, super::super::second_click(&resp, pair)));
         }
     }
@@ -577,7 +593,7 @@ pub fn draw(
         let at = (max_top > 0).then(|| view.scroll.top as f32 / max_top as f32);
         cells::scroll_bar(buf, area.right(), list.y, list.height, at);
     }
-    if whole_ui(&ctx, *grid, view, area.x) {
+    if whole_ui(&ctx, *grid, view) {
         view.whole = None;
     }
 }
