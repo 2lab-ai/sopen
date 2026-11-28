@@ -2342,8 +2342,10 @@ impl Browser {
         };
         let rect = grid.rect(cells);
         // The list's question or the tree has the keyboard: read once, for each use below, so
-        // what the panel reads and what it carries out agree (F-git-listq).
+        // what the panel reads and what it carries out agree (F-git-listq). F12's question before
+        // a switch has it as well, over everything (F-git-covered).
         let (list_holds, tree) = (self.ops.holds_keyboard(), self.tree.is_some());
+        let switch = self.switch_asking();
         let pressed = ui.input(|inp| {
             inp.pointer.any_pressed()
                 && inp
@@ -2355,7 +2357,7 @@ impl Browser {
         // pass began or now; its box may lie over this half — a press here moves the keyboard
         // nowhere. A press on the panel whose dialog it is keeps the keyboard there.
         let held = ups.iter().any(|&j| j != i) || self.git_dialog_up(Some(i));
-        if pressed && !held && !list_holds && !tree && self.listing.is_empty() {
+        if pressed && !held && !list_holds && !tree && !switch && self.listing.is_empty() {
             if side != 1 - self.active {
                 // The other side's list had the keyboard: it is the origin list now.
                 self.active = 1 - side;
@@ -2368,10 +2370,10 @@ impl Browser {
         // after this pass's dialogs have opened or closed (`GitView::covered`).
         let mut under = self.ops.covered(grid);
         under.extend(self.git_covered(grid, Some(i)));
-        // Another panel's dialog up, the list's question, or the tree, whose other side stays as
-        // it was until it closes (05 §1): this one opens none, takes no click and its dialogs
-        // read no key.
-        let elsewhere = held || list_holds || tree;
+        // Another panel's dialog up, the list's question, the tree, whose other side stays as it
+        // was until it closes (05 §1), or F12's question: this one opens none, takes no click,
+        // its dialogs read no key and record no painting (`git_panel::draw`).
+        let elsewhere = held || list_holds || tree || switch;
         let view = &mut self.git.panels[i].view;
         view.set_dialog_elsewhere(elsewhere);
         // The keyboard is the panel's as `git_keys` gives it: not while a dialog of the list's or
@@ -2475,12 +2477,16 @@ impl Browser {
     }
 
     /// Whether what the integration would open in panel `i` waits in its channel (X4-menu
-    /// fix-check, rule 2): while another shown panel's dialog is up, or the list's question or
-    /// the tree has the keyboard — each another dialog to this panel, as `git_ui`'s `elsewhere`
-    /// (F-git-listq) — so no git dialog opens in front of the list's question, where it would take
-    /// the pointer while an Enter answered the question behind it, or beside the tree.
+    /// fix-check, rule 2): while another shown panel's dialog is up, or the list's question, the
+    /// tree or F12's question has the keyboard — each another dialog to this panel, as `git_ui`'s
+    /// `elsewhere` (F-git-listq, F-git-covered) — so no git dialog opens in front of the list's
+    /// question, where it would take the pointer while an Enter answered the question behind it,
+    /// beside the tree, or under F12's question.
     pub(super) fn git_waits(&self, i: usize) -> bool {
-        self.git_dialog_up(Some(i)) || self.ops.holds_keyboard() || self.tree.is_some()
+        self.git_dialog_up(Some(i))
+            || self.ops.holds_keyboard()
+            || self.tree.is_some()
+            || self.switch_asking()
     }
 }
 

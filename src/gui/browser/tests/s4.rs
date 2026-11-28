@@ -13,7 +13,7 @@
 //! a note where there is no git, and fail under `SOPEN_REQUIRE_GIT=1` (CI).
 
 use super::s2::{small, Gx};
-use super::s3::script;
+use super::s3::{pressed, script};
 use super::*;
 use crate::git::actions::ActionId;
 use crate::git::history::fixture::{self, Repo};
@@ -1567,4 +1567,53 @@ fn the_planner_takes_its_keys_first_and_the_banner_keys_wait() {
         g.view().edit_draft()
     );
     g.esc();
+}
+
+/// F-git-covered: a quick edit's dialog under the list's question (F7's make-folder dialog, which
+/// has the keyboard over it as a file operation's question would). `[Esc, Enter]` in one read of
+/// the terminal — the Esc closes F7's dialog in a pass the terminal does not print, the Enter
+/// reaches the reword's dialog, whose last printed frame stood under F7's — runs nothing; once a
+/// printed pass showed it with the keyboard, Enter runs it.
+#[test]
+fn f_git_covered_a_quick_edit_under_the_lists_question_runs_nothing() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(five(&git));
+    g.ready_in_git();
+    g.bar_to("five");
+    g.f(Key::F2);
+    assert_eq!(g.edit_id(), Some(EditId::Reword));
+    g.replace_typed("five, reworded");
+    g.until_quiet("the reword's plan");
+    let head = g.repo.rev("HEAD");
+    let b = &mut g.fx.b;
+    let said = b.ops.open_make_folder(&b.panels[b.active], None);
+    assert!(said.is_none(), "{said:?}");
+    g.idle(2);
+    assert!(g.b().ops.holds_keyboard(), "F7's dialog");
+    let ctx = g.fx.drv.ctx.clone();
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Escape), Modifiers::NONE);
+    cells::set_presented(&ctx, false);
+    assert!(!g.b().ops.holds_keyboard(), "the Esc closed F7's dialog");
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
+    cells::set_presented(&ctx, true);
+    g.idle(2);
+    g.until_quiet("anything the Enter ran");
+    assert_eq!(
+        (g.repo.rev("HEAD"), g.edit_id()),
+        (head, Some(EditId::Reword)),
+        "the Enter ran nothing ({})",
+        g.status()
+    );
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
+    g.idle(2);
+    g.until_quiet("the reword's run");
+    assert_eq!(
+        g.log_of("%s", "main")[0],
+        "five, reworded",
+        "the control: shown with the keyboard, its Enter runs ({})",
+        g.status()
+    );
 }

@@ -610,8 +610,9 @@ impl SearchDialog {
     }
 
     /// One pass on `grid` (the panels'), see [`SearchDialog`]: Esc and each Enter are taken
-    /// before the box's controls see them.
-    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> Option<SearchEnd> {
+    /// before the box's controls see them. `keyboard`: no other dialog stands over it with the
+    /// keyboard (F-git-covered) — without it, it takes none for its field.
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid, keyboard: bool) -> Option<SearchEnd> {
         let escape = ctx.input_mut(|i| keys::take(i, Key::Escape, Mods::None));
         let controls: Vec<egui::Id> = (0..SEARCH_FIELDS.len())
             .map(search_field_id)
@@ -623,7 +624,7 @@ impl SearchDialog {
         // egui lays a box it has no size for out unseen first (`Area`'s sizing pass: one it has
         // not shown before, or restored without its size): what that pass paints, nobody saw.
         let unseen = egui::AreaState::load(ctx, search_id()).is_none_or(|a| a.size.is_none());
-        if !began.is_some_and(|f| controls.contains(&f)) {
+        if keyboard && !began.is_some_and(|f| controls.contains(&f)) {
             ctx.memory_mut(|m| m.request_focus(search_field_id(0)));
         }
         let layout = self.layout(grid);

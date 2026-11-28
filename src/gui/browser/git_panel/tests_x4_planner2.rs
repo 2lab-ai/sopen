@@ -1098,6 +1098,33 @@ fn x4p2_an_enter_after_a_result_over_the_question_closes_nothing() {
     );
 }
 
+/// F-git-covered fix-check: a dialog with a field the integration opens over the planner's message
+/// dialog (a prefilled Commit) has the keyboard — the planner's, under it, takes none for its field
+/// even when nothing has it (the Commit's first request is dropped, its box new) — so every
+/// character typed from its first passes on goes into the Commit's field.
+#[test]
+fn f_git_covered_text_typed_over_the_planners_dialog_goes_into_the_dialog() {
+    let mut view = super::tests::fixture_view();
+    view.set_repo(repo());
+    view.open_planner(model());
+    let mut fx = super::tests::Fx::new(1000.0, 500.0, view);
+    fx.idle();
+    fx.typed("r");
+    fx.press(Key::Enter);
+    assert!(fx.view().dialog_up(), "the planner's message dialog");
+    let asked = fx.view_mut().open_action(
+        crate::git::actions::ActionId::Commit,
+        super::Target::Uncommitted,
+        Default::default(),
+    );
+    assert!(asked.is_empty(), "{asked:?}");
+    let draft = super::tests_x4_menu::typed_from_its_first_passes(&mut fx, "qzwv");
+    assert!(
+        matches!(&draft, Some(crate::git::actions::Action::Commit { message, .. }) if message == "qzwv"),
+        "the Commit's field: {draft:?}"
+    );
+}
+
 /// While another dialog has the keyboard the planner's dialog leaves the pass's typed text in the
 /// input for it; with the keyboard the planner takes every typed character, none reaching the
 /// git context's Find.

@@ -236,6 +236,34 @@ fn last_printed(ctx: &egui::Context) -> Option<u64> {
     }
 }
 
+/// What is painted from now on in the pass of a context stands covered ([`set_covered`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct Covered;
+
+fn covered_id() -> egui::Id {
+    egui::Id::unique("sopen-covered")
+}
+
+/// Says whether what is painted from now on in this pass of `ctx` stands under another dialog
+/// that has the keyboard (F-git-covered): a screen that asks [`OnScreen::start`] while it does
+/// records no painting, so a pass it stood covered in is never what the screen showed of it. The
+/// git panel's draw says so before each of its parts, and `false` once it is done.
+pub fn set_covered(ctx: &egui::Context, covered: bool) {
+    ctx.data_mut(|d| {
+        if covered {
+            d.insert_temp(covered_id(), Covered);
+        } else {
+            d.remove_temp::<Covered>(covered_id());
+        }
+    });
+}
+
+/// Whether what is painted from now on in this pass of `ctx` stands covered ([`set_covered`]):
+/// a dialog drawn then does not have the keyboard, and takes none for its field (F-git-covered).
+pub fn covered(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<Covered>(covered_id()).is_some())
+}
+
 /// A number of `ctx`'s own, the same in each of its frames and another in any other context: the
 /// window's and the terminal's count their frames apart (a switch between them moves a screen
 /// from one to the other).
@@ -263,6 +291,8 @@ pub struct OnScreen<T> {
     last: Option<(Frame, T)>,
     /// The frame [`OnScreen::start`] last answered in.
     asked: Option<Frame>,
+    /// The pass stands covered as [`OnScreen::start`] was last asked ([`set_covered`]).
+    covered: bool,
 }
 
 impl<T> Default for OnScreen<T> {
@@ -271,6 +301,7 @@ impl<T> Default for OnScreen<T> {
             shown: None,
             last: None,
             asked: None,
+            covered: false,
         }
     }
 }
@@ -282,7 +313,8 @@ impl<T> OnScreen<T> {
     /// none if it did not: a new modal's unseen first layout, a frame the screen was not drawn in
     /// at all (a viewer over a dialog), another context's frame, which showed something else
     /// (X4-quick round 1). A second pass of a frame (egui's discarded one first) gets the
-    /// frame's answer.
+    /// frame's answer. Asked while the pass stands covered ([`set_covered`]), it answers the same,
+    /// and what this pass paints is not recorded.
     pub fn start(&mut self, ctx: &egui::Context) -> Option<&T> {
         let now = frame_of(ctx);
         if self.asked != Some(now) {
@@ -296,12 +328,19 @@ impl<T> OnScreen<T> {
                 _ => None,
             };
         }
+        // Asked on each pass, the last asking its own: a frame's last pass's painting is the
+        // frame's, so a covered one drops what an earlier pass of the frame painted.
+        self.covered = covered(ctx);
+        if self.covered && self.last.as_ref().is_some_and(|(at, _)| *at == now) {
+            self.last = None;
+        }
         self.shown.as_ref().map(|(_, p)| p)
     }
 
     /// What this pass painted, after its [`OnScreen::start`]: a frame's last pass's is the frame's.
+    /// Nothing while the pass stands covered ([`set_covered`]).
     pub fn painted(&mut self, painting: T) {
-        if let Some(at) = self.asked {
+        if let (Some(at), false) = (self.asked, self.covered) {
             self.last = Some((at, painting));
         }
     }

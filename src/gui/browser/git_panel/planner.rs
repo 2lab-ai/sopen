@@ -1061,8 +1061,10 @@ impl QuickDialog {
             let painting = self.painted(fits);
             self.screen.painted(painting);
         }
-        // The first field takes the keyboard as the dialog opens, and while nothing has it.
-        if !fields.is_empty() && (!self.typing || keyed.began.is_none()) {
+        // The first field takes the keyboard as the dialog opens, and while nothing has it — not
+        // while hidden or covered: the dialog over it has the keyboard (F-git-covered).
+        let front = !hidden && !cells::covered(ctx);
+        if front && !fields.is_empty() && (!self.typing || keyed.began.is_none()) {
             ctx.memory_mut(|m| m.request_focus(self.ids.field(0)));
         }
         self.typing = !fields.is_empty();
@@ -1728,8 +1730,10 @@ impl PlannerView {
             // Without the keyboard another dialog stands over it: the screen shows that one.
             self.asked.painted(());
         }
-        // The first field takes the keyboard as the dialog opens, and while nothing has it.
-        if let (Some(f), true) = (fields.first(), first || keyed.began.is_none()) {
+        // The first field takes the keyboard as the dialog opens, and while nothing has it — not
+        // without the keyboard: the dialog over it has it, whose own first request egui may have
+        // dropped (F-git-covered).
+        if let (Some(f), true) = (fields.first(), keyboard && (first || keyed.began.is_none())) {
             ctx.memory_mut(|m| m.request_focus(*f));
         }
         let [ok, own, cancel, close, keep] =
