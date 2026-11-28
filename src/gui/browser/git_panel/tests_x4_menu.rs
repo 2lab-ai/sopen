@@ -1876,3 +1876,111 @@ mod on_screen {
         assert!(win.host.view.filters().is_default());
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// F-git-listq: while another dialog has the keyboard — another panel's, the list's question, the
+// tree (`set_dialog_elsewhere`) — none of the panel's dialogs reads a key, those it draws in its
+// body (the planner's own, the command log's entry shown whole) too.
+
+/// An Enter and an Esc in one pass, the keys a dialog runs and closes by.
+fn enter_and_esc() -> Vec<Event> {
+    let mut events = key_events(Key::Enter, Modifiers::NONE);
+    events.extend(key_events(Key::Escape, Modifiers::NONE));
+    events
+}
+
+/// The planner's run confirmation (Run…) reads neither key of the pass while another dialog has
+/// the keyboard: it neither runs nor closes. The control: Esc closes it once the keyboard is back.
+#[test]
+fn f_git_listq_the_planners_confirmation_reads_no_key_while_another_dialog_has_it() {
+    let mut fx = Fx::new(1000.0, 600.0, fixture_view());
+    fx.view_mut().set_repo(super::tests_s4::repo());
+    fx.view_mut().open_planner(super::tests_s4::model());
+    fx.idle();
+    fx.idle();
+    let run = fx.drv.find_text("[ Run… ]").expect("Run…").center();
+    pass(&mut fx, click_events(run, PointerButton::Primary));
+    fx.idle();
+    assert!(fx.view().dialog_up(), "the run's confirmation");
+    fx.view_mut().set_dialog_elsewhere(true);
+    fx.idle();
+    let asked = pass(&mut fx, enter_and_esc());
+    fx.idle();
+    assert!(asked.is_empty(), "{asked:?}");
+    assert!(fx.view().dialog_up(), "neither key was the confirmation's");
+    fx.view_mut().set_dialog_elsewhere(false);
+    fx.idle();
+    fx.press(Key::Escape);
+    assert!(!fx.view().dialog_up(), "the control: Esc closes it");
+}
+
+/// The command log's entry shown whole reads neither key of the pass while another dialog has
+/// the keyboard. The control: Esc closes it once the keyboard is back.
+#[test]
+fn f_git_listq_the_logs_entry_reads_no_key_while_another_dialog_has_it() {
+    let mut fx = Fx::new(1000.0, 600.0, fixture_view());
+    fx.view_mut().open_log(vec![super::tests_s3::entry(
+        "git fetch origin",
+        crate::git::runner::Ending::Exit(0),
+        "",
+        0,
+    )]);
+    fx.idle();
+    let at = (fx.drv.texts_starting_with("").into_iter())
+        .find(|(_, t)| t.contains("git fetch origin"))
+        .expect("the log's row")
+        .0
+        .center();
+    twice(&mut fx, at);
+    fx.idle();
+    assert!(fx.view().dialog_up(), "the entry whole");
+    fx.view_mut().set_dialog_elsewhere(true);
+    fx.idle();
+    pass(&mut fx, enter_and_esc());
+    fx.idle();
+    assert!(fx.view().dialog_up(), "neither key was the entry's");
+    fx.view_mut().set_dialog_elsewhere(false);
+    fx.idle();
+    fx.press(Key::Escape);
+    assert!(!fx.view().dialog_up(), "the control: Esc closes it");
+}
+
+/// Guards existing behaviour (its keys half held on ee259ab: the quick dialog is drawn after
+/// `take_keys`): a quick edit's dialog (Reword) reads no typed text and neither key of the pass
+/// while another dialog has the keyboard, so it never closes on an Enter meant for that dialog.
+/// The control: once the keyboard is back, typing reaches its message and Esc closes it. (Its plan
+/// waits for the integration's reads here, so no Enter runs it.)
+#[test]
+fn f_git_listq_a_quick_dialog_reads_no_key_while_another_dialog_has_it() {
+    let mut view = fixture_view();
+    view.set_repo(super::tests_s4::repo());
+    let mut fx = Fx::new(1000.0, 600.0, view);
+    let c = crate::git::model::Oid::parse(&"c".repeat(40)).unwrap();
+    let model = super::tests_s4::model();
+    let asked = fx
+        .view_mut()
+        .open_edit(crate::git::rebase::EditId::Reword, &c, &model);
+    assert!(asked.is_empty(), "{asked:?}");
+    fx.idle();
+    fx.idle();
+    assert!(fx.drv.find_text("third").is_some(), "its message");
+    fx.view_mut().set_dialog_elsewhere(true);
+    fx.idle();
+    let mut events = vec![Event::Text("x".into())];
+    events.extend(enter_and_esc());
+    let asked = pass(&mut fx, events);
+    fx.idle();
+    assert!(asked.is_empty(), "{asked:?}");
+    assert!(fx.view().dialog_up(), "neither key was the dialog's");
+    assert!(fx.drv.find_text("xthird").is_none(), "nor the typed text");
+    fx.view_mut().set_dialog_elsewhere(false);
+    fx.idle();
+    fx.typed("!");
+    fx.idle();
+    assert!(
+        fx.drv.find_text("!third").is_some(),
+        "the control: typed into its message"
+    );
+    fx.press(Key::Escape);
+    assert!(!fx.view().dialog_up(), "the control: Esc closes it");
+}

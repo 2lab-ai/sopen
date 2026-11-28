@@ -2849,6 +2849,11 @@ pub fn draw(
 ) -> Vec<GitAction> {
     let mut asked = Vec::new();
     let ctx = ui.ctx().clone();
+    // While another dialog has the keyboard — another panel's, the list's question, the tree —
+    // no dialog of this panel's reads a key or text this pass (X4-menu fix-check): those are that
+    // dialog's. Taken before the body, which draws the planner's own dialogs and the log's entry
+    // shown whole (F-git-listq), and put back after the panel's other dialogs.
+    let kept = view.dialog_elsewhere.then(|| take_keys(&ctx));
     let p = chrome::PALETTE;
     let look = chrome::git::LOOK;
     let title = if view.filters.is_default() {
@@ -3041,7 +3046,8 @@ pub fn draw(
         } else if view.backups.is_some() {
         } else if view.find.is_some() && view.search.is_none() {
             let typing = active && !dialog;
-            asked.extend(find_ui(ui, grid, none, &mut buf, view, typing, &mut caret).0);
+            let modes = (typing, dialog);
+            asked.extend(find_ui(ui, grid, none, &mut buf, view, modes, &mut caret).0);
         }
     }
     for r in eguis {
@@ -3061,10 +3067,7 @@ pub fn draw(
         cells::fill(&mut buf, r, body);
     }
     cells::paint(&painter, grid.origin, &buf, caret);
-    // The dialogs, over everything, on the panels' grid. While another dialog has the keyboard —
-    // another panel's, the list's question — they read no key or text this pass (X4-menu
-    // fix-check): those are that dialog's.
-    let kept = view.dialog_elsewhere.then(|| take_keys(&ctx));
+    // The dialogs, over everything, on the panels' grid (with no key while `kept` holds them).
     if let Some(dialog) = &mut view.filters_dialog {
         match dialog.ui(&ctx, *grid) {
             Some(filters::DialogEnd::Apply(f)) => {
@@ -3140,14 +3143,15 @@ fn take_keys(ctx: &egui::Context) -> Vec<egui::Event> {
 /// pass types into it in order and its cells show what it holds (fix-check: `[x, Esc, y, z]` lost
 /// the z, the row blank for that pass) — the same id at the same cells again, which egui takes for
 /// one widget seen twice, no clash. Its caret in `caret`; what the keys ask, and whether an Esc
-/// left Find closed.
+/// left Find closed. `dialog`: a dialog of the panel's, or another's beside it, is up — the `Aa`
+/// toggle takes no click then (F-git-listq review).
 fn find_ui(
     ui: &mut egui::Ui,
     grid: &Grid,
     cells: Cells,
     buf: &mut Buffer,
     view: &mut GitView,
-    typing: bool,
+    (typing, dialog): (bool, bool),
     caret: &mut Option<cells::Position>,
 ) -> (Vec<GitAction>, bool) {
     let ctx = ui.ctx().clone();
@@ -3163,7 +3167,7 @@ fn find_ui(
             false => Default::default(),
         };
         if let Some(find) = &mut view.find {
-            *caret = find::field(ui, grid, cells, buf, find, typing, key);
+            *caret = find::field(ui, grid, cells, buf, find, (typing, dialog), key);
         }
         asked.extend(view.find_jump());
         let mut closed = false;
@@ -3213,7 +3217,7 @@ fn graph_ui(
     let mut asked = Vec::new();
     let mut heads = Some(at.head);
     if view.find.is_some() && view.search.is_none() {
-        let (found, closed) = find_ui(ui, grid, at.head, buf, view, typing, caret);
+        let (found, closed) = find_ui(ui, grid, at.head, buf, view, (typing, dialog), caret);
         asked.extend(found);
         if closed {
             // An Esc after what was typed closed it: this pass's cells show the heads.
