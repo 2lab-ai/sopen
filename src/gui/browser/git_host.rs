@@ -260,6 +260,8 @@ pub(super) struct GitSide {
     pub(super) quiet_after: Duration,
     /// Esc asks "Stop git?" of a write running this long (03 §3.4: 10 s; tests shorten it).
     pub(super) stop_after: Duration,
+    /// The last run's id ([`Running::id`]): each run counts one up, in this window.
+    pub(super) runs: u64,
     /// The split this window keeps per repository (03 §7.8.1 `split`, S4): recorded when the
     /// Split ran, dropped once nothing is in progress or its Continue ran.
     pub(super) splits: HashMap<String, KeptSplit>,
@@ -289,6 +291,7 @@ impl GitSide {
             write_locks: HashMap::new(),
             quiet_after: QUIET_AFTER,
             stop_after: QUIET_AFTER,
+            runs: 0,
             splits: HashMap::new(),
         }
     }
@@ -1797,8 +1800,7 @@ impl Browser {
             run.handle.stop();
             self.status = Status::info(format!("{}: stopping", run.title));
         } else if ran >= stop_after {
-            let title = run.title.clone();
-            p.view.ask_stop(title);
+            p.view.ask_stop(run.title.clone(), run.id);
             self.status = Status::default();
         } else {
             self.status = Status::info(format!(
@@ -1946,9 +1948,10 @@ impl Browser {
                 }
                 GitAction::ShowBackup(refs) => self.show_backups(ctx, i, refs),
                 GitAction::TagDetails(refname) => self.ask_tag_details(ctx, i, refname),
-                GitAction::StopWrite => {
+                // Yes to "Stop git?" (03 §3.4): the write it asked about, alone.
+                GitAction::StopWrite(id) => {
                     let p = &mut self.git.panels[i];
-                    for run in &p.running {
+                    for run in p.running.iter().filter(|r| r.id == id) {
                         run.handle.stop();
                     }
                     p.view.status = Some(Status::info("stopping git…"));
@@ -2532,6 +2535,9 @@ pub(super) fn record_group(undo: &mut backup::Undo, stamp: String) {
 /// [`Pending`]: dropping it does not stop the write — a closing window waits for it and prints
 /// its result ([`wait_run`]), and a panel with one is never dropped.
 pub(super) struct Running {
+    /// The run's own id in this window: "Stop git?" asks about one run, whatever words another
+    /// shares with it (two commits are both `Commit to main`).
+    pub(super) id: u64,
     /// The action's words (its confirmation's title, else its menu label).
     pub(super) title: String,
     pub(super) handle: Handle,
@@ -3161,7 +3167,11 @@ impl Browser {
             let _ = tx.send(end);
             waker.request_repaint();
         });
+        self.git.runs += 1;
+        let id = self.git.runs;
+        let p = &mut self.git.panels[i];
         p.running.push(Running {
+            id,
             title,
             handle,
             rx,
@@ -3178,6 +3188,10 @@ impl Browser {
     /// refresh.
     pub(super) fn run_ended(&mut self, ctx: &egui::Context, i: usize, end: RunEnd) {
         let top = self.git.panels[i].top.clone();
+        // "Stop git?" goes with the write it asked about: its Yes would stop the next one.
+        let p = &mut self.git.panels[i];
+        let (view, running) = (&mut p.view, &p.running);
+        view.forget_stop_unless(|id| running.iter().any(|r| r.id == id));
         // What Esc said while it ran ("stopping") gives way to the run's own words.
         self.status = Status::default();
         if let RunEnd::Confirm { title, action } = end {
