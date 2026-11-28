@@ -1079,9 +1079,9 @@ impl GitView {
         vec![GitAction::Details(subject)]
     }
 
-    /// Carries out `command` (the key table's git context) on the view, and gives what is left
-    /// for the integration.
-    fn run(&mut self, command: Command) -> Vec<GitAction> {
+    /// Carries out `command` (the key table's git context) on the view in a pass of `ctx`, and
+    /// gives what is left for the integration.
+    fn run(&mut self, ctx: &egui::Context, command: Command) -> Vec<GitAction> {
         use GitAction as A;
         match command {
             Command::Help => return vec![A::Help],
@@ -1100,7 +1100,7 @@ impl GitView {
         // Cmd/Ctrl+L and B to switch or close it; every other key does nothing — the graph under
         // it, and so its bar's object, is not on screen.
         if self.log.is_some() || self.backups.is_some() {
-            return self.run_list(command);
+            return self.run_list(ctx, command);
         }
         match command {
             Command::HistorySearch => {
@@ -2068,7 +2068,7 @@ impl GitView {
     /// rows (the log: the bar, Enter or F3 to show an entry whole, Esc; the Backups list: also
     /// Cmd/Ctrl+Z and F8 on the line under its bar); Cmd/Ctrl+L or B closes its list or opens the
     /// other; anything else is taken and does nothing.
-    fn run_list(&mut self, command: Command) -> Vec<GitAction> {
+    fn run_list(&mut self, ctx: &egui::Context, command: Command) -> Vec<GitAction> {
         if let Some(log) = &mut self.log {
             return match command {
                 Command::Bar(_) | Command::Details | Command::Back => {
@@ -2092,7 +2092,7 @@ impl GitView {
                 | Command::Undo
                 | Command::Remove
                 | Command::Back => {
-                    let end = list.run(command);
+                    let end = list.run(ctx, command);
                     self.backups_end(end)
                 }
                 Command::Backups => {
@@ -2700,7 +2700,7 @@ pub fn keys(ctx: &egui::Context, view: &mut GitView) -> Vec<GitAction> {
                 break;
             };
             view.said = None;
-            asked.extend(view.run(command));
+            asked.extend(view.run(ctx, command));
             continue;
         }
         if view.search.is_some() {
@@ -2732,7 +2732,7 @@ pub fn keys(ctx: &egui::Context, view: &mut GitView) -> Vec<GitAction> {
             break;
         };
         view.said = None;
-        asked.extend(view.run(command));
+        asked.extend(view.run(ctx, command));
     }
     asked
 }
@@ -2793,8 +2793,8 @@ impl Layout {
 }
 
 /// `c` and the border cell right of it on each of its rows, where the details pane egui draws
-/// puts its scroll bar (`details::draw`; the log and the Backups list put theirs in their own
-/// last column).
+/// puts its scroll bar (`details::draw`, while egui draws it; the planner, the log and the Backups
+/// list, in cells, put theirs on the border as the graph does).
 fn with_border(c: Cells) -> Cells {
     Cells::new(c.x, c.y, c.width.saturating_add(1), c.height)
 }
@@ -2878,6 +2878,15 @@ pub fn draw(
             }
             None => {}
         }
+        // What covers the Backups list this pass — a dialog of the list's or the panel's own, the
+        // key help — blanked over it below: its bar's line under one is not on screen (X4-lists).
+        let hidden: Vec<Cells> = match view.backups.is_some() {
+            true => (under.iter().copied())
+                .chain(view.covered(grid))
+                .chain(help::covered(&ctx, grid))
+                .collect(),
+            false => Vec::new(),
+        };
         if view.planner.is_some() {
             // The planner over the body (03 §7.8.2): its keys first while it has the keyboard and
             // no other dialog is up, then the pane, then its own dialog.
@@ -2903,7 +2912,8 @@ pub fn draw(
                 eguis.push(at.listing);
             }
         } else if let Some(list) = &mut view.backups {
-            let end = backups::draw(ui, grid, at.listing, &mut buf, list, active && !dialog);
+            let shown = active && !dialog;
+            let end = backups::draw(ui, grid, at.listing, &mut buf, list, shown, &hidden);
             if !backups::PAINTS_CELLS {
                 eguis.push(at.listing);
             }

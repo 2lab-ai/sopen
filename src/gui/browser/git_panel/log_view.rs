@@ -3,22 +3,24 @@
 //!
 //! [`LogView`] holds the entries as `CommandLog::entries` gives them (newest first; the
 //! integration hands them again with [`LogView::set_entries`] as commands run, and the bar stays
-//! on its entry). It is drawn in the git panel's body ([`draw`]), one line an entry — its time,
-//! host and `LogEntry::status_line` — and takes the git context's rows ([`LogView::run`]): ↑ ↓
-//! PgUp PgDn Home End move the bar, Enter or F3 (`Details`) shows the entry whole in a dialog
-//! (time, host, repository, command line, stdin, ending, duration, stdout size and stderr
-//! whole), Esc (`Back`) closes that, then the log. The log is in memory only and its lines are
-//! masked already (03 §3.7).
+//! on its entry). It is drawn in the git panel's body in cells ([`draw`], X4-lists), one row an
+//! entry — its time, host and `LogEntry::status_line` — and takes the git context's rows
+//! ([`LogView::run`]): ↑ ↓ PgUp PgDn Home End move the bar, Enter or F3 (`Details`) shows the
+//! entry whole in an `ops::dialog` dialog (time, host, repository, command line, stdin, ending,
+//! duration, stdout size, and stderr whole in rows that scroll), Esc (`Back`) closes that, then
+//! the log. The log is in memory only and its lines are masked already (03 §3.7).
 
 use super::graph_view::printable;
 use super::Scroll;
-use crate::git::runner::LogEntry;
+use crate::git::runner::{Ending, LogEntry};
 use crate::gui::browser::keys::{self, Command, Mods};
-use crate::gui::cells::{Buffer, Cells, Grid};
+use crate::gui::browser::ops::dialog::{self, Button, Ink, Inputs, Layout, Part};
+use crate::gui::cells::{self, Buffer, Cells, Grid, Pen};
 use crate::gui::chrome;
 use crate::gui::chrome::git::LOOK;
-use eframe::egui::{self, Key, Pos2, Rect, RichText, Sense, Vec2};
+use eframe::egui::{self, Key, Sense};
 use std::time::SystemTime;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// The log's header.
 pub const HEADER: &str = "Command log · newest first · in memory only · Enter shows an entry whole";
@@ -37,6 +39,21 @@ pub struct LogView {
     scroll: Scroll,
     /// The entry shown whole, by index.
     whole: Option<usize>,
+    /// The first of its stderr's rows the entry shown whole shows.
+    top: usize,
+    /// The entry shown whole as last laid out ([`Laid`]): its texts are wrapped once, not on each
+    /// pass nor on each question of what it covers.
+    laid: Option<Laid>,
+}
+
+/// The dialog of the entry shown whole, laid out on `grid` for entry `at` in the panel at column
+/// `column` (its button's id).
+#[derive(Debug, Clone)]
+struct Laid {
+    grid: Grid,
+    at: usize,
+    column: u16,
+    layout: Layout,
 }
 
 /// Unix seconds of a time (0 before the epoch).
@@ -69,7 +86,9 @@ fn date_time_text(t: SystemTime) -> String {
     }
 }
 
-/// An entry's line in the log: `10:24:05  host  git push origin main · exit 0 · 1.2 s`.
+/// An entry's line in the log: `10:24:05  host  git push origin main · exit 0 · 1.2 s` (drawn cut
+/// to its room by [`row_shown`], which never builds it whole).
+#[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
 pub fn row_text(entry: &LogEntry) -> String {
     format!(
         "{}  {}  {}",
@@ -86,6 +105,8 @@ impl LogView {
             entries,
             scroll: Scroll::default(),
             whole: None,
+            top: 0,
+            laid: None,
         }
     }
 
@@ -100,6 +121,8 @@ impl LogView {
         let whole = find(self.whole, &entries);
         self.entries = entries;
         self.whole = whole;
+        // Laid out by index: the entry at it may be another now.
+        self.laid = None;
         self.scroll.to(bar.unwrap_or(0));
     }
 
@@ -113,10 +136,32 @@ impl LogView {
     }
 
     /// The cells of `grid` (the panels') the entry shown whole covers, its box and its shadow,
-    /// for the panel and the other side to blank (10 §17, X4-graph's seam): none while egui draws
-    /// it, until X4-lists.
-    pub fn covers(&self, _grid: &Grid) -> Vec<Cells> {
-        Vec::new()
+    /// for the panel and the other side to blank (10 §17, X4-graph's seam): the box [`draw`] laid
+    /// out last, or — on a grid it has not drawn on yet — the one it will lay out.
+    pub fn covers(&self, grid: &Grid) -> Vec<Cells> {
+        let Some(at) = self.whole.filter(|&k| k < self.entries.len()) else {
+            return Vec::new();
+        };
+        // Where the box stands is the grid's and the entry's alone, whatever the panel's column.
+        match &self.laid {
+            Some(l) if l.grid == *grid && l.at == at => l.layout.covers(),
+            _ => entry_layout(*grid, &self.entries[at], 0).covers(),
+        }
+    }
+
+    /// The entry shown whole, `at`, laid out on `grid` for the panel at column `column`, once for
+    /// all three ([`Laid`]).
+    fn lay_out(&mut self, grid: Grid, at: usize, column: u16) {
+        let kept = matches!(&self.laid, Some(l) if (l.grid, l.at, l.column) == (grid, at, column));
+        if !kept {
+            let layout = entry_layout(grid, &self.entries[at], column);
+            self.laid = Some(Laid {
+                grid,
+                at,
+                column,
+                layout,
+            });
+        }
     }
 
     /// A row of the git context's key table while the log is open (03 §9.2).
@@ -127,7 +172,7 @@ impl LogView {
                 None => Some(LogEnd::Close),
             },
             Command::Details if self.whole.is_none() && !self.entries.is_empty() => {
-                self.whole = Some(self.scroll.bar.min(self.entries.len() - 1));
+                self.show_whole(self.scroll.bar.min(self.entries.len() - 1));
                 None
             }
             Command::Bar(step) if self.whole.is_none() => {
@@ -138,117 +183,342 @@ impl LogView {
             _ => None,
         }
     }
+
+    /// Entry `at` shown whole, its stderr from its first row.
+    fn show_whole(&mut self, at: usize) {
+        self.whole = Some(at);
+        self.top = 0;
+    }
 }
 
-fn whole_id() -> egui::Id {
-    egui::Id::unique("sopen-git-log-entry")
+/// How many cells wide the entry shown whole is inside its box: egui's 88, within the grid by the
+/// kit's rule (`dialog::inside_width`), for its long command lines and stderr.
+const WHOLE_WIDTH: usize = 88;
+
+/// Where a field's value starts after its name (`Part::Named`'s `at`): the widest name,
+/// `Repository`, and two blank cells (10 §6's two between two texts).
+const NAME: usize = 12;
+
+/// The modal of the entry shown whole, in the panel at column `column`: two repositories' panels
+/// stand side by side in one `ui`, each with its own.
+fn whole_id(column: u16) -> egui::Id {
+    egui::Id::unique("sopen-git-log-entry").with(column)
 }
 
-/// The entry shown whole (03 §3.7) on `grid` (the panels', where it stands once it is in
-/// cells): every field, stderr whole and scrollable. Enter, Esc or a click outside closes it.
-fn whole_ui(ctx: &egui::Context, _grid: Grid, entry: &LogEntry) -> bool {
+/// Its OK button.
+fn ok_id(column: u16) -> egui::Id {
+    whole_id(column).with("ok")
+}
+
+/// A line of stderr as the dialog shows it: tabs to the next multiple of eight cells, a carriage
+/// return at its end dropped, other control characters escaped.
+fn stderr_line(line: &str) -> String {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let mut out = String::with_capacity(line.len());
+    // The cells so far, counted as the line is read (not measured again per tab).
+    let mut column = 0;
+    for (k, part) in line.split('\t').enumerate() {
+        if k > 0 {
+            let n = 8 - column % 8;
+            out.extend(std::iter::repeat_n(' ', n));
+            column += n;
+        }
+        let part = printable(part);
+        column += cells::width(&part);
+        out.push_str(&part);
+    }
+    out
+}
+
+/// `line` in rows of at most `room` cells, as `dialog::wrap` breaks a text — at its last blank
+/// that fits (the blank dropped), or after its last whole glyph — in one walk of the line:
+/// `dialog::wrap` measures the rest of a line again for each row, and stderr's last 64 KiB can be
+/// one line (03 §3.7). Each row it gives fits, so the kit's wrap keeps it whole.
+pub(super) fn cut(line: &str, room: usize) -> Vec<String> {
+    let room = room.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0;
+    // The row's last blank after a glyph: its byte and the cells before it.
+    let mut blank: Option<(usize, usize)> = None;
+    for g in line.graphemes(true) {
+        #[cfg(test)]
+        counted(&CUT, 1);
+        let w = cells::width(g);
+        if used + w > room && !row.is_empty() {
+            if g == " " {
+                // The row ends at this blank, which goes.
+                rows.push(std::mem::take(&mut row));
+                (used, blank) = (0, None);
+                continue;
+            }
+            match blank.take() {
+                Some((at, before)) => {
+                    let rest = row.split_off(at + 1);
+                    row.truncate(at);
+                    rows.push(std::mem::replace(&mut row, rest));
+                    used -= before + 1;
+                }
+                None => {
+                    rows.push(std::mem::take(&mut row));
+                    used = 0;
+                }
+            }
+        }
+        if g == " " && !row.is_empty() {
+            blank = Some((row.len(), used));
+        }
+        row.push_str(g);
+        used += w;
+    }
+    if !row.trim().is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    // A text's own blanks after its last word make no rows, however many (`dialog::wrap` stops
+    // at them).
+    while rows.len() > 1 && rows.last().is_some_and(|r| r.trim().is_empty()) {
+        rows.pop();
+    }
+    rows
+}
+
+/// `text` whole if it holds at most `most` cells, else its longest start within them and `…`, in
+/// one walk that stops there. The `…` keeps a cut in a run of blanks a text's middle, as it was:
+/// the kit's wrap makes no rows of the blanks a text ends in.
+fn head(text: &str, most: usize) -> String {
+    let mut used = 0;
+    for (i, g) in text.grapheme_indices(true) {
+        used += cells::width(g);
+        if used > most {
+            return format!("{}…", &text[..i]);
+        }
+    }
+    text.to_string()
+}
+
+/// Text taken a grapheme at a time, its control characters escaped, until it holds more cells
+/// than `room` ([`row_shown`]).
+struct Walk {
+    out: String,
+    used: usize,
+    room: usize,
+}
+
+impl Walk {
+    /// `piece` taken; false once the text holds more than `room` cells (and nothing more is).
+    fn take(&mut self, piece: &str) -> bool {
+        // A piece whose bytes fit, with no control character (so no glyph wider than its bytes), is
+        // taken whole, measured once: most rows' every piece.
+        if self.used + piece.len() <= self.room && !piece.chars().any(char::is_control) {
+            #[cfg(test)]
+            counted(&ROWS_WALKED, piece.len());
+            self.used += cells::width(piece);
+            self.out.push_str(piece);
+            return true;
+        }
+        for g in piece.graphemes(true) {
+            #[cfg(test)]
+            counted(&ROWS_WALKED, 1);
+            let g = printable(g);
+            self.used += cells::width(&g);
+            self.out.push_str(&g);
+            if self.used > self.room {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// An entry's row in `room` cells as `cells::fit_start(&printable(&row_text(entry)), room)` cuts
+/// it, in one walk that stops a cell past `room`: a command line can be 64 KiB (03 §3.7), and a
+/// pass draws a screen of rows. Its ending (`status_line`'s, which reads stderr for a failure's
+/// first error line) is read only when the command line fits.
+fn row_shown(entry: &LogEntry, room: usize) -> String {
+    let mut walk = Walk {
+        out: String::new(),
+        used: 0,
+        room,
+    };
+    let whole = walk.take(&time_text(entry.time))
+        && walk.take("  ")
+        && walk.take(&entry.host)
+        && walk.take("  ")
+        && walk.take(&entry.line)
+        && walk.take(&entry.status_line()[entry.line.len()..]);
+    match whole {
+        // All of it in its room: as `fit_start` would give it, not measured again.
+        true => walk.out,
+        false => cells::fit_start(&walk.out, room),
+    }
+}
+
+/// The dialog of `entry` shown whole (03 §3.7) on `grid`, its OK button the one of the panel at
+/// column `column`: each field its name in the weak ink and its value from the 13th cell, wrapped
+/// there by cells (`Part::Named`, egui's grid of two columns; on a dialog with no cell after the
+/// 12th, under its name); then `Stderr`, weak, and its lines in rows that scroll, at most half the
+/// grid's rows and six at least (egui's half the window), `nothing` in the weak ink when there is
+/// none; then `[ OK ]` and the keys' hint. Each value reaches the kit cut to the cells the box can
+/// show — the grid's rows and two more, of its room (`dialog::named_room`) and a cell more —
+/// since the kit's `dialog::wrap` measures the rest of a text again for each row and a command
+/// line can be 64 KiB (the files backup's batches of paths): what the box shows is the same, the
+/// rest being cut with `…` there.
+pub(super) fn entry_layout(grid: Grid, entry: &LogEntry, column: u16) -> Layout {
+    let width = dialog::inside_width(grid.cols, WHOLE_WIDTH, 0);
+    let most = (usize::from(grid.rows) + 2) * (dialog::named_room(width, NAME) + 1);
+    entry_layout_in(grid, entry, column, most)
+}
+
+/// [`entry_layout`] with each value cut to `most` cells (the tests: none, to see it the same).
+pub(super) fn entry_layout_in(grid: Grid, entry: &LogEntry, column: u16, most: usize) -> Layout {
+    let stdin = entry.stdin.as_deref().unwrap_or("nothing");
+    let fields = [
+        ("Time", date_time_text(entry.time)),
+        ("Host", entry.host.clone()),
+        ("Repository", entry.repo.clone()),
+        ("Command", entry.line.clone()),
+        ("Stdin", stdin.to_string()),
+        ("Ending", entry.ending.to_string()),
+        ("Duration", format!("{:.1} s", entry.duration.as_secs_f64())),
+        ("Stdout", format!("{} bytes", entry.stdout_bytes)),
+    ];
+    // The box's inside: egui's 88 cells, or the grid less eight, whatever its texts want (88 is
+    // above the kit's widest, 76), so its rows of stderr are cut to it here, once.
+    let width = dialog::inside_width(grid.cols, WHOLE_WIDTH, 0);
+    let mut parts: Vec<Part> = (fields.into_iter())
+        .map(|(name, value)| Part::Named {
+            name: name.to_string(),
+            value: head(&printable(&value), most),
+            at: NAME,
+        })
+        .collect();
+    #[cfg(test)]
+    for p in &parts {
+        if let Part::Named { name, value, .. } = p {
+            counted(&HANDED, name.len() + value.len());
+        }
+    }
+    let rows: Vec<(String, Ink)> = match entry.stderr.as_str() {
+        "" => vec![("nothing".to_string(), Ink::Weak)],
+        all => (all.strip_suffix('\n').unwrap_or(all).split('\n'))
+            .flat_map(|line| cut(&stderr_line(line), width))
+            .map(|row| (row, Ink::Text))
+            .collect(),
+    };
+    parts.extend([
+        Part::Text("Stderr".to_string(), Ink::Weak),
+        Part::Scroll {
+            rows,
+            most: (grid.rows / 2).max(6),
+            top: 0,
+        },
+        Part::Blank,
+        Part::Buttons(vec![Button::new("OK", ok_id(column))]),
+        Part::Text("Enter or Esc closes".to_string(), Ink::Weak),
+    ]);
+    #[cfg(test)]
+    LAID.with(|n| n.set(n.get() + 1));
+    dialog::layout(grid, "Command", width, &parts)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`entry_layout`] laid out an entry on this thread: its work, which the
+    /// tests bound to once for a grid, however many passes show it.
+    pub(super) static LAID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The characters of entries' texts walked to draw their rows: a pass's work, which the tests
+    /// bound by the rows' room, however long a command line.
+    pub(super) static ROWS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The bytes of the fields' texts handed to the kit, which wraps them by `dialog::wrap`.
+    pub(super) static HANDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The graphemes [`cut`] walked.
+    pub(super) static CUT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `n` more on the counter `key` (the tests' only).
+#[cfg(test)]
+fn counted(key: &'static std::thread::LocalKey<std::cell::Cell<usize>>, n: usize) {
+    key.with(|c| c.set(c.get() + n));
+}
+
+/// The entry shown whole (03 §3.7) on `grid` (the panels'), in the panel at column `column`: an
+/// `ops::dialog` dialog ([`entry_layout`]), its stderr scrolled by the wheel and the box's scroll
+/// bar. Enter, Esc, OK or a click outside closes it: true then.
+fn whole_ui(ctx: &egui::Context, grid: Grid, view: &mut LogView, column: u16) -> bool {
+    let Some(at) = view.whole.filter(|&k| k < view.entries.len()) else {
+        return false;
+    };
     let close = ctx.input_mut(|i| {
         keys::take(i, Key::Enter, Mods::None) | keys::take(i, Key::Escape, Mods::None)
     });
-    let width = super::dialogs::width(ctx, 88.0);
-    let room = (ctx.content_rect().height() * 0.5).max(6.0 * chrome::CELL.y);
-    let mut ok = false;
-    let response = chrome::dialog(ctx, whole_id(), "Command", |ui| {
-        ui.set_width(width);
-        let stdin = entry.stdin.clone().unwrap_or_else(|| "nothing".to_string());
-        let fields = [
-            ("Time", date_time_text(entry.time)),
-            ("Host", entry.host.clone()),
-            ("Repository", entry.repo.clone()),
-            ("Command", entry.line.clone()),
-            ("Stdin", stdin),
-            ("Ending", entry.ending.to_string()),
-            ("Duration", format!("{:.1} s", entry.duration.as_secs_f64())),
-            ("Stdout", format!("{} bytes", entry.stdout_bytes)),
-        ];
-        egui::Grid::new(whole_id().with("fields"))
-            .num_columns(2)
-            .show(ui, |ui| {
-                for (name, value) in fields {
-                    ui.label(RichText::new(name).weak());
-                    ui.add(egui::Label::new(value).wrap());
-                    ui.end_row();
-                }
-            });
-        ui.label(RichText::new("Stderr").weak());
-        egui::ScrollArea::vertical()
-            .id_salt("sopen-git-log-stderr")
-            .max_height(room)
-            .show(ui, |ui| {
-                let text = if entry.stderr.is_empty() {
-                    "nothing"
-                } else {
-                    entry.stderr.as_str()
-                };
-                ui.add(egui::Label::new(text).wrap());
-            });
-        ui.add_space(chrome::CELL.y / 2.0);
-        ok = ui.button("OK").clicked();
-        ui.label(RichText::new("Enter or Esc closes").weak());
-    });
-    close || ok || response.should_close()
+    view.lay_out(grid, at, column);
+    let (Some(laid), top) = (&view.laid, &mut view.top) else {
+        return close;
+    };
+    let inputs = Inputs {
+        top: Some(top),
+        ..Inputs::default()
+    };
+    let shown = dialog::show(ctx, whole_id(column), &laid.layout, inputs);
+    close || shown.clicked(ok_id(column)) || shown.modal.should_close()
 }
 
-/// Whether [`draw`] paints the log's cells (10 §17, X4-graph's seam): not yet — egui draws it at
-/// `grid.rect(cells)`, its scroll bar in its own last column, and the panel leaves
-/// those cells to `term::compose` (a hand-off box in a terminal) until X4-lists makes it `true`.
-pub(super) const PAINTS_CELLS: bool = false;
+/// Whether [`draw`] paints the log's cells (10 §17, X4-graph's seam): it does (X4-lists), so the
+/// panel leaves none of them to egui.
+pub(super) const PAINTS_CELLS: bool = true;
 
-/// The log at cells `cells` of `grid` (the git panel's body): the header, one line an entry with
-/// the bar, the scroll bar; and the entry shown whole, over everything, on `grid`. `buf` is the
-/// panel's buffer, for the log's cells once it paints them ([`PAINTS_CELLS`]). A click puts the
-/// bar on an entry, a double click shows it whole.
+/// The log at cells `area` of `grid` (the git panel's body), written into `buf`, the panel's
+/// buffer (10 §4, X4-lists): the header dim in the heads' row, then one row an entry — a failed
+/// one in the error colour — the bar on its entry, cut by cells in one walk ([`row_shown`]), and
+/// the scroll bar on the border right of `area`; and the entry shown whole, over everything, on
+/// `grid`. Only the rows on screen are drawn; the wheel scrolls them by `CELL.y`, the bar stays.
+/// Each row is an `interact` rect at its cells, its id salted with the panel's column (two
+/// repositories' panels draw into one `ui`), sensing clicks alone (`Sense::CLICK`, never the
+/// keyboard's focus), over one more under them all (`backups::blank_clicks`): a click on a blank
+/// moves no bar; a click puts the bar on its entry, a double click on one entry shows it whole (the browser's
+/// `second_click`, the pair the entry itself, never its place: an entry logged between the two
+/// clicks moves the rows). At no cells (a panel too short for its parts) only the entry shown
+/// whole is drawn, so its keys still reach it.
 pub fn draw(
     ui: &mut egui::Ui,
     grid: &Grid,
-    cells: Cells,
-    _buf: &mut Buffer,
+    area: Cells,
+    buf: &mut Buffer,
     view: &mut LogView,
     active: bool,
 ) {
-    let rect = grid.rect(cells);
     let ctx = ui.ctx().clone();
-    let font = chrome::mono(ui);
-    let (cw, text_h) = ctx.fonts_mut(|f| (f.glyph_width(&font, '0'), f.row_height(&font)));
-    let row_h = text_h.ceil();
-    let painter = ui.painter_at(rect);
-    let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), row_h));
-    let list = Rect::from_min_max(
-        Pos2::new(rect.left(), header.bottom()),
-        Pos2::new(rect.right() - chrome::CELL.x, rect.bottom()),
-    );
-    let chars = (list.width() / cw).floor().max(0.0) as usize;
-    let fit = |s: &str| chrome::fit_start(&ctx, &printable(s), &font, cw * chars as f32);
-    painter.text(
-        header.left_top(),
-        egui::Align2::LEFT_TOP,
-        fit(HEADER),
-        font.clone(),
-        LOOK.dim,
-    );
-    if view.entries.is_empty() {
-        painter.text(
-            list.left_top(),
-            egui::Align2::LEFT_TOP,
-            "no command has run",
-            font.clone(),
-            LOOK.dim,
-        );
+    let p = chrome::PALETTE;
+    let width = usize::from(area.width);
+    let body = Pen::new(LOOK.text, p.back);
+    cells::fill(buf, area, body);
+    if area.height > 0 {
+        // Over blanks in its own colours, which an ambiguous-wide terminal's `·` may take.
+        let dim = Pen::new(LOOK.dim, p.back);
+        let header = cells::fit_start(HEADER, width);
+        cells::fill(buf, Cells::new(area.x, area.y, area.width, 1), dim);
+        cells::put(buf, area.x, area.y, &header, width, dim);
     }
-    let visible = ((list.height() / row_h).floor() as usize).max(1);
+    // The entries under the header.
+    let list = Cells::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    );
     let len = view.entries.len();
-    if ui.rect_contains_pointer(list) {
+    if len == 0 && list.height > 0 {
+        let dim = Pen::new(LOOK.dim, p.back);
+        cells::put(buf, list.x, list.y, "no command has run", width, dim);
+    }
+    let visible = usize::from(list.height).max(1);
+    if super::super::pointer_on_pane(ui, grid.rect(list)) {
         let lines: f32 = ctx.input(|i| {
             i.events
                 .iter()
                 .map(|e| match e {
                     egui::Event::MouseWheel { unit, delta, .. } => match unit {
-                        egui::MouseWheelUnit::Point => -delta.y / row_h,
+                        egui::MouseWheelUnit::Point => -delta.y / chrome::CELL.y,
                         _ => -delta.y * 3.0,
                     },
                     _ => 0.0,
@@ -260,53 +530,54 @@ pub fn draw(
     }
     view.scroll.settle(visible, len);
     let range = view.scroll.range(len);
-    for k in range.clone() {
-        let y = list.top() + row_h * (k - range.start) as f32;
-        let row = Rect::from_min_size(Pos2::new(list.left(), y), Vec2::new(list.width(), row_h));
-        let painter = painter.with_clip_rect(row.intersect(list));
-        let on_bar = k == view.scroll.bar;
-        if on_bar {
-            chrome::bar(&painter, row, active);
-        }
+    let shown = range.start..range.end.min(range.start + usize::from(list.height));
+    let mut clicked = None;
+    // Under the rows, the log's cells, the frame's border either side and egui's reach below them
+    // (the frame's rule): a click on a blank of them moves no bar (egui gives a click a few points
+    // off a widget to it where nothing is under the pointer).
+    let under = ui.scope_id().with(("sopen-git-log-under", area.x));
+    let blank = super::backups::blank_clicks(ui, grid, area);
+    ui.interact(blank, under, Sense::CLICK);
+    for (n, k) in shown.enumerate() {
+        let y = list.y + n as u16;
+        let row = Cells::new(list.x, y, list.width, 1);
         let entry = &view.entries[k];
-        let failed = !matches!(entry.ending, crate::git::runner::Ending::Exit(0));
-        let colour = match (on_bar && active, failed) {
+        let on_bar = k == view.scroll.bar;
+        let back = match (on_bar, active) {
+            (false, _) => p.back,
+            (true, true) => p.bar,
+            (true, false) => p.bar_idle,
+        };
+        let failed = !matches!(entry.ending, Ending::Exit(0));
+        let fg = match (on_bar && active, failed) {
             (true, _) => LOOK.on_bar,
             (false, true) => LOOK.error,
             (false, false) => LOOK.text,
         };
-        painter.text(
-            row.left_top(),
-            egui::Align2::LEFT_TOP,
-            fit(&row_text(entry)),
-            font.clone(),
-            colour,
-        );
-        let resp = ui.interact(
-            row,
-            ui.scope_id().with(("sopen-git-log", k)),
-            Sense::click(),
-        );
-        if resp.clicked() || resp.double_clicked() {
-            view.scroll.to(k);
-        }
-        if resp.double_clicked() {
-            view.whole = Some(k);
+        let pen = Pen::new(fg, back);
+        cells::fill(buf, row, pen);
+        let text = row_shown(entry, width);
+        cells::put(buf, list.x, y, &text, width, pen);
+        let id = ui.scope_id().with(("sopen-git-log", area.x, k));
+        let resp = ui.interact(grid.rect(row), id, Sense::CLICK);
+        if resp.clicked() {
+            let pair = egui::Id::unique(("sopen-git-log-click", area.x, entry.time, &entry.line));
+            clicked = Some((k, super::super::second_click(&resp, pair)));
         }
     }
-    let max_top = len.saturating_sub(visible);
-    let column = Rect::from_min_max(
-        Pos2::new(list.right(), list.top()),
-        Pos2::new(list.right() + chrome::CELL.x, list.bottom()),
-    );
-    chrome::scroll_bar(
-        &ui.painter_at(column),
-        column,
-        (max_top > 0).then(|| view.scroll.top as f32 / max_top as f32),
-    );
-    if let Some(entry) = view.whole().cloned() {
-        if whole_ui(&ctx, *grid, &entry) {
-            view.whole = None;
+    if let Some((k, twice)) = clicked.filter(|_| view.whole.is_none()) {
+        view.scroll.to(k);
+        if twice {
+            view.show_whole(k);
         }
+    }
+    // The scroll bar on the border, beside the rows.
+    if list.height > 0 {
+        let max_top = len.saturating_sub(visible);
+        let at = (max_top > 0).then(|| view.scroll.top as f32 / max_top as f32);
+        cells::scroll_bar(buf, area.right(), list.y, list.height, at);
+    }
+    if whole_ui(&ctx, *grid, view, area.x) {
+        view.whole = None;
     }
 }

@@ -418,8 +418,8 @@ fn two_panels_finds_are_their_own() {
     let mut drv = Driver::new(1000.0, 500.0);
     let mut pair = Pair::new();
     drv.idle(&mut pair, 1);
-    pair.views[0].run(Command::FindWith('x'));
-    pair.views[1].run(Command::FindWith('y'));
+    pair.views[0].run(&drv.ctx, Command::FindWith('x'));
+    pair.views[1].run(&drv.ctx, Command::FindWith('y'));
     drv.idle(&mut pair, 2);
     let g = pair.grid;
     let [left, right] = cells::halves(g.all());
@@ -743,7 +743,7 @@ fn an_enter_runs_only_the_search_on_screen() {
     assert_eq!(asked, [GitAction::Search(wanted)]);
     // The first pass seen: the box laid out unseen in the pass before.
     let mut fx = Fx::new(1000.0, 500.0, hangul_view());
-    fx.view_mut().run(Command::HistorySearch);
+    fx.host.view.run(&fx.drv.ctx, Command::HistorySearch);
     fx.view_mut().search_dialog.as_mut().unwrap().query.message = "one".into();
     fx.drv.frame(&mut fx.host, vec![], Modifiers::NONE);
     let enter = || key_events(Key::Enter, Modifiers::NONE);
@@ -891,8 +891,8 @@ fn only_the_active_panels_find_types() {
     let mut pair = Pair::new();
     pair.actives = [true, false];
     drv.idle(&mut pair, 1);
-    pair.views[0].run(Command::FindWith('x'));
-    pair.views[1].run(Command::FindWith('y'));
+    pair.views[0].run(&drv.ctx, Command::FindWith('x'));
+    pair.views[1].run(&drv.ctx, Command::FindWith('y'));
     drv.idle(&mut pair, 2);
     drv.frame(&mut pair, vec![Event::Text("z".into())], Modifiers::NONE);
     drv.idle(&mut pair, 1);
@@ -1133,7 +1133,7 @@ fn finds_keys_are_the_keyboards_only() {
     let mut fx = Fx::new(1000.0, 500.0, fixture_view());
     fx.typed("x");
     let bar = fx.view().bar_place().0;
-    fx.view_mut().run(Command::HistorySearch);
+    fx.host.view.run(&fx.drv.ctx, Command::HistorySearch);
     fx.idle();
     fx.idle();
     fx.typed("one");
@@ -1145,7 +1145,7 @@ fn finds_keys_are_the_keyboards_only() {
     assert_eq!(fx.view().bar_place().0, bar, "Find did not step");
     let mut fx = Fx::new(1000.0, 500.0, fixture_view());
     fx.typed("x");
-    fx.view_mut().run(Command::HistorySearch);
+    fx.host.view.run(&fx.drv.ctx, Command::HistorySearch);
     fx.idle();
     fx.idle();
     fx.press(Key::Escape);
@@ -1160,7 +1160,7 @@ fn finds_keys_are_the_keyboards_only() {
     pair.actives = [true, false];
     drv.idle(&mut pair, 1);
     for view in &mut pair.views {
-        view.run(Command::FindWith('m'));
+        view.run(&drv.ctx, Command::FindWith('m'));
     }
     drv.idle(&mut pair, 2);
     let bars = |pair: &Pair| pair.views.each_ref().map(|v| v.bar_place().0);
@@ -1583,7 +1583,7 @@ fn search_in_terminal(bursts: Vec<Vec<crossterm::event::Event>>) -> (Vec<SearchQ
     chrome::install(&ctx);
     let mut b = crate::gui::term::Backend::new(tty, std::io::sink(), ctx, true);
     let mut view = hangul_view();
-    view.run(Command::HistorySearch);
+    view.run(&b.ctx, Command::HistorySearch);
     let mut win = InTerminal {
         host: Host {
             view,
@@ -1777,13 +1777,13 @@ mod ts4 {
     fn host(search: bool) -> Host {
         let mut view = hangul_view();
         if search {
-            view.run(Command::HistorySearch);
+            view.run(&egui::Context::default(), Command::HistorySearch);
             let d = view.search_dialog.as_mut().unwrap();
             d.query.message = "한글".into();
             d.query.author = "김철수".into();
             d.query.case = true;
         } else {
-            view.run(Command::Find);
+            view.run(&egui::Context::default(), Command::Find);
             view.find.as_mut().unwrap().text = "김철".into();
         }
         Host {

@@ -1028,49 +1028,6 @@ mod ts4 {
 // ---------------------------------------------------------------------------------------------
 // Review round 1.
 
-/// The cells the composed screen leaves to hand-off boxes, inside the panel's grid.
-fn boxes(fx: &Fx) -> Vec<Cells> {
-    let g = grid_of(fx);
-    let layers = cells::layers(&fx.drv.ctx);
-    let screen = crate::gui::term::compose(&fx.drv.ctx, &layers, g.cols, g.rows);
-    screen
-        .hand_offs
-        .into_iter()
-        .filter(|r| r.y < g.rows)
-        .collect()
-}
-
-/// R1 MUST 1: the log and the Backups list draw their egui scroll bar inside their own cells,
-/// so the frame's right border stays the panel's on every body row (`║` in the window and the
-/// terminal), and the box a terminal shows is exactly their cells: the heads' row and the body.
-/// The details pane, whose scroll bar egui draws on the border, takes the border cell too. (The
-/// planner is cells since X4-planner: `tests_x4_planner.rs`.)
-#[test]
-fn the_log_backups_and_planner_leave_the_frames_right_border() {
-    for open in ["log", "backups"] {
-        let mut fx = Fx::new(1000.0, 500.0, fixture_view());
-        let v = fx.view_mut();
-        match open {
-            "log" => v.open_log(vec![super::tests_s3::entry(
-                "git fetch",
-                crate::git::runner::Ending::Exit(0),
-                "",
-                0,
-            )]),
-            _ => v.open_backups(super::tests_s3::records()),
-        }
-        fx.idle();
-        fx.idle();
-        let g = grid_of(&fx);
-        let (w, h) = (g.cols, g.rows);
-        for y in 1..h - 3 {
-            assert_eq!(cell(&fx, w - 1, y).symbol, "║", "{open}: row {y}");
-            assert_eq!(cell(&fx, 0, y).symbol, "║", "{open}: row {y}");
-        }
-        assert_eq!(boxes(&fx), [Cells::new(1, 1, w - 2, h - 4)], "{open}");
-    }
-}
-
 /// R1 MUST 2: a panel too short for its parts still runs those that hold the keyboard: the log's
 /// entry shown whole closes with Esc, and text typed into an open Find goes into it, the bar on
 /// the match.
