@@ -471,10 +471,10 @@ fn a_state_it_cannot_take_is_refused_before_any_window() {
     let refused = |line: &str| read_state(&mut line.as_bytes()).err();
     assert_eq!(
         refused(&format!(
-            "{{\"v\":3,\"panels\":[{{\"folder\":\"{root}\"}},{{\"folder\":\"{root}\"}}]}}\n"
+            "{{\"v\":4,\"panels\":[{{\"folder\":\"{root}\"}},{{\"folder\":\"{root}\"}}]}}\n"
         ))
         .as_deref(),
-        Some("the sender sent switch state v3; this sopen reads up to v2 — update one of them")
+        Some("the sender sent switch state v4; this sopen reads up to v3 — update one of them")
     );
     assert_eq!(
         refused("").as_deref(),

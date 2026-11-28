@@ -148,11 +148,11 @@ fn root() -> (tempfile::TempDir, String) {
     (tmp, root.to_str().unwrap().to_string())
 }
 
-/// The state through its line: one line, `"v":2` first, read back as it was.
+/// The state through its line: one line, `"v":3` first, read back as it was.
 pub(crate) fn through_the_line(state: &SwitchState) -> SwitchState {
     let line = state.line();
     assert!(!line.contains('\n'), "one line: {line}");
-    assert!(line.starts_with(r#"{"v":2,"#), "{line}");
+    assert!(line.starts_with(r#"{"v":3,"#), "{line}");
     let read = read(&line, "HOST").expect("its own line reads");
     assert_eq!(&read, state, "{line}");
     read
@@ -457,9 +457,9 @@ fn the_keyboard_in_the_git_panel_crosses() {
 }
 
 /// A v1 line without its optional fields, and with a field this sopen does not know (ignored,
-/// §7.4), reads with their defaults — v2's among them — as a v2 state; `"v": 3` is refused with
-/// §7.4's line, naming who sent it, and `"v": 0` — no sopen wrote one: v1 is the first — with
-/// its own.
+/// §7.4), reads with their defaults — v2's and v3's among them — as a v3 state; `"v": 4` is
+/// refused with §7.4's line, naming who sent it, and `"v": 0` — no sopen wrote one: v1 is the
+/// first — with its own.
 #[test]
 fn a_sparse_line_reads_and_other_versions_are_refused() {
     let line = r#"{"v":1,"panels":[{"folder":"/a"},{"folder":"/b","bar":"x"}],"later":[1,2]}"#;
@@ -475,7 +475,7 @@ fn a_sparse_line_reads_and_other_versions_are_refused() {
     assert_eq!(
         state,
         SwitchState {
-            v: 2,
+            v: 3,
             host: None,
             mode: Mode::Preview,
             active: 0,
@@ -489,8 +489,8 @@ fn a_sparse_line_reads_and_other_versions_are_refused() {
         }
     );
     assert_eq!(
-        read(r#"{"v":3,"panels":"a later shape"}"#, "laptop"),
-        Err("laptop sent switch state v3; this sopen reads up to v2 — update one of them".into())
+        read(r#"{"v":4,"panels":"a later shape"}"#, "laptop"),
+        Err("laptop sent switch state v4; this sopen reads up to v3 — update one of them".into())
     );
     let zero = r#"{"v":0,"panels":[{"folder":"/a"},{"folder":"/b"}]}"#;
     assert_eq!(
@@ -1107,7 +1107,7 @@ fn v2s_parts_are_checked_where_they_come_in() {
     );
     assert!(read(&both, "HOST").is_ok(), "{both}");
     let v1 = read(&format!(r#"{{"v":1,{panels}}}"#), "HOST").expect("a v1 line");
-    assert_eq!((v1.v, v1.tree, v1.git), (2, None, Vec::new()));
+    assert_eq!((v1.v, v1.tree, v1.git), (3, None, Vec::new()));
     // A v2 tree without its later fields: their defaults.
     let tree = read(
         &format!(r#"{{"v":2,{panels},"tree":{{"bar":"/a/x","folders":[]}}}}"#),
@@ -1465,4 +1465,201 @@ fn what_the_sender_left_out_is_said_here() {
         said.starts_with("the git panel of /x: its plan is left out"),
         "{said}"
     );
+}
+
+// v3 (X4-state2): what is typed in a history edit's own dialog — a quick edit's, the planner's.
+
+/// A v2 line, with its git part, reads as a v3 state, the new fields at their defaults; a v4 line
+/// is refused with §7.4's line.
+#[test]
+fn a_v2_line_reads_and_v4_is_refused() {
+    let panels = r#""panels":[{"folder":"/a"},{"folder":"/b"}]"#;
+    let search = r#""dialog":{"search":{"fields":["msg","","","","",""],"case":true}}"#;
+    let v2 = format!(r#"{{"v":2,{panels},"git":[{{"top":"/a",{search}}}]}}"#);
+    let state = read(&v2, "laptop").expect("a v2 line");
+    assert_eq!(state.v, 3);
+    assert!(
+        matches!(&state.git[0].dialog, Some(GitDialog::Search { fields, case: true }) if fields[0] == "msg"),
+        "{state:?}"
+    );
+    assert_eq!(
+        read(&format!(r#"{{"v":4,{panels}}}"#), "laptop"),
+        Err("laptop sent switch state v4; this sopen reads up to v3 — update one of them".into())
+    );
+}
+
+/// v3's dialogs are checked where they come in: a history edit's on a commit by its full id, its
+/// messages each within a text's bound (8 MiB) and kept byte for byte — a Hangul message with CRLF
+/// between its lines — an author's name, email and date each within a name's (4,096 bytes, as a
+/// plan row's author); the planner's own only on a row of the plan it comes with.
+#[test]
+fn v3s_dialogs_are_checked_and_bounded_where_they_come_in() {
+    let panels = r#""panels":[{"folder":"/a"},{"folder":"/b"}]"#;
+    let id = "0123456789".repeat(4);
+    let other = "fedcba9876".repeat(4);
+    let plan = format!(
+        r#""plan":{{"base":null,"rows":[{{"commit":"{id}","verb":"reword","message":null,"author":null}}],"autostash":false,"update_refs":false,"bar":"{id}"}}"#
+    );
+    let git = |part: &str| format!(r#"{{"v":3,{panels},"git":[{{"top":"/a",{part}}}]}}"#);
+    let dialog = |d: &str| git(&format!(r#""dialog":{d}"#));
+    let planned = |d: &str| git(&format!(r#""dialog":{d},{plan}"#));
+    let form = |name: &str| {
+        format!(
+            r#"{{"name":"{name}","email":"a@b","date":"2026-01-01 10:00 +0900","committer":"now"}}"#
+        )
+    };
+    let hangul = "다시 쓴 메시지\\r\\n둘째 줄";
+    for good in [
+        dialog(&format!(
+            r#"{{"reword":{{"commit":"{id}","message":"{hangul}"}}}}"#
+        )),
+        dialog(&format!(
+            r#"{{"squash":{{"commit":"{id}","message":"A\n\nB"}}}}"#
+        )),
+        dialog(&format!(
+            r#"{{"author":{{"commit":"{id}","author":{}}}}}"#,
+            form("Bea")
+        )),
+        planned(&format!(
+            r#"{{"plan_message":{{"commit":"{id}","message":"C\n edited"}}}}"#
+        )),
+        planned(&format!(
+            r#"{{"plan_author":{{"commit":"{id}","author":{}}}}}"#,
+            form("Bea")
+        )),
+    ] {
+        let state = read(&good, "HOST").unwrap_or_else(|e| panic!("{good}: {e}"));
+        assert_eq!(read(&state.line(), "HOST").as_ref(), Ok(&state), "{good}");
+    }
+    let state = read(
+        &dialog(&format!(
+            r#"{{"reword":{{"commit":"{id}","message":"{hangul}"}}}}"#
+        )),
+        "HOST",
+    );
+    assert!(
+        state
+            .unwrap()
+            .line()
+            .contains(r#""message":"다시 쓴 메시지\r\n둘째 줄""#),
+        "byte for byte"
+    );
+    for bad in [
+        dialog(r#"{"reword":{"commit":"HEAD~1","message":"m"}}"#),
+        dialog(&format!(r#"{{"fixup":{{"commit":"{id}","message":"m"}}}}"#)),
+        dialog(&format!(
+            r#"{{"author":{{"commit":"{id}","author":{{"name":"A","email":"a@b","date":"d","committer":"tomorrow"}}}}}}"#
+        )),
+        // The planner's own without its plan, or on a row its plan has not.
+        dialog(&format!(
+            r#"{{"plan_message":{{"commit":"{id}","message":"m"}}}}"#
+        )),
+        planned(&format!(
+            r#"{{"plan_author":{{"commit":"{other}","author":{}}}}}"#,
+            form("A")
+        )),
+    ] {
+        assert!(read(&bad, "HOST").is_err(), "{bad}");
+    }
+    // A text's bound, 8 MiB, held to each new text.
+    let at = |n: usize| "x".repeat(n);
+    let refused = |line: String| read(&line, "HOST").is_err();
+    let reword = |m: &str| {
+        dialog(&format!(
+            r#"{{"reword":{{"commit":"{id}","message":"{m}"}}}}"#
+        ))
+    };
+    assert!(!refused(reword(&at(8 << 20))), "8 MiB of message");
+    assert!(refused(reword(&at((8 << 20) + 1))), "a byte more");
+    let author = |name: &str| {
+        dialog(&format!(
+            r#"{{"author":{{"commit":"{id}","author":{}}}}}"#,
+            form(name)
+        ))
+    };
+    assert!(!refused(author(&at(4096))), "4,096 bytes of name");
+    assert!(refused(author(&at(4097))), "a byte more");
+    // The planner's author dialog: each of its texts a name's length at most.
+    let fields = |name: &str, email: &str, date: &str| {
+        planned(&format!(
+            r#"{{"plan_author":{{"commit":"{id}","author":{{"name":"{name}","email":"{email}","date":"{date}","committer":"keep"}}}}}}"#
+        ))
+    };
+    assert!(
+        !refused(fields(&at(4096), &at(4096), &at(4096))),
+        "each 4,096 bytes"
+    );
+    assert!(refused(fields(&at(4097), "a@b", "d")), "a name a byte more");
+    assert!(refused(fields("A", &at(4097), "d")), "an email a byte more");
+    assert!(refused(fields("A", "a@b", &at(4097))), "a date a byte more");
+    let message = |m: &str| {
+        planned(&format!(
+            r#"{{"plan_message":{{"commit":"{id}","message":"{m}"}}}}"#
+        ))
+    };
+    assert!(!refused(message(&at(8 << 20))), "8 MiB of the planner's");
+    assert!(refused(message(&at((8 << 20) + 1))), "a byte more");
+}
+
+/// HOST's `fit` covers v3's parts: a history edit's dialog past a text's bound is left out and
+/// said; the planner's own dialog goes with its plan — a plan that fails its check, or one shed
+/// for the line's budget — and is said; the line then fits and reads.
+#[test]
+fn hosts_fit_covers_v3s_dialogs() {
+    let id = "0123456789".repeat(4);
+    let long = format!(
+        r#"{{"v":3,"panels":[{{"folder":"/a"}},{{"folder":"/b"}}],"git":[{{"top":"/a","dialog":{{"squash":{{"commit":"{id}","message":"{}"}}}}}}]}}"#,
+        "x".repeat((8 << 20) + 1)
+    );
+    let long: SwitchState = serde_json::from_str(&long).expect("unchecked");
+    let fit = long.fit(budget());
+    assert!(fit.git[0].dialog.is_none(), "{:?}", fit.said);
+    assert_eq!(fit.said.len(), 1, "{:?}", fit.said);
+    assert!(
+        fit.said[0].starts_with("the git panel of /a: its dialog is left out: "),
+        "{:?}",
+        fit.said
+    );
+    assert!(read(&fit.line(), "HOST").is_ok());
+
+    // A plan of nine rows, each with 8 MiB of message, and the planner's message dialog on one.
+    let rows: Vec<String> = (0..9)
+        .map(|k| {
+            format!(
+                r#"{{"commit":"{}","verb":"reword","message":"{}","author":null}}"#,
+                format!("{k}123456789").repeat(4),
+                "y".repeat(8 << 20)
+            )
+        })
+        .collect();
+    let big = format!(
+        r#"{{"v":3,"panels":[{{"folder":"/a"}},{{"folder":"/b"}}],"git":[{{"top":"/a","plan":{{"base":null,"rows":[{}],"autostash":false,"update_refs":false,"bar":null}},"dialog":{{"plan_message":{{"commit":"{}","message":"m"}}}}}}]}}"#,
+        rows.join(","),
+        "0123456789".repeat(4)
+    );
+    let big: SwitchState = serde_json::from_str(&big).expect("unchecked");
+    assert!(big.check().is_ok(), "each part within its bounds");
+    let fit = big.fit(budget());
+    assert!(
+        fit.git[0].plan.is_none() && fit.git[0].dialog.is_none(),
+        "{:?}",
+        fit.said
+    );
+    assert_eq!(fit.said.len(), 2, "{:?}", fit.said);
+    assert!(fit.line().len() <= budget());
+    assert!(read(&fit.line(), "HOST").is_ok());
+
+    // A plan that fails its check (a verb sopen has not) takes its planner's dialog with it.
+    let bad = format!(
+        r#"{{"v":3,"panels":[{{"folder":"/a"}},{{"folder":"/b"}}],"git":[{{"top":"/a","plan":{{"base":null,"rows":[{{"commit":"{id}","verb":"exec","message":null,"author":null}}],"autostash":false,"update_refs":false,"bar":null}},"dialog":{{"plan_message":{{"commit":"{id}","message":"m"}}}}}}]}}"#
+    );
+    let bad: SwitchState = serde_json::from_str(&bad).expect("unchecked");
+    let fit = bad.fit(budget());
+    assert!(
+        fit.git[0].plan.is_none() && fit.git[0].dialog.is_none(),
+        "{:?}",
+        fit.said
+    );
+    assert_eq!(fit.said.len(), 2, "{:?}", fit.said);
+    assert!(read(&fit.line(), "HOST").is_ok());
 }

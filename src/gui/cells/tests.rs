@@ -1298,3 +1298,82 @@ fn on_screen_another_context_shows_nothing_of_this_one() {
     );
     assert_eq!(turn(&terminal, &mut screen, None), Some(2));
 }
+
+/// `keep` holds each paint from its turning on, recording off or on, apart from the record:
+/// `clear` forgets none of it, and turning it off (or on again) forgets all of it (F-menu-own).
+#[test]
+fn keep_holds_the_paints_apart_from_the_record() {
+    let ctx = egui::Context::default();
+    chrome::install(&ctx);
+    let pen = Pen::new(PALETTE.text, PALETTE.back);
+    let mut one = Buffer::empty(Cells::new(0, 0, 3, 1));
+    put(&mut one, 0, 0, "abc", 3, pen);
+    let two = Buffer::empty(Cells::new(0, 1, 2, 1));
+    let size = Vec2::new(200.0, 100.0);
+    keep(&ctx, true);
+    let (_, recorded) = pass(&ctx, size, |p| {
+        paint(p, Pos2::ZERO, &one, None);
+        paint(p, Pos2::ZERO, &two, None);
+    });
+    assert!(recorded.is_empty(), "recording off: nothing recorded");
+    let held: Vec<Buffer> = kept(&ctx).iter().map(|l| l.buf.clone()).collect();
+    assert_eq!(held, [one.clone(), two.clone()], "both, in order");
+    set_recording(&ctx, true);
+    clear(&ctx);
+    assert_eq!(kept(&ctx).len(), 2, "clear forgets the record's alone");
+    keep(&ctx, false);
+    assert!(kept(&ctx).is_empty(), "off: forgotten");
+    let (_, recorded) = pass(&ctx, size, |p| paint(p, Pos2::ZERO, &one, None));
+    assert_eq!(recorded.len(), 1, "the record as it was");
+    assert!(kept(&ctx).is_empty(), "off: nothing kept");
+}
+
+/// `with_later`: a layer with what was painted over it later on its egui layer at its origin, in
+/// its area, where that has a colour of its own — not a cell of no colour, nor another egui
+/// layer's, nor what lies outside its area.
+#[test]
+fn with_later_lays_the_later_cells_of_its_layer_over_it() {
+    let ctx = skin();
+    let pen = Pen::new(PALETTE.text, PALETTE.back);
+    let mut under = Buffer::empty(Cells::new(0, 0, 6, 1));
+    put(&mut under, 0, 0, "abcdef", 6, pen);
+    let mut patch = Buffer::empty(Cells::new(2, 0, 6, 1));
+    put(&mut patch, 2, 0, "XY", 2, pen);
+    put(&mut patch, 6, 0, "ZZ", 2, pen);
+    let mut over = Buffer::empty(Cells::new(0, 0, 1, 1));
+    put(&mut over, 0, 0, "Q", 1, pen);
+    let (_, layers) = pass(&ctx, Vec2::new(200.0, 100.0), |p| {
+        paint(p, Pos2::ZERO, &under, None);
+        paint(p, Pos2::ZERO, &patch, None);
+        let id = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("over"));
+        let other = egui::Painter::new(p.ctx().clone(), id, p.clip_rect());
+        paint(&other, Pos2::ZERO, &over, None);
+    });
+    let l = with_later(&layers, 0);
+    assert_eq!(l.buf.area, under.area);
+    assert_eq!(row_text(&l.buf, 0).0, "abXYef");
+    assert_eq!(
+        row_text(&with_later(&layers, 2).buf, 0).0,
+        "Q",
+        "the last: itself"
+    );
+}
+
+/// `with_later` takes a later layer's cell only where its clip lets it show — its centre inside
+/// the clip, as `term::compose` lays a layer and the renderer cuts it: a coloured cell outside
+/// it is not seen.
+#[test]
+fn with_later_keeps_to_the_later_layers_clip() {
+    let ctx = skin();
+    let pen = Pen::new(PALETTE.text, PALETTE.back);
+    let mut under = Buffer::empty(Cells::new(0, 0, 6, 1));
+    put(&mut under, 0, 0, "abcdef", 6, pen);
+    let mut patch = Buffer::empty(Cells::new(1, 0, 4, 1));
+    put(&mut patch, 1, 0, "XYZW", 4, pen);
+    let (_, layers) = pass(&ctx, Vec2::new(200.0, 100.0), |p| {
+        paint(p, Pos2::ZERO, &under, None);
+        let three = Rect::from_min_size(Pos2::ZERO, Vec2::new(3.0 * CELL.x, CELL.y));
+        paint(&p.with_clip_rect(three), Pos2::ZERO, &patch, None);
+    });
+    assert_eq!(row_text(&with_later(&layers, 0).buf, 0).0, "aXYdef");
+}
