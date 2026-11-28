@@ -1054,7 +1054,8 @@ impl ActionDialog {
         // The form's first text field takes the keyboard when it shows anew, or while nothing
         // has it.
         let typing = (controls.iter()).any(|c| c.text_field() == Some(0));
-        if typing && (!self.typing || began.is_none()) {
+        // Not while covered: the dialog in front has the keyboard (F-git-covered).
+        if typing && !cells::covered(ctx) && (!self.typing || began.is_none()) {
             ctx.memory_mut(|m| m.request_focus(field_id(0)));
         }
         self.typing = typing;

@@ -2421,7 +2421,7 @@ fn a_tree_that_waits(g: &mut Gx) {
 }
 
 /// A press and a release of `key`, as one pass's events.
-fn pressed(key: Key) -> Vec<egui::Event> {
+pub(super) fn pressed(key: Key) -> Vec<egui::Event> {
     [true, false]
         .map(|pressed| egui::Event::Key {
             key,
@@ -3337,4 +3337,94 @@ fn f_git_listq_a_result_over_the_planners_question_takes_no_key_from_it() {
     assert!(g.shows("Enter keeps it"), "the planner's question stays");
     assert_eq!(message(&g), None, "the Enter kept no message");
     drop(tx);
+}
+
+// ---------------------------------------------------------------------------------------------
+// F-git-covered: F12's question before a switch is another dialog to the git panel's, as the
+// list's question and another panel's dialog are: what a git dialog paints under one is not what
+// the screen showed of it, and what the integration would open waits for it.
+
+/// F-git-covered: a confirmation under F12's question. `[Esc, Enter]` in one read of the terminal
+/// — the Esc cancels the switch in a pass the terminal does not print, the Enter reaches the
+/// confirmation, whose last printed frame stood under the question — runs nothing; once a printed
+/// pass showed it with the keyboard, Enter runs what it shows.
+#[test]
+fn f_git_covered_a_confirmation_under_the_switchs_question_runs_nothing() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.wait_for_the_panel();
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let (head, light) = a_confirmation_opens(&mut g, i);
+    assert_eq!(g.fx.b.before_switch("box"), Before::Held);
+    g.idle(2);
+    assert!(
+        g.shows("is not carried to box"),
+        "the switch's question: {:#?}",
+        g.texts()
+    );
+    let ctx = g.fx.drv.ctx.clone();
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Escape), Modifiers::NONE);
+    cells::set_presented(&ctx, false);
+    assert!(!g.b().switch_asking(), "the Esc cancelled the switch");
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
+    cells::set_presented(&ctx, true);
+    assert_eq!(
+        after_the_run(&mut g, i),
+        (head, Some(ActionId::Reset)),
+        "the Enter ran nothing ({})",
+        g.status()
+    );
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
+    assert_eq!(
+        after_the_run(&mut g, i),
+        (light, None),
+        "the control: shown with the keyboard, its Enter runs ({})",
+        g.status()
+    );
+}
+
+/// F-git-covered: what the integration would open waits for F12's question (`Browser::git_waits`),
+/// as for the list's: a tag's details read while the question is up over the planner stay in
+/// their channel — no result opens under the question — and open once Cancel closes it.
+#[test]
+fn f_git_covered_a_result_waits_for_the_switchs_question() {
+    let git = git_or_skip!();
+    let repo = Repo::new(&git);
+    for (k, name) in ["base", "A", "B"].into_iter().enumerate() {
+        repo.write("c.txt", format!("{k}\n"));
+        repo.commit(name);
+    }
+    let mut g = Gx::new(repo);
+    g.ready_in_git();
+    g.bar_to("base");
+    g.cmd(Key::E);
+    g.idle(2);
+    g.until_quiet("the planner's range");
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    assert!(!g.view().dialog_up(), "the planner, no dialog of it");
+    assert_eq!(g.fx.b.before_switch("box"), Before::Held);
+    g.idle(2);
+    assert!(g.b().switch_asking(), "the switch's question");
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(("Tag v1.0".to_string(), Ok("tagged by Ann".to_string())))
+        .unwrap();
+    g.fx.b.git.panels[i].text_read = Some(git_host::Pending {
+        rx,
+        handle: crate::git::runner::Handle::new(),
+    });
+    g.idle(3);
+    assert!(g.b().git.panels[i].text_read.is_some(), "in its channel");
+    assert!(!g.view().dialog_up(), "no result under the question");
+    g.fx.drv.click_text_on_top(&mut g.fx.b, "[ Cancel ]");
+    g.idle(3);
+    assert!(!g.b().switch_asking(), "Cancel closed the question");
+    assert!(
+        g.b().git.panels[i].text_read.is_none(),
+        "heard once the question closed"
+    );
+    assert!(g.view().dialog_up(), "the result opened");
+    assert!(g.shows("tagged by Ann"), "{:#?}", g.texts());
 }

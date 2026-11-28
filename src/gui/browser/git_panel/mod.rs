@@ -1549,6 +1549,16 @@ impl GitView {
         out
     }
 
+    /// One of [`GitView::modals`]' dialogs is up — the menu, a quick edit's, an action's, the
+    /// result, "Stop git?" — drawn over the filters and the history search.
+    fn modal_up(&self) -> bool {
+        self.menu.is_some()
+            || self.quick.is_some()
+            || self.dialog.is_some()
+            || self.result.is_some()
+            || self.stop_question.is_some()
+    }
+
     /// A dialog is up that is not the planner's own: the pane then takes no key.
     fn other_dialog_up(&self) -> bool {
         self.filters_dialog.is_some()
@@ -3084,6 +3094,24 @@ pub fn draw(
     // dialog's. Taken before the body, which draws the planner's own dialogs and the log's entry
     // shown whole (F-git-listq), and put back after the panel's other dialogs.
     let kept = view.dialog_elsewhere.then(|| take_keys(&ctx));
+    // While one of `modals`' dialogs is up (the menu, a quick edit's, an action's, the result,
+    // "Stop git?") it has the keys and the keyboard, drawn last over the rest — one the
+    // integration opened over the log's entry shown whole, the filters or the history search
+    // (F-git-covered review 1). Nothing drawn before it reads the pass's keys: they are taken here
+    // and put back just before `modals`, as `kept` keeps them for another's dialog. (The body's
+    // other readers act on nothing while a dialog is up: the planner's keys, the log's rows, the
+    // details pane, the banner's keys, Find's field.)
+    let under_modal = view.modal_up();
+    let held = (under_modal && kept.is_none()).then(|| take_keys(&ctx));
+    // A screen of the panel's counts what it paints as shown only while it has the keyboard
+    // (F-git-covered): the draw says before each part whether another dialog has it — another
+    // panel's, the list's question, the tree, F12's — or one of the panel's own drawn over the
+    // part, which then has its keys: the planner's dialogs and the Backups list in the body yield
+    // them to any other, the filters and the history search to `modals`' (below). Said here, by
+    // `cells::set_covered`, rather than passed to each guard: one rule for every `OnScreen` of the
+    // panel, a new one's included.
+    let elsewhere = view.dialog_elsewhere;
+    cells::set_covered(&ctx, elsewhere || view.other_dialog_up());
     let p = chrome::PALETTE;
     let look = chrome::git::LOOK;
     let title = if view.filters.is_default() {
@@ -3297,9 +3325,14 @@ pub fn draw(
         cells::fill(&mut buf, r, body);
     }
     cells::paint(&painter, grid.origin, &buf, caret);
-    // The dialogs, over everything, on the panels' grid (with no key while `kept` holds them).
+    // The dialogs, over everything, on the panels' grid (with no key while `kept` or `held` holds
+    // them). The filters and the history search under another's dialog or one of `modals`' have
+    // neither the keyboard — they take none for their field, which would leave the dialog in
+    // front without it — nor a painting the screen showed.
+    let keyboard = !(elsewhere || under_modal);
+    cells::set_covered(&ctx, !keyboard);
     if let Some(dialog) = &mut view.filters_dialog {
-        match dialog.ui(&ctx, *grid) {
+        match dialog.ui(&ctx, *grid, keyboard) {
             Some(filters::DialogEnd::Apply(f)) => {
                 view.filters_dialog = None;
                 if f != view.filters {
@@ -3313,7 +3346,7 @@ pub fn draw(
         }
     }
     if let Some(dialog) = &mut view.search_dialog {
-        match dialog.ui(&ctx, *grid) {
+        match dialog.ui(&ctx, *grid, keyboard) {
             Some(find::SearchEnd::Run(query)) => {
                 view.search_dialog = None;
                 view.find = None;
@@ -3324,7 +3357,15 @@ pub fn draw(
             None => {}
         }
     }
+    if let Some(held) = held {
+        ctx.input_mut(|i| i.events.extend(held));
+    }
+    cells::set_covered(&ctx, elsewhere);
     asked.extend(view.modals(&ctx, *grid));
+    // Not a value from before `draw` restored: nothing outside `draw` sets the flag, so each pass
+    // of the panel's starts from `false` (an `OnScreen` asked outside it, as the Backups list's
+    // keys ask, reads `false`).
+    cells::set_covered(&ctx, false);
     if let Some(kept) = kept {
         ctx.input_mut(|i| i.events.extend(kept));
     }

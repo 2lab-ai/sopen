@@ -747,6 +747,71 @@ fn the_lists_first_pass_takes_no_action() {
     assert!(dialog_action(&fx).is_some());
 }
 
+/// F-git-covered: the Backups list under a dialog of its own panel — a result over it, its box
+/// clear of the bar's line — does not have the keyboard, so a pass it stood under the result in
+/// is not what the screen showed of it: Esc closes the result in a pass the terminal does not
+/// print, then F8 in the next asks nothing; the next F8, the list printed with the keyboard,
+/// asks to delete the group under the bar.
+#[test]
+fn f_git_covered_the_list_under_its_panels_result_takes_no_key() {
+    let mut fx = backups_fx(1000.0, 400.0, records());
+    fx.view_mut()
+        .show_text("Fetch", "fatal: the remote hung up", None);
+    fx.idle();
+    fx.idle();
+    let grid = grid_of(&fx);
+    let bar_line = Cells::new(0, FIRST_Y, grid.cols, 1);
+    let covered = fx.view().covered(&grid);
+    assert!(!covered.is_empty(), "the result is up");
+    assert!(
+        covered.iter().all(|c| !c.intersects(bar_line)),
+        "the bar's line in sight: {covered:?}"
+    );
+    let esc = key_events(Key::Escape, Modifiers::NONE);
+    fx.drv.frame(&mut fx.host, esc, Modifiers::NONE);
+    cells::set_presented(&fx.drv.ctx, false);
+    assert!(!fx.view().dialog_up(), "Esc closed the result");
+    let f8 = key_events(Key::F8, Modifiers::NONE);
+    fx.drv.frame(&mut fx.host, f8, Modifiers::NONE);
+    cells::set_presented(&fx.drv.ctx, true);
+    fx.idle();
+    assert_eq!(dialog_action(&fx), None, "shown covered: nothing asked");
+    fx.press(Key::F8);
+    let stamp = "20261123T102405Z".to_string();
+    assert_eq!(dialog_action(&fx), Some(Action::DeleteBackup { stamp }));
+}
+
+/// F-git-covered review 1: the log's entry shown whole under a result of its panel's (a run's
+/// failure the integration opened over it) reads no key: Esc closes the result, and the entry
+/// stays; the next Esc closes the entry.
+#[test]
+fn f_git_covered_the_logs_entry_under_a_result_reads_no_key() {
+    let e = entry("git fetch origin", Ending::Exit(1), "fatal: hung up\n", 0);
+    let mut fx = log_fx(1000.0, 500.0, vec![e]);
+    fx.press(Key::Enter);
+    assert!(
+        fx.view().log.as_ref().is_some_and(|l| l.whole().is_some()),
+        "the entry whole"
+    );
+    fx.view_mut()
+        .show_text("Fetch", "fatal: the remote hung up", None);
+    fx.idle();
+    fx.idle();
+    let esc = key_events(Key::Escape, Modifiers::NONE);
+    fx.drv.frame(&mut fx.host, esc, Modifiers::NONE);
+    fx.idle();
+    assert!(fx.view().result.is_none(), "the Esc closed the result");
+    assert!(
+        fx.view().log.as_ref().is_some_and(|l| l.whole().is_some()),
+        "and left the entry under it"
+    );
+    fx.press(Key::Escape);
+    assert!(
+        fx.view().log.as_ref().is_some_and(|l| l.whole().is_none()),
+        "the next Esc closes the entry"
+    );
+}
+
 /// The bar scrolled off the lines by the wheel is under no line the owner sees: Enter Shows
 /// nothing; a ↓ brings it back into view and the next Enter Shows its line.
 #[test]

@@ -234,6 +234,28 @@ fn f10_and_enter_in_one_pass_choose_nothing_unseen() {
     assert_eq!(chose(&fx, &asked), Some(ActionId::Tag), "{asked:?}");
 }
 
+/// F-git-covered: a menu under another dialog that has the keyboard — another panel's, the list's
+/// question, F12's (`set_dialog_elsewhere`) — is not what the screen shows: a printed pass under
+/// one, then Enter in the pass after it chooses nothing; the next Enter, the menu printed with the
+/// keyboard in the pass before, chooses.
+#[test]
+fn f_git_covered_a_menu_under_another_dialog_chooses_nothing() {
+    let mut fx = panel();
+    fx.press(Key::ArrowDown);
+    fx.press(Key::F10);
+    assert!(fx.view().menu.is_some(), "the menu is open");
+    fx.view_mut().set_dialog_elsewhere(true);
+    let asked = pass(&mut fx, vec![]);
+    assert_eq!(chose(&fx, &asked), None, "{asked:?}");
+    fx.view_mut().set_dialog_elsewhere(false);
+    let asked = pass(&mut fx, key_events(Key::Enter, Modifiers::NONE));
+    assert_eq!(chose(&fx, &asked), None, "shown covered: {asked:?}");
+    assert!(fx.view().menu.is_some(), "the menu stays");
+    let asked = pass(&mut fx, key_events(Key::Enter, Modifiers::NONE));
+    assert!(fx.view().menu.is_none());
+    assert_eq!(chose(&fx, &asked), Some(ActionId::Tag), "{asked:?}");
+}
+
 /// The menu's keys one at a time, in order, several in one pass: two ↓ and Enter choose the third
 /// item.
 #[test]
@@ -910,7 +932,7 @@ impl crate::gui::Window for Alone {
             }
         }
         if let Some(d) = &mut self.filters {
-            if let Some(end) = d.ui(&ctx, grid) {
+            if let Some(end) = d.ui(&ctx, grid, true) {
                 self.ends.push(format!("{end:?}"));
                 self.filters = None;
             }
@@ -1983,4 +2005,284 @@ fn f_git_listq_a_quick_dialog_reads_no_key_while_another_dialog_has_it() {
     );
     fx.press(Key::Escape);
     assert!(!fx.view().dialog_up(), "the control: Esc closes it");
+}
+
+// ---------------------------------------------------------------------------------------------
+// F-git-covered: a dialog of the panel's that does not have the keyboard reads no key and
+// records no painting.
+
+/// The filters under a result of their own panel's (`modals` draws it over them): they read no
+/// key, the pass's are the result's, and record no painting. Enter closes the result and applies
+/// nothing under it; once a printed pass shows the filters with the keys, Enter applies them.
+#[test]
+fn f_git_covered_the_filters_under_their_panels_result_read_no_key() {
+    let mut fx = filters_open(fixture_view());
+    fx.idle();
+    fx.view_mut()
+        .show_text("Fetch", "fatal: the remote hung up", None);
+    fx.idle();
+    fx.idle();
+    let asked = pass(&mut fx, key_events(Key::Enter, Modifiers::NONE));
+    assert!(fx.view().result.is_none(), "the Enter closed the result");
+    assert!(
+        fx.view().filters_dialog.is_some(),
+        "and applied nothing under it: {asked:?}"
+    );
+    fx.idle();
+    pass(&mut fx, key_events(Key::Enter, Modifiers::NONE));
+    assert!(
+        fx.view().filters_dialog.is_none(),
+        "printed with the keys, the filters apply"
+    );
+}
+
+/// Another dialog has the keyboard (`set_dialog_elsewhere`) in a printed pass, then closes in a
+/// pass the terminal does not print: an Enter read with that close acts on nothing of the panel's
+/// dialog; the next Enter, the dialog printed with the keys, does.
+fn covered_then_enter(fx: &mut Fx) -> (Vec<GitAction>, Vec<GitAction>) {
+    fx.idle();
+    fx.idle();
+    fx.view_mut().set_dialog_elsewhere(true);
+    pass(fx, vec![]);
+    fx.view_mut().set_dialog_elsewhere(false);
+    pass(fx, vec![]);
+    cells::set_presented(&fx.drv.ctx, false);
+    let first = pass(fx, key_events(Key::Enter, Modifiers::NONE));
+    cells::set_presented(&fx.drv.ctx, true);
+    let up = fx.view().dialog_up();
+    let second = pass(fx, key_events(Key::Enter, Modifiers::NONE));
+    assert!(up, "the dialog stayed up after the first Enter: {first:?}");
+    (first, second)
+}
+
+/// "Stop git?" under another dialog that has the keyboard (another panel's, the list's question,
+/// F12's): `[close the other, Enter]` read together stops nothing; the next Enter stops the run.
+#[test]
+fn f_git_covered_stop_git_under_another_dialog_stops_nothing() {
+    let mut fx = panel();
+    fx.view_mut().ask_stop("git fetch".to_string(), 7);
+    let (first, second) = covered_then_enter(&mut fx);
+    assert_eq!(first, [], "shown covered");
+    assert_eq!(second, [GitAction::StopWrite(7)]);
+    assert!(!fx.view().dialog_up());
+}
+
+/// A result under another dialog that has the keyboard: `[close the other, Enter]` read together
+/// closes nothing; the next Enter closes it.
+#[test]
+fn f_git_covered_a_result_under_another_dialog_closes_on_no_enter() {
+    let mut fx = panel();
+    fx.view_mut()
+        .show_text("Fetch", "fatal: the remote hung up", None);
+    covered_then_enter(&mut fx);
+    assert!(fx.view().result.is_none(), "the second Enter closed it");
+}
+
+/// `text` typed a character a pass, in the passes right after an action's dialog opened over
+/// another of the panel's, with no pass between: the dialog's draft after them.
+pub(super) fn typed_from_its_first_passes(fx: &mut Fx, text: &str) -> Option<Action> {
+    for c in text.chars() {
+        let typed = vec![Event::Text(c.to_string())];
+        fx.drv.frame(&mut fx.host, typed, Modifiers::NONE);
+    }
+    fx.idle();
+    fx.view().draft().cloned()
+}
+
+/// F-git-covered review 1: an action's dialog with a field over the filters — the Stash dialog
+/// the integration opened, as the Commit after a `merge --squash` its prefill opens — has the
+/// keyboard: the filters, under it, take none for their own field, so every character typed from
+/// its first passes on goes into its field, and none into the filters'.
+#[test]
+fn f_git_covered_text_typed_over_the_filters_goes_into_the_dialog() {
+    let mut fx = panel();
+    fx.key(Key::K, Modifiers::COMMAND);
+    assert!(fx.view().filters_dialog.is_some(), "the filters");
+    fx.idle();
+    let asked =
+        (fx.view_mut()).open_action(ActionId::Stash, Target::Uncommitted, Default::default());
+    assert!(asked.is_empty(), "{asked:?}");
+    let draft = typed_from_its_first_passes(&mut fx, "qzwv");
+    assert!(
+        matches!(&draft, Some(Action::Stash { message, .. }) if message == "qzwv"),
+        "the dialog's field: {draft:?}"
+    );
+    let rows = filters_rows(&fx);
+    assert!(
+        rows.iter().all(|r| !r.contains('q') && !r.contains('z')),
+        "the filters' field stays empty: {rows:#?}"
+    );
+}
+
+/// F-git-covered fix-check: the keyboard comes back to the filters' field once the dialog over
+/// them closes — Esc on the Stash dialog, a pass — so what is typed then narrows the filters.
+#[test]
+fn f_git_covered_the_filters_take_the_keyboard_back() {
+    let mut fx = panel();
+    fx.key(Key::K, Modifiers::COMMAND);
+    fx.idle();
+    let asked =
+        (fx.view_mut()).open_action(ActionId::Stash, Target::Uncommitted, Default::default());
+    assert!(asked.is_empty(), "{asked:?}");
+    fx.idle();
+    fx.idle();
+    fx.press(Key::Escape);
+    assert!(fx.view().draft().is_none(), "Esc closed the Stash dialog");
+    assert!(fx.view().filters_dialog.is_some(), "and left the filters");
+    fx.idle();
+    fx.typed("qz");
+    let rows = filters_rows(&fx);
+    assert!(
+        rows.iter().any(|r| r.contains("qz")),
+        "typed into the filters' field: {rows:#?}"
+    );
+}
+
+/// F-git-covered review 1: the cover under a result is what the filters painted, not only which
+/// keys they read: a result over them in a printed pass, Esc closing it in a pass the terminal
+/// does not print, then Enter applies nothing — the screen last showed the filters under the
+/// result; after a printed pass Enter applies them.
+#[test]
+fn f_git_covered_the_filters_shown_under_a_result_apply_on_no_enter() {
+    let mut fx = filters_open(fixture_view());
+    fx.idle();
+    fx.view_mut()
+        .show_text("Fetch", "fatal: the remote hung up", None);
+    fx.idle();
+    fx.idle();
+    pass(&mut fx, key_events(Key::Escape, Modifiers::NONE));
+    cells::set_presented(&fx.drv.ctx, false);
+    assert!(fx.view().result.is_none(), "the Esc closed the result");
+    let asked = pass(&mut fx, key_events(Key::Enter, Modifiers::NONE));
+    cells::set_presented(&fx.drv.ctx, true);
+    assert!(
+        fx.view().filters_dialog.is_some(),
+        "shown under the result: nothing applied ({asked:?})"
+    );
+    fx.idle();
+    pass(&mut fx, key_events(Key::Enter, Modifiers::NONE));
+    assert!(fx.view().filters_dialog.is_none(), "shown, they apply");
+}
+
+/// The panel under a dialog in front of it with a field — the list's, F12's, another panel's —
+/// which takes the keyboard while nothing has it, as the git dialogs do, and reads what is typed
+/// while it has it.
+struct Front {
+    host: super::tests::Host,
+    typed: String,
+}
+
+impl Front {
+    fn field() -> egui::Id {
+        egui::Id::unique("f-git-covered-front-field")
+    }
+}
+
+impl crate::gui::Window for Front {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        self.host.ui(ui);
+        let ctx = ui.ctx().clone();
+        if ctx.memory(|m| m.focused()).is_none() {
+            ctx.memory_mut(|m| m.request_focus(Front::field()));
+        }
+        if ctx.memory(|m| m.has_focus(Front::field())) {
+            ctx.input(|i| {
+                for e in &i.events {
+                    if let Event::Text(t) = e {
+                        self.typed.push_str(t);
+                    }
+                }
+            });
+        }
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// `view` in a 1000×600 window, `open` opening its git dialog, drawn twice; then the front dialog
+/// comes up over it (`set_dialog_elsewhere`), its first request for the keyboard dropped (a new
+/// box's: nothing holds the keyboard as the next pass begins), and `qzwv` is typed a character a
+/// pass: what the front dialog read, and the git dialog's draft.
+fn typed_under_a_front_dialog(
+    view: GitView,
+    open: impl FnOnce(&mut Driver, &mut Front),
+) -> (String, Option<Action>) {
+    let mut win = Front {
+        host: super::tests::Host {
+            view,
+            active: true,
+            actions: Vec::new(),
+            rect: egui::Rect::NOTHING,
+            under: Vec::new(),
+            side: None,
+        },
+        typed: String::new(),
+    };
+    let mut drv = Driver::new(1000.0, 600.0);
+    drv.idle(&mut win, 1);
+    open(&mut drv, &mut win);
+    drv.idle(&mut win, 2);
+    assert!(win.host.view.dialog_up(), "the git dialog");
+    assert_ne!(
+        drv.ctx.memory(|m| m.focused()),
+        Some(Front::field()),
+        "the git dialog has the keyboard"
+    );
+    win.host.view.set_dialog_elsewhere(true);
+    drv.ctx.memory_mut(|m| {
+        if let Some(f) = m.focused() {
+            m.surrender_focus(f);
+        }
+    });
+    for c in "qzwv".chars() {
+        drv.frame(&mut win, vec![Event::Text(c.to_string())], Modifiers::NONE);
+    }
+    (win.typed, win.host.view.draft().cloned())
+}
+
+/// F-git-covered: a covered action dialog takes no keyboard, even while nothing has it: every
+/// character typed goes into the front dialog's field, none into the Stash dialog's behind it.
+#[test]
+fn f_git_covered_a_covered_action_dialog_takes_no_keyboard() {
+    let mut view = fixture_view();
+    view.set_repo(super::tests_s3::repo());
+    let (front, draft) = typed_under_a_front_dialog(view, |_, win| {
+        let asked =
+            (win.host.view).open_action(ActionId::Stash, Target::Uncommitted, Default::default());
+        assert!(asked.is_empty(), "{asked:?}");
+    });
+    assert_eq!(front, "qzwv", "the front dialog's field");
+    assert!(
+        matches!(&draft, Some(Action::Stash { message, .. }) if message.is_empty()),
+        "{draft:?}"
+    );
+}
+
+/// F-git-covered: a covered quick edit's dialog takes no keyboard either.
+#[test]
+fn f_git_covered_a_covered_quick_edit_takes_no_keyboard() {
+    let mut view = fixture_view();
+    view.set_repo(super::tests_s4::repo());
+    let (front, _) = typed_under_a_front_dialog(view, |_, win| {
+        let c = crate::git::model::Oid::parse(&"c".repeat(40)).unwrap();
+        let model = super::tests_s4::model();
+        let asked = win.host.view.open_edit(EditId::Reword, &c, &model);
+        assert!(asked.is_empty(), "{asked:?}");
+    });
+    assert_eq!(front, "qzwv", "the front dialog's field");
+}
+
+/// F-git-covered: a covered menu takes the keyboard back no more.
+#[test]
+fn f_git_covered_a_covered_menu_takes_no_keyboard() {
+    let mut view = fixture_view();
+    view.set_repo(super::tests_s3::repo());
+    let (front, _) = typed_under_a_front_dialog(view, |drv, win| {
+        drv.key(win, Key::ArrowDown, Modifiers::NONE);
+        drv.key(win, Key::F10, Modifiers::NONE);
+        assert!(win.host.view.menu.is_some(), "the menu");
+    });
+    assert_eq!(front, "qzwv", "the front dialog's field");
 }
