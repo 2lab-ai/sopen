@@ -1881,8 +1881,9 @@ impl<T: Tty, O: Write> Backend<T, O> {
                     return Ok(End::Signal(signal));
                 }
                 self.said = switch(self)?;
-                // That pass was not printed (a switch, or the dimmed screen of one).
-                cells::set_presented(&self.ctx, false);
+                // No pass since this one reached the screen as it was: a switch ran its own on
+                // the dimmed screen of one (`cells::set_unseen`).
+                cells::set_unseen(&self.ctx);
                 due = Some(Instant::now());
                 continue;
             }
