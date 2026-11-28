@@ -657,10 +657,10 @@ fn command_k_opens_the_filters_and_a_filter_reloads() {
         .contains(&"v1.0".to_string()));
     g.cmd(Key::K);
     g.idle(3);
-    assert!(g.painted("Tags"), "the filters' dialog");
-    g.fx.drv.click_text(&mut g.fx.b, "Tags");
+    assert!(g.painted("[X] Tags"), "the filters' dialog");
+    g.fx.drv.click_text(&mut g.fx.b, "[X] Tags");
     g.idle(2);
-    g.fx.drv.click_text(&mut g.fx.b, "Apply");
+    g.fx.drv.click_text(&mut g.fx.b, "[ Apply ]");
     g.idle(2);
     g.until("the reload", |b| {
         let i = b.git.panel(&b.panels[0].dir).unwrap();

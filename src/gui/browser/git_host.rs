@@ -1379,10 +1379,11 @@ impl Browser {
     /// Everything panel `i` waits for, heard.
     pub(super) fn poll_panel(&mut self, ctx: &egui::Context, i: usize) {
         self.poll_actions(ctx, i);
-        // The load's reads.
-        let read = self.git.panels[i]
-            .read
-            .as_ref()
+        // The load's reads — after a quick `split`, whose Split's confirmation opens with them,
+        // only while no other panel's dialog is up (X4-menu fix-check, rule 2).
+        let wait = self.git.panels[i].split_next && self.git_dialog_up(Some(i));
+        let read = (self.git.panels[i].read.as_ref())
+            .filter(|_| !wait)
             .and_then(|r| r.pending.rx.try_recv().ok());
         if let Some(result) = read {
             let Some(read) = self.git.panels[i].read.take() else {
@@ -1818,6 +1819,10 @@ impl Browser {
         let Some(i) = self.git_focused() else {
             return;
         };
+        // Another panel's dialog is up: it has the keyboard (one dialog at a time, X4-menu).
+        if self.git_dialog_up(Some(i)) {
+            return;
+        }
         // A key of the owner's: what was said before is old news.
         let pressed = ctx.input(|inp| {
             inp.events.iter().any(|e| {
@@ -2320,6 +2325,9 @@ impl Browser {
     /// when wide), in cells (10 §4, X4-graph) — those under a dialog of the list's blanked first,
     /// as the list's are (`Ops::covered`) — its clicks carried out; a press on it gives it the
     /// keyboard.
+    /// `ups`: the shown panels whose dialog was up as the pass's panels began
+    /// ([`Browser::git_dialogs_up`]), so a dialog that closes during the left panel's draw frees
+    /// no press of that pass for the right.
     pub(super) fn git_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -2327,6 +2335,7 @@ impl Browser {
         grid: &Grid,
         cells: cells::Cells,
         top: &str,
+        ups: &[usize],
     ) {
         let Some(i) = self.git.panel(top) else {
             return;
@@ -2339,7 +2348,16 @@ impl Browser {
                     .interact_pos()
                     .is_some_and(|pos| on_pane(rect, pos))
         });
-        if pressed && !self.ops.holds_keyboard() && self.tree.is_none() && self.listing.is_empty() {
+        // One dialog at a time (X4-menu round 1): while another git panel's dialog is up — as the
+        // pass began or now; its box may lie over this half — a press here moves the keyboard
+        // nowhere. A press on the panel whose dialog it is keeps the keyboard there.
+        let held = ups.iter().any(|&j| j != i) || self.git_dialog_up(Some(i));
+        if pressed
+            && !held
+            && !self.ops.holds_keyboard()
+            && self.tree.is_none()
+            && self.listing.is_empty()
+        {
             if side != 1 - self.active {
                 // The other side's list had the keyboard: it is the origin list now.
                 self.active = 1 - side;
@@ -2352,7 +2370,14 @@ impl Browser {
         // after this pass's dialogs have opened or closed (`GitView::covered`).
         let mut under = self.ops.covered(grid);
         under.extend(self.git_covered(grid, Some(i)));
+        // Another panel's dialog up, or the list's question: this one opens none, takes no click
+        // and its dialogs read no key.
+        let elsewhere = held || self.ops.holds_keyboard();
         let view = &mut self.git.panels[i].view;
+        view.set_dialog_elsewhere(elsewhere);
+        // The keyboard is the panel's as `git_keys` gives it: not while a dialog of the list's or
+        // the tree holds it, since Find takes its Enter and Esc in the pass itself (X4-find).
+        let active = active && !self.ops.holds_keyboard() && self.tree.is_none();
         let mut actions = git_panel::draw(ui, grid, cells, view, active, &under);
         if self.ops.holds_keyboard() || self.tree.is_some() {
             actions.clear();
@@ -2366,6 +2391,14 @@ impl Browser {
     /// painted (10 §17, X4-graph), as it blanks those under the list's dialogs — all of them but
     /// panel `except`'s (a panel blanks its own as its pass leaves them).
     pub(super) fn git_covered(&self, grid: &Grid, except: Option<usize>) -> Vec<cells::Cells> {
+        (self.git_shown().into_iter())
+            .filter(|&i| Some(i) != except)
+            .flat_map(|i| self.git.panels[i].view.covered(grid))
+            .collect()
+    }
+
+    /// The git panels on screen, by index.
+    fn git_shown(&self) -> Vec<usize> {
         let Some(shown) = &self.shown else {
             return Vec::new();
         };
@@ -2378,9 +2411,52 @@ impl Browser {
         tops.dedup();
         (tops.into_iter())
             .filter_map(|top| self.git.panel(top))
-            .filter(|&i| Some(i) != except)
-            .flat_map(|i| self.git.panels[i].view.covered(grid))
             .collect()
+    }
+
+    /// The shown git panels whose dialog is up now (`GitView::dialog_up`), for the pass's panels
+    /// to hold as it began (`git_ui`'s `ups`).
+    pub(super) fn git_dialogs_up(&self) -> Vec<usize> {
+        (self.git_shown().into_iter())
+            .filter(|&i| self.git.panels[i].view.dialog_up())
+            .collect()
+    }
+
+    /// The keyboard follows an open git dialog (X4-menu fix-check, rule 1): while a shown panel's
+    /// dialog is up, that panel has the keyboard, as a click on it gives it — so its dialog reads
+    /// the keys, Esc is its (`git_stop_on_esc`), and no other panel's or list's key acts. A dialog
+    /// the integration opened in a panel the keyboard was not in takes it so. Not under the tree
+    /// or a viewer, which hold the keyboard themselves.
+    pub(super) fn git_follow_dialog(&mut self) {
+        if self.tree.is_some() || self.viewer.is_some() {
+            return;
+        }
+        let ups = self.git_dialogs_up();
+        let Some(&i) = (ups.iter())
+            .find(|&&i| Some(i) == self.git_focused())
+            .or(ups.first())
+        else {
+            return;
+        };
+        let Some(shown) = &self.shown else {
+            return;
+        };
+        let here = view::Content::Git(self.git.panels[i].top.clone());
+        let sides: Vec<usize> = (0..2).filter(|&s| shown[s] == here).collect();
+        if !sides.contains(&(1 - self.active)) {
+            if let Some(&s) = sides.first() {
+                self.active = 1 - s;
+            }
+        }
+        self.git.focus = true;
+    }
+
+    /// Whether a dialog of a git panel on screen is up (`GitView::dialog_up`: a menu, the
+    /// filters, an action's dialog, the log's entry, …), panel `except`'s left out.
+    pub(super) fn git_dialog_up(&self, except: Option<usize>) -> bool {
+        (self.git_shown().into_iter())
+            .filter(|&i| Some(i) != except)
+            .any(|i| self.git.panels[i].view.dialog_up())
     }
 }
 
@@ -3415,10 +3491,17 @@ impl Browser {
     /// dialog's reads, the Backups list, a restore's entries, a tag's details; and the command
     /// log handed again when the runner logged more.
     pub(super) fn poll_actions(&mut self, ctx: &egui::Context, i: usize) {
+        // One dialog at a time (X4-menu fix-check, rule 2): while another shown panel's dialog is
+        // up, nothing that may open a dialog here is heard — a run's end (its result, a
+        // confirmation again, the Commit after a squash, "delete anyway?"), a prefill, a history
+        // edit's range, the Backups list, a restore's entries, a tag's details. They stay in
+        // their channels and open once that dialog closes, the keyboard following them.
+        let wait = self.git_dialog_up(Some(i));
         let mut ended = Vec::new();
-        self.git.panels[i]
-            .running
-            .retain_mut(|run| match run.rx.try_recv() {
+        // Not received at all while it waits: a receive would take the end off its channel.
+        if !wait {
+            let running = &mut self.git.panels[i].running;
+            running.retain_mut(|run| match run.rx.try_recv() {
                 Ok(end) => {
                     ended.push(end);
                     false
@@ -3433,11 +3516,17 @@ impl Browser {
                     false
                 }
             });
+        }
         for end in ended {
             self.run_ended(ctx, i, end);
         }
         let p = &mut self.git.panels[i];
-        if let Some(Ok(prefilled)) = p.prefill.as_ref().map(|r| r.rx.try_recv()) {
+        let prefilled = p
+            .prefill
+            .as_ref()
+            .filter(|_| !wait)
+            .map(|r| r.rx.try_recv());
+        if let Some(Ok(prefilled)) = prefilled {
             p.prefill = None;
             match prefilled.read {
                 Ok(read) => {
@@ -3479,7 +3568,12 @@ impl Browser {
         }
         // S4: the range a history edit opens on came — its dialog, or the planner.
         let p = &mut self.git.panels[i];
-        if let Some(Ok(opened)) = p.edit_open.as_ref().map(|r| r.rx.try_recv()) {
+        let opened = p
+            .edit_open
+            .as_ref()
+            .filter(|_| !wait)
+            .map(|r| r.rx.try_recv());
+        if let Some(Ok(opened)) = opened {
             p.edit_open = None;
             p.view.seen(opened.generation, opened.seen);
             let what = match &opened.opening {
@@ -3508,7 +3602,12 @@ impl Browser {
         }
         self.dialog_reads(ctx, i);
         let p = &mut self.git.panels[i];
-        if let Some(Ok(read)) = p.backups_read.as_ref().map(|r| r.rx.try_recv()) {
+        let backups = p
+            .backups_read
+            .as_ref()
+            .filter(|_| !wait)
+            .map(|r| r.rx.try_recv());
+        if let Some(Ok(read)) = backups {
             p.backups_read = None;
             match read {
                 Ok(records) => p.view.open_backups(records),
@@ -3518,7 +3617,12 @@ impl Browser {
                 }
             }
         }
-        if let Some(Ok(read)) = p.restore_read.as_ref().map(|r| r.rx.try_recv()) {
+        let restore = p
+            .restore_read
+            .as_ref()
+            .filter(|_| !wait)
+            .map(|r| r.rx.try_recv());
+        if let Some(Ok(read)) = restore {
             p.restore_read = None;
             match read {
                 Ok((stamp, entries, only)) => {
@@ -3529,7 +3633,12 @@ impl Browser {
             }
         }
         let p = &mut self.git.panels[i];
-        if let Some(Ok((title, text))) = p.text_read.as_ref().map(|r| r.rx.try_recv()) {
+        let text = p
+            .text_read
+            .as_ref()
+            .filter(|_| !wait)
+            .map(|r| r.rx.try_recv());
+        if let Some(Ok((title, text))) = text {
             p.text_read = None;
             match text {
                 Ok(text) => p.view.show_text(&title, &text, None),

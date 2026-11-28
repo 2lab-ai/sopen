@@ -1173,7 +1173,8 @@ pub(crate) mod fixture {
             self.run_in(&self.top, args)
         }
 
-        /// `git <args>` in `dir`; its stdout.
+        /// `git <args>` in `dir`; its stdout. Started through [`crate::testutil::run_fresh`]: a
+        /// stand-in a test has just written in `git`'s place can be busy for a moment on Linux.
         pub fn run_in(&self, dir: &Path, args: &[&str]) -> String {
             let at = self.clock.fetch_add(60, Ordering::SeqCst);
             let date = format!("{at} +0000");
@@ -1185,7 +1186,7 @@ pub(crate) mod fixture {
             c.envs(env(&self.home()))
                 .env("GIT_AUTHOR_DATE", &date)
                 .env("GIT_COMMITTER_DATE", &date);
-            let out = c.output().unwrap();
+            let out = crate::testutil::run_fresh(&mut c);
             assert!(
                 out.status.success(),
                 "git {args:?}: {}",
@@ -1352,6 +1353,48 @@ pub(crate) mod fixture {
         assert!(child.wait().unwrap().success(), "fast-import");
         repo.run(&["reset", "-q", "--hard", "main"]);
         repo
+    }
+
+    /// The real thing (Linux only: macOS starts a script that is still open for writing): a
+    /// stand-in in `git`'s place whose write descriptor is still open — as a child another test
+    /// thread forked holds it until its exec — is busy; the fixture's command runs once the
+    /// descriptor is closed. The descriptor is closed only after the fixture's start was refused
+    /// ([`crate::testutil::busy_refusals`]; 5 s at most, so a fixture that never retries still
+    /// ends), never on a timer: a stall of this thread cannot let a start that does not retry
+    /// pass.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stand_in_git_still_open_for_writing_runs_once_it_is_closed() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let Some(git) = git() else {
+            return;
+        };
+        let mut repo = Repo::new(&git);
+        let wrapper = repo.tmp.path().join("git-wrapper");
+        let mut file = std::fs::File::create(&wrapper).unwrap();
+        write!(file, "#!/bin/sh\nexec '{}' \"$@\"\n", git.display()).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = Command::new(&wrapper).output().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ExecutableFileBusy, "{err}");
+        repo.git = wrapper.clone();
+        let refused = || crate::testutil::busy_refusals(&wrapper);
+        let top = std::thread::scope(|s| {
+            s.spawn(move || {
+                let until = Instant::now() + Duration::from_secs(5);
+                while refused() == 0 && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                drop(file);
+            });
+            repo.run(&["rev-parse", "--show-toplevel"])
+        });
+        assert!(
+            refused() >= 1,
+            "the fixture's start was refused, then retried"
+        );
+        assert_eq!(top.trim(), repo.top());
     }
 }
 

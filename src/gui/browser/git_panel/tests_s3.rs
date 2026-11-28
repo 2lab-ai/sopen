@@ -322,7 +322,7 @@ impl Window for Host {
                 ctx.input_mut(|i| keys::find(&mut i.events, Context::Git, WITH_SLICE_3))
             {
                 if let Some(v) = &mut self.backups {
-                    self.backups_ends.extend(v.run(c));
+                    self.backups_ends.extend(v.run(&ctx, c));
                 } else if let Some(v) = &mut self.log {
                     self.log_ends.extend(v.run(c));
                 }
@@ -347,7 +347,7 @@ impl Window for Host {
                         .extend(in_progress::draw(ui, &grid, top, &mut buf, b));
                 }
                 if let Some(v) = &mut self.backups {
-                    let end = backups::draw(ui, &grid, body, &mut buf, v, !modal);
+                    let end = backups::draw(ui, &grid, body, &mut buf, v, !modal, &[]);
                     self.backups_ends.extend(end);
                 } else if let Some(v) = &mut self.log {
                     log_view::draw(ui, &grid, body, &mut buf, v, !modal);
@@ -712,7 +712,9 @@ fn the_menu_draws_in_the_dialog_look_and_its_keys_choose() {
     fx.idle();
     fx.assert_shows("Fetch all remotes…");
     fx.assert_shows("Ctrl/⌘+Shift+R");
+    // Its last line is the panel over both sides (X4-menu round 1, T17); Undo above it.
     fx.press(Key::End);
+    fx.press(Key::ArrowUp);
     fx.press(Key::Enter);
     assert_eq!(
         fx.host.menu_ends,
@@ -1271,8 +1273,8 @@ fn the_backups_list_shows_groups_and_its_keys_and_buttons_act() {
             stamp: "20261123T102405Z".into()
         }))
     );
-    // The buttons do what the keys do.
-    fx.click("Restore");
+    // The buttons do what the keys do (in cells, `[ Restore ]`-style: X4-lists).
+    fx.click("[ Restore ]");
     assert_eq!(
         fx.host.backups_ends.pop(),
         Some(BackupsEnd::Restore {
@@ -1280,7 +1282,7 @@ fn the_backups_list_shows_groups_and_its_keys_and_buttons_act() {
             only: Some(refs[0].clone())
         })
     );
-    fx.click("Show");
+    fx.click("[ Show ]");
     assert_eq!(
         fx.host.backups_ends.pop(),
         Some(BackupsEnd::Show(vec![refs[0].clone()]))
@@ -1288,7 +1290,7 @@ fn the_backups_list_shows_groups_and_its_keys_and_buttons_act() {
     // The bar to the second group: Restore is the group.
     fx.press(Key::End);
     fx.press(Key::ArrowUp);
-    fx.click("Restore");
+    fx.click("[ Restore ]");
     assert_eq!(
         fx.host.backups_ends.pop(),
         Some(BackupsEnd::Restore {
@@ -1343,7 +1345,9 @@ fn the_command_log_lists_newest_first_and_enter_shows_an_entry_whole() {
     fx.press(Key::Enter);
     fx.idle();
     assert!(fx.host.log.as_ref().unwrap().whole().is_some());
-    fx.assert_shows("error: failed to push some refs\nhint: fetch first");
+    // In cells each line of stderr is a row of its own (X4-lists).
+    fx.assert_shows("error: failed to push some refs");
+    fx.assert_shows("hint: fetch first");
     fx.assert_shows("message, 3 lines");
     fx.assert_shows("/srv/sopen");
     fx.press(Key::Escape);
