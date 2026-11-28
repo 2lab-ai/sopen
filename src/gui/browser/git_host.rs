@@ -2383,10 +2383,11 @@ impl Browser {
         // for (`ask_more`, which marks it asked). A dialog closes itself as it returns its end
         // (`GitView::modals`), so the host cannot refuse that end afterwards: dropping it closed
         // the dialog without its run. (The integration opens none in front of the list's question
-        // or beside the tree, `git_waits`; the keyboard follows one it opens before the pass's
-        // keys, which are dropped (`Browser::ui`), so no F10 of the list's opens the tree beside
-        // it; egui still gives a git dialog the click of the pass a question arrives in, the
-        // question drawn after the panels: what runs is what showed.)
+        // or beside the tree, `git_waits`; a pass in which any dialog slot of a shown panel
+        // changed drops its keys, and the keyboard follows a dialog up before any key is read
+        // (`Browser::ui`), so no F10 of the list's opens the tree beside one; egui still gives a
+        // git dialog the click of the pass a question arrives in, the question drawn after the
+        // panels: what runs is what showed.)
         let actions = git_panel::draw(ui, grid, cells, view, active, &under);
         let ctx = ui.ctx().clone();
         self.git_actions(&ctx, i, actions);
@@ -2432,16 +2433,21 @@ impl Browser {
     /// dialog is up, that panel has the keyboard, as a click on it gives it — so its dialog reads
     /// the keys, Esc is its (`git_stop_on_esc`), and no other panel's or list's key acts. A dialog
     /// the integration opened in a panel the keyboard was not in takes it so. Not under the tree
-    /// or a viewer, which hold the keyboard themselves. The panel it gave the keyboard to, if any.
-    pub(super) fn git_follow_dialog(&mut self) -> Option<usize> {
+    /// or a viewer, which hold the keyboard themselves.
+    pub(super) fn git_follow_dialog(&mut self) {
         if self.tree.is_some() || self.viewer.is_some() {
-            return None;
+            return;
         }
         let ups = self.git_dialogs_up();
-        let &i = (ups.iter())
+        let Some(&i) = (ups.iter())
             .find(|&&i| Some(i) == self.git_focused())
-            .or(ups.first())?;
-        let shown = self.shown.as_ref()?;
+            .or(ups.first())
+        else {
+            return;
+        };
+        let Some(shown) = &self.shown else {
+            return;
+        };
         let here = view::Content::Git(self.git.panels[i].top.clone());
         let sides: Vec<usize> = (0..2).filter(|&s| shown[s] == here).collect();
         if !sides.contains(&(1 - self.active)) {
@@ -2450,7 +2456,14 @@ impl Browser {
             }
         }
         self.git.focus = true;
-        Some(i)
+    }
+
+    /// Each shown panel's dialog slots (`GitView::fronts`), for the pass to compare across its
+    /// git pass (`Browser::ui`, F-git-listq).
+    pub(super) fn git_fronts(&self) -> Vec<(usize, [(bool, u64); git_panel::Front::KINDS])> {
+        (self.git_shown().into_iter())
+            .map(|i| (i, self.git.panels[i].view.fronts()))
+            .collect()
     }
 
     /// Whether a dialog of a git panel on screen is up (`GitView::dialog_up`: a menu, the

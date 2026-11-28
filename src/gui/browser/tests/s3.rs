@@ -2818,6 +2818,13 @@ fn a_run_that_ended(
     i: usize,
     end: git_host::RunEnd,
 ) -> std::sync::mpsc::Sender<git_host::RunEnd> {
+    let (_, tx) = a_run_that_runs(g, i);
+    tx.send(end).unwrap();
+    tx
+}
+
+/// A run of panel `i`'s, as `spawn_run` gives one, its end not sent yet: its id and its sender.
+fn a_run_that_runs(g: &mut Gx, i: usize) -> (u64, std::sync::mpsc::Sender<git_host::RunEnd>) {
     let (tx, rx) = std::sync::mpsc::channel();
     g.fx.b.git.runs += 1;
     let id = g.fx.b.git.runs;
@@ -2831,8 +2838,7 @@ fn a_run_that_ended(
         network: Vec::new(),
         worker: None,
     });
-    tx.send(end).unwrap();
-    tx
+    (id, tx)
 }
 
 /// Waits, drawing no pass, until panel `i`'s first run's worker has sent its end: the next pass
@@ -3008,4 +3014,256 @@ fn f_git_listq_finds_toggle_takes_no_click_beside_the_tree() {
     g.fx.drv.click(&mut g.fx.b, aa.center());
     g.idle(2);
     assert!(g.painted("[X] Aa"), "the control: the click turns it");
+}
+
+/// "Stop git?" up and painted over a running write of panel `i`'s (`ask_stop`, as Esc after
+/// 10 s asks it), the keyboard in the panel: the write's sender, to end it with.
+fn stop_git_is_up(g: &mut Gx, i: usize) -> std::sync::mpsc::Sender<git_host::RunEnd> {
+    let (id, tx) = a_run_that_runs(g, i);
+    g.fx.b.git.panels[i].view.ask_stop("Push".into(), id);
+    g.idle(2);
+    assert!(
+        g.shows("Push is still running."),
+        "Stop git?: {:#?}",
+        g.texts()
+    );
+    assert_eq!(g.b().git_focused(), Some(i), "the keyboard in the panel");
+    tx
+}
+
+/// The details as they stand: a read on its way, one come, the pane open.
+fn details_of(g: &Gx, i: usize) -> (bool, bool, bool) {
+    let p = &g.b().git.panels[i];
+    (
+        p.details.is_some(),
+        p.last_details.is_some(),
+        p.view.details_open(),
+    )
+}
+
+/// F-git-listq fix-check: "Stop git?" is up and painted; its write ends with nothing to say (a
+/// success, no result) in the pass of the owner's Enter, meant for "Stop git?". The dialog goes
+/// with its run, and the Enter is dropped with the pass (its front dialog changed under it): it
+/// does not fall through to the graph, whose Enter opens the bar's details. The next Enter is the
+/// graph's.
+#[test]
+fn f_git_listq_stop_git_gone_with_its_run_leaves_the_enter_to_nothing() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.ready_in_git();
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let details = details_of(&g, i);
+    let tx = stop_git_is_up(&mut g, i);
+    let light = g.repo.rev("light");
+    tx.send(git_host::RunEnd::Ran {
+        outcome: Box::new(crate::git::actions::Outcome {
+            steps: Vec::new(),
+            backup: None,
+        }),
+        title: "Push".into(),
+        what: "pushed".into(),
+        changes_files: false,
+        squash: false,
+        action: Box::new(Action::Reset {
+            to: crate::git::model::Oid::parse(&light).unwrap(),
+            mode: crate::git::actions::ResetMode::Hard,
+        }),
+    })
+    .unwrap();
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
+    g.idle(2);
+    let p = &g.b().git.panels[i];
+    assert!(p.running.is_empty(), "its end heard");
+    assert!(!p.view.dialog_up(), "Stop git? went with its run");
+    assert_eq!(
+        details_of(&g, i),
+        details,
+        "the Enter did not reach the graph"
+    );
+    g.until_quiet("the refresh after the run");
+    g.key(Key::Enter);
+    g.idle(2);
+    assert_ne!(
+        details_of(&g, i),
+        details,
+        "the control: the next Enter is the graph's"
+    );
+    drop(tx);
+}
+
+/// F-git-listq fix-check: "Stop git?" up and painted; its write's end puts its confirmation in
+/// front again (`RunEnd::Confirm`) in the pass of the owner's Esc, meant for "Stop git?" (No). The
+/// confirmation, never on screen, is not cancelled by it; once it shows, its click runs.
+#[test]
+fn f_git_listq_a_confirmation_in_place_of_stop_git_stays_with_its_esc() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.ready_in_git();
+    g.fx.drv.resize(1000.0, 1400.0);
+    g.idle(2);
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let tx = stop_git_is_up(&mut g, i);
+    let (head, light) = (g.repo.rev("HEAD"), g.repo.rev("light"));
+    tx.send(git_host::RunEnd::Confirm {
+        title: "Reset".into(),
+        action: Box::new(Action::Reset {
+            to: crate::git::model::Oid::parse(&light).unwrap(),
+            mode: crate::git::actions::ResetMode::Hard,
+        }),
+    })
+    .unwrap();
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Escape), Modifiers::NONE);
+    g.idle(2);
+    assert_eq!(
+        g.b().git.panels[i].view.draft().map(Action::id),
+        Some(ActionId::Reset),
+        "the unseen confirmation stays"
+    );
+    the_confirmation_is_up(&mut g, i);
+    assert_eq!(g.repo.rev("HEAD"), head);
+    g.click("[ Run ]");
+    assert_eq!(
+        after_the_run(&mut g, i),
+        (light, None),
+        "its click runs what it shows"
+    );
+    drop(tx);
+}
+
+/// F-git-listq fix-check: a confirmation up and painted is replaced by another of its kind — a
+/// run's end puts another action's confirmation in its place — in the pass of the owner's Esc,
+/// meant for the first. The front dialog's serial changed, so the Esc is dropped with the pass:
+/// the new confirmation, never on screen, stays.
+#[test]
+fn f_git_listq_a_confirmation_replaced_by_another_keeps_the_esc_from_it() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.wait_for_the_panel();
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    a_confirmation_opens(&mut g, i);
+    assert_eq!(g.b().git_focused(), Some(i), "the keyboard in the panel");
+    let first = g.repo.rev("main~3");
+    let other = Action::Reset {
+        to: crate::git::model::Oid::parse(&first).unwrap(),
+        mode: crate::git::actions::ResetMode::Hard,
+    };
+    let tx = a_run_that_ended(
+        &mut g,
+        i,
+        git_host::RunEnd::Confirm {
+            title: "Reset".into(),
+            action: Box::new(other.clone()),
+        },
+    );
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Escape), Modifiers::NONE);
+    g.idle(2);
+    assert_eq!(
+        g.b().git.panels[i].view.draft(),
+        Some(&other),
+        "the unseen confirmation in its place stays"
+    );
+    g.idle(4);
+    g.key(Key::Escape);
+    g.idle(2);
+    assert!(
+        !g.b().git.panels[i].view.dialog_up(),
+        "the control: once shown, Esc cancels it"
+    );
+    drop(tx);
+}
+
+/// F-git-listq fix-check, guarding #181's own rule too: "Stop git?" up and painted; its write's
+/// failure (a result) comes in the pass of the owner's `key`. The result stays, its reason
+/// readable; the next Esc closes it.
+fn a_result_in_place_of_stop_git(key: Key) {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.ready_in_git();
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let tx = stop_git_is_up(&mut g, i);
+    tx.send(git_host::RunEnd::NotRun {
+        title: "Push".into(),
+        why: "the remote refused it".into(),
+        line: None,
+    })
+    .unwrap();
+    g.fx.drv.frame(&mut g.fx.b, pressed(key), Modifiers::NONE);
+    g.idle(2);
+    assert!(g.b().git.panels[i].view.dialog_up(), "its result stays");
+    assert!(g.shows("the remote refused it"), "its reason");
+    g.key(Key::Escape);
+    g.idle(2);
+    assert!(
+        !g.b().git.panels[i].view.dialog_up(),
+        "the next Esc closes it"
+    );
+    drop(tx);
+}
+
+#[test]
+fn f_git_listq_a_result_in_place_of_stop_git_stays_with_its_enter() {
+    a_result_in_place_of_stop_git(Key::Enter);
+}
+
+#[test]
+fn f_git_listq_a_result_in_place_of_stop_git_stays_with_its_esc() {
+    a_result_in_place_of_stop_git(Key::Escape);
+}
+
+/// F-git-listq fix-check 2: every slot counts, not the one first in some order. The planner's
+/// question (a reword's message, the planner's own dialog in the body) is up and painted; a run's
+/// failure comes in the pass of the owner's Enter, meant for that question, and puts a result up
+/// over it. The pass's keys are dropped: the question does not keep the message on an Enter
+/// pressed before the result was there, and the result does not close on it either — both stay.
+#[test]
+fn f_git_listq_a_result_over_the_planners_question_takes_no_key_from_it() {
+    let git = git_or_skip!();
+    let repo = Repo::new(&git);
+    repo.write("a.txt", "a\n");
+    repo.commit("base");
+    repo.write("b.txt", "b\n");
+    repo.commit("one");
+    repo.write("c.txt", "c\n");
+    repo.commit("two");
+    let mut g = Gx::new(repo);
+    g.ready_in_git();
+    g.bar_to("base");
+    g.cmd(Key::E);
+    g.idle(2);
+    g.until_quiet("the planner's range");
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let message = |g: &Gx| {
+        let model = g.view().planner_model().expect("the planner");
+        model.rows[0].message.clone()
+    };
+    g.fx.typed("r");
+    g.idle(1);
+    g.key(Key::Enter);
+    g.idle(2);
+    assert!(
+        g.shows("Enter keeps it"),
+        "the planner's question: {:#?}",
+        g.texts()
+    );
+    assert_eq!(message(&g), None, "no message kept yet");
+    let tx = a_run_that_ended(
+        &mut g,
+        i,
+        git_host::RunEnd::NotRun {
+            title: "Push".into(),
+            why: "the remote refused it".into(),
+            line: None,
+        },
+    );
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
+    g.idle(2);
+    assert!(g.b().git.panels[i].running.is_empty(), "its end heard");
+    assert!(g.shows("the remote refused it"), "the result up");
+    assert!(g.shows("Enter keeps it"), "the planner's question stays");
+    assert_eq!(message(&g), None, "the Enter kept no message");
+    drop(tx);
 }

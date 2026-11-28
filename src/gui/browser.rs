@@ -3233,19 +3233,23 @@ impl Window for Browser {
         // The viewer's views (08 §8): a view key's switch, a view made — before the title row,
         // whose strip shows it.
         self.views_before(&ctx);
-        // The panels' dialogs as the pass began: a key of this pass that opened one (Esc's "Stop
-        // git?") has already run.
-        let began = self.git_dialogs_up();
+        // The shown panels' dialog slots as the pass began: a key of this pass that opened one
+        // (Esc's "Stop git?") has already run.
+        let began = self.git_fronts();
         self.git_pass(&ctx);
-        // A dialog the git pass opened: the keyboard follows it before any key is read (X4-menu
-        // fix-check, rule 1), so the list's F10 never opens the tree beside it — and the pass's
-        // keys are dropped, since they were pressed before it was on screen: neither it nor what
-        // had the keyboard acts on them (F-git-listq review: the list's Enter or Esc closed a
-        // result or a confirmation never shown), as the switch's question drops its pass's.
-        let followed = self.git_follow_dialog();
-        if followed.is_some_and(|i| !began.contains(&i)) {
+        // A pass in which any dialog slot of a shown panel changed — one opened, was replaced (by
+        // another of its kind too) or closed in the git pass — drops its keys (F-git-listq): they
+        // were pressed at what the screen showed before, so neither a new dialog (a
+        // confirmation's Esc cancelling it unseen, the planner's question taking an Enter over a
+        // result) nor what a closed one uncovers (the graph's Enter, Esc's unpin) acts on them,
+        // as the switch's question drops its pass's. Not under a viewer, which has the keys and
+        // over which no panel is drawn. A change by the owner's key in a dialog comes in the
+        // panels' draw, after this. Then the keyboard follows a dialog up before any key is read
+        // (X4-menu fix-check, rule 1), so the list's F10 never opens the tree beside one.
+        if self.viewer.is_none() && self.git_fronts() != began {
             drop_keys(&ctx);
         }
+        self.git_follow_dialog();
         if self.tree.is_some() {
             self.tree_pass(&ctx);
         } else if self.git_focused().is_some() {

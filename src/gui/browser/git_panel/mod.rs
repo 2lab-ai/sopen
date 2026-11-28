@@ -465,6 +465,11 @@ pub struct GitView {
     /// "Stop git?" over a write running for 10 s (03 §3.4): the action's words, and the id of the
     /// run it asks about.
     stop_question: Option<(String, u64)>,
+    /// Each dialog slot's serial, by [`Front`]: bumped whenever the slot is set or cleared other
+    /// than by the owner's own key in that dialog (those come in the pass's draw), so
+    /// [`GitView::fronts`] tells a dialog replaced by another of its kind — a result by the next —
+    /// from the one that was up (F-git-listq).
+    front_serials: [u64; Front::KINDS],
     /// The Backups list in the body (Cmd/Ctrl+B, 03 §8.2).
     backups: Option<backups::BackupsView>,
     /// The command log in the body (Cmd/Ctrl+L, 03 §3.7).
@@ -489,6 +494,27 @@ pub struct GitView {
     /// while egui draws it, so the blanking is proved through these until their units land.
     #[cfg(test)]
     pub test_covers: Vec<Cells>,
+}
+
+/// A dialog slot of a panel's (F-git-listq): the planner's own dialogs and the log's entry shown
+/// whole in the body, the filters, the history search, the menu, a quick edit's, an action's, the
+/// result, "Stop git?" ([`GitView::fronts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Front {
+    Planner,
+    Entry,
+    Filters,
+    Search,
+    Menu,
+    Quick,
+    Dialog,
+    Result,
+    Stop,
+}
+
+impl Front {
+    /// How many slots there are.
+    pub const KINDS: usize = 9;
 }
 
 /// The results that wait behind the one up (F-git-outcome). While a result is up it has the
@@ -617,6 +643,7 @@ impl GitView {
             result_screen: ResultScreen::default(),
             results_dropped: 0,
             stop_question: None,
+            front_serials: [0; Front::KINDS],
             backups: None,
             log: None,
             to_copy: None,
@@ -871,6 +898,7 @@ impl GitView {
     pub fn open_filters(&mut self) {
         // The dialog has the typing: Find, which would keep it, closes.
         self.find = None;
+        self.bump(Front::Filters);
         self.filters_dialog = Some(filters::Dialog::new(
             &self.filters,
             &self.refs,
@@ -1181,6 +1209,7 @@ impl GitView {
         }
         match command {
             Command::HistorySearch => {
+                self.bump(Front::Search);
                 self.search_dialog = Some(find::SearchDialog::default());
                 return Vec::new();
             }
@@ -1422,6 +1451,34 @@ impl GitView {
         self.dialog_elsewhere = up;
     }
 
+    /// Every dialog slot of the panel's, by [`Front`]: whether it is up, and its serial
+    /// (F-git-listq). The integration compares them across its own pass (`Browser::ui`): a slot
+    /// that opened, was replaced (by another of its kind too: the serial) or closed there holds
+    /// what the owner's keys of that pass were not pressed at — whichever of the panel's dialogs
+    /// those keys would reach, so no order of precedence between them is guessed at.
+    pub fn fronts(&self) -> [(bool, u64); Front::KINDS] {
+        let planner = self.planner.as_ref().is_some_and(|p| p.dialog_up());
+        let entry = self.log.as_ref().is_some_and(|l| l.whole().is_some());
+        // In `Front`'s order.
+        let up = [
+            planner,
+            entry,
+            self.filters_dialog.is_some(),
+            self.search_dialog.is_some(),
+            self.menu.is_some(),
+            self.quick.is_some(),
+            self.dialog.is_some(),
+            self.result.is_some(),
+            self.stop_question.is_some(),
+        ];
+        std::array::from_fn(|k| (up[k], self.front_serials[k]))
+    }
+
+    /// Slot `kind` set or cleared: its serial moves on ([`GitView::fronts`]).
+    fn bump(&mut self, kind: Front) {
+        self.front_serials[kind as usize] += 1;
+    }
+
     /// A dialog is up — the filters', history search's, S3's menu, action dialog, result, "Stop
     /// git?", the log's whole entry, S4's quick edit dialog and the planner's own (its message,
     /// author, question and run): it has the keyboard (its own Enter and Esc), and Esc is its.
@@ -1599,6 +1656,7 @@ impl GitView {
             None => self.backups = Some(backups::BackupsView::new(records)),
         }
         self.log = None;
+        self.bump(Front::Entry);
     }
 
     /// The Backups list's groups as it shows them (`None` while it is closed).
@@ -1611,6 +1669,7 @@ impl GitView {
         // Its keys are its own: Find, which would keep Enter and Esc, closes (X4-find).
         self.find = None;
         self.log = Some(log_view::LogView::new(entries));
+        self.bump(Front::Entry);
         self.backups = None;
     }
 
@@ -1622,6 +1681,8 @@ impl GitView {
 
     /// The log's entries again, while it shows (its bar stays on its entry).
     pub fn set_log(&mut self, entries: Vec<LogEntry>) {
+        // No slot changes here: the entry shown whole is found again by itself, or goes (its
+        // slot's up flag says so, `GitView::fronts`).
         if let Some(log) = &mut self.log {
             log.set_entries(entries);
         }
@@ -1661,6 +1722,7 @@ impl GitView {
         if self.result.is_none() {
             self.result = Some(result);
             self.result_screen.next();
+            self.bump(Front::Result);
             return;
         }
         if self.waiting.len() >= RESULTS_WAITING {
@@ -1673,6 +1735,7 @@ impl GitView {
     /// "Stop git?" (03 §3.4) over the write `what`, the run of id `run`, running for 10 s.
     pub fn ask_stop(&mut self, what: String, run: u64) {
         self.stop_question = Some((what, run));
+        self.bump(Front::Stop);
     }
 
     /// "Stop git?" goes once the run it asks about no longer runs — `runs` says whether the run of
@@ -1684,6 +1747,7 @@ impl GitView {
             .is_some_and(|(_, id)| !runs(*id))
         {
             self.stop_question = None;
+            self.bump(Front::Stop);
         }
     }
 
@@ -1695,7 +1759,10 @@ impl GitView {
             return Vec::new();
         };
         match dialogs::ActionDialog::confirm(action, repo, dialogs::PLAN) {
-            dialogs::Opened::Dialog(dialog) => self.dialog = Some(dialog),
+            dialogs::Opened::Dialog(dialog) => {
+                self.dialog = Some(dialog);
+                self.bump(Front::Dialog);
+            }
             dialogs::Opened::Run(action) => {
                 let what = menu::label(action.id()).trim_end_matches('…');
                 self.said = Some(Status::info(format!("{what}: run it again")));
@@ -1712,6 +1779,7 @@ impl GitView {
     pub fn confirm_again(&mut self, action: Action) -> Vec<GitAction> {
         if self.waiting.pop_back().is_none() {
             self.result = None;
+            self.bump(Front::Result);
         }
         self.confirm(action)
     }
@@ -1988,6 +2056,7 @@ impl GitView {
             dialogs::Opened::Run(action) => vec![GitAction::Run(action)],
             dialogs::Opened::Dialog(dialog) => {
                 self.dialog = Some(dialog);
+                self.bump(Front::Dialog);
                 Vec::new()
             }
         }
@@ -2020,6 +2089,7 @@ impl GitView {
                 Vec::new()
             }
             (A::Search, _) => {
+                self.bump(Front::Search);
                 self.search_dialog = Some(find::SearchDialog::default());
                 Vec::new()
             }
@@ -2157,6 +2227,7 @@ impl GitView {
         };
         if let Some(repo) = &self.repo {
             self.menu = Some(menu::HistoryMenu::new(target, eligible, repo));
+            self.bump(Front::Menu);
         }
     }
 
@@ -2191,11 +2262,13 @@ impl GitView {
                 Command::Bar(_) | Command::Details | Command::Back => {
                     if log.run(command) == Some(log_view::LogEnd::Close) {
                         self.log = None;
+                        self.bump(Front::Entry);
                     }
                     Vec::new()
                 }
                 Command::Log => {
                     self.log = None;
+                    self.bump(Front::Entry);
                     Vec::new()
                 }
                 Command::Backups => vec![GitAction::Backups],
@@ -2356,6 +2429,8 @@ impl GitView {
             if result.ui(ctx, grid) && seen {
                 self.result = self.waiting.pop_front();
                 self.result_screen.next();
+                // The owner's own close, in the draw: each result keeps a serial of its own.
+                self.bump(Front::Result);
                 let dropped = std::mem::take(&mut self.results_dropped);
                 if let Some(next) = &mut self.result {
                     next.say_dropped(dropped);
@@ -2589,6 +2664,7 @@ impl GitView {
         match planner::QuickDialog::open(id, this, below, repo, planner::PLAN) {
             planner::QuickOpened::Dialog(dialog) => {
                 self.quick = Some(dialog);
+                self.bump(Front::Quick);
                 Vec::new()
             }
             planner::QuickOpened::Run(edit) => vec![GitAction::RunEdit(edit)],
@@ -2603,6 +2679,7 @@ impl GitView {
         };
         self.find = None;
         self.planner = Some(planner::PlannerView::new(model, repo));
+        self.bump(Front::Planner);
     }
 
     /// The open action dialog's "Plan the commits first…" button, when it draws one (tests).
@@ -2630,11 +2707,13 @@ impl GitView {
             None => Vec::new(),
             Some(planner::PlannerEnd::Close) => {
                 self.planner = None;
+                self.bump(Front::Planner);
                 Vec::new()
             }
             Some(planner::PlannerEnd::Run(edit)) => {
                 let shown = self.planner.as_mut().and_then(|p| p.take_shown());
                 self.planner = None;
+                self.bump(Front::Planner);
                 self.confirmed_edit = shown.filter(|(e, _)| *e == edit);
                 vec![GitAction::RunEdit(edit)]
             }
@@ -2650,6 +2729,7 @@ impl GitView {
         match planner::QuickDialog::confirm(edit, repo, planner::PLAN) {
             planner::QuickOpened::Dialog(dialog) => {
                 self.quick = Some(dialog);
+                self.bump(Front::Quick);
                 Vec::new()
             }
             planner::QuickOpened::Run(edit) => vec![GitAction::RunEdit(edit)],
@@ -2673,7 +2753,10 @@ impl GitView {
             return;
         };
         match planner::QuickDialog::confirm(edit, repo, planner::PLAN) {
-            planner::QuickOpened::Dialog(dialog) => self.quick = Some(dialog),
+            planner::QuickOpened::Dialog(dialog) => {
+                self.quick = Some(dialog);
+                self.bump(Front::Quick);
+            }
             planner::QuickOpened::Run(_) | planner::QuickOpened::Planner(_) => {
                 self.said = Some(Status::info("the history edit: run it again"));
             }
