@@ -212,6 +212,13 @@ pub fn set_presented(ctx: &egui::Context, presented: bool) {
     });
 }
 
+/// Says that what the screen shows of `ctx` is none of its frames' (the terminal's switch, whose
+/// passes ran on its dimmed screen before it says so): nothing counts as shown until a frame is
+/// printed again, whatever [`set_presented`] said before (X4-quick fix-check).
+pub fn set_unseen(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(unpresented_id(), Unpresented { since: 0 }));
+}
+
 /// Whether the pass before this one reached the screen ([`set_presented`]). A screen that acts
 /// only on what was on screen keeps its paintings in an [`OnScreen`].
 pub fn presented(ctx: &egui::Context) -> bool {

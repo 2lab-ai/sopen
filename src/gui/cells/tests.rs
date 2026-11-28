@@ -1150,6 +1150,31 @@ fn on_screen_a_printed_gap_then_an_unprinted_frame_shows_nothing() {
     assert_eq!(turn(&ctx, &mut screen, None), Some(2));
 }
 
+/// The terminal's switch runs passes on its dimmed screen before it says so: after `set_unseen`
+/// none of them counts — nothing shows until a frame is printed again (X4-quick fix-check).
+#[test]
+fn on_screen_nothing_shows_after_set_unseen_until_a_printed_frame() {
+    let ctx = egui::Context::default();
+    let mut screen = OnScreen::default();
+    turn(&ctx, &mut screen, Some(1));
+    assert_eq!(turn(&ctx, &mut screen, Some(1)), Some(1));
+    turn(&ctx, &mut screen, Some(2));
+    turn(&ctx, &mut screen, Some(2));
+    set_unseen(&ctx);
+    assert_eq!(
+        turn(&ctx, &mut screen, Some(3)),
+        None,
+        "the switch's screen"
+    );
+    assert_eq!(
+        turn(&ctx, &mut screen, Some(3)),
+        None,
+        "nothing printed since"
+    );
+    set_presented(&ctx, true);
+    assert_eq!(turn(&ctx, &mut screen, None), Some(3));
+}
+
 /// Two passes of one frame (egui's discarded one first) ask in turn: both get the frame's answer,
 /// and the frame's painting is its last pass's.
 #[test]

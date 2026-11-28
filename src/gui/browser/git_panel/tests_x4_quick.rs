@@ -240,11 +240,19 @@ struct Host {
     /// Passes left in which the dialog is not drawn (a viewer over it, `browser.rs`' Enter
     /// viewer): the screen shows something else.
     skip: usize,
+    /// Each frame's first pass asks egui to discard it (a second pass runs, its output shown).
+    discard: bool,
+    /// The passes run.
+    passes: usize,
 }
 
 impl Window for Host {
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.passes += 1;
+        if self.discard && ctx.current_pass_index() == 0 {
+            ctx.request_discard("a test's discarded pass");
+        }
         let grid = Grid::over(ctx.content_rect());
         // The screen under it, the cells it covers blanked first (cells.rs's rule).
         let body = Pen::new(PALETTE.text, PALETTE.back);
@@ -304,6 +312,8 @@ impl Fx {
                 ends: Vec::new(),
                 covers: Vec::new(),
                 skip: 0,
+                discard: false,
+                passes: 0,
             },
         }
     }
@@ -1213,6 +1223,78 @@ fn x4q_an_enter_that_commits_a_composition_runs_nothing() {
     assert_eq!(message(&fx), "가third\n\nbody of third\n");
 }
 
+fn preedit(text: &str) -> Event {
+    Event::Ime(egui::ImeEvent::Preedit {
+        text: text.into(),
+        active_range_chars: None,
+    })
+}
+
+/// The author's name a run returned.
+fn ran_author(fx: &Fx) -> String {
+    match &fx.host.ends[..] {
+        [QuickEnd::Run(Edit::Quick(Quick::Author { author, .. }))] => author.name.clone(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A composition ends with a click — it interrupts the input method, which then sends only
+/// winit's `Disabled`, which egui-winit drops: no event reaches egui — so Enter runs what shows
+/// (X4-quick fix-check): Reword, `가` composed, a click on the message's own cells.
+#[test]
+fn x4q_a_click_in_the_field_ends_a_composition() {
+    let mut fx = Fx::new(open(EditId::Reword, fake), fake, 100, 30);
+    fx.frame(vec![preedit("가")]);
+    let at = place(&fx.boxed("Fake reword"), "가third");
+    fx.drv.click(&mut fx.host, at_cell(at.x + 3, at.y));
+    fx.press(Key::Enter);
+    assert_eq!(fx.host.ends, [reword("가third\n\nbody of third\n")]);
+}
+
+/// Author: composed in Name, a click into Email ends it, Enter runs.
+#[test]
+fn x4q_a_click_into_another_field_ends_a_composition() {
+    let mut fx = Fx::new(open(EditId::Author, fake), fake, 100, 30);
+    fx.frame(vec![preedit("가")]);
+    let at = place(&fx.boxed("Fake author"), "ada@example.com");
+    fx.drv.click(&mut fx.host, at_cell(at.x + 1, at.y));
+    fx.press(Key::Enter);
+    assert_eq!(ran_author(&fx), "Ada가");
+}
+
+/// Author: composed in Name, the keyboard moved to Email without a click ends it too, Enter runs.
+#[test]
+fn x4q_the_keyboard_leaving_the_composing_field_ends_it() {
+    let mut fx = Fx::new(open(EditId::Author, fake), fake, 100, 30);
+    fx.frame(vec![preedit("가")]);
+    fx.focus(planner::quick_field(1));
+    fx.press(Key::Enter);
+    assert_eq!(ran_author(&fx), "Ada가");
+}
+
+/// A frame of two passes, egui's discarded one first (`request_discard`): both are told the same
+/// screen, and what the frame showed is its last pass's painting — typed into in the first pass,
+/// the next frame's Enter runs what the second painted (X4-quick fix-check).
+#[test]
+fn x4q_a_frame_s_discarded_pass_and_its_last() {
+    let mut fx = Fx::new(open(EditId::Reword, fake), fake, 100, 30);
+    let passes = fx.host.passes;
+    fx.host.discard = true;
+    fx.raw(vec![Event::Text("x".into())]);
+    fx.host.discard = false;
+    assert_eq!(fx.host.passes, passes + 2, "the frame ran two passes");
+    let answers = fx.dialog_mut().answers();
+    let n = answers.len();
+    assert_eq!(
+        answers[n - 2],
+        answers[n - 1],
+        "one answer a frame: {answers:?}"
+    );
+    assert!(answers[n - 1].is_some(), "{answers:?}");
+    fx.raw(vec![down(Key::Enter)]);
+    assert_eq!(fx.host.ends, [reword("xthird\n\nbody of third\n")]);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Through the terminal.
 
@@ -1313,6 +1395,8 @@ fn in_a_terminal(
             ends: Vec::new(),
             covers: Vec::new(),
             skip: 0,
+            discard: false,
+            passes: 0,
         },
         ends,
     };

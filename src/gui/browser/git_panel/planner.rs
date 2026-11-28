@@ -477,7 +477,7 @@ pub struct QuickDialog {
     /// What it is called until a plan names it.
     label: String,
     /// The edit as the options make it now.
-    draft: Edit,
+    draft: Draft,
     /// reword's and squash's message field.
     message: Option<String>,
     /// author's fields.
@@ -495,8 +495,8 @@ pub struct QuickDialog {
     /// What the box shows, as a number: one more each time the draft changes or `shows` does, so
     /// a pass's painting is this, never a copy of the draft (X4-quick round 1: a 1 MiB message).
     revision: u64,
-    /// The message or a field is in an input method's composition, as the last pass left it.
-    composing: bool,
+    /// The field in an input method's composition, as the last pass left it.
+    composing: Option<egui::Id>,
     /// Its first field took the keyboard last pass (on its first, not yet).
     typing: bool,
     /// The first of the plan's rows shown.
@@ -510,6 +510,9 @@ pub struct QuickDialog {
     screen: cells::OnScreen<Painting>,
     /// A pass has laid the box out (the next one paints where it can be seen).
     laid_once: bool,
+    /// What each pass was told the screen shows (the tests: one answer a frame).
+    #[cfg(test)]
+    answers: Vec<Option<Painting>>,
 }
 
 /// What a pass of a quick edit's dialog painted: the revision of what it shows — the draft, its
@@ -560,6 +563,32 @@ fn copy_of(edit: &Edit) -> Edit {
         copying(message.len());
     }
     edit.clone()
+}
+
+/// A quick edit's dialog's edit. Every copy of it counts its message's bytes ([`copy_of`]),
+/// wherever it is made: a `clone()` of the draft that comes back in a pass is seen (X4-quick
+/// fix-check), not only the copies the dialog says it makes.
+#[derive(Debug)]
+struct Draft(Edit);
+
+impl Clone for Draft {
+    fn clone(&self) -> Self {
+        Draft(copy_of(&self.0))
+    }
+}
+
+impl std::ops::Deref for Draft {
+    type Target = Edit;
+
+    fn deref(&self) -> &Edit {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Draft {
+    fn deref_mut(&mut self) -> &mut Edit {
+        &mut self.0
+    }
 }
 
 /// A quick edit's dialog's nominal width in cells, as egui's was (10 §6's rule widens it to its
@@ -684,7 +713,7 @@ impl QuickDialog {
     ) -> QuickDialog {
         QuickDialog {
             label,
-            draft,
+            draft: Draft(draft),
             message,
             author,
             refused,
@@ -693,20 +722,29 @@ impl QuickDialog {
             planned: None,
             shows: Shows::default(),
             revision: 0,
-            composing: false,
+            composing: None,
             typing: false,
             plan_top: 0,
             changed: false,
             screen: cells::OnScreen::default(),
             laid_once: false,
+            #[cfg(test)]
+            answers: Vec::new(),
         }
+    }
+
+    /// What each pass was told the screen shows, as `(revision, runs)` (the tests).
+    #[cfg(test)]
+    pub(super) fn answers(&self) -> Vec<Option<(u64, bool)>> {
+        let pair = |p: &Painting| (p.revision, p.runs);
+        self.answers.iter().map(|a| a.as_ref().map(pair)).collect()
     }
 
     fn start(mut self, planner: EditPlanner) -> QuickOpened {
         self.update(planner);
         let options = self.message.is_some() || self.author.is_some();
         if !options && matches!(&self.planned, Some((_, Ok(Plan { confirm: None, .. })))) {
-            return QuickOpened::Run(self.draft);
+            return QuickOpened::Run(self.draft.0);
         }
         QuickOpened::Dialog(Box::new(self))
     }
@@ -740,7 +778,7 @@ impl QuickDialog {
     /// The draft from the fields (a date that does not read leaves it as it was); whether it
     /// changed, its revision one more. A message is compared, and copied only when it changed.
     fn sync(&mut self) -> bool {
-        let changed = match &mut self.draft {
+        let changed = match &mut *self.draft {
             Edit::Quick(Quick::Reword { message, .. } | Quick::Squash { message, .. }) => {
                 match &self.message {
                     Some(m) if m != message => {
@@ -943,20 +981,28 @@ impl QuickDialog {
         let enters = take_enters(ctx, began.is_some() && !in_field, in_field);
         // An Enter that commits an input method's composition — in a pass of its composition, or
         // while it composes — is the composition's (an integration that passes it on sends it
-        // with the commit), never the dialog's: it runs nothing. A composition is a field's: one
-        // left without its commit (egui-winit drops winit's `Disabled`) ends with the keyboard
-        // leaving the field.
-        let composing = self.composing && in_field;
-        let composed = ctx.input(|i| composition(&i.events, composing));
-        let enters = match composing || composed.is_some() {
+        // with the commit), never the dialog's: it runs nothing. A composition is its field's,
+        // and one may end with no event at all (egui-winit drops winit's `Disabled`): a pointer
+        // press ends it — a click interrupts the input method — and so does the keyboard on
+        // another control than the field that composes (X4-quick fix-check).
+        let pressed = ctx.input(|i| i.pointer.any_pressed());
+        let composing = (self.composing).filter(|id| began == Some(*id) && !pressed);
+        let composed = ctx.input(|i| composition(&i.events, composing.is_some()));
+        let enters = match composing.is_some() || composed.is_some() {
             true => Vec::new(),
             false => enters,
         };
-        self.composing = composed.unwrap_or(composing);
+        self.composing = match composed {
+            Some(true) => began.filter(|id| fields.contains(id)),
+            Some(false) => None,
+            None => composing,
+        };
         let (layout, fits) = self.layout(grid);
         // What the owner saw — the painting of the last pass that reached the screen (the
         // terminal prints none while input waits) — and what this pass paints.
         let seen = self.screen.start(ctx).copied();
+        #[cfg(test)]
+        self.answers.push(seen);
         if std::mem::replace(&mut self.laid_once, true) {
             let painting = self.painted(fits);
             self.screen.painted(painting);
@@ -1024,7 +1070,7 @@ impl QuickDialog {
             ctx.request_repaint();
             return None;
         }
-        end.runs.then(|| QuickEnd::Run(copy_of(&self.draft)))
+        end.runs.then(|| QuickEnd::Run(self.draft.clone().0))
     }
 }
 
