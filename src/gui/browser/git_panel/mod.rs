@@ -408,6 +408,8 @@ pub struct GitView {
     filters: Filters,
     filters_dialog: Option<filters::Dialog>,
     find: Option<find::Find>,
+    /// Find's ids: the panel's own, whatever its column or `ui` (`find::panel_key`, X4-find).
+    find_key: egui::Id,
     search_dialog: Option<find::SearchDialog>,
     search: Option<find::Results>,
     pane: Option<details::Pane>,
@@ -525,6 +527,7 @@ impl GitView {
             filters: Filters::default(),
             filters_dialog: None,
             find: None,
+            find_key: find::panel_key(),
             search_dialog: None,
             search: None,
             pane: None,
@@ -1008,11 +1011,33 @@ impl GitView {
         changed
     }
 
-    /// Enter (`forward`) or Shift+Enter in Find: the next or the previous match.
-    fn find_step(&mut self, forward: bool) -> Option<GitAction> {
-        self.refresh_find();
-        let at = self.find.as_ref()?.step(self.graph_scroll.bar, forward)?;
-        self.move_bar(at)
+    /// Enter (`forward`) or Shift+Enter in Find: the next or the previous match — after the jump
+    /// to the first match a text typed before it in the pass owes (X4-find).
+    fn find_step(&mut self, forward: bool) -> Vec<GitAction> {
+        let mut asked = self.find_jump();
+        let at = self
+            .find
+            .as_ref()
+            .and_then(|f| f.step(self.graph_scroll.bar, forward));
+        asked.extend(at.and_then(|at| self.move_bar(at)));
+        asked
+    }
+
+    /// Find's matches brought up to date, and the bar on the first match from where Find opened
+    /// when its text or case changed.
+    fn find_jump(&mut self) -> Vec<GitAction> {
+        if !self.refresh_find() {
+            return Vec::new();
+        }
+        let first = self.find.as_ref().and_then(find::Find::first);
+        first.and_then(|to| self.move_bar(to)).into_iter().collect()
+    }
+
+    /// Esc in Find: closed, with the bar where what was typed before it put it (X4-find).
+    fn find_close(&mut self) -> Vec<GitAction> {
+        let asked = self.find_jump();
+        self.find = None;
+        asked
     }
 
     /// Enter or F3 on the graph's bar (03 §6.1, §6.4): one other marked row compares it with the
@@ -1061,9 +1086,9 @@ impl GitView {
         vec![GitAction::Details(subject)]
     }
 
-    /// Carries out `command` (the key table's git context) on the view, and gives what is left
-    /// for the integration.
-    fn run(&mut self, command: Command) -> Vec<GitAction> {
+    /// Carries out `command` (the key table's git context) on the view in a pass of `ctx`, and
+    /// gives what is left for the integration.
+    fn run(&mut self, ctx: &egui::Context, command: Command) -> Vec<GitAction> {
         use GitAction as A;
         match command {
             Command::Help => return vec![A::Help],
@@ -1082,7 +1107,7 @@ impl GitView {
         // Cmd/Ctrl+L and B to switch or close it; every other key does nothing — the graph under
         // it, and so its bar's object, is not on screen.
         if self.log.is_some() || self.backups.is_some() {
-            return self.run_list(command);
+            return self.run_list(ctx, command);
         }
         match command {
             Command::HistorySearch => {
@@ -1499,6 +1524,8 @@ impl GitView {
 
     /// The Backups list (03 §8.2) in the body, or read again while it shows (the bar stays).
     pub fn open_backups(&mut self, records: Vec<Record>) {
+        // Its keys are its own: Find, which would keep Enter and Esc, closes (X4-find).
+        self.find = None;
         match &mut self.backups {
             Some(list) => list.set_records(records),
             None => self.backups = Some(backups::BackupsView::new(records)),
@@ -1513,6 +1540,8 @@ impl GitView {
 
     /// The command log (03 §3.7) in the body, newest first.
     pub fn open_log(&mut self, entries: Vec<LogEntry>) {
+        // Its keys are its own: Find, which would keep Enter and Esc, closes (X4-find).
+        self.find = None;
         self.log = Some(log_view::LogView::new(entries));
         self.backups = None;
     }
@@ -2051,7 +2080,7 @@ impl GitView {
     /// rows (the log: the bar, Enter or F3 to show an entry whole, Esc; the Backups list: also
     /// Cmd/Ctrl+Z and F8 on the line under its bar); Cmd/Ctrl+L or B closes its list or opens the
     /// other; anything else is taken and does nothing.
-    fn run_list(&mut self, command: Command) -> Vec<GitAction> {
+    fn run_list(&mut self, ctx: &egui::Context, command: Command) -> Vec<GitAction> {
         if let Some(log) = &mut self.log {
             return match command {
                 Command::Bar(_) | Command::Details | Command::Back => {
@@ -2075,7 +2104,7 @@ impl GitView {
                 | Command::Undo
                 | Command::Remove
                 | Command::Back => {
-                    let end = list.run(command);
+                    let end = list.run(ctx, command);
                     self.backups_end(end)
                 }
                 Command::Backups => {
@@ -2149,7 +2178,7 @@ impl GitView {
                 // A key line of the repository's menu (10 T17): as its key runs it.
                 Some(menu::HistoryMenuEnd::Menu(menu::MenuEnd::Key(command))) => {
                     self.menu = None;
-                    self.run(command)
+                    self.run(ctx, command)
                 }
                 Some(menu::HistoryMenuEnd::Menu(menu::MenuEnd::Cancel)) => {
                     self.menu = None;
@@ -2674,9 +2703,10 @@ fn menu_hint(history: &menu::HistoryMenu) -> String {
 }
 
 /// The git panel's keys this frame, through the key table's git context (04 §3: exact
-/// modifiers) — the dialog context while Find's field has the typing, nothing while a dialog is
-/// up (it takes its own) — in order: each carried out on the view, what is left for the
-/// integration returned.
+/// modifiers) — while Find's field has the typing, only Find's Enter, Shift+Enter or Esc that
+/// comes before anything typed (`find::take_leading`; the rest are the field's and [`find_ui`]'s),
+/// nothing while a dialog is up (it takes its own) — in order: each carried out on the view, what
+/// is left for the integration returned.
 pub fn keys(ctx: &egui::Context, view: &mut GitView) -> Vec<GitAction> {
     let mut asked = Vec::new();
     while !view.dialog_up() {
@@ -2693,7 +2723,7 @@ pub fn keys(ctx: &egui::Context, view: &mut GitView) -> Vec<GitAction> {
                 break;
             };
             view.said = None;
-            asked.extend(view.run(command));
+            asked.extend(view.run(ctx, command));
             continue;
         }
         if view.search.is_some() {
@@ -2701,15 +2731,15 @@ pub fn keys(ctx: &egui::Context, view: &mut GitView) -> Vec<GitAction> {
             view.find = None;
         }
         if view.find.is_some() {
-            // Find's field has the typing: Enter and Esc, and Shift+Enter, only (04 §3 rule 4).
-            if ctx.input_mut(|i| keys::take(i, Key::Enter, Mods::Shift)) {
-                asked.extend(view.find_step(false));
-                continue;
-            }
-            match ctx.input_mut(|i| keys::find(&mut i.events, Context::Dialog, UPTO)) {
-                Some(Command::Accept) => asked.extend(view.find_step(true)),
-                Some(Command::Cancel) => view.find = None,
-                _ => break,
+            // Find's field has the typing: Enter, Shift+Enter and Esc only (04 §3 rule 4), each
+            // in the pass's order with what is typed into it (X4-find): one before anything typed
+            // acts here, an Esc's rest going on to the graph; the others wait for the field to
+            // type what came before them (`graph_ui`).
+            match ctx.input_mut(|i| find::take_leading(&mut i.events)) {
+                Some(find::FindKey::Next) => asked.extend(view.find_step(true)),
+                Some(find::FindKey::Previous) => asked.extend(view.find_step(false)),
+                Some(find::FindKey::Close) => asked.extend(view.find_close()),
+                None => break,
             }
             continue;
         }
@@ -2725,7 +2755,7 @@ pub fn keys(ctx: &egui::Context, view: &mut GitView) -> Vec<GitAction> {
             break;
         };
         view.said = None;
-        asked.extend(view.run(command));
+        asked.extend(view.run(ctx, command));
     }
     asked
 }
@@ -2786,8 +2816,8 @@ impl Layout {
 }
 
 /// `c` and the border cell right of it on each of its rows, where the details pane egui draws
-/// puts its scroll bar (`details::draw`; the log and the Backups list put theirs in their own
-/// last column).
+/// puts its scroll bar (`details::draw`, while egui draws it; the planner, the log and the Backups
+/// list, in cells, put theirs on the border as the graph does).
 fn with_border(c: Cells) -> Cells {
     Cells::new(c.x, c.y, c.width.saturating_add(1), c.height)
 }
@@ -2873,6 +2903,15 @@ pub fn draw(
             }
             None => {}
         }
+        // What covers the Backups list this pass — a dialog of the list's or the panel's own, the
+        // key help — blanked over it below: its bar's line under one is not on screen (X4-lists).
+        let hidden: Vec<Cells> = match view.backups.is_some() {
+            true => (under.iter().copied())
+                .chain(view.covered(grid))
+                .chain(help::covered(&ctx, grid))
+                .collect(),
+            false => Vec::new(),
+        };
         if view.planner.is_some() {
             // The planner over the body (03 §7.8.2): its keys first while it has the keyboard and
             // no other dialog is up, then the pane, then its own dialog.
@@ -2893,12 +2932,15 @@ pub fn draw(
             }
             asked.extend(view.planner_end(end));
         } else if let Some(log) = &mut view.log {
-            log_view::draw(ui, grid, at.listing, &mut buf, log, active && !dialog);
+            clicks_off(ui, dialog, |ui| {
+                log_view::draw(ui, grid, at.listing, &mut buf, log, active && !dialog)
+            });
             if !log_view::PAINTS_CELLS {
                 eguis.push(at.listing);
             }
         } else if let Some(list) = &mut view.backups {
-            let end = backups::draw(ui, grid, at.listing, &mut buf, list, active && !dialog);
+            let shown = active && !dialog;
+            let end = backups::draw(ui, grid, at.listing, &mut buf, list, shown, &hidden);
             if !backups::PAINTS_CELLS {
                 eguis.push(at.listing);
             }
@@ -2911,7 +2953,7 @@ pub fn draw(
                 &mut buf,
                 at,
                 view,
-                list_active,
+                (list_active, active && !dialog),
                 dialog,
                 &mut eguis,
                 &mut caret,
@@ -2998,15 +3040,13 @@ pub fn draw(
             });
             asked.extend(view.planner_end(end));
         } else if let Some(log) = &mut view.log {
-            log_view::draw(ui, grid, none, &mut buf, log, active && !dialog);
+            clicks_off(ui, dialog, |ui| {
+                log_view::draw(ui, grid, none, &mut buf, log, active && !dialog)
+            });
         } else if view.backups.is_some() {
-        } else if let Some(find) = view.find.as_mut().filter(|_| view.search.is_none()) {
-            caret = find::field(ui, grid, none, &mut buf, find, !dialog);
-            if view.refresh_find() {
-                if let Some(to) = view.find.as_ref().and_then(find::Find::first) {
-                    asked.extend(view.move_bar(to));
-                }
-            }
+        } else if view.find.is_some() && view.search.is_none() {
+            let typing = active && !dialog;
+            asked.extend(find_ui(ui, grid, none, &mut buf, view, typing, &mut caret).0);
         }
     }
     for r in eguis {
@@ -3063,6 +3103,18 @@ pub fn draw(
     asked
 }
 
+/// `f` in `ui`, its clicks off while `off` — a dialog up, this panel's or another panel's beside
+/// it: the command log's rows act on nothing then, not only where egui's modal lies over them
+/// (X4-menu). egui reports no click to a disabled `Ui`'s widgets; the log paints cells into the
+/// panel's buffer, which a disabled `Ui` does not dim, and its own entry shown whole is a modal of
+/// its own.
+fn clicks_off<R>(ui: &mut egui::Ui, off: bool, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    match off {
+        true => ui.add_enabled_ui(false, f).inner,
+        false => f(ui),
+    }
+}
+
 /// The pass's keys and typed text, taken out of its input to be put back after the dialogs.
 fn take_keys(ctx: &egui::Context) -> Vec<egui::Event> {
     ctx.input_mut(|i| {
@@ -3082,10 +3134,75 @@ fn take_keys(ctx: &egui::Context) -> Vec<egui::Event> {
     })
 }
 
-/// The graph's part of a pass ([`draw`]): Find's field in the heads' row (its text changed, the
-/// bar jumps before the rows are drawn) or the column heads, the graph's rows — a history
-/// search's flat list instead while one is shown — and what their clicks ask; the cells egui
-/// draws (Find's field until X4-find) go in `eguis`, Find's caret in `caret`.
+/// Find's field at cells `cells` of `grid` (the heads' row, none in a panel too short for its
+/// parts), typing while `typing` (its panel active, no dialog of the panel's up), and — while it
+/// types — its keys in the pass's order with what is typed into it (X4-find): those after
+/// anything typed are taken out first ([`find::take_trailing`]: the field's engine would end its
+/// typing at an Enter), the field types, the bar jumps to the first match of a changed text, then
+/// each acts — Enter the next match, Shift+Enter the previous, Esc closes Find (the caret gone),
+/// what came after the Esc going on to the graph's keys ([`keys`]). Where those open Find again (a
+/// letter typed after the Esc), the reopened field is laid in the same pass, so the rest of the
+/// pass types into it in order and its cells show what it holds (fix-check: `[x, Esc, y, z]` lost
+/// the z, the row blank for that pass) — the same id at the same cells again, which egui takes for
+/// one widget seen twice, no clash. Its caret in `caret`; what the keys ask, and whether an Esc
+/// left Find closed.
+fn find_ui(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    cells: Cells,
+    buf: &mut Buffer,
+    view: &mut GitView,
+    typing: bool,
+    caret: &mut Option<cells::Position>,
+) -> (Vec<GitAction>, bool) {
+    let ctx = ui.ctx().clone();
+    let key = view.find_key;
+    let mut asked = Vec::new();
+    // Each turn ends at an Esc after typing; the next lays Find again where the rest opened it.
+    let mut typing = typing;
+    loop {
+        // Only the keyboard's own: a panel without it, or under a dialog of its own, leaves the
+        // pass's Enter and Esc to what has the keyboard.
+        let (after, rest) = match typing {
+            true => ctx.input_mut(|i| find::take_trailing(&mut i.events)),
+            false => Default::default(),
+        };
+        if let Some(find) = &mut view.find {
+            *caret = find::field(ui, grid, cells, buf, find, typing, key);
+        }
+        asked.extend(view.find_jump());
+        let mut closed = false;
+        for pressed in after {
+            match pressed {
+                find::FindKey::Next => asked.extend(view.find_step(true)),
+                find::FindKey::Previous => asked.extend(view.find_step(false)),
+                find::FindKey::Close => {
+                    asked.extend(view.find_close());
+                    *caret = None;
+                    ctx.input_mut(|i| find::closed_with(&mut i.events, rest));
+                    asked.extend(keys(&ctx, view));
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        if !closed {
+            return (asked, false);
+        }
+        if view.find.is_none() || view.search.is_some() {
+            return (asked, true);
+        }
+        // Opened again by what followed the Esc: its field this pass, typing unless the rest
+        // opened a dialog of the panel's.
+        typing = typing && !view.dialog_up();
+    }
+}
+
+/// The graph's part of a pass ([`draw`]): Find's field in the heads' row ([`find_ui`]: its text
+/// changed, the bar jumps before the rows are drawn) or the column heads, the graph's rows — a
+/// history search's flat list instead while one is shown — and what their clicks ask; the cells
+/// egui draws go in `eguis`, Find's caret in `caret`. `(list_active, typing)`: the rows have the
+/// keyboard; Find's field has it (its panel active, no dialog of the panel's up).
 #[allow(clippy::too_many_arguments)]
 fn graph_ui(
     ui: &mut egui::Ui,
@@ -3093,25 +3210,25 @@ fn graph_ui(
     buf: &mut Buffer,
     at: &Layout,
     view: &mut GitView,
-    list_active: bool,
+    (list_active, typing): (bool, bool),
     dialog: bool,
     eguis: &mut Vec<Cells>,
     caret: &mut Option<cells::Position>,
 ) -> Vec<GitAction> {
     let mut asked = Vec::new();
-    let heads = match &mut view.find {
-        Some(find) if view.search.is_none() => {
-            *caret = find::field(ui, grid, at.head, buf, find, !dialog);
+    let mut heads = Some(at.head);
+    if view.find.is_some() && view.search.is_none() {
+        let (found, closed) = find_ui(ui, grid, at.head, buf, view, typing, caret);
+        asked.extend(found);
+        if closed {
+            // An Esc after what was typed closed it: this pass's cells show the heads.
+            let p = chrome::PALETTE;
+            cells::fill(buf, at.head, Pen::new(p.text, p.back));
+        } else {
+            heads = None;
             if !find::PAINTS_CELLS {
                 eguis.push(at.head);
             }
-            None
-        }
-        _ => Some(at.head),
-    };
-    if view.find.is_some() && view.refresh_find() {
-        if let Some(to) = view.find.as_ref().and_then(find::Find::first) {
-            asked.extend(view.move_bar(to));
         }
     }
     let no_marks = HashSet::new();

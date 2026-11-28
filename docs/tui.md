@@ -39,15 +39,16 @@ changes: a folder still opens in a window.
   the git panel's graph (its rows, lanes, labels, bar, scroll bar and paging line; clicks, the
   right click and the wheel act on it), its details pane and its banner (a click on a step's
   button is the step's key), its history planner (its rows, bar, scroll bar, note, buttons and
-  keys' hint; clicks and the wheel act on it), its menu (F10, Shift+F10 or a right click: every
-  action of what is under the bar, and in the repository's menu each Ctrl+Shift key of the
-  panel's, which a terminal without the kitty protocol cannot send) and its filters (Ctrl+K)
-  are drawn in the terminal as in the window. What the terminal does not draw yet — the
-  preview of a picture, a video or a sound, the other viewers, the git panel's Find field,
-  command log and Backups list, and the dialogs of the viewers and the git panel's others (the
-  planner's own among them) — is a box saying `F12 shows it in the window` (inside the git
-  panel's frame for its parts); a click on it is F12. F1's key help is drawn in the terminal as
-  in the window.
+  keys' hint), its Find field and history search (a letter typed in the graph or Cmd/Ctrl+F;
+  Cmd/Ctrl+Shift+F) and its command log and Backups list (Cmd/Ctrl+L and B: their rows, bar,
+  scroll bar and buttons, and the log's entry shown whole), its menu (F10, Shift+F10 or a right
+  click: every action of what is under the bar, and in the repository's menu each Ctrl+Shift
+  key of the panel's, which a terminal without the kitty protocol cannot send) and its filters
+  (Ctrl+K), clicks and the wheel acting on each, are drawn in the terminal as in the window.
+  What the terminal does not draw yet — the preview of a picture, a video or a sound, the other
+  viewers, and the dialogs of the viewers and of the git panel (the planner's own among them) —
+  is a box saying `F12 shows it in the window` (inside the git panel's frame for its parts); a
+  click on it is F12. F1's key help is drawn in the terminal as in the window.
 - **Keys**: where the terminal offers the kitty keyboard protocol sopen turns it on and every key
   arrives as in the window. Elsewhere Ctrl+digits and some Ctrl+Shift chords cannot arrive, so
   **Alt+1…0 are F1…F10** (on a Mac the terminal must send Option as Alt). Ctrl is the window's
