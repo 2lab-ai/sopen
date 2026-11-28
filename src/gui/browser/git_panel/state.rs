@@ -1,25 +1,28 @@
 //! The git panel's part of the switch's state (10 §7.4, v2; X4-state): what [`GitView::part`]
 //! takes of a view — the bar and the marks by their rows, the label cursor, the details pane's
 //! subject and keyboard, the filters, Find's open field, an open dialog with what is typed in it
-//! and the planner's plan — and how a new view on the receiving host is given it, a part at a
-//! time as the integration (`switch_state`) gets there: the filters before the graph is read
+//! (from v3, X4-state2, a quick edit's and the planner's own too) and the planner's plan — and
+//! how a new view on the receiving host is given it, a part at a time as the integration
+//! (`switch_state`) gets there: the filters before the graph is read
 //! ([`GitView::give_filters`]); the rest once the bar's row is loaded ([`GitView::give_view`]),
 //! every commit the part names looked up on this host first ([`GitView::commits`]) and what it
 //! lacks left out; the planner opened as Cmd/Ctrl+E opens it, on this host's own range
 //! ([`GitView::open_plan`], [`GitView::give_plan`]), then the dialog as its key opens it, on this
-//! host's own rows, refs and files ([`GitView::give_dialog`]), and what was typed given once it
-//! is open ([`GitView::give_typed`]). Nothing here runs anything: a view of the menu's, or an open
+//! host's own rows, refs and files ([`GitView::give_dialog`]) — a quick edit's from its range
+//! read, the planner's own on its row of the plan given — and what was typed given once it is
+//! open ([`GitView::give_typed`]). Nothing here runs anything: a view of the menu's, or an open
 //! that would run at once, is refused, and what is given starts unseen (its box's `OnScreen`), so
 //! no Enter runs it before the owner has seen it.
 
 use super::filters::{BranchChoice, Filters, Order};
+use super::planner::{copy_text, AuthorForm, QuickDialog, Typed};
 use super::{details, end_text, find, GitAction, GitView, Row, RowKey, Subject, Target};
 use crate::git::actions::ActionId;
-use crate::git::model::Oid;
-use crate::git::rebase::{Author, Base, CommitterDate, Date, Model, Op, Verb};
+use crate::git::model::{CommitRow, Oid};
+use crate::git::rebase::{Author, Base, CommitterDate, Date, Edit, EditId, Model, Op, Quick, Verb};
 use crate::gui::browser::switch_state::{
-    GitAuthor, GitChoice, GitCommitter, GitDetails, GitDialog, GitFilters, GitFind, GitOrder,
-    GitPlan, GitPlanRow, GitRow, GitState, GitSubject, GitTarget, GitText,
+    bound, GitAuthor, GitAuthorForm, GitChoice, GitCommitter, GitDetails, GitDialog, GitFilters,
+    GitFind, GitOrder, GitPlan, GitPlanRow, GitRow, GitState, GitSubject, GitTarget, GitText,
 };
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
@@ -93,6 +96,105 @@ fn committer_of(c: GitCommitter) -> CommitterDate {
         GitCommitter::Keep => CommitterDate::Keep,
         GitCommitter::Now => CommitterDate::Now,
         GitCommitter::Author => CommitterDate::Author,
+    }
+}
+
+/// An author's fields as the state carries them (v3), and back.
+fn form_part(f: &AuthorForm) -> GitAuthorForm {
+    GitAuthorForm {
+        name: f.name.clone(),
+        email: f.email.clone(),
+        date: f.date.clone(),
+        committer: committer_part(f.committer),
+    }
+}
+
+fn form_of(a: &GitAuthorForm) -> AuthorForm {
+    AuthorForm {
+        name: a.name.clone(),
+        email: a.email.clone(),
+        date: a.date.clone(),
+        committer: committer_of(a.committer),
+    }
+}
+
+/// A quick edit's dialog with what is typed in it (v3): reword's or squash's message, author's
+/// fields, on its commit; `None` for any other — a confirmation alone, or one that refuses its
+/// commit's message, holds nothing typed.
+fn quick_part(q: &QuickDialog) -> Option<GitDialog> {
+    let commit = |c: &Oid| c.as_str().to_string();
+    Some(match (q.draft(), q.typed()?) {
+        (Edit::Quick(Quick::Reword { commit: c, .. }), Typed::Message(m)) => GitDialog::Reword {
+            commit: commit(c),
+            message: copy_text(m),
+        },
+        (Edit::Quick(Quick::Squash { commit: c, .. }), Typed::Message(m)) => GitDialog::Squash {
+            commit: commit(c),
+            message: copy_text(m),
+        },
+        (Edit::Quick(Quick::Author { commit: c, .. }), Typed::Author(f)) => GitDialog::Author {
+            commit: commit(c),
+            author: form_part(f),
+        },
+        _ => return None,
+    })
+}
+
+/// Whether `q` holds what is typed in it, as [`quick_part`] takes it.
+fn quick_holds(q: &QuickDialog) -> bool {
+    matches!(
+        (q.draft(), q.typed()),
+        (
+            Edit::Quick(Quick::Reword { .. } | Quick::Squash { .. }),
+            Some(Typed::Message(_))
+        ) | (Edit::Quick(Quick::Author { .. }), Some(Typed::Author(_)))
+    )
+}
+
+/// An open dialog that holds something a switch carries ([`GitView::holding`]).
+#[derive(Debug, Clone, Copy)]
+enum Holds {
+    Quick,
+    Action,
+    Search,
+    Filters,
+    Planner,
+}
+
+impl Holds {
+    /// As the question names it when another crosses in its place.
+    fn named(self) -> &'static str {
+        match self {
+            // Never shown: a quick edit's is always in front. Kept so the match covers each case.
+            Holds::Quick => "what is typed in the history edit's dialog",
+            Holds::Action => "what is typed or chosen in the action's dialog",
+            Holds::Search => "what is typed in the history search",
+            Holds::Filters => "what is chosen in the filters' dialog",
+            Holds::Planner => "what is typed in the planner's dialog",
+        }
+    }
+
+    /// As the question names it when it is in front but past what a state holds of it.
+    fn too_long(self) -> &'static str {
+        match self {
+            Holds::Quick => "what is typed in the history edit's dialog (too long to carry)",
+            Holds::Action => "what is typed or chosen in the action's dialog (too long to carry)",
+            Holds::Search => "what is typed in the history search (too long to carry)",
+            Holds::Filters => "what is chosen in the filters' dialog (too long to carry)",
+            Holds::Planner => "what is typed in the planner's dialog (too long to carry)",
+        }
+    }
+}
+
+/// Whether `q` is quick edit `id`'s dialog on `commit`.
+fn is_quick(q: &QuickDialog, id: EditId, commit: &str) -> bool {
+    match q.draft() {
+        Edit::Quick(
+            quick @ (Quick::Reword { commit: c, .. }
+            | Quick::Squash { commit: c, .. }
+            | Quick::Author { commit: c, .. }),
+        ) => quick.id() == id && c.as_str() == commit,
+        _ => false,
     }
 }
 
@@ -267,48 +369,91 @@ impl GitView {
         }
     }
 
-    /// The open dialog with what is typed in it (the menu, the result, the log's entry, the stop
-    /// question, a confirmation alone, a restore and the planner's question and run hold nothing
-    /// typed).
+    /// The open dialogs that hold something a switch carries — typed or chosen — front first among
+    /// those that hold something, as `modals` draws them over the filters and the history search,
+    /// the history search over the filters, all of them over the planner's own, and the keyboard
+    /// is the front one's: a quick edit's, an action's, the history search's, the filters', the
+    /// planner's own. One crosses — the first, one git dialog at a time ([`GitView::part`]); the
+    /// question names the rest ([`GitView::untaken`]). The menu, the result, the log's entry, the stop question, a
+    /// confirmation alone, a restore and the planner's question and run hold nothing typed.
+    fn holding(&self) -> Vec<Holds> {
+        [
+            (self.quick.as_deref().is_some_and(quick_holds), Holds::Quick),
+            (
+                self.dialog.as_deref().is_some_and(|d| d.carried()),
+                Holds::Action,
+            ),
+            (self.search_dialog.is_some(), Holds::Search),
+            (self.filters_dialog.is_some(), Holds::Filters),
+            (
+                self.planner.as_ref().is_some_and(|p| p.typed().is_some()),
+                Holds::Planner,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(open, what)| open.then_some(what))
+        .collect()
+    }
+
+    /// The front one of [`GitView::holding`] with what is typed or chosen in it.
     fn dialog_part(&self) -> Option<GitDialog> {
-        if let Some(d) = &self.filters_dialog {
-            let (filters, typed) = d.taken();
-            let filters = filters_part(filters);
-            let typed = typed.to_string();
-            return Some(GitDialog::Filters { filters, typed });
-        }
-        if let Some(d) = &self.search_dialog {
-            let q = &d.query;
-            let fields = [&q.message, &q.author, &q.text, &q.path, &q.since, &q.until];
-            let fields = fields.map(|f| f.clone());
-            return Some(GitDialog::Search {
-                fields,
-                case: q.case,
-            });
-        }
-        let (id, on, texts, choices) = self.dialog.as_ref()?.taken()?;
-        let texts = (texts.into_iter())
-            .map(|(field, text)| GitText { field, text })
-            .collect();
-        let choices = (choices.into_iter())
-            .map(|(row, chosen)| GitChoice { row, chosen })
-            .collect();
-        let (id, on) = (id.as_str().to_string(), target_part(on));
-        Some(GitDialog::Action {
-            id,
-            on,
-            texts,
-            choices,
+        Some(match self.holding().first()? {
+            Holds::Quick => quick_part(self.quick.as_deref()?)?,
+            Holds::Action => {
+                let (id, on, texts, choices) = self.dialog.as_ref()?.taken()?;
+                let texts = (texts.into_iter())
+                    .map(|(field, text)| GitText { field, text })
+                    .collect();
+                let choices = (choices.into_iter())
+                    .map(|(row, chosen)| GitChoice { row, chosen })
+                    .collect();
+                let (id, on) = (id.as_str().to_string(), target_part(on));
+                GitDialog::Action {
+                    id,
+                    on,
+                    texts,
+                    choices,
+                }
+            }
+            Holds::Search => {
+                let q = &self.search_dialog.as_ref()?.query;
+                let fields = [&q.message, &q.author, &q.text, &q.path, &q.since, &q.until];
+                let fields = fields.map(|f| f.clone());
+                GitDialog::Search {
+                    fields,
+                    case: q.case,
+                }
+            }
+            Holds::Filters => {
+                let (filters, typed) = self.filters_dialog.as_ref()?.taken();
+                let filters = filters_part(filters);
+                let typed = typed.to_string();
+                GitDialog::Filters { filters, typed }
+            }
+            Holds::Planner => {
+                let (commit, typed) = self.planner.as_ref()?.typed()?;
+                let commit = commit.as_str().to_string();
+                match typed {
+                    Typed::Message(m) => GitDialog::PlanMessage {
+                        commit,
+                        message: copy_text(m),
+                    },
+                    Typed::Author(f) => GitDialog::PlanAuthor {
+                        commit,
+                        author: form_part(f),
+                    },
+                }
+            }
         })
     }
 
-    /// What of this panel's the switch's question says is dropped (10 §7.4, v2), each as it names
-    /// it: of a panel the state does not carry (`carried` false: not on screen), its planner's plan
-    /// and its open dialog; of one it carries, what is typed in a quick edit's dialog or the
-    /// planner's own message or author dialog (X4-state2's), and what is chosen in a restore's.
+    /// What of this panel's the switch's question says is dropped (10 §7.4), each as it names it:
+    /// of a panel the state does not carry (`carried` false: not on screen), its planner's plan and
+    /// its open dialog; of one it carries, what is chosen in a restore's, the front dialog's typing
+    /// when it is past what a state holds (`fit` leaves it out), and what is typed or chosen in
+    /// each dialog behind the one that crosses ([`GitView::holding`]).
     pub fn untaken(&self, carried: bool) -> Vec<&'static str> {
         use crate::git::actions::Action;
-        use crate::git::rebase::{Edit, Quick};
         if !carried {
             let plan = self
                 .planner
@@ -318,29 +463,63 @@ impl GitView {
                 (self.dialog_up()).then_some("the open dialog of a git panel not on screen");
             return plan.into_iter().chain(dialog).collect();
         }
-        let typed = |q: &super::planner::QuickDialog| {
-            matches!(
-                q.draft(),
-                Edit::Quick(Quick::Reword { .. } | Quick::Squash { .. } | Quick::Author { .. })
-            )
-        };
         let restore =
             |d: &super::dialogs::ActionDialog| matches!(d.draft(), Action::Restore { .. });
-        [
-            (self.quick.as_deref().is_some_and(typed))
-                .then_some("what is typed in the history edit's dialog"),
-            (self.dialog.as_deref().is_some_and(restore))
-                .then_some("what is chosen in the restore's dialog"),
-            (self.planner.as_ref().is_some_and(|p| p.typing()))
-                .then_some("what is typed in the planner's dialog"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
+        let restore = (self.dialog.as_deref().is_some_and(restore))
+            .then_some("what is chosen in the restore's dialog");
+        let holding = self.holding();
+        // The front one crosses — unless it is past what a state holds of it.
+        let front = (holding.first())
+            .filter(|_| !self.carried_whole())
+            .map(|h| h.too_long());
+        let behind = holding.iter().skip(1).map(|h| h.named());
+        restore.into_iter().chain(front).chain(behind).collect()
+    }
+
+    /// Whether the dialog that crosses ([`GitView::dialog_part`]'s) is within what a state holds
+    /// of what is typed in it — the bounds `GitState::check_typed` holds those texts to, by which
+    /// `fit` would leave it out: a message or a field's text [`bound::TEXT`], an author's name,
+    /// email and date [`bound::NAME`], the filters' names as `check_filters` holds them. Read in
+    /// place, nothing copied: the question asks it every pass it is up (F-git-drafted's rule).
+    fn carried_whole(&self) -> bool {
+        let text = |t: &str| t.len() <= bound::TEXT;
+        let typed = |t: Typed| match t {
+            Typed::Message(m) => text(m),
+            Typed::Author(f) => [&f.name, &f.email, &f.date]
+                .iter()
+                .all(|t| t.len() <= bound::NAME),
+        };
+        let Some(front) = self.holding().first().copied() else {
+            return true;
+        };
+        match front {
+            Holds::Quick => (self.quick.as_deref().and_then(|q| q.typed())).is_none_or(typed),
+            Holds::Action => (self.dialog.as_deref()).is_none_or(|d| d.texts_within(bound::TEXT)),
+            Holds::Search => self.search_dialog.as_ref().is_none_or(|d| {
+                let q = &d.query;
+                [&q.message, &q.author, &q.text, &q.path, &q.since, &q.until]
+                    .iter()
+                    .all(|f| text(f))
+            }),
+            Holds::Filters => self.filters_dialog.as_ref().is_none_or(|d| {
+                let (f, typed) = d.taken();
+                let names = |n: usize, mut all: std::collections::btree_set::Iter<'_, String>| {
+                    n <= bound::NAMES && all.all(|s| s.len() <= bound::NAME)
+                };
+                let branches = match &f.branches {
+                    BranchChoice::All => true,
+                    BranchChoice::Only(chosen) => names(chosen.len(), chosen.iter()),
+                };
+                text(typed) && branches && names(f.hidden_remotes.len(), f.hidden_remotes.iter())
+            }),
+            Holds::Planner => {
+                (self.planner.as_ref().and_then(|p| p.typed())).is_none_or(|(_, t)| typed(t))
+            }
+        }
     }
 
     /// Every commit `part` names, once, to look up on this host before any is used: the bar's,
-    /// the marks', the details pane's, its plan's base, rows and bar, its dialog's target's.
+    /// the marks', the details pane's, its plan's base, rows and bar, its dialog's target or row.
     pub fn commits(part: &GitState) -> Vec<Oid> {
         let mut rows: Vec<&GitRow> = part.bar.iter().chain(&part.marks).collect();
         match part.details.as_ref().map(|d| &d.subject) {
@@ -367,6 +546,13 @@ impl GitView {
                 on: GitTarget::Stash(c),
                 ..
             }) => ids.push(c),
+            Some(
+                GitDialog::Reword { commit, .. }
+                | GitDialog::Squash { commit, .. }
+                | GitDialog::Author { commit, .. }
+                | GitDialog::PlanMessage { commit, .. }
+                | GitDialog::PlanAuthor { commit, .. },
+            ) => ids.push(commit),
             _ => {}
         }
         let mut seen = HashSet::new();
@@ -486,10 +672,13 @@ impl GitView {
     /// `part`'s dialog opened as its key opens it, on this host's own (10 §7.4, v2): the filters'
     /// and the history search's at once, with what was typed; an action's on the rows, refs or
     /// files of this host its target names — the read it starts from is the integration's
-    /// (`GitAction::Open`), and what was typed comes once it is open ([`GitView::give_typed`]).
-    /// `Err`: why it is not opened again — a view of the menu's (it would act at once: a copy, the
-    /// editor, a filter), a target this host lacks, one this host's menu does not offer there, one
-    /// that would run at once (no dialog of it reached the screen here).
+    /// (`GitAction::Open`), and what was typed comes once it is open ([`GitView::give_typed`]); a
+    /// quick edit's (v3) on its commit's row, from its range read (`GitAction::OpenEdit`), its
+    /// typing likewise once it is open; the planner's own (v3) at once, on its row of the planner
+    /// given, with what was typed. `Err`: why it is not opened again — a view of the menu's (it
+    /// would act at once: a copy, the editor, a filter), a target this host lacks, one this host's
+    /// menu does not offer there, one that would run at once (no dialog of it reached the screen
+    /// here), a row the planner here has not or opens no such dialog on.
     pub fn give_dialog(
         &mut self,
         ctx: &egui::Context,
@@ -536,18 +725,94 @@ impl GitView {
                 }
                 asked
             }
+            Some(GitDialog::Reword { commit, .. }) => {
+                self.give_quick(EditId::Reword, commit, known)?
+            }
+            Some(GitDialog::Squash { commit, .. }) => {
+                self.give_quick(EditId::Squash, commit, known)?
+            }
+            Some(GitDialog::Author { commit, .. }) => {
+                self.give_quick(EditId::Author, commit, known)?
+            }
+            Some(GitDialog::PlanMessage { commit, message }) => {
+                self.give_planners(commit, known, Typed::Message(message))?;
+                Vec::new()
+            }
+            Some(GitDialog::PlanAuthor { commit, author }) => {
+                let form = form_of(author);
+                self.give_planners(commit, known, Typed::Author(&form))?;
+                Vec::new()
+            }
         })
     }
 
-    /// What was typed in `part`'s action dialog, given once it is open here: `None` while it is
-    /// not yet; `Some(Err)` says what went otherwise (another dialog in its place, a choice this
-    /// host does not offer).
+    /// Quick edit `id` on `commit`'s row, as its key opens it (v3): its range read first
+    /// (`GitAction::OpenEdit`), where this host's history row offers it there.
+    fn give_quick(
+        &mut self,
+        id: EditId,
+        commit: &str,
+        known: &HashSet<Oid>,
+    ) -> Result<Vec<GitAction>, String> {
+        let row = self
+            .loaded(commit, known)
+            .ok_or("what it acts on is not here")?;
+        if !self.history_of(&row).contains(&id) {
+            return Err("it is not offered here".into());
+        }
+        let asked = self.act_edit(id, row);
+        // Its range's read, which opens it: nothing else, and not nothing (a squash whose
+        // parent is not loaded here).
+        match !asked.is_empty() && (asked.iter()).all(|a| matches!(a, GitAction::OpenEdit { .. })) {
+            true => Ok(asked),
+            false => Err("it is not offered here".into()),
+        }
+    }
+
+    /// The planner's own dialog on its row `commit` of the planner given here (v3), with what was
+    /// typed in it.
+    fn give_planners(
+        &mut self,
+        commit: &str,
+        known: &HashSet<Oid>,
+        typed: Typed,
+    ) -> Result<(), String> {
+        let row = known_oid(known, commit).ok_or("its row is not here")?;
+        let planner = self
+            .planner
+            .as_mut()
+            .ok_or("its planner is not open here")?;
+        planner.give_typed(&row, typed).map_err(str::to_string)
+    }
+
+    /// `oid`'s row, loaded, when this host has its commit.
+    fn loaded(&self, oid: &str, known: &HashSet<Oid>) -> Option<CommitRow> {
+        let oid = known_oid(known, oid)?;
+        self.rows.iter().find_map(|r| match r {
+            Row::Commit { commit, .. } if commit.oid == oid => Some(commit.clone()),
+            _ => None,
+        })
+    }
+
+    /// What was typed in `part`'s action or quick edit's dialog, given once it is open here:
+    /// `None` while it is not yet; `Some(Err)` says what went otherwise (another dialog in its
+    /// place, a choice or field this host does not offer, the owner's own opened meanwhile).
     pub fn give_typed(&mut self, part: &GitState) -> Option<Result<(), String>> {
-        let Some(GitDialog::Action {
-            id, texts, choices, ..
-        }) = &part.dialog
-        else {
-            return Some(Ok(()));
+        let (id, texts, choices) = match &part.dialog {
+            Some(GitDialog::Action {
+                id, texts, choices, ..
+            }) => (id, texts, choices),
+            Some(GitDialog::Reword { commit, message }) => {
+                return self.give_quick_typed(EditId::Reword, commit, Typed::Message(message))
+            }
+            Some(GitDialog::Squash { commit, message }) => {
+                return self.give_quick_typed(EditId::Squash, commit, Typed::Message(message))
+            }
+            Some(GitDialog::Author { commit, author }) => {
+                let form = form_of(author);
+                return self.give_quick_typed(EditId::Author, commit, Typed::Author(&form));
+            }
+            _ => return Some(Ok(())),
         };
         let d = self.dialog.as_mut()?;
         if d.draft().id().as_str() != id {
@@ -561,6 +826,32 @@ impl GitView {
         Some(d.give(&texts, &choices).map_err(|w| {
             format!("its dialog opened, but {w} is not offered here: that choice is as it opens")
         }))
+    }
+
+    /// What was typed in quick edit `id`'s dialog on `commit`, given once its range is read and it
+    /// is open here (`None` until then), as afresh. The owner's own dialog opened meanwhile —
+    /// before it came, or beside it — stays, and this one goes (v2's rule).
+    fn give_quick_typed(
+        &mut self,
+        id: EditId,
+        commit: &str,
+        typed: Typed,
+    ) -> Option<Result<(), String>> {
+        let quick = self.quick.take();
+        let given = quick.as_deref().is_some_and(|q| is_quick(q, id, commit));
+        if self.dialog_up() {
+            self.quick = quick.filter(|_| !given);
+            return Some(Err("its dialog was not given: one of yours is open".into()));
+        }
+        let mut q = quick?;
+        if !given {
+            self.quick = Some(q);
+            let why = "its dialog was not opened again: another opened in its place";
+            return Some(Err(why.into()));
+        }
+        let done = q.give(typed);
+        self.quick = Some(q);
+        Some(done.map_err(|what| format!("its dialog opened, but {what} is not edited here")))
     }
 
     /// The target `on` names, as this host has it: the rows loaded and the commits looked up

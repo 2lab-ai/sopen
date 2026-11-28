@@ -5,8 +5,9 @@
 //! encoding and wrap) and the host the folders are on; from v2 (X4-state) also the tree's bar and
 //! the folders the owner opened or closed in it, and each git panel on screen's part — its bar,
 //! marks, label cursor, details pane, filters, Find's field, an open dialog with what is typed in
-//! it, the planner's plan (`git_panel::state`). No caches, streams or jobs: the receiver opens
-//! them again.
+//! it, the planner's plan (`git_panel::state`); from v3 (X4-state2) what is typed in a history
+//! edit's own dialog — a quick edit's (reword, squash, author) and the planner's message and
+//! author dialogs. No caches, streams or jobs: the receiver opens them again.
 //!
 //! - **Taking** ([`Browser::take_state`]) reads the browser and changes nothing; taken while a
 //!   given state is still being put back, the parts not back yet are the given ones.
@@ -53,8 +54,10 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 /// The version this sopen writes, and the newest it reads (10 §7.4: each step that moves a
 /// screen adds that screen's fields and bumps it). v2 (X4-state) adds the tree's bar and the
-/// folders the owner opened or closed ([`TreeState`]) and the git panels' parts ([`GitState`]).
-pub(crate) const VERSION: u64 = 2;
+/// folders the owner opened or closed ([`TreeState`]) and the git panels' parts ([`GitState`]);
+/// v3 (X4-state2) a history edit's own dialogs ([`GitDialog::Reword`] to
+/// [`GitDialog::PlanAuthor`]).
+pub(crate) const VERSION: u64 = 3;
 
 /// The switch's state, as its line carries it (10 §7.4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,6 +223,50 @@ pub(crate) enum GitDialog {
     Filters { filters: GitFilters, typed: String },
     /// The history search's (03 §4.7): its six fields, in the dialog's order, and the case.
     Search { fields: [String; 6], case: bool },
+    /// v3: Reword's (03 §7.8.1) on `commit`, its message as typed.
+    Reword { commit: String, message: String },
+    /// v3: Squash's on `commit`, its message — the two joined — as typed.
+    Squash { commit: String, message: String },
+    /// v3: Author and date's on `commit`, its fields as typed.
+    Author {
+        commit: String,
+        author: GitAuthorForm,
+    },
+    /// v3: the planner's own message dialog (03 §7.8.2) on its plan's row `commit`, as typed.
+    PlanMessage { commit: String, message: String },
+    /// v3: the planner's own author dialog on its plan's row `commit`, its fields as typed.
+    PlanAuthor {
+        commit: String,
+        author: GitAuthorForm,
+    },
+}
+
+impl GitDialog {
+    /// A quick edit's: it opens once its range is read (`edit_open`).
+    pub(crate) fn quick(&self) -> bool {
+        matches!(
+            self,
+            GitDialog::Reword { .. } | GitDialog::Squash { .. } | GitDialog::Author { .. }
+        )
+    }
+
+    /// The planner's own: it stands on its plan, and goes with it.
+    pub(crate) fn planners(&self) -> bool {
+        matches!(
+            self,
+            GitDialog::PlanMessage { .. } | GitDialog::PlanAuthor { .. }
+        )
+    }
+}
+
+/// An author's fields as typed (`author`'s dialog, the planner's `A`): the date as its field's
+/// text, which may not read yet, the committer date by its word.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct GitAuthorForm {
+    pub name: String,
+    pub email: String,
+    pub date: String,
+    pub committer: GitCommitter,
 }
 
 /// A text field of an action's dialog, by its number in the form, and what is typed in it.
@@ -559,7 +606,7 @@ impl SwitchState {
 /// What a line may hold of v2's parts (10 §7.4; X4-state's review): enough for any screen an
 /// owner makes, so no honest state is refused, and a bound on what HOST walks and keeps of one
 /// that is not. The line itself is bounded where it is read (`STATE_LINE_MAX`, 64 MiB).
-mod bound {
+pub(crate) mod bound {
     /// Marked rows: a mark on each row of twenty pages of the graph (500 a page); Compare takes
     /// one, Pick and Revert a handful.
     pub const MARKS: usize = 10_000;
@@ -569,8 +616,8 @@ mod bound {
     /// One typed text (a message, a field, Find's text): eight times the 1 MiB message the
     /// dialogs' tests hold to (X4-quick), an eighth of the line.
     pub const TEXT: usize = 8 << 20;
-    /// A name — a path, a refname, a choice's word, a stash or commit id's text: PATH_MAX (Linux
-    /// 4096; macOS's 1024 under it); a refname is a path.
+    /// A name — a path, a refname, a choice's word, a stash or commit id's text, an author's name,
+    /// email or date: PATH_MAX (Linux 4096; macOS's 1024 under it); a refname is a path.
     pub const NAME: usize = 4096;
     /// Names in one list — a row of choices, the filters' branches and remotes, a target's files,
     /// the tree's folders: five times the 20,000 branches the filters' dialog is held to
@@ -759,8 +806,20 @@ impl GitState {
     }
 
     /// The open dialog: an action sopen has, on commits by their ids, its texts and choices within
-    /// their bounds.
+    /// their bounds ([`GitState::check_typed`]); the planner's own on a row of its plan.
     fn check_dialog(&self) -> Result<(), String> {
+        if let Some(GitDialog::PlanMessage { commit, .. } | GitDialog::PlanAuthor { commit, .. }) =
+            &self.dialog
+        {
+            self.plan_row(commit)?;
+        }
+        self.check_typed()
+    }
+
+    /// The open dialog itself, its plan aside: what `fit` leaves it out by when it fails. The
+    /// question before the switch holds the dialog that would cross to the same bounds of what is
+    /// typed in it, in place (`GitView::carried_whole`).
+    fn check_typed(&self) -> Result<(), String> {
         match &self.dialog {
             Some(GitDialog::Action {
                 id,
@@ -811,7 +870,36 @@ impl GitState {
                 }
                 Ok(())
             }
+            Some(GitDialog::Reword { commit, message } | GitDialog::Squash { commit, message }) => {
+                self.oid("a commit", commit)?;
+                short("a history edit's message", message, bound::TEXT)
+            }
+            Some(GitDialog::Author { commit, author }) => {
+                self.oid("a commit", commit)?;
+                check_form(author)
+            }
+            Some(GitDialog::PlanMessage { commit, message }) => {
+                self.oid("a commit", commit)?;
+                short("the planner's message", message, bound::TEXT)
+            }
+            Some(GitDialog::PlanAuthor { commit, author }) => {
+                self.oid("a commit", commit)?;
+                check_form(author)
+            }
             None => Ok(()),
+        }
+    }
+
+    /// `commit`, a row of its plan: the planner's own dialog stands on one.
+    fn plan_row(&self, commit: &str) -> Result<(), String> {
+        self.oid("a commit", commit)?;
+        let rows = self.plan.as_ref().map(|p| p.rows.as_slice());
+        match rows.unwrap_or_default().iter().any(|r| r.commit == commit) {
+            true => Ok(()),
+            false => Err(format!(
+                "{}: the switch's state has the planner's dialog on a row of no plan it has",
+                self.top
+            )),
         }
     }
 
@@ -841,6 +929,14 @@ impl GitState {
     }
 }
 
+/// An author's typed fields, each a name's length at most, as a plan row's author is — a dialog
+/// may read its fields every pass, and one kept goes into the plan.
+fn check_form(a: &GitAuthorForm) -> Result<(), String> {
+    short("an author's name", &a.name, bound::NAME)?;
+    short("an author's email", &a.email, bound::NAME)?;
+    short("an author date", &a.date, bound::NAME)
+}
+
 /// The filters' names within their bounds.
 fn check_filters(f: &GitFilters) -> Result<(), String> {
     let branches = f.branches.as_deref().unwrap_or_default();
@@ -856,9 +952,10 @@ impl SwitchState {
     /// This browser's own state made one a reader takes (X4-state's review and fix-check),
     /// `budget` the bytes its line may take: a part that would fail [`SwitchState::check`] — a
     /// bound passed — is left out, the rest kept; then, while the line as it is written (its JSON,
-    /// escaping and all) passes `budget`, its plans go, then its dialogs, then the tree, then its
-    /// git panels, the last first. Each part left out is said, in [`SwitchState::said`] — the
-    /// reader's status row says it once the state is back. v1's own parts stay as they are.
+    /// escaping and all) passes `budget`, its plans go — each with its planner's own dialog —
+    /// then its dialogs, then the tree, then its git panels, the last first. Each part left out is
+    /// said, in [`SwitchState::said`] — the reader's status row says it once the state is back.
+    /// v1's own parts stay as they are.
     pub(crate) fn fit(mut self, budget: usize) -> SwitchState {
         let mut said = std::mem::take(&mut self.said);
         if let Some(Err(why)) = self.tree.as_ref().map(TreeState::check) {
@@ -877,6 +974,14 @@ impl SwitchState {
                 return false;
             }
             tops.push(g.top.clone());
+            // The plan first: the planner's own dialog stands on it (`check_dialog`).
+            if let Err(why) = g.check_plan() {
+                said.push(format!(
+                    "the git panel of {}: its plan is left out: {why}",
+                    g.top
+                ));
+                g.plan = None;
+            }
             if let Err(why) = g.check_dialog() {
                 said.push(format!(
                     "the git panel of {}: its dialog is left out: {why}",
@@ -892,13 +997,6 @@ impl SwitchState {
                 ));
             }
             dialog |= g.dialog.is_some();
-            if let Err(why) = g.check_plan() {
-                said.push(format!(
-                    "the git panel of {}: its plan is left out: {why}",
-                    g.top
-                ));
-                g.plan = None;
-            }
             true
         });
         let past = format!("the line would pass {} MiB", (budget + (1 << 20) - 1) >> 20);
@@ -921,6 +1019,13 @@ impl SwitchState {
                     "the git panel of {}: its plan is left out: {past}",
                     g.top
                 ));
+                // The planner's own dialog goes with it.
+                if g.dialog.take_if(|d| d.planners()).is_some() {
+                    said.push(format!(
+                        "the git panel of {}: its dialog is left out: {past}",
+                        g.top
+                    ));
+                }
                 continue;
             }
             if let Some(g) = (self.git.iter_mut().rev()).find(|g| g.dialog.is_some()) {
@@ -1585,8 +1690,9 @@ impl Browser {
     /// looked up here, and the bar goes to its row, pages read until it comes; then the rest of
     /// the view, its plan (the planner opened as Cmd/Ctrl+E opens it), and — once no other part's
     /// planner is still opening (`plans`) — its dialog, opened as its key opens it, what was typed
-    /// once it is open. A commit this host lacks is left out — a mark or a pane's end silently but
-    /// for the marks' count, the bar said; a dialog or plan on one, or one the owner's own already
+    /// once it is open (a quick edit's once its range is read, the planner's own only over the
+    /// plan given). A commit this host lacks is left out — a mark or a pane's end silently but for
+    /// the marks' count, the bar said; a dialog or plan on one, or one the owner's own already
     /// stands in the place of, is not given, and said.
     fn give_git(
         &mut self,
@@ -1728,14 +1834,19 @@ impl Browser {
             }
             Stage::Planning(known) => {
                 let p = &mut self.git.panels[i];
-                match p.view.give_plan(&g.part, known) {
+                let given = p.view.give_plan(&g.part, known);
+                match &given {
                     None if p.edit_open.is_some() => return false,
                     None => say("its plan was not given: its range did not read here"),
                     Some(Ok(())) => drop_typing(ctx),
                     Some(Err(why)) => {
                         drop_typing(ctx);
-                        say(&why);
+                        say(why);
                     }
+                }
+                // Not given: the planner's own dialog does not open on the planner as read.
+                if !matches!(given, Some(Ok(()))) {
+                    g.part.plan = None;
                 }
                 g.stage = Stage::Dialog(std::mem::take(known));
                 false
@@ -1746,6 +1857,12 @@ impl Browser {
                 }
                 if plans {
                     return false;
+                }
+                // The planner's own stands on its plan, given first.
+                let planners = g.part.dialog.as_ref().is_some_and(GitDialog::planners);
+                if planners && g.part.plan.is_none() {
+                    say("its dialog was not given: its plan was not");
+                    return true;
                 }
                 // The owner's own opened meanwhile (while the plan's planner opened, say): it stays.
                 if self.git.panels[i].view.dialog_up() {
@@ -1776,6 +1893,10 @@ impl Browser {
                     Some(given) => {
                         drop_typing(ctx);
                         if let Err(why) = given {
+                            // A quick edit's range still being read for it: it does not open.
+                            if g.part.dialog.as_ref().is_some_and(GitDialog::quick) {
+                                p.edit_open = None;
+                            }
                             say(&why);
                         }
                         true
@@ -1807,8 +1928,11 @@ impl Browser {
             given.said.push(format!("the git panel of {at}: {why}"));
             if let Some(i) = self.git.panel(&g.part.top) {
                 let p = &mut self.git.panels[i];
+                let quick = g.part.dialog.as_ref().is_some_and(GitDialog::quick);
                 match g.stage {
                     Stage::Planning(_) => p.edit_open = None,
+                    // A quick edit's dialog opens from its range's read, an action's prefilled.
+                    Stage::Opening if quick => p.edit_open = None,
                     Stage::Opening => p.prefill = None,
                     _ => {}
                 }

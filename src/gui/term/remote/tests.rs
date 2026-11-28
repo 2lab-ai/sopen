@@ -485,7 +485,7 @@ fn tw2_each_end_of_hosts_half_is_its_line_and_the_terminal_stays() {
         (
             "printf '%s\\n' 'sopen-xtools-state {\"v\":9}'",
             false,
-            "box sent switch state v9; this sopen reads up to v2 — update one of them",
+            "box sent switch state v9; this sopen reads up to v3 — update one of them",
         ),
     ];
     for (body, missing, want) in cases {

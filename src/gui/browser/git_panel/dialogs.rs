@@ -912,6 +912,19 @@ impl ActionDialog {
         Some((*id, target, texts, choices))
     }
 
+    /// Whether a switch carries it ([`ActionDialog::taken`] gives it), asked without a copy of
+    /// its texts.
+    pub fn carried(&self) -> bool {
+        self.origin.is_some()
+    }
+
+    /// Whether each text a switch carries of it ([`ActionDialog::taken`]'s) is at most `max`
+    /// bytes, read in place (the switch's question asks it every pass it is up).
+    pub fn texts_within(&self, max: usize) -> bool {
+        let local = machine_local(&self.form.draft);
+        (texts_of(&self.form).into_iter()).all(|(n, t)| local.contains(&n) || t.len() <= max)
+    }
+
     /// A switch's choices and texts given to it, opened here as its key opens it (v2): the
     /// choices row by row as they show (one may show another), each by its words — `Err` is a
     /// word this host does not offer, and that row stays as it opened — then the texts of the
@@ -1528,34 +1541,46 @@ fn may_change(ctx: &egui::Context) -> bool {
 
 /// The form's texts its fields edit in place, by field number: the draft's own (a message, a name,
 /// a URL) and the form's (`archive`'s path, a remote's push URL, `edit-remote`'s fetch URL) —
-/// exactly the fields [`controls`] shows.
+/// exactly the fields [`controls`] shows. One match for both [`texts`] and [`texts_of`]: `$as` and
+/// `$r` are `as_mut` and `&mut`, or `as_ref` and `&`.
+macro_rules! form_texts {
+    ($form:expr, $as:ident, $($r:tt)+) => {{
+        let Form {
+            draft, text, url, ..
+        } = $form;
+        match draft {
+            Action::Commit { message, .. } | Action::Stash { message, .. } => vec![(0, message)],
+            Action::Amend { message: Some(m) }
+            | Action::MoveTag {
+                message: Some(m), ..
+            } => {
+                vec![(0, m)]
+            }
+            Action::AddRemote { name, url: u, .. } => vec![(0, name), (1, u), (2, text)],
+            Action::EditRemote { now, .. } => vec![(0, $($r)+ now.name), (1, url), (2, text)],
+            Action::User { name, email, .. } => vec![(0, name), (1, email)],
+            Action::Tag { name, message, .. } => {
+                let mut all = vec![(0, name)];
+                all.extend(message.$as().map(|m| (1, m)));
+                all
+            }
+            Action::Branch { name, .. }
+            | Action::CheckoutRemote { name, .. }
+            | Action::StashBranch { name, .. } => vec![(0, name)],
+            Action::Rename { to, .. } => vec![(0, to)],
+            Action::Archive { .. } => vec![(0, text)],
+            _ => Vec::new(),
+        }
+    }};
+}
+
 fn texts(form: &mut Form) -> Vec<(usize, &mut String)> {
-    let Form {
-        draft, text, url, ..
-    } = form;
-    match draft {
-        Action::Commit { message, .. } | Action::Stash { message, .. } => vec![(0, message)],
-        Action::Amend { message: Some(m) }
-        | Action::MoveTag {
-            message: Some(m), ..
-        } => {
-            vec![(0, m)]
-        }
-        Action::AddRemote { name, url: u, .. } => vec![(0, name), (1, u), (2, text)],
-        Action::EditRemote { now, .. } => vec![(0, &mut now.name), (1, url), (2, text)],
-        Action::User { name, email, .. } => vec![(0, name), (1, email)],
-        Action::Tag { name, message, .. } => {
-            let mut all = vec![(0, name)];
-            all.extend(message.as_mut().map(|m| (1, m)));
-            all
-        }
-        Action::Branch { name, .. }
-        | Action::CheckoutRemote { name, .. }
-        | Action::StashBranch { name, .. } => vec![(0, name)],
-        Action::Rename { to, .. } => vec![(0, to)],
-        Action::Archive { .. } => vec![(0, text)],
-        _ => Vec::new(),
-    }
+    form_texts!(form, as_mut, &mut)
+}
+
+/// [`texts`], read in place.
+fn texts_of(form: &Form) -> Vec<(usize, &String)> {
+    form_texts!(form, as_ref, &)
 }
 
 /// The fields of `draft`'s form whose text names a place on the machine that shows the window —
