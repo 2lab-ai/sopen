@@ -1276,8 +1276,9 @@ pub struct PlannerView {
     /// The edit and plan the run dialog showed when Enter returned [`PlannerEnd::Run`] (S4-C:
     /// what runs is the plan shown, [`PlannerView::take_shown`]).
     shown: Option<(Edit, Plan)>,
-    /// This planner's own key for its dialogs' ids (`find::panel_key`'s, made once): which planner
-    /// it is, not where it stands, so two panels side by side never share a field's state.
+    /// This planner's own key for its ids — its dialogs', its pane's rows' and buttons'
+    /// (`find::panel_key`'s, made once): which planner it is, not where it stands, so two panels
+    /// side by side never share a field's state or a click.
     key: egui::Id,
     /// The open dialog's first pass is behind it (its fields opened afresh, its box laid out once).
     opened: bool,
@@ -1427,7 +1428,8 @@ impl PlannerView {
 
     /// The id of `what` of its dialogs — a box (`message`, `author`, `ask`), a field (`message-field`,
     /// [`AUTHOR_FIELDS`]), a row of choices (`committer`) or a button (`ok`, `own`, `cancel`,
-    /// `close`, `keep`) — this planner's own ([`PlannerView::key`]).
+    /// `close`, `keep`) — or of its pane — the rows (`row`, with the row's place) and the foot's
+    /// buttons (`foot-run`, `foot-close`) — this planner's own ([`PlannerView::key`]).
     pub(super) fn part_id(&self, what: &str) -> egui::Id {
         self.key.with(("sopen-git-planner", what))
     }
@@ -2186,11 +2188,14 @@ fn paint(
             put(buf, y, author, AUTHOR_CELLS, name, pen);
             put(buf, y, date, DATE_CELLS, &graph_view::date_text(time), pen);
         }
+        // This planner's own id (two panels side by side draw into one `ui`), sensing clicks
+        // alone: the bar moves by the pane's keys, and egui's focusable `Sense::click()` would let
+        // Tab reach a row and its Space or Enter click it.
         let resp = ui.interact(
             grid.rect(row_cells),
-            ui.scope_id().with(("sopen-git-planner-row", k)),
+            view.part_id("row").with(k),
             if active && view.inner.is_none() {
-                Sense::click()
+                Sense::CLICK
             } else {
                 Sense::hover()
             },
@@ -2217,26 +2222,26 @@ fn paint(
     let mut clicked = None;
     let mut c = 0;
     if (area.top()..area.bottom()).contains(&y) {
-        for (word, foot, salt) in [
-            ("Run…", Foot::Run, "sopen-git-planner-run"),
-            ("Close", Foot::Close, "sopen-git-planner-close"),
+        for (word, foot, part) in [
+            ("Run…", Foot::Run, "foot-run"),
+            ("Close", Foot::Close, "foot-close"),
         ] {
             let label = button(word);
             let w = cells::width(&label);
             // A button is drawn, and acts, only where it fits whole.
             if c + w <= chars {
                 let at = Cells::new(x(c), y, w as u16, 1);
-                let id = ui.scope_id().with(salt);
+                // This planner's own id, sensing clicks alone: neither is meant for the keyboard,
+                // whose own keys run (Cmd/Ctrl+Enter) and close (Esc), and whose Tab is the git
+                // panel's way back to the list — egui's focusable `Sense::click()` would let Tab
+                // reach one and Space press it (F-git-ids).
+                let id = view.part_id(part);
                 // Acts only while nothing else's dialog is up (`active` carries it: X4-menu).
-                if ui.interact(grid.rect(at), id, Sense::click()).clicked() && active {
+                if ui.interact(grid.rect(at), id, Sense::CLICK).clicked() && active {
                     clicked = Some(foot);
                 }
-                // egui's button colours: black on cyan, the bar's when it has the focus (10 §6).
-                let pen = if ctx.memory(|m| m.has_focus(id)) {
-                    Pen::new(p.bar_text, p.bar)
-                } else {
-                    Pen::new(p.dialog_text, p.dialog_back)
-                };
+                // egui's button colours: black on cyan (10 §6); they never have the focus.
+                let pen = Pen::new(p.dialog_text, p.dialog_back);
                 cells::put(buf, x(c), y, &label, w, pen);
             }
             c += w + GAP;

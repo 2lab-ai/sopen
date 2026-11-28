@@ -7,12 +7,13 @@
 //!
 //! - The grid ([`Grid`]): the whole cells over a window area, and their rects in points.
 //! - The painter ([`paint`]) and the layer record ([`set_recording`], [`layers`]): what each paint
-//!   drew, kept for the pass when recording is on, for the test kit and the terminal.
+//!   drew, kept for the pass when recording is on, for the test kit and the terminal; and, apart
+//!   from it, what [`keep`] holds while a screen asks ([`kept`]).
 //! - The cell API ([`put`], [`put_right`], [`fill`], [`frame`], [`rule`], [`scroll_bar`]): colours
 //!   as a [`Pen`] of the skin's opaque RGB (T15); widths as the buffer lays text out
 //!   (unicode-width, by grapheme).
-//! - The read-back ([`Layer::seen`], [`row_text`], [`find`], [`colors`], [`runs`]): character,
-//!   colours and caret per cell.
+//! - The read-back ([`Layer::seen`], [`with_later`], [`row_text`], [`find`], [`colors`],
+//!   [`runs`]): character, colours and caret per cell.
 //! - [`index256`]: a skin colour in a 256-colour terminal (10 §5).
 //! - [`set_ambiguous_wide`], [`ambiguous_wide`]: whether the passes are shown in a terminal that
 //!   draws a glyph of ambiguous width in two cells (10 §10).
@@ -511,17 +512,54 @@ pub fn layers(ctx: &egui::Context) -> Vec<Arc<Layer>> {
         .unwrap_or_default()
 }
 
+/// What [`keep`] holds: apart from the record, so recording and [`clear`] are as they were.
+#[derive(Clone, Default)]
+struct Kept {
+    on: bool,
+    layers: Vec<Arc<Layer>>,
+}
+
+fn kept_id() -> egui::Id {
+    egui::Id::unique("sopen-cell-kept")
+}
+
+/// Keeps each [`paint`] from now on, recording on or not (`on`), or stops (`off`); either way
+/// what it kept before is forgotten. A screen painted before a dialog it did not know of is
+/// drawn over it in the same pass can be blanked under that dialog from what it kept
+/// (F-menu-own: the browser keeps the sides' paints while a git panel's menu is up, the panel
+/// blanks them under the dialog a choice opens in its draw).
+pub fn keep(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(kept_id(), Kept { on, layers: vec![] }));
+}
+
+/// The layers painted since [`keep`] was turned on, in the order [`paint`] was called.
+pub fn kept(ctx: &egui::Context) -> Vec<Arc<Layer>> {
+    ctx.data(|d| d.get_temp::<Kept>(kept_id()))
+        .map(|k| k.layers)
+        .unwrap_or_default()
+}
+
 fn record(painter: &egui::Painter, origin: Pos2, buf: &Buffer, caret: Option<Position>) {
     painter.ctx().data_mut(|d| {
-        let r = d.get_temp_mut_or_default::<Record>(record_id());
-        if r.on {
-            r.layers.push(Arc::new(Layer {
-                origin,
-                layer: painter.layer_id(),
-                clip: painter.clip_rect(),
-                buf: buf.clone(),
-                caret,
-            }));
+        let recording = d.get_temp_mut_or_default::<Record>(record_id()).on;
+        let keeping = d.get_temp_mut_or_default::<Kept>(kept_id()).on;
+        if !(recording || keeping) {
+            return;
+        }
+        let layer = Arc::new(Layer {
+            origin,
+            layer: painter.layer_id(),
+            clip: painter.clip_rect(),
+            buf: buf.clone(),
+            caret,
+        });
+        if keeping {
+            let k = d.get_temp_mut_or_default::<Kept>(kept_id());
+            k.layers.push(layer.clone());
+        }
+        if recording {
+            let r = d.get_temp_mut_or_default::<Record>(record_id());
+            r.layers.push(layer);
         }
     });
 }
@@ -774,6 +812,31 @@ impl Layer {
             })
             .collect()
     }
+}
+
+/// Layer `at` of `layers` (one pass's, [`layers`]) as the pass left it: each later layer on its
+/// egui layer at its origin — the cells a screen blanked under a dialog drawn after it was
+/// painted — laid over it inside its area, one cell at a time, where that one has a colour of its
+/// own and its centre is inside that layer's clip. A glyph the clip cuts, or one a later cell
+/// overwrites half of, is not erased as `term::compose` erases it.
+pub fn with_later(layers: &[Arc<Layer>], at: usize) -> Layer {
+    let mut out = (*layers[at]).clone();
+    let area = out.buf.area;
+    for l in &layers[at + 1..] {
+        if l.layer != out.layer || l.origin != out.origin {
+            continue;
+        }
+        let r = l.buf.area.intersection(area);
+        for y in r.top()..r.bottom() {
+            for x in r.left()..r.right() {
+                let shows = l.clip.contains(l.rect(Cells::new(x, y, 1, 1)).center());
+                if shows && c32(l.buf[(x, y)].bg).is_some() {
+                    out.buf[(x, y)] = l.buf[(x, y)].clone();
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Row `y` of `buf` as text, with the cell each character is in (a wide glyph's second cell

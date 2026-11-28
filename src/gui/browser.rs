@@ -2781,6 +2781,12 @@ impl Browser {
                 return;
             }
         }
+        // In a pass the right side's git panel may open a box in its draw (a choice in its menu, a
+        // right click, a key after Find's typing), the pass's paints are kept, and the panel
+        // blanks the left side, painted before it, under that box from them (F-menu-own,
+        // `git_panel::draw`). Not for a panel on the left, which the right side follows; most
+        // passes have none of these.
+        cells::keep(&ctx, self.git_may_open_on_the_right(&ctx));
         for (i, side) in cells::halves(grid.all()).into_iter().enumerate() {
             match self.shown.as_ref().map(|s| s[i].clone()) {
                 Some(view::Content::Preview(_)) => {
@@ -2800,6 +2806,7 @@ impl Browser {
                 _ => self.panel_cells(ui, i, &grid, side),
             }
         }
+        cells::keep(&ctx, false);
     }
 
     /// The status row: a running fetch with its progress, a listing, a running file operation

@@ -1070,8 +1070,9 @@ fn a_value_cut_to_the_box_lays_out_as_the_whole_value() {
                 cols,
                 rows,
             };
-            let cut = log_view::entry_layout(grid, &e, 0);
-            let whole = log_view::entry_layout_in(grid, &e, 0, usize::MAX);
+            let panel = egui::Id::unique("sopen-git-test-panel");
+            let cut = log_view::entry_layout(grid, &e, panel);
+            let whole = log_view::entry_layout_in(grid, &e, panel, usize::MAX);
             let at = format!("{} bytes at {cols}x{rows}", line.len());
             assert_eq!(format!("{cut:?}"), format!("{whole:?}"), "{at}");
         }
