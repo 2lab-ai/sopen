@@ -2090,7 +2090,7 @@ fn undo_takes_the_newest_stamp_whatever_order_the_runs_end_in() {
 /// Two repositories' panels side by side (X4-menu): `a`'s (the test's `g.repo`) pinned on the
 /// right, the right list in `b` and active, so `b`'s own panel stands on the left (02 §3.1 O6)
 /// with the keyboard in it. Their indexes, `a`'s then `b`'s.
-fn two_panels(g: &mut Gx, b: &Repo) -> (usize, usize) {
+pub(super) fn two_panels(g: &mut Gx, b: &Repo) -> (usize, usize) {
     g.wait_for_the_panel();
     g.cmd(Key::G);
     g.settle();
@@ -2122,7 +2122,7 @@ fn two_panels(g: &mut Gx, b: &Repo) -> (usize, usize) {
 }
 
 /// A second repository for [`two_panels`]: one commit.
-fn other_repo(git: &Path) -> Repo {
+pub(super) fn other_repo(git: &Path) -> Repo {
     let b = Repo::new(git);
     b.write("b.txt", "b\n");
     b.commit("only in b");
@@ -2884,7 +2884,7 @@ fn f_git_listq_a_dialog_heard_in_a_pass_takes_its_keys() {
 /// A run of panel `i`'s, as `spawn_run` gives one, whose worker already sent `end`: the next pass
 /// hears it (as `x4_menu_a_runs_end_waits_for_the_other_panels_dialog_and_is_heard` builds one).
 /// Its sender, to keep while it matters.
-fn a_run_that_ended(
+pub(super) fn a_run_that_ended(
     g: &mut Gx,
     i: usize,
     end: git_host::RunEnd,
@@ -2895,7 +2895,10 @@ fn a_run_that_ended(
 }
 
 /// A run of panel `i`'s, as `spawn_run` gives one, its end not sent yet: its id and its sender.
-fn a_run_that_runs(g: &mut Gx, i: usize) -> (u64, std::sync::mpsc::Sender<git_host::RunEnd>) {
+pub(super) fn a_run_that_runs(
+    g: &mut Gx,
+    i: usize,
+) -> (u64, std::sync::mpsc::Sender<git_host::RunEnd>) {
     let (tx, rx) = std::sync::mpsc::channel();
     g.fx.b.git.runs += 1;
     let id = g.fx.b.git.runs;
@@ -3203,12 +3206,13 @@ fn f_git_listq_a_confirmation_in_place_of_stop_git_stays_with_its_esc() {
     drop(tx);
 }
 
-/// F-git-listq fix-check: a confirmation up and painted is replaced by another of its kind — a
-/// run's end puts another action's confirmation in its place — in the pass of the owner's Esc,
-/// meant for the first. The front dialog's serial changed, so the Esc is dropped with the pass:
-/// the new confirmation, never on screen, stays.
+/// F-git-listq fix-check: a confirmation up and painted; a run's end asks for another action's
+/// confirmation in the pass of the owner's Esc, meant for the first. Since F-git-own-two the new
+/// one waits for the first instead of taking its place: the Esc closes the first, shown, and the
+/// new one opens at the next pass's poll, whose keys are dropped (its slot changed there), so it
+/// stays, never cancelled unseen.
 #[test]
-fn f_git_listq_a_confirmation_replaced_by_another_keeps_the_esc_from_it() {
+fn f_git_listq_a_confirmation_asked_behind_another_opens_after_its_esc() {
     let git = git_or_skip!();
     let mut g = Gx::new(small(&git));
     g.wait_for_the_panel();
@@ -3234,7 +3238,7 @@ fn f_git_listq_a_confirmation_replaced_by_another_keeps_the_esc_from_it() {
     assert_eq!(
         g.b().git.panels[i].view.draft(),
         Some(&other),
-        "the unseen confirmation in its place stays"
+        "the unseen confirmation after it stays"
     );
     g.idle(4);
     g.key(Key::Escape);

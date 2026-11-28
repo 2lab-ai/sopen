@@ -9,6 +9,7 @@ use eframe::egui::{Event, PointerButton, Vec2};
 use std::io::Write;
 use std::path::Path;
 
+mod f_git_own_two;
 mod page;
 mod s1;
 mod s2;
@@ -24,6 +25,21 @@ mod x1b;
 mod x2host;
 mod x2switch;
 mod x4state;
+
+impl git_host::RepoPanel {
+    /// An action runs or waits for the write lock, or a read for one is on its way — a prefill,
+    /// a dialog's reads, the Backups list, a restore's entries, a tag's details, a history edit's
+    /// range — held or not (F-git-own-two): what the tests wait for to be quiet.
+    pub(super) fn acting(&self) -> bool {
+        !self.running.is_empty()
+            || self.prefill.is_some()
+            || self.inspect.is_some()
+            || self.backups_read.is_some()
+            || self.restore_read.is_some()
+            || self.text_read.is_some()
+            || self.edit_open.is_some()
+    }
+}
 
 const RUST: &str = "// a comment\nfn main() {\n    let answer = 42;\n}\n";
 

@@ -1472,10 +1472,11 @@ fn drawn(fx: &Fx) -> String {
         .join(" ")
 }
 
-/// F2 and Cmd/Ctrl+K in one pass: Reword's range is read while the filters' dialog opens, and
-/// Reword opens in front of it (`modals`, over the filters). With its message typed, the state
-/// carries the one in front — Reword's, one git dialog at a time — and the switch asks first,
-/// naming the filters' dialog behind it, which it drops.
+/// Reword in front of the filters' dialog (`modals`, over the filters). With its message typed,
+/// the state carries the one in front — Reword's, one git dialog at a time — and the switch asks
+/// first, naming the filters' dialog behind it, which it drops. The stacked state is unreachable
+/// by keys since F-git-own-two (F2's range waits behind the filters), so the filters are opened
+/// under the Reword directly: `untaken`'s "behind" branch is defence in depth.
 #[test]
 fn the_dialog_in_front_is_carried_and_the_one_behind_is_named() {
     use crate::git::rebase::{Edit, Quick};
@@ -1484,20 +1485,10 @@ fn the_dialog_in_front_is_carried_and_the_one_behind_is_named() {
         return;
     };
     g.bar_to("B");
-    let press = |key, modifiers| Event::Key {
-        key,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers,
-    };
-    let both = vec![
-        press(Key::F2, Modifiers::NONE),
-        press(Key::K, Modifiers::COMMAND),
-    ];
-    g.fx.drv.frame(&mut g.fx.b, both, Modifiers::NONE);
+    g.fx.drv.key(&mut g.fx.b, Key::F2, Modifiers::NONE);
     let top = g.top();
     g.until("Reword's dialog", |b| quick_draft(b, &top).is_some());
+    g.panel_mut().view.open_filters();
     g.until_quiet("its reads");
     assert!(
         g.panel().view.fronts()[2].0,

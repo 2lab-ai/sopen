@@ -182,10 +182,91 @@ pub(super) struct RepoPanel {
     /// The range a quick edit's dialog or the planner opens on, being read (S4-A's
     /// `open_needs` / `inspect` / `open`).
     pub(super) edit_open: Option<Pending<EditOpened>>,
-    /// A quick `split` ran to its stop: once the refresh shows the edit stop, its Split's
-    /// confirmation opens (03 §7.8.1: "at the stop sopen records the commit's paths and runs
-    /// `reset --mixed`").
+    /// What `edit_open` was asked with (F-git-own-two), while it reads.
+    pub(super) edit_ask: Option<EditAsk>,
+    /// A poll held the prefill `prefill` reads (F-git-own-two): read for an older snapshot, it is
+    /// read again at its release.
+    pub(super) prefill_held: bool,
+    /// The action `prefill` reads for, as its menu names it (`Commit`): what F12's question says
+    /// it drops while held ([`RepoPanel::asked_untaken`]).
+    pub(super) prefill_what: &'static str,
+    /// A quick `split` ran to its stop: its load is waited for (by another panel's dialog only),
+    /// and once the refresh shows the edit stop its Split's confirmation is due (`split_due`;
+    /// 03 §7.8.1: "at the stop sopen records the commit's paths and runs `reset --mixed`").
     pub(super) split_next: bool,
+    /// The refresh after a quick `split` came: its Split's confirmation opens once nothing holds
+    /// it, no dialog of the panel's up but a result (F-git-own-two; `Browser::split_confirmation`).
+    pub(super) split_due: bool,
+    /// The Split's confirmation due waited for a dialog: a stop gone meanwhile is said so.
+    pub(super) split_waited: bool,
+    /// What `restore_read` was asked with (F-git-own-two), while it reads.
+    pub(super) restore_ask: Option<RestoreAsk>,
+}
+
+/// What a restore's entries were asked with ([`RepoPanel::restore_ask`]): read for an older
+/// snapshot than the one at its release while held, they are read again, as a prefill is.
+#[derive(Debug, Clone)]
+pub(super) struct RestoreAsk {
+    pub(super) stamp: String,
+    pub(super) only: Option<String>,
+    /// The snapshot it was asked in.
+    pub(super) generation: Option<u64>,
+    /// A poll held it.
+    pub(super) held: bool,
+}
+
+/// What a history edit's range was asked with ([`RepoPanel::edit_ask`]).
+#[derive(Debug, Clone)]
+pub(super) struct EditAsk {
+    /// It opens a quick edit's dialog (`Opening::Edit`), so it waits for the panel's own dialog
+    /// too; the planner's pane does not ([`RepoPanel::holds`]).
+    pub(super) dialog: bool,
+    /// Where its range starts: asked again from there when it turns stale while held.
+    pub(super) from: From,
+    /// A poll held it.
+    pub(super) held: bool,
+    /// The edit as its menu names it (`Reword`), or the planner: what F12's question says it
+    /// drops while held ([`RepoPanel::asked_untaken`]).
+    pub(super) what: &'static str,
+}
+
+/// Which of a panel's reads, its runs' questions asked again and a split's confirmation wait —
+/// in their channels, in the view's queue, in `split_due` — a flag per kind
+/// ([`RepoPanel::holds`]; X4-menu rule 2, F-git-own-two).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Holds {
+    /// A prefill, a restore's entries, the Backups list: each opens a dialog (the list closes
+    /// the log, with an entry shown whole).
+    dialog: bool,
+    /// A tag's details: a result, which takes no dialog's place.
+    text: bool,
+    /// The range a history edit opens on.
+    range: bool,
+    /// The load after a quick `split`.
+    load: bool,
+    /// A quick `split`'s Split confirmation, its load in.
+    split: bool,
+    /// A run's question asked again (`GitView::ask_again`).
+    question: bool,
+}
+
+impl Holds {
+    /// What `self` holds and `o` does not.
+    fn but(self, o: Holds) -> Holds {
+        let not = |a: bool, b: bool| a && !b;
+        Holds {
+            dialog: not(self.dialog, o.dialog),
+            text: not(self.text, o.text),
+            range: not(self.range, o.range),
+            load: not(self.load, o.load),
+            split: not(self.split, o.split),
+            question: not(self.question, o.question),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.dialog || self.text || self.range || self.load || self.split || self.question
+    }
 }
 
 /// Panels kept per window (02 §3.1: the least recently shown is dropped).
@@ -318,44 +399,101 @@ impl GitSide {
             let showing = shown
                 .iter()
                 .any(|c| matches!(c, view::Content::Git(top) if *top == p.top));
+            // What is held for the panel's own dialog (F-git-own-two) is not on its way: nothing
+            // of it shows until a key closes that dialog, so a receipt's next key waits not for
+            // it. (What waits for another dialog is, as before: X4-menu's rule.)
             !showing
-                || (p.read.is_none()
-                    && p.stream.as_ref().is_none_or(|s| s.asked == 0)
-                    && p.details.is_none()
-                    && p.reveal.is_none()
-                    && p.resolving.is_none()
+                || (!p.on_its_way(false)
+                    && !p.reading()
                     && p.view.selecting().is_none()
-                    && p.search.as_ref().is_none_or(|s| s.link.asked == 0)
-                    && !p.acting()
                     && !p.dialog_reading())
         })
-    }
-
-    pub(super) fn busy(&self) -> bool {
-        !self.asking.is_empty()
-            || self.panels.iter().any(|p| {
-                p.read.is_some()
-                    || p.stream.as_ref().is_some_and(|s| s.asked > 0)
-                    || p.details.is_some()
-                    || p.reveal.is_some()
-                    || p.resolving.is_some()
-                    || p.search.as_ref().is_some_and(|s| s.link.asked > 0)
-                    || p.acting()
-            })
     }
 }
 
 impl RepoPanel {
-    /// An action runs or waits for the write lock, or a read for one is on its way (a prefill,
-    /// a dialog's reads, the Backups list, a restore's entries, a tag's details).
-    pub(super) fn acting(&self) -> bool {
+    /// What `poll_actions` and `poll_panel` leave where it is now (X4-menu rule 2,
+    /// F-git-own-two). `waits` — another dialog has the keyboard (`Browser::git_waits`) — holds
+    /// all. The panel's own dialog up holds what would open a dialog over it or in its place: a
+    /// prefill, a restore's entries, the Backups list, a quick edit's range (the planner's, whose
+    /// pane is no dialog, only for a dialog of the body). A run's question asked again and a
+    /// quick `split`'s Split confirmation wait for one up other than a result
+    /// (`GitView::holds_questions`), opening in front of a result as ever. A tag's details, a
+    /// result, waits for no dialog of its own panel's, and the load after a quick `split` only
+    /// for another's: the snapshot is never held for the panel's own.
+    pub(super) fn holds(&self, waits: bool) -> Holds {
+        let own = waits || self.view.dialog_up();
+        let quick = self.edit_ask.as_ref().is_some_and(|a| a.dialog);
+        // A quick edit's range waits for any dialog of the panel's; the planner's, whose pane
+        // takes the body, for one of the body's (an entry of the log shown whole, the planner's
+        // own), which it would take the place of.
+        let range = match quick {
+            true => self.view.dialog_up(),
+            false => self.view.body_dialog_up(),
+        };
+        Holds {
+            dialog: own,
+            text: waits,
+            range: waits || range,
+            load: self.split_next && waits,
+            split: waits || self.view.holds_questions(),
+            question: waits || self.view.holds_questions(),
+        }
+    }
+
+    /// What waits now, held or not, by the kinds of [`Holds`].
+    fn waiting(&self) -> Holds {
+        Holds {
+            dialog: self.prefill.is_some()
+                || self.backups_read.is_some()
+                || self.restore_read.is_some(),
+            text: self.text_read.is_some(),
+            range: self.edit_open.is_some(),
+            load: self.read.is_some(),
+            split: self.split_due,
+            question: self.view.asks_again(),
+        }
+    }
+
+    /// What the owner asked for that waits, held or on its way, a line per kind as F12's
+    /// question names it: the switch drops it either way, as no state holds a read
+    /// (F-git-own-two). Named on its way too, so the question says it whatever held it before —
+    /// a decision made again after another question (the viewer's Discard) finds it unheld.
+    /// A quick `split`'s Split confirmation is named in both its phases, the load after it and
+    /// the confirmation due, in one set of words.
+    pub(super) fn asked_untaken(&self) -> Vec<std::borrow::Cow<'static, str>> {
+        let edit = (self.edit_open.as_ref()).and(self.edit_ask.as_ref());
+        let split = (self.split_next && self.read.is_some()) || self.split_due;
+        [
+            edit.map(|a| a.what),
+            (self.prefill.is_some()).then_some(self.prefill_what),
+            (self.restore_read.is_some()).then_some("restore"),
+            (self.backups_read.is_some()).then_some("Backups list"),
+            (self.text_read.is_some()).then_some("tag details"),
+            split.then_some("Split's confirmation"),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|what| format!("the {what} asked for").into())
+        .collect()
+    }
+
+    /// An action runs, a dialog's reads are on their way, or something of [`Holds`]' kinds waits
+    /// that `holds(waits)` does not keep (a read on its way, a question about to open).
+    fn on_its_way(&self, waits: bool) -> bool {
         !self.running.is_empty()
-            || self.prefill.is_some()
             || self.inspect.is_some()
-            || self.backups_read.is_some()
-            || self.restore_read.is_some()
-            || self.text_read.is_some()
-            || self.edit_open.is_some()
+            || self.waiting().but(self.holds(waits)).any()
+    }
+
+    /// The panel's reads that are never held: a page, a history search's page, the details, a
+    /// file row's diff or file, `SOPEN_STATE`'s commit.
+    fn reading(&self) -> bool {
+        self.stream.as_ref().is_some_and(|s| s.asked > 0)
+            || self.details.is_some()
+            || self.reveal.is_some()
+            || self.resolving.is_some()
+            || self.search.as_ref().is_some_and(|s| s.link.asked > 0)
     }
 
     /// The open dialog still lacks a read its plan needs (`actions::needs`, or `rebase::needs`
@@ -1424,7 +1562,13 @@ impl Browser {
             text_read: None,
             shown: Vec::new(),
             edit_open: None,
+            edit_ask: None,
+            prefill_held: false,
+            prefill_what: "",
             split_next: false,
+            split_due: false,
+            split_waited: false,
+            restore_ask: None,
         });
         let i = self.git.panels.len() - 1;
         self.start_read(ctx, i, false, 1);
@@ -1459,12 +1603,42 @@ impl Browser {
         }
     }
 
+    /// A quick `split`'s Split confirmation, its load in (`split_due`), once nothing holds it
+    /// (F-git-own-two): no dialog of the panel's up, nor another's with the keyboard. The load
+    /// itself was heard, so the banner and the graph show the stop meanwhile.
+    fn split_confirmation(&mut self, ctx: &egui::Context, i: usize) {
+        let waits = self.git_waits(i);
+        let p = &mut self.git.panels[i];
+        if !p.split_due {
+            return;
+        }
+        if p.holds(waits).split {
+            p.split_waited = true;
+            return;
+        }
+        p.split_due = false;
+        let waited = std::mem::take(&mut p.split_waited);
+        match p.view.split_at_the_stop() {
+            Some(asked) => self.git_actions(ctx, i, asked),
+            None => {
+                // No edit stop: the run never stopped, or — while it waited — the stop went.
+                let why = match waited {
+                    true => "Split: the edit stop is gone; nothing was split",
+                    false => "Split: the run did not stop to edit its commit; nothing was split",
+                };
+                self.git.panels[i].view.status = Some(Status::error(why));
+            }
+        }
+    }
+
     /// Everything panel `i` waits for, heard.
     pub(super) fn poll_panel(&mut self, ctx: &egui::Context, i: usize) {
         self.poll_actions(ctx, i);
-        // The load's reads — after a quick `split`, whose Split's confirmation opens with them,
+        // The load's reads — after a quick `split`, whose Split's confirmation is due with them,
         // only while no other dialog has the keyboard (X4-menu fix-check, rule 2; `git_waits`).
-        let wait = self.git.panels[i].split_next && self.git_waits(i);
+        // Never held for the panel's own dialog: only the confirmation waits for that
+        // (F-git-own-two; `RepoPanel::holds`, `split_confirmation`).
+        let wait = self.git.panels[i].holds(self.git_waits(i)).load;
         let read = (self.git.panels[i].read.as_ref())
             .filter(|_| !wait)
             .and_then(|r| r.pending.rx.try_recv().ok());
@@ -1653,18 +1827,11 @@ impl Browser {
         let p = &mut self.git.panels[i];
         p.view
             .set_split(self.git.splits.get(&top).map(|kept| kept.split.clone()));
-        // A quick `split` stopped at its commit: its Split's confirmation, now that the banner
-        // shows the stop.
+        // A quick `split` stopped at its commit: its Split's confirmation is due, now that the
+        // banner shows the stop — at once, or once no dialog of the panel's is up.
         if std::mem::take(&mut p.split_next) {
-            match p.view.split_at_the_stop() {
-                Some(asked) => self.git_actions(ctx, i, asked),
-                None => {
-                    let p = &mut self.git.panels[i];
-                    p.view.status = Some(Status::error(
-                        "Split: the run did not stop to edit its commit; nothing was split",
-                    ));
-                }
-            }
+            p.split_due = true;
+            self.split_confirmation(ctx, i);
         }
         let p = &mut self.git.panels[i];
         // Show's backups stay until the next refresh (03 §8.2).
@@ -2578,12 +2745,28 @@ impl Browser {
     /// tree or F12's question has the keyboard — each another dialog to this panel, as `git_ui`'s
     /// `elsewhere` (F-git-listq, F-git-covered) — so no git dialog opens in front of the list's
     /// question, where it would take the pointer while an Enter answered the question behind it,
-    /// beside the tree, or under F12's question.
+    /// beside the tree, or under F12's question. The panel's own dialog is not counted here: a
+    /// run's end is heard under it, and the reads that would open a dialog wait for it in
+    /// `poll_actions` (F-git-own-two).
     pub(super) fn git_waits(&self, i: usize) -> bool {
         self.git_dialog_up(Some(i))
             || self.ops.holds_keyboard()
             || self.tree.is_some()
             || self.switch_asking()
+    }
+
+    /// Something of git is on its way that a timed pass must hear (the window then asks for one
+    /// every 100 ms): a detection, a page, the details, a run, a dialog's reads, a read not
+    /// held. What is held — for the panel's own dialog or another's (`RepoPanel::holds`) — asks
+    /// for no pass (F-git-own-two): nothing comes of it until that dialog closes, and the pass
+    /// that closes it, held no more, asks for the next as this says. A run stays counted: one
+    /// whose end waits for another dialog is not told from one still running.
+    pub(super) fn git_busy(&self) -> bool {
+        !self.git.asking.is_empty()
+            || (0..self.git.panels.len()).any(|i| {
+                let p = &self.git.panels[i];
+                p.reading() || p.on_its_way(self.git_waits(i))
+            })
     }
 }
 
@@ -2692,6 +2875,9 @@ impl Running {
 pub(super) struct Prefilled {
     pub(super) id: ActionId,
     pub(super) target: git_panel::Target,
+    /// The snapshot it was asked in: held and read for an older one, it is read again
+    /// (F-git-own-two).
+    pub(super) generation: Option<u64>,
     pub(super) read: std::result::Result<git_panel::Prefill, String>,
 }
 
@@ -3322,22 +3508,17 @@ impl Browser {
         // What Esc said while it ran ("stopping") gives way to the run's own words.
         self.status = Status::default();
         if let RunEnd::Confirm { title, action } = end {
-            // Nothing ran, nothing to refresh: the action's confirmation, again.
+            // Nothing ran, nothing to refresh: the action's confirmation, again — once no dialog
+            // of the panel's but a result is up (F-git-own-two), the status row saying so.
             let p = &mut self.git.panels[i];
-            p.view.status = Some(Status::info(format!(
-                "{title}: not run — its plan asks for a confirmation"
-            )));
-            let asked = p.view.reconfirm(*action);
+            let asked = p.view.reconfirm(&title, *action);
             self.git_actions(ctx, i, asked);
             return;
         }
         if let RunEnd::ConfirmEdit { title, edit } = end {
-            // A history edit's shown plan was lost: its confirmation again, nothing run.
-            let p = &mut self.git.panels[i];
-            p.view.status = Some(Status::info(format!(
-                "{title}: not run — its plan asks for a confirmation"
-            )));
-            p.view.reconfirm_edit(*edit);
+            // A history edit's shown plan was lost: its confirmation again, nothing run, as an
+            // action's.
+            self.git.panels[i].view.reconfirm_edit(&title, *edit);
             return;
         }
         match end {
@@ -3464,16 +3645,24 @@ impl Browser {
             .repo()
             .map(|(r, _)| r.remotes.clone())
             .unwrap_or_default();
+        let generation = p.view.repo().map(|(_, generation)| generation);
         let handle = Handle::new();
         let git = RunnerGit::new(runner, handle.clone());
         let (tx, rx) = mpsc::channel();
         let (top, waker) = (p.top.clone(), ctx.clone());
         std::thread::spawn(move || {
             let read = read_prefill(&git, &top, id, &target, &remotes);
-            let _ = tx.send(Prefilled { id, target, read });
+            let _ = tx.send(Prefilled {
+                id,
+                target,
+                generation,
+                read,
+            });
             waker.request_repaint();
         });
         p.prefill = Some(Pending { rx, handle });
+        p.prefill_held = false;
+        p.prefill_what = git_panel::action_label(id).trim_end_matches('…');
     }
 
     /// The reads the open dialog's plan needs beyond the refresh (S3-A's `needs` / `inspect`; a
@@ -3534,6 +3723,16 @@ impl Browser {
             return;
         };
         let mut repo = repo.clone();
+        let what = match &opening {
+            Opening::Edit { id, .. } => git_panel::history_label(*id).trim_end_matches('…'),
+            Opening::Planner => "planner",
+        };
+        p.edit_ask = Some(EditAsk {
+            dialog: matches!(opening, Opening::Edit { .. }),
+            from: from.clone(),
+            held: false,
+            what,
+        });
         let handle = Handle::new();
         let (tx, rx) = mpsc::channel();
         let (h, waker) = (handle.clone(), ctx.clone());
@@ -3576,6 +3775,12 @@ impl Browser {
             return;
         };
         let head = repo.head.clone();
+        p.restore_ask = Some(RestoreAsk {
+            stamp: stamp.clone(),
+            only: only.clone(),
+            generation: p.view.repo().map(|(_, generation)| generation),
+            held: false,
+        });
         let handle = Handle::new();
         let (tx, rx) = mpsc::channel();
         let (top, h, waker) = (p.top.clone(), handle.clone(), ctx.clone());
@@ -3622,6 +3827,31 @@ impl Browser {
         // a confirmation again, the Commit after a squash, "delete anyway?"), a prefill, a history
         // edit's range, the Backups list, a restore's entries, a tag's details. They stay in
         // their channels and open once that dialog closes, the keyboard following them.
+        //
+        // While the panel's own dialog is up (F-git-own-two), the reads it asked for whose answer
+        // opens a dialog wait for it too: a prefill (`opened` would set its dialog behind the
+        // menu, or in place of an action dialog and its draft), a quick edit's range
+        // (`open_edit`), a restore's entries, the Backups list (it closes the log, with an entry
+        // shown whole), a quick `split`'s Split confirmation (its load is heard: the snapshot
+        // is never held for the panel's own dialog) — a failed read's result with them, on the
+        // same channel, and the run at once of a prefill's or a range's edit that asks no
+        // confirmation (`Opened::Run`, `QuickOpened::Run`), which so starts once the owner's
+        // dialog closes. A prefill or a range held, read for an older snapshot than the one at
+        // its release, is read again (a refresh came while it waited). Asked at each read
+        // (`RepoPanel::holds`), as a run's end or an earlier read of this poll may have opened
+        // one. Not so:
+        // - a run's end: heard, so "Stop git?" goes with its run (`forget_stop_unless`: its Yes
+        //   would stop the next write) and the run no longer reads as running; its result waits
+        //   behind one up (F-git-outcome), its question asked again — its confirmation, a
+        //   history edit's, "delete anyway?" — waits in the view for a dialog up other than a
+        //   result (`GitView::ask_again`, opened here before the reads), and the Commit's
+        //   prefill a squash asks for waits here as a read;
+        // - a tag's details, a result (`show_text`): it never takes another dialog's place, and
+        //   waits behind a result, a menu, a quick edit's or an action's dialog (`modals`);
+        // - the planner's range, but for a dialog of the body (an entry of the log shown whole,
+        //   the planner's own), whose place its pane would take: its pane is no dialog, and the
+        //   switch opens a plan under the owner's dialog (X4-state);
+        // - "Stop git?": the owner's Esc opens it, never a read, and only with no dialog up.
         let wait = self.git_waits(i);
         let mut ended = Vec::new();
         // Not received at all while it waits: a receive would take the end off its channel.
@@ -3646,15 +3876,33 @@ impl Browser {
         for end in ended {
             self.run_ended(ctx, i, end);
         }
+        // A run's question that waited, once nothing holds it, the oldest first (a fresh one
+        // heard in this poll waits behind it, `GitView::reconfirm`): before the reads, and before
+        // the open dialog's reads are checked, so they are its own (F-git-drafted). Then a quick
+        // `split`'s Split confirmation, its load in.
         let p = &mut self.git.panels[i];
+        if p.view.asks_again() && !p.holds(wait).question {
+            let asked = p.view.ask_again();
+            self.git_actions(ctx, i, asked);
+        }
+        self.split_confirmation(ctx, i);
+        let p = &mut self.git.panels[i];
+        let hold = p.holds(wait).dialog;
+        p.prefill_held |= hold && p.prefill.is_some();
         let prefilled = p
             .prefill
             .as_ref()
-            .filter(|_| !wait)
+            .filter(|_| !hold)
             .map(|r| r.rx.try_recv());
         if let Some(Ok(prefilled)) = prefilled {
             p.prefill = None;
+            // Held, and read for an older snapshot: read again for this one (F-git-own-two), so
+            // what the dialog starts from — HEAD's message, the name and email, the URLs — is the
+            // repository's now. One that came at once opens as read, as ever.
+            let current = p.view.repo().map(|(_, generation)| generation);
+            let stale = std::mem::take(&mut p.prefill_held) && prefilled.generation != current;
             match prefilled.read {
+                _ if stale => self.ask_prefill(ctx, i, prefilled.id, prefilled.target),
                 Ok(read) => {
                     let asked = p.view.open_action(prefilled.id, prefilled.target, read);
                     self.git_actions(ctx, i, asked);
@@ -3694,27 +3942,39 @@ impl Browser {
         }
         // S4: the range a history edit opens on came — its dialog, or the planner.
         let p = &mut self.git.panels[i];
+        let hold = p.holds(wait).range;
+        if let (true, Some(_), Some(ask)) = (hold, &p.edit_open, &mut p.edit_ask) {
+            ask.held = true;
+        }
         let opened = p
             .edit_open
             .as_ref()
-            .filter(|_| !wait)
+            .filter(|_| !hold)
             .map(|r| r.rx.try_recv());
         if let Some(Ok(opened)) = opened {
             p.edit_open = None;
+            let ask = p.edit_ask.take();
             p.view.seen(opened.generation, opened.seen);
             let what = match &opened.opening {
                 Opening::Edit { id, .. } => git_panel::history_label(*id).trim_end_matches('…'),
                 Opening::Planner => "Edit history",
             };
             // Read for an older snapshot: a refresh came meanwhile, so the range may no longer
-            // be the history — nothing opens on it (S4-C review, round 3).
+            // be the history — nothing opens on it (S4-C review, round 3). One held for a dialog
+            // is read again from where it started (F-git-own-two): the refresh came while the
+            // owner could not open it, and a commit gone since is said when it comes.
             let current = p.view.repo().map(|(_, generation)| generation);
             match (opened.model, opened.opening) {
-                _ if current != Some(opened.generation) => {
-                    p.view.status = Some(Status::info(format!(
-                        "{what}: the repository changed while it was read — open it again"
-                    )));
-                }
+                (_, opening) if current != Some(opened.generation) => match ask {
+                    Some(EditAsk {
+                        held: true, from, ..
+                    }) => self.ask_edit_open(ctx, i, opening, from),
+                    _ => {
+                        p.view.status = Some(Status::info(format!(
+                            "{what}: the repository changed while it was read — open it again"
+                        )));
+                    }
+                },
                 (Ok(model), Opening::Edit { id, commit }) => {
                     let asked = p.view.open_edit(id, &commit, &model);
                     self.git_actions(ctx, i, asked);
@@ -3731,7 +3991,7 @@ impl Browser {
         let backups = p
             .backups_read
             .as_ref()
-            .filter(|_| !wait)
+            .filter(|_| !p.holds(wait).dialog)
             .map(|r| r.rx.try_recv());
         if let Some(Ok(read)) = backups {
             p.backups_read = None;
@@ -3743,14 +4003,25 @@ impl Browser {
                 }
             }
         }
+        let hold = p.holds(wait).dialog;
+        if let (true, Some(_), Some(ask)) = (hold, &p.restore_read, &mut p.restore_ask) {
+            ask.held = true;
+        }
         let restore = p
             .restore_read
             .as_ref()
-            .filter(|_| !wait)
+            .filter(|_| !hold)
             .map(|r| r.rx.try_recv());
         if let Some(Ok(read)) = restore {
             p.restore_read = None;
+            // Held, and read for an older snapshot: read again for this one, as a prefill is.
+            let current = p.view.repo().map(|(_, generation)| generation);
+            let again = (p.restore_ask.take()).filter(|a| a.held && a.generation != current);
             match read {
+                _ if again.is_some() => {
+                    let RestoreAsk { stamp, only, .. } = again.expect("checked");
+                    self.ask_restore(ctx, i, stamp, only);
+                }
                 Ok((stamp, entries, only)) => {
                     let asked = p.view.open_restore(stamp, entries, only.as_deref());
                     self.git_actions(ctx, i, asked);
@@ -3762,7 +4033,7 @@ impl Browser {
         let text = p
             .text_read
             .as_ref()
-            .filter(|_| !wait)
+            .filter(|_| !p.holds(wait).text)
             .map(|r| r.rx.try_recv());
         if let Some(Ok((title, text))) = text {
             p.text_read = None;

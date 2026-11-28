@@ -472,6 +472,13 @@ pub struct GitView {
     /// "Stop git?" over a write running for 10 s (03 §3.4): the action's words, and the id of the
     /// run it asks about.
     stop_question: Option<(String, u64)>,
+    /// Runs' questions asked again while a dialog of the panel's other than a result was up, or
+    /// while older ones waited, in the order they came, each with its run's title, at most
+    /// [`RESULTS_WAITING`] (F-git-own-two): none takes that dialog's place; each opens once none
+    /// is up ([`GitView::ask_again`]), said on the status row meanwhile.
+    asked_again: VecDeque<(String, Again)>,
+    /// The questions dropped past [`RESULTS_WAITING`] since none waited, said on the status row.
+    questions_dropped: usize,
     /// Each dialog slot's serial, by [`Front`]: bumped whenever the slot is set or cleared other
     /// than by the owner's own key in that dialog (those come in the pass's draw), so
     /// [`GitView::fronts`] tells a dialog replaced by another of its kind — a result by the next —
@@ -501,6 +508,17 @@ pub struct GitView {
     /// while egui draws it, so the blanking is proved through these until their units land.
     #[cfg(test)]
     pub test_covers: Vec<Cells>,
+}
+
+/// A run's question asked again ([`GitView::asked_again`]).
+#[derive(Debug)]
+enum Again {
+    /// Its action's confirmation (`RunEnd::Confirm`, [`GitView::reconfirm`]).
+    Confirm(Action),
+    /// A history edit's (`RunEnd::ConfirmEdit`, [`GitView::reconfirm_edit`]).
+    Edit(Edit),
+    /// "Delete anyway?" ([`GitView::confirm_again`]): the error it answers already gone.
+    Forced(Action),
 }
 
 /// A dialog slot of a panel's (F-git-listq): the planner's own dialogs and the log's entry shown
@@ -676,6 +694,8 @@ impl GitView {
             result_screen: ResultScreen::default(),
             results_dropped: 0,
             stop_question: None,
+            asked_again: VecDeque::new(),
+            questions_dropped: 0,
             front_serials: [0; Front::KINDS],
             backups: None,
             log: None,
@@ -998,10 +1018,23 @@ impl GitView {
     /// The status row while the git panel has the keyboard: the view's own word, else the
     /// integration's, else what the keys do.
     pub fn status_line(&self) -> Status {
+        // A run's question waits behind the open dialog (F-git-own-two): said while it waits,
+        // before the front's own keys, since it shows nowhere else.
+        if let Some((title, _)) = self.asked_again.front() {
+            let said = format!("{title} asks again: close the dialog to see it");
+            return Status::info(match self.questions_dropped {
+                0 => said,
+                1 => format!("{said} · 1 earlier question dropped"),
+                n => format!("{said} · {n} earlier questions dropped"),
+            });
+        }
+        // The front dialog's keys, in the order the dialogs are drawn: the menu over all, the
+        // filters' only while no dialog `modals` draws is over them (under a result, the words
+        // of its run below).
         if let Some(menu) = &self.menu {
             return Status::info(menu_hint(menu));
         }
-        if self.filters_dialog.is_some() {
+        if self.filters_dialog.is_some() && !self.modal_up() {
             return Status::info(filters::HINT);
         }
         if let Some(said) = self.said.as_ref().or(self.status.as_ref()) {
@@ -1817,12 +1850,26 @@ impl GitView {
     }
 
     /// The confirmation of `action` again, as a dialog (review 1: a run whose shown plan was lost
-    /// and whose plan now asks for a confirmation). Never a run from here: a plan that asks for
-    /// none says so on the status row instead.
-    pub fn reconfirm(&mut self, action: Action) -> Vec<GitAction> {
+    /// and whose plan now asks for a confirmation), its run `title`'s words on the status row.
+    /// Never a run from here: a plan that asks for none says so on the status row instead. While
+    /// a dialog of the panel's other than a result is up, or an older question waits, it waits
+    /// ([`GitView::ask_again`], F-git-own-two).
+    pub fn reconfirm(&mut self, title: &str, action: Action) -> Vec<GitAction> {
+        if self.questions_wait() {
+            self.ask_later(title.to_string(), Again::Confirm(action));
+            return Vec::new();
+        }
+        self.reconfirm_now(title, action)
+    }
+
+    /// [`GitView::reconfirm`]'s dialog, now.
+    fn reconfirm_now(&mut self, title: &str, action: Action) -> Vec<GitAction> {
         let Some(repo) = &self.repo else {
             return Vec::new();
         };
+        self.status = Some(Status::info(format!(
+            "{title}: not run — its plan asks for a confirmation"
+        )));
         match dialogs::ActionDialog::confirm(action, repo, dialogs::PLAN) {
             dialogs::Opened::Dialog(dialog) => {
                 self.dialog = Some(dialog);
@@ -1840,13 +1887,79 @@ impl GitView {
     /// A second dialog for an action git refused (03 §7.2: `delete-branch`'s "not fully merged":
     /// the same action, forced), in place of the error dialog it answers: the newest result,
     /// which the run's end has just put up or set waiting — never a result up before it
-    /// (F-git-outcome).
+    /// (F-git-outcome). That error goes at once; while another dialog of the panel's is up, the
+    /// question waits for it ([`GitView::ask_again`], F-git-own-two).
     pub fn confirm_again(&mut self, action: Action) -> Vec<GitAction> {
         if self.waiting.pop_back().is_none() {
             self.result = None;
             self.bump(Front::Result);
         }
+        if self.questions_wait() {
+            let what = menu::label(action.id()).trim_end_matches('…');
+            self.ask_later(what.to_string(), Again::Forced(action));
+            return Vec::new();
+        }
         self.confirm(action)
+    }
+
+    /// A dialog of the panel's is up other than a result (F-git-own-two): a run's question asked
+    /// again waits for it, none taking its place or its draft. A result is no reason to wait: it
+    /// never stands in a dialog's place, the question is drawn over it (`modals`) and "delete
+    /// anyway?" replaces the one it answers.
+    pub fn holds_questions(&self) -> bool {
+        let result = Front::Result as usize;
+        (self.fronts().iter().enumerate()).any(|(k, (up, _))| *up && k != result)
+    }
+
+    /// A run's question asked now waits: a dialog holds questions, or an older one waits, which
+    /// opens first ([`GitView::ask_again`]).
+    fn questions_wait(&self) -> bool {
+        self.holds_questions() || !self.asked_again.is_empty()
+    }
+
+    /// `again` waits, after those before it; past [`RESULTS_WAITING`] the oldest goes, counted
+    /// for the status row.
+    fn ask_later(&mut self, title: String, again: Again) {
+        if self.asked_again.len() >= RESULTS_WAITING {
+            self.asked_again.pop_front();
+            self.questions_dropped += 1;
+        }
+        self.asked_again.push_back((title, again));
+    }
+
+    /// Whether a run's question waits ([`GitView::ask_again`]).
+    pub fn asks_again(&self) -> bool {
+        !self.asked_again.is_empty()
+    }
+
+    /// The titles of the runs whose questions wait, oldest first: what F12's switch drops
+    /// (`GitView::untaken`).
+    pub fn waiting_questions(&self) -> impl Iterator<Item = &str> {
+        self.asked_again.iter().map(|(title, _)| title.as_str())
+    }
+
+    /// The first run's question that waited, now that no dialog of the panel's but a result is
+    /// up (the integration asks before the pass's draw, so that pass drops its keys, F-git-listq):
+    /// what it asks the integration for — "delete anyway?"'s run, where its plan asks for no
+    /// confirmation now. The others wait for it in turn.
+    pub fn ask_again(&mut self) -> Vec<GitAction> {
+        if self.holds_questions() {
+            return Vec::new();
+        }
+        let next = self.asked_again.pop_front();
+        if self.asked_again.is_empty() {
+            self.questions_dropped = 0;
+        }
+        // Opened now, never waiting again behind those after it.
+        match next {
+            None => Vec::new(),
+            Some((title, Again::Confirm(action))) => self.reconfirm_now(&title, action),
+            Some((title, Again::Edit(edit))) => {
+                self.reconfirm_edit_now(&title, edit);
+                Vec::new()
+            }
+            Some((_, Again::Forced(action))) => self.confirm(action),
+        }
     }
 
     /// `SOPEN_STATE dialog=<id>` (02 §9): an action's id on the object under the bar, else on the
@@ -2729,8 +2842,17 @@ impl GitView {
     }
 
     /// A quick edit's dialog (03 §7.8.1) on `commit`, from `model`, the range its reads opened:
-    /// its row and, for `squash`, the row below it. A commit the range does not hold is said.
+    /// its row and, for `squash`, the row below it. A commit the range does not hold is said, and
+    /// so is a dialog of the panel's up: none opens over it or in its place (F-git-own-two; the
+    /// integration holds the range in its channel meanwhile, so this is a backstop).
     pub fn open_edit(&mut self, id: EditId, commit: &Oid, model: &Model) -> Vec<GitAction> {
+        if self.dialog_up() {
+            let what = menu::history_label(id).trim_end_matches('…');
+            self.said = Some(Status::error(format!(
+                "{what}: not opened over the open dialog; close it and try again"
+            )));
+            return Vec::new();
+        }
         let Some(repo) = &self.repo else {
             return Vec::new();
         };
@@ -2757,13 +2879,29 @@ impl GitView {
     }
 
     /// The planner (03 §7.8.2) on `model`, the range read, over the body; it has the keyboard.
+    /// The command log goes, as for the Backups list: an entry of it shown whole would stay a
+    /// dialog of the panel's under the planner and keep its keys (F-git-own-two; the range
+    /// waits for an entry shown whole, `body_dialog_up`).
     pub fn open_planner(&mut self, model: Model) {
+        if self.repo.is_none() {
+            return;
+        }
+        self.find = None;
+        if self.log.take().is_some() {
+            self.bump(Front::Entry);
+        }
         let Some(repo) = &self.repo else {
             return;
         };
-        self.find = None;
         self.planner = Some(planner::PlannerView::new(model, repo));
         self.bump(Front::Planner);
+    }
+
+    /// A dialog of the body is up — the command log's entry shown whole, the planner's own —
+    /// which the planner's pane would take the place of: its range waits for it (F-git-own-two).
+    pub fn body_dialog_up(&self) -> bool {
+        let fronts = self.fronts();
+        fronts[Front::Entry as usize].0 || fronts[Front::Planner as usize].0
     }
 
     /// The open action dialog's "Plan the commits first…" button, when it draws one (tests).
@@ -2831,11 +2969,25 @@ impl GitView {
     }
 
     /// A history edit's confirmation again, as a dialog: its run's shown plan was lost and the
-    /// plan made now asks for a confirmation (S3-C's review rule). Never a run from here.
-    pub fn reconfirm_edit(&mut self, edit: Edit) {
+    /// plan made now asks for a confirmation (S3-C's review rule), its run `title`'s words on the
+    /// status row. Never a run from here. While a dialog of the panel's other than a result is
+    /// up, or an older question waits, it waits ([`GitView::ask_again`], F-git-own-two).
+    pub fn reconfirm_edit(&mut self, title: &str, edit: Edit) {
+        if self.questions_wait() {
+            self.ask_later(title.to_string(), Again::Edit(edit));
+            return;
+        }
+        self.reconfirm_edit_now(title, edit);
+    }
+
+    /// [`GitView::reconfirm_edit`]'s dialog, now.
+    fn reconfirm_edit_now(&mut self, title: &str, edit: Edit) {
         let Some(repo) = &self.repo else {
             return;
         };
+        self.status = Some(Status::info(format!(
+            "{title}: not run — its plan asks for a confirmation"
+        )));
         match planner::QuickDialog::confirm(edit, repo, planner::PLAN) {
             planner::QuickOpened::Dialog(dialog) => {
                 self.quick = Some(dialog);
