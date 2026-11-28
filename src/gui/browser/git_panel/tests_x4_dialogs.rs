@@ -533,8 +533,7 @@ fn x4d_run_is_off_while_the_plan_refuses() {
     assert_eq!(fx.host.ends, [DialogEnd::Cancel]);
 }
 
-/// What the dialog covers is its box and its shadow, and the screen under it is blank there; the
-/// forms egui still draws (03 §7.1–§7.5's, until X4-dialogs2) cover nothing and are egui's box.
+/// What the dialog covers is its box and its shadow, and the screen under it is blank there.
 #[test]
 fn x4d_the_dialog_covers_its_box_and_shadow() {
     let d = open(A::Stash, Target::Uncommitted, &dirty(), fake);
@@ -561,16 +560,6 @@ fn x4d_the_dialog_covers_its_box_and_shadow() {
             }
         }
     }
-    // An egui form: no cells, nothing covered.
-    let bar = Target::Commit {
-        commit: super::tests::commit(2, &[1], "Ann", 0, "second"),
-        marked: Vec::new(),
-    };
-    let d = open(A::Reset, bar, &repo(), fake);
-    let fx = Fx::new(d, fake, 100, 30);
-    assert!(fx.host.covers.is_empty());
-    assert!(boxed(&fx.drv, "Fake reset").is_none(), "egui's dialog");
-    assert!(fx.drv.find_text("Fake reset").is_some());
 }
 
 // ---------------------------------------------------------------------------------------------

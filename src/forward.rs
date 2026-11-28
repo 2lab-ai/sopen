@@ -2250,6 +2250,9 @@ mod tests {
              printf 'sopen-xtools-st'; sleep 0.2; printf 'ate {\"v\":1}\\n'\n\
              head -c 10000 /dev/zero | tr '\\000' b >&2; echo >&2\n",
         );
+        // Run once now (it writes no file): a just-written stand-in can be "busy" for a moment on
+        // Linux (testutil), and the switch would fail to start it.
+        crate::testutil::run_fresh(&mut Command::new(&ssh));
         let switch = Switch {
             ssh: ssh.as_os_str(),
             connection: vec![],
@@ -2733,6 +2736,7 @@ mod tests {
             &ssh,
             &format!(
                 "#!/bin/sh\n\
+                 [ \"$1\" = warm ] && exit 0\n\
                  printf '%s %s\\n' \"$$\" \"$PPID\" >> {pids}\n\
                  for a in \"$@\"; do printf '%s\\n' \"$a\"; done >> {calls}\n\
                  echo --- >> {calls}\n\
@@ -2743,6 +2747,9 @@ mod tests {
                 calls = file("calls"),
             ),
         );
+        // Run once now (`warm` ends it before it records anything): a just-written stand-in can
+        // be "busy" for a moment on Linux (testutil), and the tunnel would fail to start it.
+        crate::testutil::run_fresh(Command::new(&ssh).arg("warm"));
         ssh
     }
 

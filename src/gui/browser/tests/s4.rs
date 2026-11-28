@@ -1025,7 +1025,7 @@ fn g_h4_a_merge_in_the_range_refused_and_rebase_lists_it() {
     assert_eq!(g.dialog_id(), Some(ActionId::Rebase));
     g.idle(4);
     assert!(g.shows(short), "the merge listed: {:#?}", g.texts());
-    g.click(git_panel::PLAN_FIRST);
+    g.click(&format!("[ {} ]", git_panel::PLAN_FIRST));
     g.until_quiet("the planner's range");
     assert!(g.dialog_id().is_none(), "nothing ran");
     let subjects: Vec<String> = g.plan_rows().into_iter().map(|(s, _)| s).collect();
@@ -1256,7 +1256,9 @@ fn a_failing_read_opens_nothing_and_runs_nothing() {
     let i = g.b().git.panel(g.repo.top()).unwrap();
     g.fx.b.start_edit(&ctx, i, edit);
     g.until_quiet("the run's reads");
-    assert!(g.shows("a raw read that fails"), "{:#?}", g.texts());
+    // The result's line is wider than its box (80 cells): it wraps by cells at a blank.
+    let said = g.texts().join(" ");
+    assert!(said.contains("a raw read that fails"), "{:#?}", g.texts());
     assert!(g.status().ends_with(": not run"), "{}", g.status());
     assert_eq!(g.repo.rev("HEAD"), head, "nothing ran");
 }
@@ -1485,6 +1487,10 @@ fn the_planner_takes_its_keys_first_and_the_banner_keys_wait() {
         &editor,
         &format!("sed -i.bak 's/^pick {}/edit {}/' \"$1\"", &b[..7], &b[..7]),
     );
+    // Run once now (no file: sed only fails; in the test's own folder whatever it does): a
+    // just-written script can be "busy" for a moment on Linux (testutil), and git would fail to
+    // start it as the sequence editor.
+    crate::testutil::run_fresh(std::process::Command::new(&editor).current_dir(stopped.tmp.path()));
     let out = std::process::Command::new(&stopped.git)
         .current_dir(&stopped.top)
         .envs(fixture::env(&stopped.home()))

@@ -5,23 +5,45 @@
 //! [`items`] is the menu of a [`Target`], in 03 §7's table order, with what each item is called
 //! and its key; an action is offered only where its table says it applies (`checkout-branch` not
 //! on the checked-out branch, `fetch-into` only beside a local branch that is not checked out, no
-//! remote action without a remote, nothing that names a ref or a path that is not UTF-8). The
-//! [`Menu`] draws it in the dialog look (`chrome::dialog`) with a bar of its own — ↑ ↓ PgUp PgDn
-//! Home End move it, Enter or a click chooses, Esc or F10 closes it — and every menu but the
-//! repository's ends in `Repository…`, which turns it into the repository's menu. Choosing gives
-//! the id and its target back; [`super::dialogs::ActionDialog::open`] makes the dialog of it, and
-//! the views among the ids ([`is_view`]) are the panel's to carry out.
+//! remote action without a remote, nothing that names a ref or a path that is not UTF-8). Every
+//! menu but the repository's ends in `Repository…`, which turns it into the repository's menu.
+//! Choosing gives the id and its target back; [`super::dialogs::ActionDialog::open`] makes the
+//! dialog of it, and the views among the ids ([`is_view`]) are the panel's to carry out.
+//!
+//! **In cells** (X4-menu, 10 §17): the menu is an `ops::dialog` box on the panels' grid, its
+//! lines one list of the kit's — each item with its key at the right, then a commit's history
+//! row, then `Repository…` — with the bar, ↑ ↓ PgUp PgDn Home End moving it and the rows it shows
+//! following it, the wheel and ↑ ░ ↓ on the box's border scrolling them. It is as wide as its
+//! widest line by 10 §6's rule (24 cells at least, as egui's was), and its list shows at most
+//! seven tenths of the grid's rows, as egui's 70 % of the window, giving way where the grid is
+//! shorter. No line stands between the groups: the kit's list has no line the bar passes over. A
+//! commit's title is its subject cut at 40 cells, and the no-item line wraps at 40 as egui's did.
+//! Enter or a click chooses, as egui's menu; Space chooses nothing (in the panel it marks, 03
+//! §9.2), though the kit's list would take it. Esc, F10 or a click outside closes it; its keys
+//! are taken before anything else sees them, and an Enter, Space, Esc or F10 it does not act on
+//! is dropped, never left for what is under it. A key at an
+//! item's right is that item's key in the panel, not while the menu is open (as egui's menu). Only
+//! what the screen showed is chosen: a choice acts only on the lines the last pass that reached
+//! the screen painted (`cells::OnScreen`: a terminal prints no pass while input waits), in the
+//! box where it painted them, so a pass's choices after `Repository…` made the lines anew are
+//! dropped (the menu's lines change no other way: a refresh does not touch an open menu), a box
+//! laid elsewhere (the grid resized) chooses nothing in that pass, and presses after a Tab in
+//! the pass are the kit's to drop. Its ids are one set for the window:
+//! the menu has no panel's column (the panel hands its dialogs the panels' grid alone,
+//! `GitView::modals`).
 
 use super::filters::split_remote;
-use crate::git::actions::{ActionId, Repo};
+use super::in_progress::{self, StopStep};
+use crate::git::actions::{ActionId, Proceed, Repo};
 use crate::git::model::{
     CommitRow, Head, ObjectType, RefKind, RefLabel, StashRow, StatusEntry, StatusState,
 };
 use crate::git::rebase::EditId;
-use crate::gui::browser::keys::{self, Mods};
-use crate::gui::cells::{Cells, Grid};
-use crate::gui::chrome;
+use crate::gui::browser::keys::{self, Command, Mods};
+use crate::gui::browser::ops::dialog::{self as kit, Bar, Ink, Input, Inputs, Part, Row, Rows};
+use crate::gui::cells::{self, Cells, Grid};
 use eframe::egui::{self, Key};
+use std::sync::Arc;
 
 /// The object whose menu opens (03 §7.1–§7.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,8 +487,10 @@ pub fn items(target: &Target, repo: &Repo) -> Vec<Item> {
 fn title(target: &Target) -> String {
     match target {
         Target::Commit { commit, .. } => {
-            let subject: String = commit.subject.chars().take(40).collect();
-            super::graph_view::printable(&format!("{} {subject}", commit.oid.short())).into_owned()
+            // The subject cut by cells, a Hangul one at 19 characters and `…` (egui's took 40
+            // characters of any width).
+            let subject = super::graph_view::printable(&commit.subject);
+            format!("{} {}", commit.oid.short(), cells::fit_start(&subject, 40))
         }
         Target::Label(r) => super::graph_view::printable(r.name()).into_owned(),
         Target::Stash(s) => s.selector.clone(),
@@ -485,8 +509,63 @@ pub enum MenuEnd {
     /// Enter or a click on an item: its id, on this target (the repository's after
     /// `Repository…`).
     Chose { id: ActionId, target: Target },
+    /// A line of the repository's menu that is a key of the panel's ([`Step`]): its command, for
+    /// the panel to run as that key runs it.
+    Key(Command),
     /// Esc, F10 or a click outside it.
     Cancel,
+}
+
+/// A line of the repository's menu that runs one of the panel's Cmd/Ctrl+Shift keys (10 §9,
+/// T17): a terminal without the kitty protocol loses the Shift of those chords, so the menu holds
+/// each, chosen as its key runs it — the banner's steps the state offers (Continue, Skip, Abort,
+/// bisect's Reset), an edit stop's Amend and Split (`Edit::SplitStop`, not the history row's
+/// quick split), and the panel over both sides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub command: Command,
+    pub label: String,
+    /// Its key, at the line's right end: `Ctrl/⌘+Shift+C`.
+    pub key: String,
+}
+
+/// The repository's key lines on `repo`: those before its items — the banner's steps the state
+/// offers, then an edit stop's — and those after them (the panel over both sides). The banner and
+/// the edit stop are the panel's own (`GitView::set_repo` reads them so from the snapshot).
+fn steps_of(repo: &Repo) -> (Vec<Step>, Vec<Step>) {
+    let banner = in_progress::BannerView::probe(&repo.in_progress, &repo.status);
+    let stop = in_progress::EditStop::probe(&repo.in_progress, &repo.status, repo.head.oid());
+    let mut before = Vec::new();
+    for p in banner.as_ref().map_or(&[][..], |b| b.offers()) {
+        let (command, id) = match p {
+            Proceed::Continue => (Command::Continue, ActionId::Continue),
+            Proceed::Skip => (Command::Skip, ActionId::Skip),
+            Proceed::Abort => (Command::Abort, ActionId::Abort),
+            Proceed::BisectReset => (Command::BisectReset, ActionId::BisectReset),
+        };
+        before.push(Step {
+            command,
+            label: label(id).to_string(),
+            key: in_progress::key_text(*p),
+        });
+    }
+    for s in stop.map_or_else(Vec::new, |s| s.offers()) {
+        let (command, words) = match s {
+            StopStep::Amend => (Command::Amend, "Amend the stopped commit…"),
+            StopStep::Split => (Command::Split, "Split the stopped commit…"),
+        };
+        before.push(Step {
+            command,
+            label: words.to_string(),
+            key: in_progress::stop_key_text(s),
+        });
+    }
+    let after = vec![Step {
+        command: Command::Wide,
+        label: "The git panel over both sides, and back".to_string(),
+        key: format!("{}G", Mods::CommandShift.prefix()),
+    }];
+    (before, after)
 }
 
 /// The menu of one object, open.
@@ -497,21 +576,241 @@ pub struct Menu {
     items: Vec<Item>,
     /// The repository's items, for `Repository…` (none on the repository's own menu).
     repository: Vec<Item>,
-    /// The line under the menu's bar (`items.len()`: `Repository…`).
-    bar: usize,
-    /// The bar moved by a key: the next pass shows it.
-    #[cfg_attr(not(test), allow(dead_code))] // S3-B's own pass (see `Menu::ui`).
-    moved: bool,
+    /// The repository's key lines, before its items and after them ([`steps_of`]): the
+    /// repository's menu shows them, another keeps them for `Repository…`.
+    steps: (Vec<Step>, Vec<Step>),
+    /// Its lines in cells: the items, then `Repository…` unless this is the repository's menu.
+    list: List,
+}
+
+/// A menu's lines in cells (X4-menu): the kit's rows, the bar, and which rows the screen shows —
+/// a choice acts only on the rows the owner saw.
+#[derive(Debug, Clone)]
+struct List {
+    rows: Arc<Rows>,
+    bar: Bar,
+    /// How many times the rows were made anew (`Repository…`): which rows these are.
+    made: u64,
+    /// The `made` of the rows and where the box stood, as the last pass that reached the screen
+    /// painted them (`cells::OnScreen`: a terminal prints no pass while input waits).
+    screen: cells::OnScreen<(u64, Vec<Cells>)>,
+}
+
+impl List {
+    fn new(rows: Arc<Rows>) -> List {
+        List {
+            rows,
+            bar: Bar::default(),
+            made: 0,
+            screen: cells::OnScreen::default(),
+        }
+    }
+
+    /// The rows made anew, the bar on the first: none of them is painted yet.
+    fn renew(&mut self, rows: Arc<Rows>) {
+        self.rows = rows;
+        self.bar = Bar::default();
+        self.made += 1;
+    }
+}
+
+/// A menu's rows: its key lines before its items, the items, the key lines after them, each
+/// with its key at the right ([`Menu::lines`]), a commit's `history` row, then `Repository…`
+/// where `repository`.
+fn rows_of(menu: &Menu, history: &[HistoryItem], repository: bool) -> Arc<Rows> {
+    let row = |label: &str, key: &Option<String>| Row::new(label, key.as_deref().unwrap_or(""));
+    let (before, items, after) = menu.lines();
+    let step = |s: &Step| Row::new(&s.label, &s.key);
+    let mut all: Vec<Row> = before.iter().map(step).collect();
+    all.extend(items.iter().map(|i| row(&i.label, &i.key)));
+    all.extend(after.iter().map(step));
+    all.extend(history.iter().map(|i| row(&i.label, &i.key)));
+    if repository {
+        all.push(Row::new(REPOSITORY, ""));
+    }
+    Rows::new(all)
 }
 
 /// Why a menu has no item.
 const NOTHING: &str = "nothing to do here: a name that is not valid UTF-8 names nothing";
 
+/// The cells [`NOTHING`] is wrapped at: egui's menu was 40 wide for it.
+const NOTHING_CELLS: usize = 40;
+
 /// The line that turns a menu into the repository's.
 const REPOSITORY: &str = "Repository…";
 
+/// A menu's nominal width inside, in cells: egui's narrowest (10 §6's rule widens it to its
+/// widest line, at most 76).
+const NOMINAL: usize = 24;
+
 fn menu_id() -> egui::Id {
     egui::Id::unique("sopen-git-menu")
+}
+
+fn list_id() -> egui::Id {
+    menu_id().with("list")
+}
+
+/// The box of a menu titled `title` with `list`, on `grid` (the panels'): [`NOTHING`] first when
+/// it has no item, then its lines, at most seven tenths of the grid's rows of them on screen.
+fn layout(grid: Grid, title: &str, list: &List, nothing: bool) -> kit::Layout {
+    let most = u16::try_from(u32::from(grid.rows) * 7 / 10).unwrap_or(u16::MAX);
+    let mut parts = Vec::new();
+    if nothing {
+        // Wrapped at 40 cells, as egui's menu wrapped it, so the box keeps egui's width.
+        let rows = kit::wrap(NOTHING, NOTHING_CELLS).into_iter();
+        parts.extend(rows.map(|row| Part::Text(row, Ink::Text)));
+    }
+    if !list.rows.rows().is_empty() {
+        parts.push(Part::List {
+            rows: list.rows.clone(),
+            id: list_id(),
+            most: most.max(1),
+        });
+    }
+    kit::layout(grid, title, NOMINAL, &parts)
+}
+
+/// What a pass of a menu's lines did ([`pass`]).
+enum Pass {
+    /// Esc, F10 or a click outside the box.
+    Cancel,
+    /// The lines chosen, in order — none where the pass before painted other rows, or the box
+    /// elsewhere — and the pass's events after its first Enter, set aside ([`set_aside`]).
+    Chose(Vec<usize>, Vec<egui::Event>),
+}
+
+/// The pass's events after its first plain Enter, taken out of its input: the Enter may choose a
+/// line that opens a dialog, and what was typed after it is that dialog's ([`hand_on`]).
+fn set_aside(ctx: &egui::Context) -> Vec<egui::Event> {
+    ctx.input_mut(|i| {
+        let enter = i.events.iter().position(|e| {
+            matches!(
+                e,
+                egui::Event::Key {
+                    key: Key::Enter,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if Mods::None.matches(*modifiers)
+            )
+        });
+        match enter {
+            Some(at) => i.events.split_off(at + 1),
+            None => Vec::new(),
+        }
+    })
+}
+
+/// The events [`set_aside`] took, back in the pass after the menu's own: in their order for the
+/// dialog a choice opened — an action's (`GitView::dialog`) or a quick edit's (`quick`), which
+/// `GitView::modals` shows in the same pass, as if they were typed once it was open (10 §17,
+/// X4-menu); a dialog that opens after the integration's reads (a prefilled one, a history edit's
+/// range), the result, the log's entry or the filters gets none of them — but no Enter, which would run a dialog never shown (only what showed
+/// runs); with no choice, without the pass's Enters and Spaces, which would have been the menu's
+/// and come after a choice it dropped — the first Enter's too, when the list did not take it
+/// (after a Tab). The menu's keyboard goes with a choice, so the dialog's field
+/// takes the typing in that pass as it does whenever nothing has it.
+fn hand_on(ctx: &egui::Context, rest: Vec<egui::Event>, chose: bool) {
+    ctx.input_mut(|i| i.events.extend(rest));
+    if chose {
+        drop_presses(ctx, &[Key::Enter]);
+        ctx.memory_mut(|m| m.surrender_focus(list_id()));
+    } else {
+        drop_presses(ctx, &[Key::Enter, Key::Space]);
+    }
+}
+
+/// Every Esc and F10 left in the pass, taken out of its input: whether there was one.
+fn closes(ctx: &egui::Context) -> bool {
+    let take = |key: Key| ctx.input_mut(|i| keys::take(i, key, Mods::None));
+    let mut close = false;
+    while take(Key::Escape) || take(Key::F10) {
+        close = true;
+    }
+    close
+}
+
+/// The end of a pass that chose `end` with `rest` set aside: the rest handed on; with no choice,
+/// an Esc or F10 among it closes the menu (it came after an Enter that chose nothing).
+fn finish<E>(ctx: &egui::Context, rest: Vec<egui::Event>, end: Option<E>, cancel: E) -> Option<E> {
+    hand_on(ctx, rest, end.is_some());
+    if end.is_none() && closes(ctx) {
+        ctx.memory_mut(|m| m.surrender_focus(list_id()));
+        return Some(cancel);
+    }
+    end
+}
+
+/// The pass's plain presses of `dropped`, and a Space's text, taken out of its input: the menu
+/// has the keyboard, so none reaches what is under it.
+fn drop_presses(ctx: &egui::Context, dropped: &[Key]) {
+    ctx.input_mut(|i| {
+        let mut typed = false;
+        i.events.retain(|e| match (e, std::mem::take(&mut typed)) {
+            (egui::Event::Text(text), true) if text == " " => false,
+            (
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                },
+                _,
+            ) if dropped.contains(key) && Mods::None.matches(*modifiers) => {
+                typed = *key == Key::Space;
+                false
+            }
+            _ => true,
+        });
+    });
+}
+
+/// One pass of a menu titled `title` with `list` on `grid` (see the module's notes): every Esc
+/// and F10 of the pass closes it; else the box, its list's keys and clicks, and the lines chosen.
+fn pass(ctx: &egui::Context, grid: Grid, title: &str, list: &mut List, nothing: bool) -> Pass {
+    // What the screen shows as the owner pressed this pass's keys: the last painting that
+    // reached it.
+    let seen = list.screen.start(ctx).cloned();
+    // What follows the pass's first Enter waits: it may be the dialog's that Enter opens.
+    let rest = set_aside(ctx);
+    if closes(ctx) {
+        // Its Enters and Spaces too, the rest's among them: the closing pass leaves none for what
+        // is under it.
+        hand_on(ctx, rest, false);
+        ctx.memory_mut(|m| m.surrender_focus(list_id()));
+        return Pass::Cancel;
+    }
+    // The list holds the keyboard; egui drops a focus its layer cannot take yet (a new box's
+    // first pass), so it is asked for again while it is elsewhere.
+    if !ctx.memory(|m| m.has_focus(list_id())) {
+        ctx.memory_mut(|m| m.request_focus(list_id()));
+    }
+    // Space chooses nothing: egui's menu chose on Enter or a click only, and in the panel Space
+    // marks (03 §9.2), so a Space meant for the rows never runs an item.
+    drop_presses(ctx, &[Key::Space]);
+    let laid = layout(grid, title, list, nothing);
+    let inputs = Inputs {
+        by_id: vec![(list_id(), Input::List(&mut list.bar))],
+        ..Inputs::default()
+    };
+    let shown = kit::show(ctx, menu_id(), &laid, inputs);
+    // What the owner saw when they chose: the rows the screen shows, in the box where it shows
+    // them. egui gives a click to the widget the pass before laid out under the pointer (its hit
+    // test reads the last pass's widgets, `Context::begin_pass`), but the list finds its row by
+    // where it stands now: a box laid elsewhere (the grid resized) has another line there.
+    let now = (list.made, laid.covers());
+    let seen = seen.as_ref() == Some(&now);
+    list.screen.painted(now);
+    if shown.modal.should_close() {
+        hand_on(ctx, rest, false);
+        return Pass::Cancel;
+    }
+    match seen {
+        true => Pass::Chose(shown.chosen(list_id()), rest),
+        false => Pass::Chose(Vec::new(), rest),
+    }
 }
 
 impl Menu {
@@ -521,120 +820,94 @@ impl Menu {
             Target::Repository => Vec::new(),
             _ => items(&Target::Repository, repo),
         };
-        Menu {
+        let mut menu = Menu {
             title: title(&target),
+            list: List::new(Rows::new(Vec::new())),
             items: items(&target, repo),
             target,
             repository,
-            bar: 0,
-            moved: false,
+            steps: steps_of(repo),
+        };
+        let repository = !menu.repository.is_empty();
+        menu.list = List::new(rows_of(&menu, &[], repository));
+        menu
+    }
+
+    /// Its lines before the history row: the key lines before its items, the items, the key
+    /// lines after them — the key lines only on the repository's menu.
+    fn lines(&self) -> (&[Step], &[Item], &[Step]) {
+        match self.target {
+            Target::Repository => (&self.steps.0, &self.items, &self.steps.1),
+            _ => (&[], &self.items, &[]),
         }
+    }
+
+    /// How many lines [`Menu::lines`] holds.
+    fn len(&self) -> usize {
+        let (before, items, after) = self.lines();
+        before.len() + items.len() + after.len()
     }
 
     pub fn target(&self) -> &Target {
         &self.target
     }
 
-    pub fn items(&self) -> &[Item] {
-        &self.items
-    }
-
-    /// Its lines: the items, then `Repository…` unless this is the repository's menu.
-    #[cfg_attr(not(test), allow(dead_code))] // S3-B's own pass (see `Menu::ui`).
-    fn lines(&self) -> usize {
-        self.items.len() + usize::from(!self.repository.is_empty())
-    }
-
-    /// The line under the bar chosen: its id, or the repository's menu in its place.
+    /// The line under the bar chosen: its id, a key line's command, or the repository's menu in
+    /// its place (its lines made anew).
     fn choose(&mut self, at: usize) -> Option<MenuEnd> {
-        match self.items.get(at) {
-            Some(item) => Some(MenuEnd::Chose {
+        let (before, items, after) = self.lines();
+        let (b, n) = (before.len(), items.len());
+        if let Some(step) = before.get(at) {
+            return Some(MenuEnd::Key(step.command));
+        }
+        if let Some(item) = items.get(at - b) {
+            return Some(MenuEnd::Chose {
                 id: item.id,
                 target: self.target.clone(),
-            }),
-            None if at == self.items.len() && !self.repository.is_empty() => {
-                self.target = Target::Repository;
-                self.title = title(&self.target);
-                self.items = std::mem::take(&mut self.repository);
-                self.bar = 0;
-                None
-            }
-            None => None,
+            });
         }
+        if let Some(step) = after.get(at - b - n) {
+            return Some(MenuEnd::Key(step.command));
+        }
+        if at == self.len() && !self.repository.is_empty() {
+            self.target = Target::Repository;
+            self.title = title(&self.target);
+            self.items = std::mem::take(&mut self.repository);
+            let rows = rows_of(self, &[], false);
+            self.list.renew(rows);
+        }
+        None
     }
 
-    /// One pass on `grid` (the panels', where it stands once it is in cells): its keys are taken
-    /// before anything else sees them. The panel draws [`HistoryMenu`], which holds this menu and
-    /// draws it with a commit's history row (S4-C); S3-B's tests draw it alone.
+    /// The cells of `grid` its box covers, as [`HistoryMenu::covers`] (S3-B's tests' menu).
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn ui(&mut self, ctx: &egui::Context, _grid: Grid) -> Option<MenuEnd> {
-        let take = |key: Key| ctx.input_mut(|i| keys::take(i, key, Mods::None));
-        if take(Key::Escape) || take(Key::F10) {
-            return Some(MenuEnd::Cancel);
-        }
-        let last = self.lines().saturating_sub(1);
-        let page = 8;
-        for (key, to) in [
-            (Key::ArrowUp, self.bar.saturating_sub(1)),
-            (Key::ArrowDown, (self.bar + 1).min(last)),
-            (Key::PageUp, self.bar.saturating_sub(page)),
-            (Key::PageDown, (self.bar + page).min(last)),
-            (Key::Home, 0),
-            (Key::End, last),
-        ] {
-            if take(key) {
-                self.bar = to;
-                self.moved = true;
+    pub fn covers(&self, grid: &Grid) -> Vec<Cells> {
+        layout(*grid, &self.title, &self.list, self.len() == 0).covers()
+    }
+
+    /// One pass on `grid` (the panels'), in cells (see the module's notes): its keys are taken
+    /// before anything else sees them. The panel draws [`HistoryMenu`], which holds this menu and
+    /// draws it with a commit's history row through the same pass; S3-B's tests draw it alone.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> Option<MenuEnd> {
+        let nothing = self.len() == 0;
+        let made = self.list.made;
+        let (chosen, rest) = match pass(ctx, grid, &self.title, &mut self.list, nothing) {
+            Pass::Cancel => return Some(MenuEnd::Cancel),
+            Pass::Chose(chosen, rest) => (chosen, rest),
+        };
+        let mut end = None;
+        for at in chosen {
+            // `Repository…` made the lines anew: the pass's later choices were of the old ones.
+            if self.list.made != made {
+                break;
+            }
+            end = self.choose(at);
+            if end.is_some() {
+                break;
             }
         }
-        let mut chosen = take(Key::Enter).then_some(self.bar);
-        let cells = self
-            .items
-            .iter()
-            .map(|i| i.label.chars().count() + i.key.as_ref().map_or(0, |k| k.chars().count() + 4))
-            .max()
-            .unwrap_or(0)
-            .max(NOTHING.chars().count().min(40))
-            .max(24);
-        let width = (cells as f32 * chrome::CELL.x).min(ctx.content_rect().width() * 0.8);
-        let (bar, moved) = (self.bar, std::mem::take(&mut self.moved));
-        let response = chrome::dialog(ctx, menu_id(), &self.title, |ui| {
-            ui.set_width(width);
-            egui::ScrollArea::vertical()
-                .max_height(ctx.content_rect().height() * 0.7)
-                .show(ui, |ui| {
-                    for (k, item) in self.items.iter().enumerate() {
-                        let mut button = egui::Button::selectable(k == bar, item.label.as_str())
-                            .min_size(egui::vec2(width, chrome::CELL.y));
-                        if let Some(key) = &item.key {
-                            button = button.right_text(key.as_str());
-                        }
-                        let r = ui.add(button);
-                        if moved && k == bar {
-                            r.scroll_to_me(None);
-                        }
-                        if r.clicked() {
-                            chosen = Some(k);
-                        }
-                    }
-                    if self.items.is_empty() {
-                        ui.add(egui::Label::new(NOTHING).wrap());
-                    }
-                });
-            if !self.repository.is_empty() {
-                ui.add_space(chrome::CELL.y / 2.0);
-                let at = self.items.len();
-                let button = egui::Button::selectable(at == bar, REPOSITORY)
-                    .min_size(egui::vec2(width, chrome::CELL.y));
-                if ui.add(button).clicked() {
-                    chosen = Some(at);
-                }
-            }
-        });
-        if let Some(at) = chosen {
-            return self.choose(at);
-        }
-        response.should_close().then_some(MenuEnd::Cancel)
+        finish(ctx, rest, end, MenuEnd::Cancel)
     }
 }
 
@@ -750,10 +1023,6 @@ pub struct HistoryMenu {
     /// The commit whose history row this is (none once `Repository…` was chosen).
     commit: Option<CommitRow>,
     history: Vec<HistoryItem>,
-    /// The line under the bar: S3-B's items, then the history row, then `Repository…`.
-    bar: usize,
-    /// The bar moved by a key: the next pass shows it.
-    moved: bool,
 }
 
 impl HistoryMenu {
@@ -767,12 +1036,14 @@ impl HistoryMenu {
             }
             _ => (None, Vec::new()),
         };
+        let mut menu = Menu::new(target, repo);
+        // Its lines: S3-B's items, the history row, then `Repository…`.
+        let repository = !menu.repository.is_empty();
+        menu.list = List::new(rows_of(&menu, &history, repository));
         HistoryMenu {
-            menu: Menu::new(target, repo),
+            menu,
             commit,
             history,
-            bar: 0,
-            moved: false,
         }
     }
 
@@ -781,19 +1052,9 @@ impl HistoryMenu {
         &self.menu
     }
 
-    pub fn history(&self) -> &[HistoryItem] {
-        &self.history
-    }
-
-    /// Its lines: S3-B's items, the history row, then `Repository…` unless this is the
-    /// repository's menu.
-    fn lines(&self) -> usize {
-        self.menu.items.len() + self.history.len() + usize::from(!self.menu.repository.is_empty())
-    }
-
     /// The line `at` chosen.
     fn choose(&mut self, at: usize) -> Option<HistoryMenuEnd> {
-        let n = self.menu.items.len();
+        let n = self.menu.len();
         if at < n {
             return self.menu.choose(at).map(HistoryMenuEnd::Menu);
         }
@@ -805,114 +1066,56 @@ impl HistoryMenu {
             });
         }
         if at == n + self.history.len() && !self.menu.repository.is_empty() {
-            // `Repository…`: S3-B's menu turns into the repository's; the history row goes.
+            // `Repository…`: S3-B's menu turns into the repository's, its lines made anew; the
+            // history row goes.
             self.history.clear();
             self.commit = None;
-            self.bar = 0;
             return self.menu.choose(n).map(HistoryMenuEnd::Menu);
         }
         None
     }
 
-    /// The cells of `grid` (the panels') the menu covers, its box and its shadow, for the panel and
-    /// the other side to blank (10 §17, X4-graph's seam): none while egui draws it, until X4-menu.
-    pub fn covers(&self, _grid: &Grid) -> Vec<Cells> {
-        Vec::new()
+    /// How many lines it offers to choose: the key lines, the items and the history row
+    /// (`Repository…` aside), as the status row counts them.
+    pub fn lines(&self) -> usize {
+        self.menu.len() + self.history.len()
     }
 
-    /// One pass on `grid` (the panels', where it stands once it is in cells), as S3-B's
-    /// [`Menu::ui`]: ↑ ↓ PgUp PgDn Home End move the bar over all its lines, Enter or a click
-    /// chooses, Esc or F10 closes; its keys are taken before anything else sees them.
-    pub fn ui(&mut self, ctx: &egui::Context, _grid: Grid) -> Option<HistoryMenuEnd> {
-        let take = |key: Key| ctx.input_mut(|i| keys::take(i, key, Mods::None));
-        if take(Key::Escape) || take(Key::F10) {
-            return Some(HistoryMenuEnd::Menu(MenuEnd::Cancel));
-        }
-        let last = self.lines().saturating_sub(1);
-        let page = 8;
-        for (key, to) in [
-            (Key::ArrowUp, self.bar.saturating_sub(1)),
-            (Key::ArrowDown, (self.bar + 1).min(last)),
-            (Key::PageUp, self.bar.saturating_sub(page)),
-            (Key::PageDown, (self.bar + page).min(last)),
-            (Key::Home, 0),
-            (Key::End, last),
-        ] {
-            if take(key) {
-                self.bar = to;
-                self.moved = true;
-            }
-        }
-        let mut chosen = take(Key::Enter).then_some(self.bar);
-        let cells = self
-            .menu
-            .items
-            .iter()
-            .map(|i| (i.label.as_str(), i.key.as_deref()))
-            .chain(
-                self.history
-                    .iter()
-                    .map(|i| (i.label.as_str(), i.key.as_deref())),
-            )
-            .map(|(label, key)| label.chars().count() + key.map_or(0, |k| k.chars().count() + 4))
-            .max()
-            .unwrap_or(0)
-            .max(NOTHING.chars().count().min(40))
-            .max(24);
-        let width = (cells as f32 * chrome::CELL.x).min(ctx.content_rect().width() * 0.8);
-        let (bar, moved) = (self.bar, std::mem::take(&mut self.moved));
-        let n = self.menu.items.len();
-        let line = |ui: &mut egui::Ui, at: usize, label: &str, key: Option<&str>| {
-            let mut button = egui::Button::selectable(at == bar, label)
-                .min_size(egui::vec2(width, chrome::CELL.y));
-            if let Some(key) = key {
-                button = button.right_text(key);
-            }
-            let r = ui.add(button);
-            if moved && at == bar {
-                r.scroll_to_me(None);
-            }
-            r.clicked()
+    /// Whether it has no item to choose (only `Repository…`, if anything).
+    fn nothing(&self) -> bool {
+        self.menu.len() == 0 && self.history.is_empty()
+    }
+
+    /// The cells of `grid` (the panels') the menu covers, its box and its shadow, for the panel and
+    /// the other side to blank (10 §17): the box as this pass lays it out, from the menu as it
+    /// stands when the pass begins.
+    pub fn covers(&self, grid: &Grid) -> Vec<Cells> {
+        let m = &self.menu;
+        layout(*grid, &m.title, &m.list, self.nothing()).covers()
+    }
+
+    /// One pass on `grid` (the panels'), in cells, as S3-B's [`Menu::ui`] (see the module's
+    /// notes): ↑ ↓ PgUp PgDn Home End move the bar over all its lines, Enter or a click chooses,
+    /// Esc or F10 closes; its keys are taken before anything else sees them.
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> Option<HistoryMenuEnd> {
+        let nothing = self.nothing();
+        let made = self.menu.list.made;
+        let m = &mut self.menu;
+        let (chosen, rest) = match pass(ctx, grid, &m.title, &mut m.list, nothing) {
+            Pass::Cancel => return Some(HistoryMenuEnd::Menu(MenuEnd::Cancel)),
+            Pass::Chose(chosen, rest) => (chosen, rest),
         };
-        let response = chrome::dialog(ctx, menu_id(), &self.menu.title, |ui| {
-            ui.set_width(width);
-            // As tall as it needs up to the most it may take, at once: without the floor egui
-            // grows a new modal's scroll area over several passes (about 20 lines at first).
-            let most = ctx.content_rect().height() * 0.7;
-            egui::ScrollArea::vertical()
-                .max_height(most)
-                .min_scrolled_height(most)
-                .show(ui, |ui| {
-                    for (k, item) in self.menu.items.iter().enumerate() {
-                        if line(ui, k, &item.label, item.key.as_deref()) {
-                            chosen = Some(k);
-                        }
-                    }
-                    if !self.history.is_empty() {
-                        ui.add_space(chrome::CELL.y / 2.0);
-                    }
-                    for (k, item) in self.history.iter().enumerate() {
-                        if line(ui, n + k, &item.label, item.key.as_deref()) {
-                            chosen = Some(n + k);
-                        }
-                    }
-                    if self.menu.items.is_empty() && self.history.is_empty() {
-                        ui.add(egui::Label::new(NOTHING).wrap());
-                    }
-                });
-            if !self.menu.repository.is_empty() {
-                ui.add_space(chrome::CELL.y / 2.0);
-                let at = n + self.history.len();
-                if line(ui, at, REPOSITORY, None) {
-                    chosen = Some(at);
-                }
+        let mut end = None;
+        for at in chosen {
+            // `Repository…` made the lines anew: the pass's later choices were of the old ones.
+            if self.menu.list.made != made {
+                break;
             }
-        });
-        if let Some(at) = chosen {
-            return self.choose(at);
+            end = self.choose(at);
+            if end.is_some() {
+                break;
+            }
         }
-        response
-            .should_close()
-            .then_some(HistoryMenuEnd::Menu(MenuEnd::Cancel))
+        finish(ctx, rest, end, HistoryMenuEnd::Menu(MenuEnd::Cancel))
     }
 }

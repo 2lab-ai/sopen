@@ -43,7 +43,8 @@
 //!   an [`Op`] the model applies or refuses; a refusal is the pane's note, in the error colour.
 
 use super::dialogs::{
-    plan_part, plan_rows, plan_wants, remote_warning, step_line, width, PlanRow, CHANGED, TOO_SHORT,
+    plan_part, plan_rows, plan_wants, remote_warning, step_line, take_enters, width, PlanRow,
+    CHANGED, TOO_SHORT,
 };
 use super::graph_view::{self, printable};
 use super::menu;
@@ -1094,79 +1095,6 @@ fn composition(events: &[Event], composing: bool) -> Option<bool> {
     seen.then_some(now)
 }
 
-/// The pass's presses of Enter with no modifiers, taken out of its input in order, each saying
-/// whether it came after the pass's first move of the keyboard — `dialogs::take_enters`, an
-/// action's dialog's, word for word (X4-dialogs; private there while X4-dialogs2 holds
-/// `dialogs.rs`). Where egui cannot follow the moves the owner made before an Enter — after a
-/// move in a pass with a Shift+Tab or an arrow that moves the keyboard (egui moves it later), or
-/// after a second move (egui moves it once a pass) — that Enter is dropped, and a Space there
-/// too, with its text, unless the pass began on a text field (`on_text`), which types it.
-fn take_enters(ctx: &egui::Context, arrows_move: bool, on_text: bool) -> Vec<bool> {
-    let arrow = |key: &Key| {
-        matches!(
-            key,
-            Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight
-        )
-    };
-    // Whether a key moves the keyboard as egui reads it (`None`: not), and whether egui makes
-    // that move only later (`true`: a Shift+Tab, an arrow) rather than in the pass (a Tab).
-    let moves = |e: &Event| match e {
-        Event::Key {
-            key: Key::Tab,
-            pressed: true,
-            modifiers,
-            ..
-        } if !modifiers.any() || modifiers.shift_only() => Some(modifiers.shift),
-        Event::Key {
-            key,
-            pressed: true,
-            modifiers,
-            ..
-        } if arrows_move && arrow(key) && !modifiers.any() => Some(true),
-        _ => None,
-    };
-    ctx.input_mut(|i| {
-        let later = i.events.iter().any(|e| moves(e) == Some(true));
-        let (mut moved, mut out, mut typed) = (0usize, Vec::new(), false);
-        // A press here goes where egui cannot follow the owner's moves.
-        let lost = |moved: usize| moved >= 2 || (moved == 1 && later);
-        i.events.retain(|e| match (e, std::mem::take(&mut typed)) {
-            (Event::Text(text), true) if text == " " => false,
-            (
-                Event::Key {
-                    key: Key::Enter,
-                    pressed: true,
-                    modifiers,
-                    ..
-                },
-                _,
-            ) if Mods::None.matches(*modifiers) => {
-                if !lost(moved) {
-                    out.push(moved > 0);
-                }
-                false
-            }
-            (
-                Event::Key {
-                    key: Key::Space,
-                    pressed: true,
-                    modifiers,
-                    ..
-                },
-                _,
-            ) if !on_text && lost(moved) && Mods::None.matches(*modifiers) => {
-                typed = true;
-                false
-            }
-            (e, _) => {
-                moved += usize::from(moves(e).is_some());
-                true
-            }
-        });
-        out
-    })
-}
-
 // ---------------------------------------------------------------------------------------------
 // The planner (03 §7.8.2).
 
@@ -2049,7 +1977,11 @@ fn paint(
         let resp = ui.interact(
             grid.rect(row_cells),
             ui.scope_id().with(("sopen-git-planner-row", k)),
-            Sense::click(),
+            if active && view.inner.is_none() {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
         );
         if resp.clicked() {
             clicked_row = Some(k);
@@ -2083,7 +2015,8 @@ fn paint(
             if c + w <= chars {
                 let at = Cells::new(x(c), y, w as u16, 1);
                 let id = ui.scope_id().with(salt);
-                if ui.interact(grid.rect(at), id, Sense::click()).clicked() {
+                // Acts only while nothing else's dialog is up (`active` carries it: X4-menu).
+                if ui.interact(grid.rect(at), id, Sense::click()).clicked() && active {
                     clicked = Some(foot);
                 }
                 // egui's button colours: black on cyan, the bar's when it has the focus (10 §6).

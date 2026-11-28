@@ -972,6 +972,13 @@ fn a_click_moves_the_bar_and_a_double_click_opens_details() {
 fn g_f1_each_filter_changes_the_rows() {
     let names =
         |refs: Vec<RefLabel>| -> Vec<String> { refs.into_iter().map(|r| r.refname).collect() };
+    // The first choice of a row with a label is one run of cells with the label (X4-menu):
+    // clicked at the run's last cell.
+    let first_choice = |fx: &mut Fx, run: &str| {
+        let at = fx.drv.find_text(run).expect(run);
+        let p = egui::pos2(at.right() - chrome::CELL.x / 2.0, at.center().y);
+        fx.drv.click(&mut fx.host, p);
+    };
     let open = |fx: &mut Fx| {
         fx.view_mut().open_filters();
         // egui lays a new dialog out unseen first.
@@ -994,7 +1001,7 @@ fn g_f1_each_filter_changes_the_rows() {
     // Tags off: no tag labels, no tags among the revisions.
     let mut fx = Fx::new(1000.0, 600.0, fixture_view());
     open(&mut fx);
-    fx.drv.click_text_on_top(&mut fx.host, "Tags");
+    fx.drv.click_text_on_top(&mut fx.host, "[X] Tags");
     let f = apply(&mut fx);
     assert!(!f.tags);
     assert!(!names(f.revisions(&refs(), &[]))
@@ -1008,7 +1015,7 @@ fn g_f1_each_filter_changes_the_rows() {
     // A remote off: its labels go, its branches are no revisions.
     let mut fx = Fx::new(1000.0, 600.0, fixture_view());
     open(&mut fx);
-    fx.drv.click_text_on_top(&mut fx.host, "origin");
+    first_choice(&mut fx, "Remotes [X] origin");
     let f = apply(&mut fx);
     assert_eq!(
         names(f.revisions(&refs(), &[])),
@@ -1027,8 +1034,8 @@ fn g_f1_each_filter_changes_the_rows() {
     // stashes: 03:298–299), and the rows are its history.
     let mut fx = Fx::new(1000.0, 600.0, fixture_view());
     open(&mut fx);
-    fx.drv.click_text_on_top(&mut fx.host, "All branches");
-    fx.drv.click_text_on_top(&mut fx.host, "feature");
+    first_choice(&mut fx, "Branches [X] All branches");
+    fx.drv.click_text_on_top(&mut fx.host, "[ ] feature");
     let f = apply(&mut fx);
     assert_eq!(names(f.revisions(&refs(), &[])), ["refs/heads/feature"]);
     assert!(!f.head_is_revision());
@@ -1056,7 +1063,7 @@ fn g_f1_each_filter_changes_the_rows() {
     // Stashes off: no stash row, no stash base among the revisions.
     let mut fx = Fx::new(1000.0, 600.0, fixture_view());
     open(&mut fx);
-    fx.drv.click_text_on_top(&mut fx.host, "Stashes");
+    fx.drv.click_text_on_top(&mut fx.host, "[X] Stashes");
     let f = apply(&mut fx);
     assert!(f.stash_revisions(&stashes()).is_empty());
     fx.view_mut()
@@ -1069,7 +1076,8 @@ fn g_f1_each_filter_changes_the_rows() {
     // First parent only: git gives the first-parent chain and the layout draws first parents.
     let mut fx = Fx::new(1000.0, 600.0, fixture_view());
     open(&mut fx);
-    fx.drv.click_text_on_top(&mut fx.host, "First parent only");
+    fx.drv
+        .click_text_on_top(&mut fx.host, "[ ] First parent only");
     let f = apply(&mut fx);
     assert!(f.first_parent);
     let chain: Vec<CommitRow> = history()
@@ -1110,17 +1118,17 @@ fn g_f1_each_filter_changes_the_rows() {
     // Order: the dialog's choice reaches the log's options; the rows are drawn as given.
     let mut fx = Fx::new(1000.0, 600.0, fixture_view());
     open(&mut fx);
-    fx.drv.click_text_on_top(&mut fx.host, "author date");
+    fx.drv.click_text_on_top(&mut fx.host, "( ) author date");
     assert_eq!(apply(&mut fx).order, Order::AuthorDate);
     open(&mut fx);
-    fx.drv.click_text_on_top(&mut fx.host, "topological");
+    fx.drv.click_text_on_top(&mut fx.host, "( ) topological");
     assert_eq!(apply(&mut fx).order, Order::Topo);
 
     // Reflog commits: `--reflog` with every branch shown, a branch filter or not.
     let mut fx = Fx::new(1000.0, 600.0, fixture_view());
     fx.view_mut().only_branch("refs/heads/feature");
     open(&mut fx);
-    fx.drv.click_text_on_top(&mut fx.host, "Reflog commits");
+    fx.drv.click_text_on_top(&mut fx.host, "[ ] Reflog commits");
     let f = apply(&mut fx);
     assert!(f.reflog);
     assert!(f.head_is_revision());
@@ -1133,10 +1141,10 @@ fn g_f1_each_filter_changes_the_rows() {
     // Back to the defaults: no `[filtered]`.
     let mut fx = Fx::new(1000.0, 600.0, fixture_view());
     open(&mut fx);
-    fx.drv.click_text_on_top(&mut fx.host, "Tags");
+    fx.drv.click_text_on_top(&mut fx.host, "[X] Tags");
     apply(&mut fx);
     open(&mut fx);
-    fx.drv.click_text_on_top(&mut fx.host, "Tags");
+    fx.drv.click_text_on_top(&mut fx.host, "[ ] Tags");
     assert!(apply(&mut fx).is_default());
     fx.idle();
     assert!(fx.shows("box:/srv/repo"));
@@ -1144,7 +1152,7 @@ fn g_f1_each_filter_changes_the_rows() {
     // Esc cancels the dialog: nothing changes.
     let mut fx = Fx::new(1000.0, 600.0, fixture_view());
     open(&mut fx);
-    fx.drv.click_text_on_top(&mut fx.host, "Tags");
+    fx.drv.click_text_on_top(&mut fx.host, "[X] Tags");
     assert!(fx.press(Key::Escape).is_empty());
     assert!(fx.view().filters().is_default());
     // A filter that leaves no ref: `no refs chosen` (03:302–304).
@@ -1505,12 +1513,18 @@ fn remotes_by_their_whole_names_and_only_their_own_head() {
     fx.view_mut().open_filters();
     fx.idle();
     fx.idle();
-    assert!(fx.shows("team") && fx.shows("team/up"), "a toggle each");
-    fx.drv.click_text_on_top(&mut fx.host, "team/up");
+    assert!(
+        fx.shows("[X] team") && fx.shows("[X] team/up"),
+        "a toggle each"
+    );
+    fx.drv.click_text_on_top(&mut fx.host, "[X] team/up");
     let asked = fx.press(Key::Enter);
     let [GitAction::FiltersChanged(f)] = &asked[..] else {
         panic!("{asked:?}");
     };
+    // The remote clicked is the one turned off, by its whole name (X4-menu round 1).
+    let team_up = std::collections::BTreeSet::from(["team/up".to_string()]);
+    assert_eq!(f.hidden_remotes, team_up);
     assert_eq!(
         names(f.revisions(&r, &remotes)),
         [
@@ -1537,9 +1551,11 @@ fn remotes_by_their_whole_names_and_only_their_own_head() {
 }
 
 /// Item 5: the branch chooser lays out only the branches it shows on screen, however many there
-/// are, and narrows as the filter is typed.
+/// are, and narrows as the filter is typed; in cells (X4-menu) a pass that changes nothing
+/// measures none of its rows and draws only the eight it shows.
 #[test]
 fn the_branch_chooser_draws_only_its_visible_rows() {
+    use crate::gui::browser::ops::dialog::work;
     let mut many = refs();
     many.extend((0..20_000).map(|k| {
         let mut b = label(&format!("refs/heads/b{k:05}"), 1, None);
@@ -1561,7 +1577,23 @@ fn the_branch_chooser_draws_only_its_visible_rows() {
     assert!(widgets < 400, "{widgets} widgets laid out");
     fx.typed("b1999");
     fx.idle();
-    assert!(fx.shows("b19995") && !fx.shows("b00001"));
+    assert!(fx.shows("[X] b19995") && !fx.shows("[X] b00001"));
+    // One branch off: the filter holds the other 20,004 by name (X4-menu round 1), and a pass that
+    // changes nothing copies, compares, measures none of them and draws the rows it shows.
+    fx.drv.click_text_on_top(&mut fx.host, "[X] b19995");
+    fx.idle();
+    assert!(fx.shows("[ ] b19995"));
+    filters::copied();
+    work::take();
+    fx.idle();
+    let done = work::take();
+    assert_eq!(
+        filters::copied(),
+        0,
+        "branch names copied or compared in a pass"
+    );
+    assert_eq!(done.measured, 0, "{done:?}");
+    assert!(done.drawn <= 8, "{done:?}");
 }
 
 /// Item 6: a message line longer than the pane wraps into lines of the pane, all of it readable.
