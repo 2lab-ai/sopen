@@ -457,3 +457,78 @@ Thirteen PRs merged and shipped one by one, each prerelease installed on the Mac
 | X4-menu | ✅ done 2026-11-28 | 10 §17: the menu and the filters in cells, one git dialog at a time (#175) | coder |
 | X4-dialogs2 | ✅ done 2026-11-28 | 10 §17: every git dialog in cells, egui's action dialog gone (#177) | coder |
 | X4-quick | ✅ done 2026-11-28 | 10 §17: the quick edits' dialogs in cells; `OnScreen` by frame and context (#178) | coder |
+
+## R1 (part 12) — X4 closed: the planner's dialogs, the switch state's v2, and the git panel's dialog fixes, 2026-11-28
+
+Eight PRs (#179 to #186) merged and shipped one by one, each prerelease installed on the Mac and the Linux host. With X4-planner2 no dialog of the git panel is egui's. With X4-state, F12 carries the tree and the git panel across, so X4 is whole except for X4-state2 (a history edit's own dialog's text, v3).
+
+- **The ledger of part 11** (#179).
+- **F-docs-cells** (#180): `docs/tui.md`'s cells lists are one line a part, and AGENTS.md points to them.
+- **F-git-outcome** (#181): a result up stays until it is closed. Later results wait behind it, at most 8; past them, the next result up says how many were not shown. A result closes only once the screen showed it.
+- **F-git-listq** (#182): a git dialog's run is never dropped under the tree or the list's question.
+  - The tree counts as another dialog, and what a dialog returns is carried out.
+  - The integration's dialogs wait for the list's question and the tree.
+  - A pass in which any dialog slot of a shown panel changed during the git pass drops its keys.
+  - Find's `Aa` takes no click while another dialog holds the keyboard.
+- **X4-planner2** (#183): the planner's own dialogs in cells (a row's message, the author and dates, Esc's question, the run's confirmation), reading the pass's keys in order. A covered dialog counts as unseen, and the planner's ids are its own. The egui form parts and `dialogs::width` are deleted.
+- **F-git-drafted** (#184): the host keys a dialog's reads by its serial and revision and borrows the draft. Ten idle passes with a 1 MiB message copy 0 bytes (31 MB before).
+- **F-git-covered** (#185): a git dialog under another dialog is not on screen.
+  - The F12 question counts as another dialog.
+  - `cells::set_covered`: a covered pass records no painting.
+  - The filters, the search and the log's entry leave their keys to a dialog drawn over them.
+  - No covered dialog takes the keyboard.
+- **X4-state** (#186): the switch state's v2.
+  - **What crosses:**
+    - the tree's bar and its folders;
+    - each git panel's bar (looked up on HOST, then paged to), marks, details, filters and Find;
+    - an action's dialog, the filters' dialog and the history search, with what is typed;
+    - the planner's plan, which the question says goes.
+  - **How the line is held:**
+    - every list is bounded as it is parsed, and the line is held to 64 MiB both ways;
+    - every commit id is looked up before use;
+    - Archive's destination never crosses;
+    - HOST fits its state to the line before sending it back, and says what it left out.
+  - **Version:** v1 is still read, and v3 is refused.
+- **Receipts:**
+  - **X4-planner2.** On the Mac (`--here`, an empty `SOPEN_CONFIG`, a private tmux, 100×30), the window's `SOPEN_CELLS` and `sopen --tui`'s are byte-identical for the run's confirmation, a reword's message (also with Hangul typed), Author and date, and Esc's question.
+  - **X4-state, the F12 receipt.** From `sopen --tui` through a stand-in ssh, with HOST's half reading the repository over SFTP and remote git:
+    - the bar on a commit, two marks and Find typed into came back with the same rows and colours;
+    - a plan with a squash row: the question came first, HOST showed the plan, and it came back as a change;
+    - the fixture repository was unchanged.
+  - **X4-state, the round trips.** In-process round trips of every listed state, among them a Hangul CRLF Commit message kept byte for byte.
+- **Reviews:** two engines a unit (GPT and Claude), then one fix-check; I verified the last fixes at their lines. Found and fixed, among others:
+  - a success that cleared a failure's dialog unread;
+  - a dialog that closed itself and had its run dropped under the tree;
+  - the list's Enter closing a run's end never on screen;
+  - a covered planner question closing on [Enter, Enter] and losing the plan;
+  - a host clone of the whole planner model every pass;
+  - the filters taking Enter from a result drawn over them;
+  - text typed into a dialog over the filters, lost;
+  - a hidden panel's plan said to go and then dropped;
+  - a state check stricter than the UI, which lost HOST's state on the way back;
+  - an unbounded line;
+  - Archive's path accepted on receipt.
+- **Merging:**
+  - Branches that met in a file were merged into each other before their turn, so each landed as a tree already gated: F-git-outcome into F-git-listq, F-git-listq into X4-planner2, and F-git-covered into X4-state.
+  - F-git-covered's test of a dialog under F12's question moved onto a restore's dialog and a quick edit's, because under v2 a run's reopened confirmation switches without asking.
+- **Prereleases:**
+  - preview-2026-11-28-0456-ebc67fbfec47 (part 11's ledger);
+  - preview-2026-11-28-0556-38c25a960bbf (F-docs-cells);
+  - preview-2026-11-28-0631-fdc553856350 (F-git-outcome);
+  - preview-2026-11-28-0734-d3e6196af5f1 (F-git-listq);
+  - preview-2026-11-28-0813-4d3742248770 (X4-planner2);
+  - preview-2026-11-28-0856-4a0035a54070 (F-git-drafted);
+  - preview-2026-11-28-0949-7a5e0f75d84c (F-git-covered);
+  - preview-2026-11-28-1037-a540d1f09ea6 (X4-state).
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| F-docs-cells | ✅ done 2026-11-28 | The TUI's cells lists one line a part (#180) | orchestrator |
+| F-git-outcome | ✅ done 2026-11-28 | A result up stays until it is closed; later ones wait (#181) | coder |
+| F-git-listq | ✅ done 2026-11-28 | A git dialog's run is never dropped under the tree or a question (#182) | coder |
+| X4-planner2 | ✅ done 2026-11-28 | 10 §17: the planner's own dialogs in cells (#183) | coder |
+| F-git-drafted | ✅ done 2026-11-28 | The host checks a dialog's reads by its revision, not a copy (#184) | coder |
+| F-git-covered | ✅ done 2026-11-28 | A git dialog under another dialog is not on screen (#185) | coder |
+| X4-state | ✅ done 2026-11-28 | 10 §17, §7.4: the switch state's v2 carries the tree and the git panel (#186) | coder |
