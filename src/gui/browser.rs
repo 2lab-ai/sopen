@@ -3190,21 +3190,27 @@ impl Browser {
             });
         }
         // Nothing of the pass's keys is left for the passes after it.
-        ctx.input_mut(|i| {
-            i.events.retain(|e| {
-                !matches!(
-                    e,
-                    egui::Event::Key { .. }
-                        | egui::Event::Text(_)
-                        | egui::Event::Ime(_)
-                        | egui::Event::Paste(_)
-                        | egui::Event::Copy
-                        | egui::Event::Cut
-                )
-            })
-        });
+        drop_keys(ctx);
         self.switching = step.map(|step| Switching { to, step, answered });
     }
+}
+
+/// The pass's keys and typed text dropped: its key, text, input method, paste, copy and cut
+/// events, so nothing after acts on them.
+fn drop_keys(ctx: &egui::Context) {
+    ctx.input_mut(|i| {
+        i.events.retain(|e| {
+            !matches!(
+                e,
+                egui::Event::Key { .. }
+                    | egui::Event::Text(_)
+                    | egui::Event::Ime(_)
+                    | egui::Event::Paste(_)
+                    | egui::Event::Copy
+                    | egui::Event::Cut
+            )
+        })
+    });
 }
 
 impl Window for Browser {
@@ -3227,7 +3233,23 @@ impl Window for Browser {
         // The viewer's views (08 §8): a view key's switch, a view made — before the title row,
         // whose strip shows it.
         self.views_before(&ctx);
+        // The shown panels' dialog slots as the pass began: a key of this pass that opened one
+        // (Esc's "Stop git?") has already run.
+        let began = self.git_fronts();
         self.git_pass(&ctx);
+        // A pass in which any dialog slot of a shown panel changed — one opened, was replaced (by
+        // another of its kind too) or closed in the git pass — drops its keys (F-git-listq): they
+        // were pressed at what the screen showed before, so neither a new dialog (a
+        // confirmation's Esc cancelling it unseen, the planner's question taking an Enter over a
+        // result) nor what a closed one uncovers (the graph's Enter, Esc's unpin) acts on them,
+        // as the switch's question drops its pass's. Not under a viewer, which has the keys and
+        // over which no panel is drawn. A change by the owner's key in a dialog comes in the
+        // panels' draw, after this. Then the keyboard follows a dialog up before any key is read
+        // (X4-menu fix-check, rule 1), so the list's F10 never opens the tree beside one.
+        if self.viewer.is_none() && self.git_fronts() != began {
+            drop_keys(&ctx);
+        }
+        self.git_follow_dialog();
         if self.tree.is_some() {
             self.tree_pass(&ctx);
         } else if self.git_focused().is_some() {
