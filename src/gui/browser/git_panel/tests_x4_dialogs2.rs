@@ -1492,11 +1492,14 @@ fn x4d2_a_stop_question_asked_again_at_once_starts_afresh() {
 
 /// A terminal for the stop question's burst: it sends its bursts back to back — each waiting
 /// while the next is unread, so the backend prints only the last pass of a burst — one burst once
-/// the backend has asked three times since the last (its pass is done and printed), then ends.
+/// the backend has asked `gap` times since the last (its pass is done and printed), then ends.
 struct Bursts {
     bursts: std::collections::VecDeque<Vec<crossterm::event::Event>>,
     now: std::collections::VecDeque<crossterm::event::Event>,
     asked: usize,
+    /// The asks, a millisecond each, before the next burst: 3 sends it before the terminal's 8 ms
+    /// floor lets a pass egui asked for run; 30 lets them run first (F-git-outcome).
+    gap: usize,
     /// The stops asked so far when each burst was sent.
     stops: std::rc::Rc<std::cell::Cell<usize>>,
     sent_at: std::rc::Rc<RefCell<Vec<usize>>>,
@@ -1525,7 +1528,7 @@ impl term::Tty for Bursts {
         }
         self.asked += 1;
         assert!(self.asked < 20_000, "the script ran out without an end");
-        if self.asked >= 3 {
+        if self.asked >= self.gap {
             if let Some(burst) = self.bursts.pop_front() {
                 self.sent_at.borrow_mut().push(self.stops.get());
                 self.asked = 0;
@@ -1540,7 +1543,8 @@ impl term::Tty for Bursts {
         Ok(!self.now.is_empty())
     }
     fn stopped(&self) -> Option<i32> {
-        (self.bursts.is_empty() && self.now.is_empty() && self.asked >= 3).then_some(libc::SIGTERM)
+        (self.bursts.is_empty() && self.now.is_empty() && self.asked >= self.gap)
+            .then_some(libc::SIGTERM)
     }
 }
 
@@ -1577,6 +1581,7 @@ fn x4d2_a_stop_the_terminal_never_printed_was_never_asked() {
         now: Default::default(),
         // The first burst before any pass is printed.
         asked: 3,
+        gap: 3,
         stops: stops.clone(),
         sent_at: sent_at.clone(),
     };
@@ -1884,4 +1889,390 @@ fn frame_cost_at_1000_by_700() {
         "the git panel's frame at 1000x700 with Merge's dialog: {:?}",
         started.elapsed() / n
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// F-git-outcome: a result up stays until it is closed, and the results after it wait.
+
+/// The panel over the S3 fixture, nothing up.
+fn results_panel() -> super::tests::Fx {
+    let mut view = super::tests::fixture_view();
+    view.set_repo(dirty());
+    let mut fx = super::tests::Fx::new(1000.0, 600.0, view);
+    fx.idle();
+    fx
+}
+
+/// The failed push's result (`outcome(true)`), as its run's end shows it.
+fn push_failed() -> ResultDialog {
+    ResultDialog::of("Push", &outcome(true)).expect("a step failed")
+}
+
+/// A read's failure, as the Backups list's read shows it.
+fn backups_failed() -> ResultDialog {
+    ResultDialog::error("Backups", "fatal: not a git repository", None)
+}
+
+/// The result the panel shows.
+fn result_up(fx: &super::tests::Fx) -> Option<&ResultDialog> {
+    fx.host.view.result.as_ref()
+}
+
+/// The topmost dialog's rows as one line of words — its frame, its shadow and the blanks between
+/// rows gone — so a line the box wraps reads whole.
+fn box_words(fx: &super::tests::Fx) -> String {
+    let frame = |c: char| c.is_whitespace() || "║│░▒▓█╔╗╚╝═─".contains(c);
+    let l = boxed(&fx.drv).expect("a dialog in cells");
+    let rows: Vec<String> = rows(&l)
+        .iter()
+        .map(|r| r.trim_matches(frame).to_string())
+        .collect();
+    rows.join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The last pass's cells hold `text`, in any layer.
+fn on_screen(fx: &super::tests::Fx, text: &str) -> bool {
+    !cells::find(&cells::layers(&fx.drv.ctx), text).is_empty()
+}
+
+/// A write that succeeds while an earlier write's failure is up leaves the failure up, unread
+/// until the owner closes it; the status row says the success's words, as the host sets them.
+#[test]
+fn x4d2_a_success_after_a_failure_leaves_the_failure_up() {
+    let mut fx = results_panel();
+    let said = fx.host.view.show_outcome("Push", "Pushed", &outcome(true));
+    fx.host.view.status = Some(said);
+    fx.idle();
+    fx.idle();
+    assert!(on_screen(&fx, "error: failed to push some refs"));
+    let deleted = "Deleted branch b";
+    let said = (fx.host.view).show_outcome("Delete branch b", deleted, &outcome(false));
+    fx.host.view.status = Some(said);
+    fx.idle();
+    assert_eq!(
+        result_up(&fx),
+        Some(&push_failed()),
+        "the failure was replaced"
+    );
+    assert!(on_screen(&fx, "error: failed to push some refs"));
+    assert_eq!(
+        fx.host.view.status_line().text,
+        dialogs::status_text(deleted, &outcome(false)),
+        "the latest run's words"
+    );
+    fx.press(Key::Enter);
+    assert_eq!(result_up(&fx), None);
+    assert!(!fx.host.view.dialog_up(), "the success has no dialog");
+}
+
+/// A second failure — both arriving before a pass, as one poll can hand them — waits behind the
+/// first and shows once the first is closed, in arrival order; the covers and `dialog_up` follow
+/// the one shown.
+#[test]
+fn x4d2_a_second_failure_waits_for_the_first() {
+    let mut fx = results_panel();
+    fx.host.view.show_outcome("Push", "Pushed", &outcome(true));
+    (fx.host.view).show_text("Backups", "fatal: not a git repository", None);
+    fx.idle();
+    fx.idle();
+    let grid = Grid::over(fx.host.rect);
+    assert_eq!(
+        result_up(&fx),
+        Some(&push_failed()),
+        "the first shows first"
+    );
+    assert!(on_screen(&fx, "error: failed to push some refs"));
+    assert!(!on_screen(&fx, "fatal: not a git repository"));
+    assert_eq!(fx.host.view.covered(&grid), push_failed().covers(&grid));
+    fx.press(Key::Enter);
+    assert_eq!(
+        result_up(&fx),
+        Some(&backups_failed()),
+        "the second after it"
+    );
+    fx.idle();
+    fx.idle();
+    assert!(on_screen(&fx, "fatal: not a git repository"));
+    assert!(!on_screen(&fx, "error: failed to push some refs"));
+    assert_eq!(fx.host.view.covered(&grid), backups_failed().covers(&grid));
+    assert!(fx.host.view.dialog_up());
+    fx.press(Key::Enter);
+    assert_eq!(result_up(&fx), None);
+    assert!(!fx.host.view.dialog_up());
+    assert!(fx.host.view.covered(&grid).is_empty());
+}
+
+/// `[Enter, Enter]` in one pass closes the result up and not the one behind it; nor do Enters in
+/// the passes before the next one showed (laid out unseen, then the first pass it paints); the
+/// Enter after them closes it.
+#[test]
+fn x4d2_two_enters_in_one_pass_close_one_result() {
+    let mut fx = results_panel();
+    fx.host.view.show_outcome("Push", "Pushed", &outcome(true));
+    (fx.host.view).show_text("Backups", "fatal: not a git repository", None);
+    fx.idle();
+    fx.idle();
+    let enters = vec![down(Key::Enter), down(Key::Enter)];
+    fx.drv.frame(&mut fx.host, enters, Modifiers::NONE);
+    assert_eq!(result_up(&fx), Some(&backups_failed()), "both closed");
+    for _ in 0..2 {
+        fx.drv
+            .frame(&mut fx.host, vec![down(Key::Enter)], Modifiers::NONE);
+        assert_eq!(result_up(&fx), Some(&backups_failed()), "closed unseen");
+    }
+    fx.drv
+        .frame(&mut fx.host, vec![down(Key::Enter)], Modifiers::NONE);
+    assert_eq!(result_up(&fx), None);
+}
+
+/// 03 §7.2: "delete anyway?" replaces the error it answers — the result its run's end just
+/// added, up alone or waiting behind another — and never a result up before it.
+#[test]
+fn x4d2_delete_anyway_replaces_only_the_error_it_answers() {
+    let forced = Action::DeleteBranch {
+        branch: "feature".into(),
+        force: true,
+        remotes: Vec::new(),
+    };
+    let refused = || outcome(true);
+    // Alone: the question in its place.
+    let mut fx = results_panel();
+    (fx.host.view).show_outcome("Delete branch feature", "Deleted", &refused());
+    assert!(fx.host.view.confirm_again(forced.clone()).is_empty());
+    assert_eq!(result_up(&fx), None, "the error it answers");
+    assert!(fx.host.view.dialog.is_some(), "delete anyway?");
+    // Behind others — one up, one waiting before it: those stay, and are all that is left once
+    // the question goes.
+    let mut fx = results_panel();
+    fx.host.view.show_outcome("Push", "Pushed", &outcome(true));
+    fx.idle();
+    fx.idle();
+    (fx.host.view).show_text("Backups", "fatal: not a git repository", None);
+    (fx.host.view).show_outcome("Delete branch feature", "Deleted", &refused());
+    assert!(fx.host.view.confirm_again(forced).is_empty());
+    assert!(fx.host.view.dialog.is_some(), "delete anyway?");
+    assert_eq!(result_up(&fx), Some(&push_failed()), "the result up before");
+    fx.idle();
+    fx.idle();
+    fx.press(Key::Escape);
+    assert!(fx.host.view.dialog.is_none(), "the question went");
+    assert_eq!(result_up(&fx), Some(&push_failed()));
+    fx.idle();
+    fx.idle();
+    fx.press(Key::Enter);
+    assert_eq!(
+        result_up(&fx),
+        Some(&backups_failed()),
+        "the one waiting before the answered error"
+    );
+    fx.idle();
+    fx.idle();
+    fx.press(Key::Enter);
+    assert_eq!(result_up(&fx), None, "the answered error came back");
+    assert!(!fx.host.view.dialog_up());
+}
+
+/// The git panel in the terminal, saying which result is up after each pass: 0 the first
+/// (`results.0`), 1 the second, 2 none.
+struct ResultsInTerminal {
+    host: super::tests::Host,
+    results: (ResultDialog, ResultDialog),
+    up: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl Window for ResultsInTerminal {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        self.host.ui(ui);
+        let up = match &self.host.view.result {
+            Some(r) if *r == self.results.0 => 0,
+            Some(r) if *r == self.results.1 => 1,
+            None => 2,
+            Some(_) => 3,
+        };
+        self.up.set(up);
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// Through the terminal, which prints no pass while input waits: the push's failure printed, the
+/// Backups read's waiting, `[Enter, a focus report, a focus report, Enter]` back to back close
+/// the first and not the second — laid out unseen and then painted in passes never printed, it
+/// was not on screen at the second Enter —; once the second is printed, an Enter closes it.
+#[test]
+fn x4d2_a_result_the_terminal_never_printed_stays() {
+    use crossterm::event::{Event as CEvent, KeyCode, KeyEvent, KeyModifiers};
+    let enter = CEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let up = std::rc::Rc::new(std::cell::Cell::new(9));
+    let sent_at = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let tty = Bursts {
+        bursts: [
+            vec![CEvent::FocusGained],
+            vec![CEvent::FocusGained],
+            vec![
+                enter.clone(),
+                CEvent::FocusGained,
+                CEvent::FocusGained,
+                enter.clone(),
+            ],
+            vec![CEvent::FocusGained],
+            vec![enter],
+        ]
+        .into(),
+        now: Default::default(),
+        asked: 0,
+        gap: 3,
+        stops: up.clone(),
+        sent_at: sent_at.clone(),
+    };
+    let ctx = egui::Context::default();
+    chrome::install(&ctx);
+    let mut b = term::Backend::new(tty, std::io::sink(), ctx, true);
+    let mut view = super::tests::fixture_view();
+    view.set_repo(dirty());
+    view.show_outcome("Push", "Pushed", &outcome(true));
+    view.show_text("Backups", "fatal: not a git repository", None);
+    let mut win = ResultsInTerminal {
+        host: super::tests::Host {
+            view,
+            active: true,
+            actions: Vec::new(),
+            rect: egui::Rect::NOTHING,
+            under: Vec::new(),
+            side: None,
+        },
+        results: (push_failed(), backups_failed()),
+        up: up.clone(),
+    };
+    let mut no_switch =
+        |_: &mut term::Backend<Bursts, std::io::Sink>| panic!("no switch in this test");
+    let end = b.run(&mut win, &mut no_switch).expect("the run");
+    assert_eq!(end, term::End::Signal(libc::SIGTERM));
+    assert_eq!(
+        *sent_at.borrow(),
+        [0, 0, 0, 1, 1],
+        "which result was up as each burst came"
+    );
+    assert_eq!(up.get(), 2, "the second closed once printed");
+}
+
+/// The first result follows the same rule: an Enter in its first passes — laid out unseen, then
+/// the first it paints — closes nothing (it came as the owner pressed a key meant for the graph);
+/// the next one does.
+#[test]
+fn x4d2_a_result_closes_only_once_shown() {
+    let mut fx = results_panel();
+    (fx.host.view).show_text("Backups", "fatal: not a git repository", None);
+    for _ in 0..2 {
+        fx.drv
+            .frame(&mut fx.host, vec![down(Key::Enter)], Modifiers::NONE);
+        assert_eq!(result_up(&fx), Some(&backups_failed()), "closed unseen");
+    }
+    fx.drv
+        .frame(&mut fx.host, vec![down(Key::Enter)], Modifiers::NONE);
+    assert_eq!(result_up(&fx), None);
+}
+
+/// At most `RESULTS_WAITING` wait behind the one up: past them the oldest waiting goes, so the
+/// one up stays and the newest — the one "delete anyway?" may answer — is always kept; the next
+/// result shown says, in a line of its own, how many were not and where their commands are (one
+/// past the cap drops one, three past it three).
+#[test]
+fn x4d2_the_results_waiting_are_bounded() {
+    let title = |k: usize| format!("Read {k:02}");
+    for over in [1, 3] {
+        let mut fx = results_panel();
+        let n = super::RESULTS_WAITING + 1 + over;
+        for k in 0..n {
+            (fx.host.view).show_text(&title(k), "fatal: x", None);
+        }
+        // The whole line, its count and where the commands that ran are, none of it cut (the box
+        // may wrap it).
+        let log = crate::gui::browser::keys::Mods::Command.prefix();
+        let tail = format!("not shown — the command log ({log}L) has the commands that ran");
+        let notice = match over {
+            1 => format!("1 earlier result {tail}"),
+            n => format!("{n} earlier results {tail}"),
+        };
+        let mut shown = Vec::new();
+        for _ in 0..=n {
+            if result_up(&fx).is_none() {
+                break;
+            }
+            fx.idle();
+            fx.idle();
+            let k = (0..n).find(|&k| on_screen(&fx, &title(k)));
+            shown.push((
+                k.expect("a result on screen"),
+                box_words(&fx).contains(&notice),
+            ));
+            fx.press(Key::Enter);
+        }
+        let kept: Vec<(usize, bool)> = (0..n)
+            .filter(|&k| k == 0 || k > over)
+            .map(|k| (k, k == over + 1))
+            .collect();
+        assert_eq!(shown, kept, "{over} past the cap");
+    }
+}
+
+/// A terminal that sends no key releases, at a press's pace: Enter on the first result, then
+/// Enter again once the terminal is idle, closes both — the next result, of the first one's size,
+/// is painted where the screen shows it before the second press.
+#[test]
+fn x4d2_each_press_in_a_terminal_closes_one_result() {
+    use crossterm::event::{Event as CEvent, KeyCode, KeyEvent, KeyModifiers};
+    let enter = CEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let up = std::rc::Rc::new(std::cell::Cell::new(9));
+    let sent_at = std::rc::Rc::new(RefCell::new(Vec::new()));
+    let tty = Bursts {
+        bursts: [
+            vec![CEvent::FocusGained],
+            vec![CEvent::FocusGained],
+            vec![enter.clone()],
+            vec![enter],
+        ]
+        .into(),
+        now: Default::default(),
+        asked: 0,
+        gap: 30,
+        stops: up.clone(),
+        sent_at: sent_at.clone(),
+    };
+    let ctx = egui::Context::default();
+    chrome::install(&ctx);
+    let mut b = term::Backend::new(tty, std::io::sink(), ctx, true);
+    let mut view = super::tests::fixture_view();
+    view.set_repo(dirty());
+    // Two results of one size: egui settles no box that changed size between them.
+    let restore = || ResultDialog::error("Restore", "fatal: not a backup group 7", None);
+    view.show_text("Backups", "fatal: not a git repository", None);
+    view.show_text("Restore", "fatal: not a backup group 7", None);
+    let mut win = ResultsInTerminal {
+        host: super::tests::Host {
+            view,
+            active: true,
+            actions: Vec::new(),
+            rect: egui::Rect::NOTHING,
+            under: Vec::new(),
+            side: None,
+        },
+        results: (backups_failed(), restore()),
+        up: up.clone(),
+    };
+    let mut no_switch =
+        |_: &mut term::Backend<Bursts, std::io::Sink>| panic!("no switch in this test");
+    let end = b.run(&mut win, &mut no_switch).expect("the run");
+    assert_eq!(end, term::End::Signal(libc::SIGTERM));
+    assert_eq!(
+        *sent_at.borrow(),
+        [0, 0, 0, 1],
+        "which result was up as each press came"
+    );
+    assert_eq!(up.get(), 2, "the second press closed the second result");
 }

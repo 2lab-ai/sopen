@@ -2275,7 +2275,7 @@ pub fn status_text(what: &str, outcome: &Outcome) -> String {
 /// a failed step's row in the error colour — then, a blank row apart, the failed command's text
 /// whole, a row a line, its tabs at every eighth cell and its control characters escaped; under
 /// them the command line in the weak colour, the warning in the error colour or the backup line,
-/// `[ OK ]` and the hint.
+/// the results before it that were not kept (in the error colour), `[ OK ]` and the hint.
 #[derive(Debug, Clone)]
 pub struct ResultDialog {
     /// The action.
@@ -2290,6 +2290,9 @@ pub struct ResultDialog {
     /// The run's warning (`Outcome::warning`: `backup <stamp> incomplete: …`), said in the
     /// error colour in place of the backup's undo line.
     warning: Option<String>,
+    /// The results that came before it and were not kept — the panel keeps so many waiting
+    /// (F-git-outcome) —, said in a line of their own ([`dropped_line`]).
+    dropped: usize,
     /// The first of its rows that scroll shown.
     top: usize,
     /// Its rows that scroll as last wrapped, and the width they were wrapped to: `covers` and
@@ -2307,16 +2310,18 @@ impl PartialEq for ResultDialog {
             error,
             backup,
             warning,
+            dropped,
             top,
             wrapped: _,
         } = self;
-        (title, steps, error, backup, warning, top)
+        (title, steps, error, backup, warning, dropped, top)
             == (
                 &other.title,
                 &other.steps,
                 &other.error,
                 &other.backup,
                 &other.warning,
+                &other.dropped,
                 &other.top,
             )
     }
@@ -2343,6 +2348,14 @@ const STEP_WORD: usize = 9;
 
 /// What the result says Enter and Esc do.
 const RESULT_HINT: &str = "Enter or Esc closes";
+
+/// The line of a result that `n` results before it were not kept (F-git-outcome), and that the
+/// command log has the commands that ran — none, for a run that never ran one (03 §3.7).
+fn dropped_line(n: usize) -> String {
+    let results = if n == 1 { "result" } else { "results" };
+    let log = Mods::Command.prefix();
+    format!("{n} earlier {results} not shown — the command log ({log}L) has the commands that ran")
+}
 
 /// A line of a command's text as a row of cells shows it: tabs to the next multiple of eight
 /// cells, control characters escaped (`\u{7}`), as the details pane shows a message.
@@ -2402,6 +2415,7 @@ impl ResultDialog {
             }),
             backup: outcome.backup.clone(),
             warning,
+            dropped: 0,
             top: 0,
             wrapped: Default::default(),
         })
@@ -2419,9 +2433,16 @@ impl ResultDialog {
             )),
             backup: None,
             warning: None,
+            dropped: 0,
             top: 0,
             wrapped: Default::default(),
         }
+    }
+
+    /// It says that `n` results before it were not kept (F-git-outcome: the panel keeps so many
+    /// waiting), in the error colour above `[ OK ]`.
+    pub fn say_dropped(&mut self, n: usize) {
+        self.dropped = n;
     }
 
     /// `text`'s lines as rows show them ([`shown_line`]), its blank lines at the end left out.
@@ -2498,6 +2519,10 @@ impl ResultDialog {
         } else if let Some(stamp) = &self.backup {
             parts.extend([Part::Blank, Part::Text(backup_line(stamp), Ink::Text)]);
         }
+        if self.dropped > 0 {
+            let line = dropped_line(self.dropped);
+            parts.extend([Part::Blank, Part::Text(line, Ink::Error)]);
+        }
         parts.extend([
             Part::Blank,
             Part::Buttons(vec![Button::new("OK", ok_id())]),
@@ -2512,7 +2537,8 @@ impl ResultDialog {
         self.layout(*grid).covers()
     }
 
-    /// One pass on `grid` (the panels'); `true` once Enter, Esc, OK or a click outside closed it.
+    /// One pass on `grid` (the panels'); `true` once Enter, Esc, OK or a click outside asked to
+    /// close it — the panel decides (it closes only a result the screen showed, F-git-outcome).
     /// Its rows scroll by the wheel over the box and the scroll bar on its border.
     pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> bool {
         let close = ctx.input_mut(|i| {
