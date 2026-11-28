@@ -10,7 +10,7 @@ use super::*;
 use crate::gui::browser::keys::{self, Mods};
 use crate::gui::cells::{Layer, Pen};
 use crate::gui::term::{self, Screen};
-use dialog::{choice_id, work, Bar, Input, Row, Rows};
+use dialog::{choice_id, work, Bar, Input, Row, Rows, Wrapped};
 use std::sync::Arc;
 
 const CELL: Vec2 = chrome::CELL;
@@ -1185,8 +1185,8 @@ fn x4kit_a_long_message_costs_its_rows_not_its_length_a_pass() {
 fn x4kit_the_wheel_over_a_message_leaves_the_reports_rows() {
     let report: Vec<(String, Ink)> = (0..30).map(|k| (format!("step {k}"), Ink::Text)).collect();
     let parts = vec![
-        Part::Scroll {
-            rows: report,
+        Part::Wrapped {
+            rows: Wrapped::new(report),
             most: 4,
             top: 0,
         },

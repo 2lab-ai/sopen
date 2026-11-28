@@ -426,41 +426,116 @@ fn the_entry_is_laid_out_once_for_its_grid() {
     assert!(laid() > before, "laid out again on another grid");
 }
 
-/// Stderr's rows are cut as the kit's `wrap` breaks a text — at the last blank that fits, else
-/// after the last whole glyph, a Hangul glyph never split — each row fitting its room, so the
-/// kit keeps each whole. (In a room narrower than a glyph the two may differ: the kit keeps a
-/// blank after a glyph alone on its row as a row of its own; the grid less eight cells is never
-/// so narrow.)
+/// F-dialog-wrap (round 1): under the planner the body is the planner's, the log's entry shown
+/// whole is not drawn — so it covers nothing (the panel blanks no cells for a box not on screen),
+/// and no pass lays it out.
 #[test]
-fn stderr_is_cut_as_the_kit_wraps() {
+fn an_entry_shown_whole_under_the_planner_covers_nothing() {
+    let e = entry(
+        "git fetch",
+        Ending::Exit(1),
+        "fatal: the entry's own line",
+        0,
+    );
+    let mut fx = log_fx(1000.0, 500.0, vec![e]);
+    fx.press(Key::Enter);
+    let grid = grid_of(&fx);
+    assert!(!fx.view().covered(&grid).is_empty(), "the entry's box");
+    fx.view_mut().set_repo(super::tests_s4::repo());
+    fx.view_mut().open_planner(super::tests_s4::model());
+    fx.idle();
+    assert!(
+        !fx.shows("fatal: the entry's own line"),
+        "not drawn under the planner"
+    );
+    let laid = log_view::LAID.with(|c| c.get());
+    fx.idle();
+    fx.idle();
+    assert_eq!(fx.view().covered(&grid), Vec::<Cells>::new());
+    assert_eq!(
+        log_view::LAID.with(|c| c.get()),
+        laid,
+        "no pass laid it out"
+    );
+}
+
+/// F-dialog-wrap: stderr's lines reach the kit as they are and are wrapped by its rule, as every
+/// text of a dialog — the kit's wrap walks a line once, so the log needs no cut of its own: at
+/// every width, a box one cell wide too, the rows the entry lays are `dialog::wrap`'s of its lines
+/// (a blank after a glyph wider than the box a row of its own, as the kit keeps it).
+#[test]
+fn stderr_is_wrapped_by_the_kit() {
+    use crate::gui::browser::ops::dialog;
     let texts = [
-        "remote: Enumerating objects: 5, done.",
-        "error: failed to push some refs to 'https://example.com/a/very/long/path/repo.git'",
-        &"x".repeat(200),
-        "한글 오류가 아주 길게 이어지는 줄입니다 한글 오류가 아주 길게 이어지는 줄입니다",
-        &"한".repeat(50),
-        "a  b   c    d",
-        "",
-        "   ",
-        // A run of blanks longer than the room after a break (review round 1, S1).
-        "a          ",
-        "abc            ",
-        "a          b",
-        "fatal: x                                                                              ",
+        "remote: Enumerating objects: 5, done.".to_string(),
+        "error: failed to push some refs to 'https://example.com/a/very/long/path/repo.git'".into(),
+        "x".repeat(200),
+        "한글 오류가 아주 길게 이어지는 줄입니다 한글 오류가 아주 길게 이어지는 줄입니다".into(),
+        "한".repeat(50),
+        "a  b   c    d".into(),
+        String::new(),
+        "   ".into(),
+        "a          ".into(),
+        "abc            ".into(),
+        "a          b".into(),
+        format!("fatal: x{}", " ".repeat(78)),
     ];
-    for text in texts {
-        for room in [1, 2, 5, 9, 20, 76] {
-            let rows = log_view::cut(text, room);
-            let widest = text.chars().map(|c| cells::width(&c.to_string())).max();
-            if room >= widest.unwrap_or(0) {
-                let kit = crate::gui::browser::ops::dialog::wrap(text, room);
-                assert_eq!(rows, kit, "{text:?} at {room}");
-            }
-            for row in &rows {
-                let wide_alone = row.chars().count() == 1;
-                assert!(cells::width(row) <= room || wide_alone, "{row:?} at {room}");
-            }
-        }
+    let e = entry("git fetch", Ending::Exit(1), &texts.join("\n"), 0);
+    let panel = egui::Id::unique("sopen-git-test-panel");
+    for cols in [9, 10, 13, 17, 28, 100] {
+        let grid = Grid {
+            origin: Pos2::ZERO,
+            cols,
+            rows: 400,
+        };
+        let width = dialog::inside_width(cols, 88, 0);
+        let want: Vec<String> = (texts.iter())
+            .flat_map(|t| dialog::wrap(t, width))
+            .collect();
+        let laid = log_view::entry_layout(grid, &e, panel).scroll_rows();
+        assert_eq!(laid, want, "{cols} columns, {width} cells inside");
+    }
+}
+
+/// F-dialog-wrap (round 1): a value taller than the box — a 6 KiB command line — shows its first
+/// rows as the kit wraps it at its room and loses the rest there, the last row it shows cut with
+/// `…`, the box standing whole on its grid: on grids short and tall, a narrow one (the value under
+/// its name, the whole inside its room) among them.
+#[test]
+fn a_value_taller_than_the_box_ends_in_its_cut_row() {
+    use crate::gui::browser::ops::dialog;
+    let line = long_line(6 * 1024);
+    let e = entry(&line, Ending::Exit(0), "fatal: x", 0);
+    let panel = egui::Id::unique("sopen-git-test-panel");
+    for (cols, rows) in [(125u16, 24u16), (125, 60), (60, 30), (20, 60)] {
+        let at = format!("{cols}x{rows}");
+        let grid = Grid {
+            origin: Pos2::ZERO,
+            cols,
+            rows,
+        };
+        let width = dialog::inside_width(cols, 88, 0);
+        let want = dialog::wrap(&line, dialog::named_room(width, 12));
+        let layout = log_view::entry_layout(grid, &e, panel);
+        assert!(layout.fits(), "{at}: the box stands whole");
+        let texts = layout.texts();
+        let first = (texts.iter()).position(|t| *t == want[0]);
+        let first = first.unwrap_or_else(|| panic!("{at}: its first row in {texts:#?}"));
+        let whole = texts[first..]
+            .iter()
+            .take_while(|t| !t.ends_with('…'))
+            .count();
+        assert!(
+            whole > 0 && whole + 1 < want.len(),
+            "{at}: {whole} rows whole"
+        );
+        assert_eq!(texts[first..first + whole], want[..whole], "{at}");
+        let cut = texts[first + whole].trim_end_matches('…');
+        assert!(
+            want[whole].starts_with(cut),
+            "{at}: {cut:?} of {:?}",
+            want[whole]
+        );
     }
 }
 
@@ -571,8 +646,7 @@ fn the_lists_wheel_and_clicks_go_by_cells() {
 }
 
 /// A click on a button asks for its action; one on the blank between two buttons, beside them or
-/// on the hint presses nothing (egui gives a click near a widget to it when nothing is under the
-/// pointer).
+/// on the hint presses nothing, nor does one two points above or below a button's cells.
 #[test]
 fn a_click_between_the_buttons_presses_nothing() {
     let mut fx = backups_fx(1000.0, 400.0, records());
@@ -1024,63 +1098,33 @@ fn long_line(bytes: usize) -> String {
     line
 }
 
-/// M2: the entry's fields reach the kit — which wraps them by `dialog::wrap`, its work growing
-/// with the square of a text — cut to the cells the box can show: a 64 KiB command line hands it
-/// a few screens of text, not 64 KiB.
+/// M2 (F-dialog-wrap): the entry's fields reach the kit whole, and a 64 KiB command line is
+/// wrapped there in one walk — each grapheme measured about once, never what is left of it at
+/// each row — once for its grid: passes that change nothing wrap none of it again.
 #[test]
-fn a_64_kib_command_line_reaches_the_kit_cut_to_the_box() {
+fn a_64_kib_command_line_is_wrapped_in_one_walk_once_for_its_grid() {
+    use crate::gui::browser::ops::dialog::work;
     let line = long_line(64 * 1024);
     let mut fx = log_fx(1000.0, 500.0, vec![entry(&line, Ending::Exit(0), "", 0)]);
-    let handed = counted(&log_view::HANDED, || {
-        fx.press(Key::Enter);
-    });
+    work::take();
+    fx.press(Key::Enter);
+    let opened = work::take();
     assert!(fx.view().dialog_up());
-    let g = grid_of(&fx);
-    let width = crate::gui::browser::ops::dialog::inside_width(g.cols, 88, 0);
-    let screens = (usize::from(g.rows) + 2) * (width + 1);
-    assert!(
-        handed <= 2 * screens + 1024,
-        "{handed} bytes handed to the kit"
-    );
+    let n = line.len();
+    // Its graphemes, those a row broken at a blank measures again, the dialog's other texts.
+    assert!((n..=2 * n + 4096).contains(&opened.wrapped), "{opened:?}");
+    fx.idle();
+    fx.idle();
+    let idle = work::take();
+    assert!(idle.wrapped < 4096 && idle.copied == 0, "{idle:?}");
     let shown = fx
         .drv
         .text_starting_with("git add -- dir/file-00000.txt dir/file-00001.txt");
     assert!(shown.is_some(), "its first row");
 }
 
-/// M2: what the box shows of a value cut to its cells is what it shows of the whole value — the
-/// same layout, row for row — on grids short and tall, for a long Latin, Hangul or blank-run
-/// command line, and one that fits.
-#[test]
-fn a_value_cut_to_the_box_lays_out_as_the_whole_value() {
-    // Longer than the cut on the short grids, and the first than the 125×60 grid's too (their
-    // whole layouts are slow: the quadratic wrap).
-    let lines = [
-        long_line(6 * 1024),
-        "커밋 메시지가 아주 긴 한글 경로/".repeat(100),
-        format!("git add -- a{}b", " ".repeat(2000)),
-        "git fetch --progress origin".to_string(),
-    ];
-    for line in lines {
-        let e = entry(&line, Ending::Exit(0), "fatal: x", 0);
-        // The narrow ones lay each value under its name (`dialog::named_room`).
-        for (cols, rows) in [(125, 18), (125, 60), (60, 12), (20, 7), (20, 40), (21, 24)] {
-            let grid = Grid {
-                origin: Pos2::ZERO,
-                cols,
-                rows,
-            };
-            let panel = egui::Id::unique("sopen-git-test-panel");
-            let cut = log_view::entry_layout(grid, &e, panel);
-            let whole = log_view::entry_layout_in(grid, &e, panel, usize::MAX);
-            let at = format!("{} bytes at {cols}x{rows}", line.len());
-            assert_eq!(format!("{cut:?}"), format!("{whole:?}"), "{at}");
-        }
-    }
-}
-
 // S1: a run of blanks longer than the room after a break makes no rows of blanks — see
-// `stderr_is_cut_as_the_kit_wraps`, whose inputs hold such runs.
+// `stderr_is_wrapped_by_the_kit`, whose inputs hold such runs.
 
 /// S3: a pass walks an entry's row up to its room and a cell more, however long its command line
 /// (64 KiB); the row it draws is the one `cells::fit_start` cuts.
@@ -1165,21 +1209,25 @@ fn a_double_click_across_a_reread_of_the_list_is_its_lines_own() {
     }
 }
 
-/// S5: stderr is cut in one walk of its graphemes — `log_view::cut`, never `dialog::wrap`, which
-/// measures the rest of a line again for each row.
+/// S5 (F-dialog-wrap): stderr is wrapped in one walk of its graphemes — the kit's `dialog::wrap`
+/// measures each row's and the first past it, never what is left of a line.
 #[test]
 fn stderr_is_walked_once() {
+    use crate::gui::browser::ops::dialog::work;
     let stderr = "y".repeat(64 * 1024);
     let mut fx = log_fx(
         1000.0,
         500.0,
         vec![entry("git fetch", Ending::Exit(1), &stderr, 0)],
     );
-    let walked = counted(&log_view::CUT, || {
-        fx.press(Key::Enter);
-    });
+    work::take();
+    fx.press(Key::Enter);
+    let done = work::take();
     assert!(fx.view().dialog_up());
-    assert_eq!(walked, stderr.len(), "each grapheme once");
+    // Each grapheme once and a grapheme a row past it (rows of eight cells at the fewest), the
+    // dialog's other texts besides.
+    let n = stderr.len();
+    assert!((n..=n + n / 8 + 4096).contains(&done.wrapped), "{done:?}");
 }
 
 /// S7: the entry's field names and `Stderr` in the dialog's weak colour, as egui had them, the
@@ -1301,31 +1349,43 @@ fn ten_thousand_entries_draw_a_screen_of_rows() {
     );
 }
 
-/// GPT: a MiB of stderr is cut once and laid out once; the passes after it do neither again.
+/// GPT (F-dialog-wrap): a MiB of stderr is measured in walks of its length — its lines fit the
+/// box, so the kit takes them as made — and laid out once; the passes after it do neither again.
+/// Counted:
+/// every grapheme any width measure walks (`cells::measured`), the panel's own drawing over the
+/// passes of the press besides.
 #[test]
-fn a_mebibyte_of_stderr_is_cut_and_laid_out_once() {
+fn a_mebibyte_of_stderr_is_wrapped_and_laid_out_once() {
+    use crate::gui::browser::ops::dialog::work;
     let stderr: String = (0..13_274).map(|k| format!("remote: {k:070}\n")).collect();
     let mut fx = log_fx(
         1000.0,
         500.0,
         vec![entry("git fetch", Ending::Exit(1), &stderr, 0)],
     );
-    let walked = counted(&log_view::CUT, || {
-        fx.press(Key::Enter);
-    });
+    cells::measured::take();
+    fx.press(Key::Enter);
+    let measured = cells::measured::take();
     assert!(stderr.len() >= 1024 * 1024);
-    assert_eq!(
-        walked,
-        stderr.len() - 13_274,
-        "each grapheme once, the newlines apart"
+    // Each grapheme the newlines apart twice, in two walks: its tabs' columns (`stderr_line`) and
+    // the rows' widest (`Wrapped::new`).
+    let n = stderr.len() - 13_274;
+    assert!(
+        (n..=2 * n + n / 8).contains(&measured),
+        "{measured} for {n}"
     );
     assert!(fx.shows(&format!("remote: {:070}", 0)));
     let laid = log_view::LAID.with(|c| c.get());
-    let again = counted(&log_view::CUT, || {
-        fx.idle();
-        fx.idle();
-    });
-    assert_eq!((again, log_view::LAID.with(|c| c.get())), (0, laid));
+    work::take();
+    fx.idle();
+    fx.idle();
+    let again = work::take();
+    assert!(again.wrapped < 4096 && again.copied == 0, "{again:?}");
+    assert!(
+        cells::measured::take() < n / 64,
+        "the passes after measure none of it"
+    );
+    assert_eq!(log_view::LAID.with(|c| c.get()), laid);
 }
 
 /// The log and the Backups list drawn alone at `area` of the window's grid.
@@ -1811,6 +1871,183 @@ fn another_context_has_shown_nothing_yet() {
     assert!(b.press(Key::Enter).is_empty(), "nothing on B's screen yet");
     let both = two_branches()[0].group.refs[..2].to_vec();
     assert_eq!(b.press(Key::Enter), [GitAction::ShowBackup(both)]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// F-click-slop: a click on a blank of a part, in the host alone and over the browser's
+// background.
+
+/// The browser's background under a host, as `Browser::panels_ui` lays it (`browser.rs:2754`):
+/// a focusable rect over everything the host draws, laid first, given egui's keyboard each pass
+/// it has not got it — what a click on a blank of a git panel falls on in the browser.
+pub(super) struct Behind<'a, W>(pub(super) &'a mut W);
+
+impl<W: Window> Window for Behind<'_, W> {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let id = egui::Id::unique("sopen-test-browser-background");
+        let back = ui.interact(ui.max_rect(), id, egui::Sense::click());
+        if ui.ctx().memory(|m| m.focused()) != Some(id) {
+            back.request_focus();
+        }
+        self.0.ui(ui);
+    }
+
+    fn ready(&self) -> bool {
+        self.0.ready()
+    }
+}
+
+/// A click at `at` in `win` — one pass's move, press and release, or three passes — past
+/// egui's double-click time since the last, and one pass after it.
+pub(super) fn click_once<W: Window>(
+    drv: &mut crate::gui::testkit::Driver,
+    win: &mut W,
+    at: Pos2,
+    one_pass: bool,
+) {
+    drv.idle(win, 30);
+    match one_pass {
+        true => drv.frame(win, click_events(at), Modifiers::NONE),
+        false => drv.click(win, at),
+    }
+    drv.idle(win, 1);
+}
+
+/// What a click may change in the fixture's panel: its cells, its dialog, which widget has egui's
+/// keyboard.
+fn panel_state(fx: &Fx) -> (Vec<Vec<Seen>>, bool, Option<egui::Id>) {
+    let focus = fx.drv.ctx.memory(|m| m.focused());
+    (panel(fx).seen(), fx.view().dialog_up(), focus)
+}
+
+/// Each of `points` (named) clicked in `fx`, alone or over the browser's background, as one pass
+/// and as three: the ones that changed the panel's cells, its dialog or egui's keyboard, or asked
+/// for anything.
+fn blank_clicks_changing(fx: &mut Fx, behind: bool, points: &[(&str, Pos2)]) -> Vec<String> {
+    let mut wrong = vec![];
+    for &(what, at) in points {
+        for one_pass in [true, false] {
+            let pass = |fx: &mut Fx| match behind {
+                true => fx.drv.idle(&mut Behind(&mut fx.host), 1),
+                false => fx.idle(),
+            };
+            pass(fx);
+            let before = panel_state(fx);
+            match behind {
+                true => click_once(&mut fx.drv, &mut Behind(&mut fx.host), at, one_pass),
+                false => click_once(&mut fx.drv, &mut fx.host, at, one_pass),
+            }
+            let asked = fx.take();
+            let after = panel_state(fx);
+            let how = if one_pass { "one pass" } else { "three passes" };
+            if after != before || !asked.is_empty() {
+                let (cells, dialog) = (after.0 != before.0, after.1 != before.1);
+                let keyboard = format!("{:?} → {:?}", before.2, after.2);
+                wrong.push(format!(
+                    "{what} ({how}, behind {behind}): cells {cells}, dialog {dialog}, keyboard \
+                     {keyboard}, asked {asked:?}"
+                ));
+            }
+        }
+    }
+    wrong
+}
+
+/// F-click-slop: with no rect of the list's under its parts, a click on a blank of the Backups
+/// list changes nothing — between two buttons, beside one, on the hint, a point above and below
+/// a button, on the frame's border beside a line, on a row with no line — no action, the same
+/// cells, the keyboard where it was, in a host alone and over the browser's background (egui's
+/// hit test reaches only the rect a click falls in: the background's in the browser, whose
+/// response only asks for the keyboard).
+#[test]
+fn a_click_on_a_blank_of_the_backups_list_changes_nothing() {
+    for behind in [false, true] {
+        let mut fx = backups_fx(1000.0, 400.0, records());
+        let g = grid_of(&fx);
+        let foot = foot_y(g.rows);
+        let cell_rect = |x: u16, y: u16| g.rect(Cells::new(x, y, 1, 1));
+        let (show, delete) = (button_x(&fx, "Show"), button_x(&fx, "Delete"));
+        let last = (FIRST_Y..foot)
+            .take_while(|&y| !text(&fx, y, 1, g.cols - 1).trim().is_empty())
+            .last()
+            .expect("a line");
+        assert!(last + 1 < foot - 1, "a row with no line under the last");
+        let points = [
+            (
+                "a point into the gap after Restore",
+                cell_rect(show - 2, foot).left_center() + Vec2::new(1.0, 0.0),
+            ),
+            ("the gap's last cell", cell_rect(show - 1, foot).center()),
+            (
+                "a point after Delete",
+                cell_rect(delete + 10, foot).left_center() + Vec2::new(1.0, 0.0),
+            ),
+            ("the hint", cell_rect(delete + 20, foot).center()),
+            (
+                "a point above Show",
+                cell_rect(show + 3, foot).center_top() - Vec2::new(0.0, 1.0),
+            ),
+            (
+                "a point under Show",
+                cell_rect(show + 3, foot).center_bottom() + Vec2::new(0.0, 1.0),
+            ),
+            (
+                "the left border",
+                cell_rect(1, FIRST_Y).left_center() - Vec2::new(1.0, 0.0),
+            ),
+            (
+                "the right border",
+                cell_rect(g.cols - 2, FIRST_Y).right_center() + Vec2::new(1.0, 0.0),
+            ),
+            (
+                "a point under the last line",
+                cell_rect(20, last).center_bottom() + Vec2::new(0.0, 1.0),
+            ),
+            ("a row with no line", cell_rect(20, last + 2).center()),
+        ];
+        let wrong = blank_clicks_changing(&mut fx, behind, &points);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert!(fx.view().backups().is_some(), "the list still open");
+    }
+}
+
+/// F-click-slop: as the Backups list's, a click on a blank of the command log changes nothing —
+/// on the frame's border beside an entry, a point under the last entry, a row with no entry.
+#[test]
+fn a_click_on_a_blank_of_the_log_changes_nothing() {
+    for behind in [false, true] {
+        let mut fx = log_fx(1000.0, 300.0, entries(3));
+        let g = grid_of(&fx);
+        let cell_rect = |x: u16, y: u16| g.rect(Cells::new(x, y, 1, 1));
+        let last = FIRST_Y + 2;
+        assert!(
+            !text(&fx, last, 1, g.cols - 1).trim().is_empty(),
+            "the last entry's row"
+        );
+        assert!(
+            text(&fx, last + 1, 1, g.cols - 1).trim().is_empty(),
+            "no entry under it"
+        );
+        let points = [
+            (
+                "the left border",
+                cell_rect(1, FIRST_Y).left_center() - Vec2::new(1.0, 0.0),
+            ),
+            (
+                "the right border",
+                cell_rect(g.cols - 2, FIRST_Y + 1).right_center() + Vec2::new(1.0, 0.0),
+            ),
+            (
+                "a point under the last entry",
+                cell_rect(20, last).center_bottom() + Vec2::new(0.0, 1.0),
+            ),
+            ("a row with no entry", cell_rect(20, last + 2).center()),
+        ];
+        let wrong = blank_clicks_changing(&mut fx, behind, &points);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        let log = fx.view().log.as_ref().expect("the log still open");
+        assert_eq!(LogView::whole(log), None, "no entry shown whole");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

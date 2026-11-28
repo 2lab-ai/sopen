@@ -320,18 +320,6 @@ fn hint_in(room: usize) -> String {
     shown
 }
 
-/// Where a click on a blank of a list at cells `area` of `grid` goes (an `interact` rect under
-/// its rows and buttons): its cells, the frame's border cell either side (the panel's own) and
-/// egui's reach below them (`interact_radius`, into the frame's rule) — every point a click on
-/// which egui would otherwise give to the nearest of the list's widgets.
-pub(super) fn blank_clicks(ui: &egui::Ui, grid: &Grid, area: Cells) -> egui::Rect {
-    let left = area.x.saturating_sub(1);
-    let borders = Cells::new(left, area.y, area.right() + 1 - left, area.height);
-    let reach = ui.style().interaction.interact_radius;
-    let rect = grid.rect(borders);
-    egui::Rect::from_min_max(rect.min, rect.max + egui::vec2(0.0, reach))
-}
-
 /// The foot's buttons, in their order, each with what it asks for.
 const BUTTONS: [(&str, Act); 3] = [
     ("Restore", Act::Restore),
@@ -362,9 +350,9 @@ pub(super) const PAINTS_CELLS: bool = true;
 /// ([`hint_in`]). Only the lines on screen are drawn; the wheel scrolls them by `CELL.y`, the bar
 /// stays. Every control is an `interact` rect at its cells, its id the list's panel's
 /// ([`BackupsView::in_panel`]: two repositories' panels draw into one `ui`), sensing clicks alone (`Sense::CLICK`: egui's
-/// `Sense::click()` takes the focus, so Tab, then Space, would press a button), over one more under
-/// them all ([`blank_clicks`]: the list's cells, the frame's border either side, egui's reach below),
-/// so a click on a blank presses nothing. A click puts the bar on a line, a double click on one line
+/// `Sense::click()` takes the focus, so Tab, then Space, would press a button), and nothing under
+/// them: a click reaches only the rect it falls in (the skin's `interact_radius` is 0,
+/// `chrome::style`; F-click-slop), so a click on a blank presses nothing. A click puts the bar on a line, a double click on one line
 /// Shows it (the browser's `second_click`, the pair the line itself, in the list's panel), a
 /// button asks for its action — each of those as the last pass that reached the screen painted
 /// the bar's line ([`BackupsView::as_painted`]), what this pass paints kept for the passes after
@@ -434,10 +422,6 @@ pub fn draw(
     // What the screen shows (asked before anything of this pass is painted).
     let _ = view.on_screen(&ctx);
     let mut clicked = None;
-    // Under the lines and the buttons, the list's cells, the frame's border either side and egui's
-    // reach below them ([`blank_clicks`]): a click on a blank of them — between two buttons, beside
-    // one, on the border, on a row with no line, just under the foot — presses nothing.
-    ui.interact(blank_clicks(ui, grid, area), id("under", 0), Sense::CLICK);
     for (n, k) in shown.enumerate() {
         let y = list.y + n as u16;
         let row = Cells::new(list.x, y, list.width, 1);

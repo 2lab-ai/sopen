@@ -1503,3 +1503,28 @@ fn x4q_the_panel_blanks_under_its_quick_dialog() {
         .expect("the dialog in cells, where it said it stands");
     assert!(rows(l).join("\n").contains("Message"), "{:#?}", rows(l));
 }
+
+/// F-dialog-wrap: a quick edit's plan of 500 rows reaches the kit kept and shared: ten idle
+/// passes — each laying the box out for its covers and its painting — copy, wrap and measure none
+/// of its rows, and draw only those the box shows; the rows still show.
+#[test]
+fn x4q_a_long_plan_copies_no_rows_a_pass() {
+    use crate::gui::browser::ops::dialog::work;
+    fn long(edit: &Edit, repo: &Repo) -> Result<Plan, Refused> {
+        let mut p = fake(edit, repo)?;
+        if let Some(c) = &mut p.confirm {
+            c.changes = (0..500)
+                .map(|k| format!("refs/heads/b{k:03}: 11111111 → 22222222, a line that wraps"))
+                .collect();
+        }
+        Ok(p)
+    }
+    let mut fx = Fx::new(open(EditId::Reword, long), long, 100, 30);
+    work::take();
+    fx.idle(10);
+    let done = work::take();
+    assert_eq!((done.copied, done.measured), (0, 0), "{done:?}");
+    assert!(done.drawn > 0 && done.drawn <= 10 * 30, "{done:?}");
+    let shown = fx.shown("Fake reword");
+    assert!(shown.contains("  refs/heads/b000: 11111111"), "{shown}");
+}
