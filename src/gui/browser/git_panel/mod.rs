@@ -2565,37 +2565,17 @@ impl GitView {
     }
 }
 
-/// "Stop git?" (03 §3.4) over the write `what`, on `grid` (the panels', where it stands once it
-/// is in cells): `Some(true)` on Enter or Yes, `Some(false)` on Esc, No or a click outside.
-fn stop_question(ctx: &egui::Context, _grid: Grid, what: &str) -> Option<bool> {
-    if ctx.input_mut(|i| keys::take(i, Key::Escape, Mods::None)) {
-        return Some(false);
-    }
-    let mut answer = ctx
-        .input_mut(|i| keys::take(i, Key::Enter, Mods::None))
-        .then_some(true);
-    let id = egui::Id::unique("sopen-git-stop");
-    let response = chrome::dialog(ctx, id, "Stop git?", |ui| {
-        ui.label(format!("{what} is still running."));
-        ui.label("It may stop between steps; the panel then shows the state it left.");
-        ui.add_space(chrome::CELL.y / 2.0);
-        ui.horizontal(|ui| {
-            if ui.button("Yes, stop it").clicked() {
-                answer = Some(true);
-            }
-            if ui.button("No").clicked() {
-                answer = Some(false);
-            }
-        });
-    });
-    answer.or_else(|| response.should_close().then_some(false))
+/// "Stop git?" (03 §3.4) over the write `what`, on `grid` (the panels'), in cells
+/// ([`dialogs::stop_question`]): `Some(true)` on Enter or Yes, `Some(false)` on Esc, No or a click
+/// outside.
+fn stop_question(ctx: &egui::Context, grid: Grid, what: &str) -> Option<bool> {
+    dialogs::stop_question(ctx, grid, what)
 }
 
 /// The cells of `grid` (the panels') "Stop git?" over `what` covers, its box and its shadow, for
-/// the panel and the other side to blank (10 §17, X4-graph's seam): none while egui draws it,
-/// until X4-dialogs2 moves [`stop_question`].
-fn stop_covers(_grid: &Grid, _what: &str) -> Vec<Cells> {
-    Vec::new()
+/// the panel and the other side to blank (10 §17, X4-graph's seam).
+fn stop_covers(grid: &Grid, what: &str) -> Vec<Cells> {
+    dialogs::stop_covers(grid, what)
 }
 
 /// The key table's rows the panel reads: the landed slices' (S2's own among them since S2-F);

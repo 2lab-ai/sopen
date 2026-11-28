@@ -20,23 +20,24 @@
 //!   `<what was done> · backup <stamp> · Cmd/Ctrl+Z undoes` (§8.3).
 //! - **Masking** (03 §3.7) is for what sopen shows from git: a URL the owner types (Add remote, a
 //!   retyped Edit remote field) shows as typed, while the result dialog and the log mask it.
-//! - **In cells** (X4-dialogs, 10 §17): every dialog without options, 03 §7.6–§7.7's forms and
-//!   a restore's are `ops::dialog`'s box on the panels' grid — the lost line, the options as the
-//!   kit's fields, message fields and choices, the plan in rows that scroll (at most three fifths
-//!   of the grid, eight at least, the kit giving them way first on a short grid), `[ Run ]` (off
-//!   until the plan is in and nothing refuses it, and while the grid holds less than all of the
-//!   box), `[ Cancel ]` and the hint — and [`ActionDialog::covers`] says its cells. Every other
-//!   form of 03 §7.1–§7.5 is egui's until X4-dialogs2. The keyboard opens on the form's first
-//!   text field, or on nothing; Enter runs (03 §8.1), but each Enter of a pass goes to what has
-//!   the keyboard at that point — before the pass's first Tab what had it then, after it what the
-//!   Tab gave it to — so Enter on a focused button is that button's press, and one after a
-//!   Shift+Tab or an arrow that moves the keyboard (egui moves it later) is dropped, a Space too;
-//!   only what the screen showed runs: a Run or an Enter runs when what would run is what the
-//!   last pass the host put on screen painted (`cells::OnScreen`), else it is dropped and
-//!   [`CHANGED`] says so; after two moves in a pass every later Enter is dropped, a Space too
-//!   unless the pass began on a text field. Space is the kit's, once a
-//!   press in the pass's order; Esc, Cancel or a click outside cancels, and a pass that both
-//!   cancels and runs cancels.
+//! - **In cells** (X4-dialogs, X4-dialogs2, 10 §17): every action's dialog is `ops::dialog`'s
+//!   box on the panels' grid — the lost line, the options as the kit's fields, message fields and
+//!   choices, the plan in rows that scroll (at most three fifths of the grid, eight at least, the
+//!   kit giving them way first on a short grid), `[ Run ]` (off until the plan is in and nothing
+//!   refuses it, and while the grid holds less than all of the box), `[ Cancel ]`, Rebase's
+//!   `[ Plan the commits first… ]` and the hint — and [`ActionDialog::covers`] says its cells; so
+//!   are the result ([`ResultDialog::covers`]) and "Stop git?" ([`stop_question`]). The keyboard
+//!   opens on the form's first text field, or on nothing; Enter runs (03 §8.1), but each Enter of
+//!   a pass goes to what has the keyboard at that point — before the pass's first Tab what had it
+//!   then, after it what the Tab gave it to — so Enter on a focused button is that button's press,
+//!   and one after a Shift+Tab or an arrow that moves the keyboard (egui moves it later) is
+//!   dropped, a Space too; only what the screen showed runs: a Run or an Enter runs when what
+//!   would run is what the last pass the host put on screen painted (`cells::OnScreen`) — the
+//!   draft, its plan's rows, whether Run was on and Check out's "Don't ask again" — else it is
+//!   dropped and [`CHANGED`] says so; after two moves in a pass every later Enter is dropped, a
+//!   Space too unless the pass began on a text field. Space is the kit's, once a press in the
+//!   pass's order; Esc, Cancel or a click outside cancels, and a pass that both cancels and runs
+//!   cancels. "Stop git?" stops only what the screen showed it asking about, by the same rule.
 
 use super::menu::{self, Target};
 use crate::git::actions::{
@@ -51,7 +52,7 @@ use crate::gui::browser::keys::{self, Mods};
 use crate::gui::browser::ops::dialog::{self as kit, Button, Ink, Input, Inputs, Part};
 use crate::gui::cells::{self, Cells, Grid};
 use crate::gui::chrome;
-use eframe::egui::{self, Key, RichText};
+use eframe::egui::{self, Key};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -664,36 +665,41 @@ fn extension(format: ArchiveFormat) -> &'static str {
 pub struct ActionDialog {
     form: Form,
     repo: Repo,
-    /// The draft last planned and its plan.
-    planned: Option<(Action, Result<Plan, Refused>)>,
-    /// The form laid out a text field last pass: the typing goes there while nothing has it — in
-    /// cells also when it shows anew (Amend's message once "edit it" is chosen).
+    /// The draft's revision last planned, and its plan.
+    planned: Option<(u64, Result<Plan, Refused>)>,
+    /// A refresh came: the draft is planned again against the new [`Repo`].
+    refreshed: bool,
+    /// The draft's revision: it moves whenever a pass changes the draft or Check out's "Don't ask
+    /// again in this window" (an edit, an option).
+    drafted: u64,
+    /// What the screen's painting is compared by ([`Painting`]): it moves with the draft's
+    /// revision and whenever a plan's rows change (an option's, a refresh's, reads landing), so
+    /// a pass compares and copies no draft.
+    revision: u64,
+    /// The form laid out a text field last pass: the typing goes there while nothing has it, and
+    /// when it shows anew (Amend's message once "edit it" is chosen).
     typing: bool,
-    /// The Cancel button's id, last pass: Enter while it has the focus cancels.
-    cancel: Option<egui::Id>,
-    /// Rebase's "Plan the commits first…" button's id, last pass: Enter while it has the focus
-    /// is its click, never the rebase's Run.
-    plan_first: Option<egui::Id>,
-    /// In cells: the first of the plan's rows shown.
+    /// The first of the plan's rows shown.
     plan_top: usize,
-    /// In cells: a Run or an Enter came when what would run was not what the screen showed, and
-    /// was not acted on — the hint says the plan changed and Enter runs it.
+    /// A Run or an Enter came when what would run was not what the screen showed, and was not
+    /// acted on — the hint says the plan changed and Enter runs it.
     changed: bool,
-    /// In cells: what the screen shows of the dialog — the painting of the last pass that reached
-    /// it — and the last pass's painting. Nothing until a pass has painted where it can be seen
-    /// (egui lays a new modal out unseen the first time).
+    /// What the screen shows of the dialog — the painting of the last pass that reached it — and
+    /// the last pass's painting. Nothing until a pass has painted where it can be seen (egui lays
+    /// a new modal out unseen the first time).
     screen: cells::OnScreen<Painting>,
-    /// In cells: a pass has laid the box out (the next one paints where it can be seen).
+    /// A pass has laid the box out (the next one paints where it can be seen).
     laid_once: bool,
 }
 
-/// What a pass of an action's dialog in cells painted: the draft, its plan's rows and whether its
-/// Run was on. A Run or an Enter runs only what the screen shows ([`cells::OnScreen`]), equal to
-/// what would run at its pass's end.
-#[derive(Debug, Clone, PartialEq)]
+/// What a pass of an action's dialog painted: the revision of what it showed — the draft, its
+/// plan's rows and Check out's "Don't ask again in this window" (which a run carries out of the
+/// dialog, so every later checkout in the window runs unasked) — and whether its Run was on. A Run
+/// or an Enter runs only what the screen shows ([`cells::OnScreen`]), equal to what would run at
+/// its pass's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Painting {
-    draft: Action,
-    plan: Vec<PlanRow>,
+    revision: u64,
     runs: bool,
 }
 
@@ -706,7 +712,7 @@ pub(super) fn field_id(n: usize) -> egui::Id {
     dialog_id().with(("field", n))
 }
 
-/// In cells: the box's id (its modal), and its buttons'.
+/// The box's id (its modal), and its buttons'.
 fn cells_id() -> egui::Id {
     dialog_id().with("cells")
 }
@@ -719,11 +725,11 @@ pub(super) fn cancel_id() -> egui::Id {
     cells_id().with("cancel")
 }
 
-fn plan_first_id() -> egui::Id {
+pub(super) fn plan_first_id() -> egui::Id {
     cells_id().with("plan-first")
 }
 
-/// In cells: the id of a form's `k`th row of choices.
+/// The id of a form's `k`th row of choices.
 pub(super) fn row_id(k: usize) -> egui::Id {
     cells_id().with(("row", k))
 }
@@ -762,7 +768,8 @@ pub(super) const CHANGED: &str = "the plan changed — Enter runs it · Esc canc
 pub(super) const TOO_SHORT: &str =
     "the window is too short for all of it: make it taller to run it";
 
-/// A dialog's width: `cells` cells, within the window.
+/// An egui dialog's width (the log's entry's and the planner's, until their units): `cells`
+/// cells, within the window.
 pub(super) fn width(ctx: &egui::Context, cells: f32) -> f32 {
     let room = ctx.content_rect().width() - 8.0 * chrome::CELL.x;
     (cells * chrome::CELL.x)
@@ -846,12 +853,13 @@ impl ActionDialog {
 
     fn with(form: Form, repo: &Repo, planned: Result<Plan, Refused>) -> Opened {
         Opened::Dialog(Box::new(ActionDialog {
-            planned: Some((form.draft.clone(), planned)),
+            planned: Some((0, planned)),
+            refreshed: false,
+            drafted: 0,
+            revision: 0,
             form,
             repo: repo.clone(),
             typing: false,
-            cancel: None,
-            plan_first: None,
             plan_top: 0,
             changed: false,
             screen: cells::OnScreen::default(),
@@ -872,23 +880,33 @@ impl ActionDialog {
     /// A refresh came while the dialog is open: the draft is planned again against `repo`.
     pub fn set_repo(&mut self, repo: Repo) {
         self.repo = repo;
-        self.planned = None;
+        self.refreshed = true;
     }
 
-    /// The draft planned again when it changed since the last plan; whether it was.
+    /// The draft planned again when it changed since the last plan, or a refresh came; whether it
+    /// was. A plan that shows otherwise than the last — its title, its lost line or its rows —
+    /// moves the revision the screen is compared by.
     fn replan(&mut self, planner: Planner) -> bool {
         if self.form.refusal().is_some() {
             return false;
         }
-        let stale = self
-            .planned
-            .as_ref()
-            .is_none_or(|(a, _)| *a != self.form.draft);
+        let stale =
+            self.refreshed || (self.planned.as_ref()).is_none_or(|(at, _)| *at != self.drafted);
         if stale {
+            let shown = self.plan_shown();
             let plan = planner(&self.form.draft, &self.repo);
-            self.planned = Some((self.form.draft.clone(), plan));
+            (self.planned, self.refreshed) = (Some((self.drafted, plan)), false);
+            if self.plan_shown() != shown {
+                self.revision += 1;
+            }
         }
         stale
+    }
+
+    /// What the box shows of the plan: its title, its lost line and its rows.
+    fn plan_shown(&self) -> (String, Option<String>, Vec<PlanRow>) {
+        let lost = self.confirmation().and_then(|c| c.loses.clone());
+        (self.title(), lost, self.plan_lines())
     }
 
     /// The confirmation of the current plan, if it has one.
@@ -907,142 +925,25 @@ impl ActionDialog {
         }
     }
 
-    /// The dialog is cells (X4-dialogs): it has no options, or it is 03 §7.6–§7.7's form or a
-    /// restore's; the other forms are egui's until X4-dialogs2.
-    fn in_cells(&self) -> bool {
-        !self.form.options
-            || matches!(
-                self.form.draft,
-                Action::Commit { .. }
-                    | Action::Amend { .. }
-                    | Action::Stash { .. }
-                    | Action::ResetChanges { .. }
-                    | Action::Clean { .. }
-                    | Action::Fetch { .. }
-                    | Action::FetchRemote { .. }
-                    | Action::PruneRemote { .. }
-                    | Action::AddRemote { .. }
-                    | Action::EditRemote { .. }
-                    | Action::DeleteRemote { .. }
-                    | Action::User { .. }
-                    | Action::UserRemove { .. }
-                    | Action::Restore { .. }
-            )
-    }
-
     /// The cells of `grid` (the panels') the dialog covers, its box and its shadow, for the panel
-    /// and the other side to blank (10 §17, X4-graph's seam), as the dialog stands now: none
-    /// while egui draws it (03 §7.1–§7.5's forms, until X4-dialogs2).
+    /// and the other side to blank (10 §17, X4-graph's seam), as the dialog stands now.
     pub fn covers(&self, grid: &Grid) -> Vec<Cells> {
-        if !self.in_cells() {
-            return Vec::new();
-        }
         // A restore's arrow is one cell either way: the box stands where the pass lays it.
         let controls = controls(&self.form, false);
         self.layout(*grid, &controls).0.covers()
     }
 
-    /// One pass on `grid` (the panels'): Esc and Enter are taken before its widgets see them
-    /// (Shift+Enter is a message field's new line); `planner` plans the draft again whenever an
-    /// option changed it. In cells where [`ActionDialog::in_cells`] says so (see the module's
-    /// notes), else egui's.
-    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid, planner: Planner) -> Option<DialogEnd> {
-        if self.in_cells() {
-            return self.cells_ui(ctx, grid, planner);
-        }
-        if self.replan(planner) {
-            ctx.request_repaint();
-        }
-        if ctx.input_mut(|i| keys::take(i, Key::Escape, Mods::None)) {
-            return Some(DialogEnd::Cancel);
-        }
-        let focused = ctx.memory(|m| m.focused());
-        let enter = ctx.input_mut(|i| keys::take(i, Key::Enter, Mods::None));
-        // Enter on the focused Cancel cancels, as its click would; on Rebase's focused "Plan the
-        // commits first…" it is that button's click.
-        if enter && focused.is_some() && focused == self.cancel {
-            return Some(DialogEnd::Cancel);
-        }
-        if enter && focused.is_some() && focused == self.plan_first {
-            if let Action::Rebase { onto, .. } = &self.form.draft {
-                return Some(DialogEnd::PlanFirst(onto.clone()));
-            }
-        }
-        let mut run = enter;
-        let mut cancel = false;
-        if self.typing && focused.is_none() {
-            ctx.memory_mut(|m| m.request_focus(field_id(0)));
-        }
-        let title = self.title();
-        let width = width(ctx, 72.0);
-        let room = (ctx.content_rect().height() * 0.6).max(8.0 * chrome::CELL.y);
-        let mut typing = false;
-        let mut cancel_button = None;
-        let (mut plan_first, mut plan_first_button) = (false, None);
-        let response = chrome::dialog(ctx, dialog_id(), &title, |ui| {
-            ui.set_width(width);
-            // 03 §8.1: a destructive or rewriting action's dialog starts with what is lost.
-            if let Some(loses) = self.confirmation().and_then(|c| c.loses.clone()) {
-                ui.add(egui::Label::new(loses).wrap());
-                ui.add_space(chrome::CELL.y / 2.0);
-            }
-            if self.form.options {
-                typing = form_ui(ui, &mut self.form);
-                ui.add_space(chrome::CELL.y / 2.0);
-            }
-            if self.replan(planner) {
-                ui.ctx().request_repaint();
-            }
-            egui::ScrollArea::vertical()
-                .id_salt("sopen-git-action-plan")
-                .max_height(room)
-                .show(ui, |ui| self.plan_ui(ui));
-            ui.add_space(chrome::CELL.y / 2.0);
-            let ready = self.ready();
-            ui.horizontal(|ui| {
-                run |= ui.add_enabled(ready, egui::Button::new("Run")).clicked();
-                let no = ui.add(egui::Button::new("Cancel"));
-                cancel_button = Some(no.id);
-                cancel |= no.clicked();
-                // 03 §7.1: Rebase offers the planner, which names the merges it would flatten.
-                if matches!(self.form.draft, Action::Rebase { .. }) {
-                    let plan = ui.add(egui::Button::new(PLAN_FIRST));
-                    plan_first_button = Some(plan.id);
-                    plan_first |= plan.clicked();
-                }
-            });
-            ui.label(RichText::new(HINT).weak());
-        });
-        self.typing = typing;
-        self.cancel = cancel_button;
-        self.plan_first = plan_first_button;
-        if cancel || response.should_close() {
-            return Some(DialogEnd::Cancel);
-        }
-        if let (true, Action::Rebase { onto, .. }) = (plan_first, &self.form.draft) {
-            return Some(DialogEnd::PlanFirst(onto.clone()));
-        }
-        if run && self.ready() {
-            let dont_ask_again =
-                self.form.dont_ask && matches!(self.form.draft, Action::Checkout { .. });
-            return Some(DialogEnd::Run {
-                action: self.form.draft.clone(),
-                dont_ask_again,
-            });
-        }
-        None
-    }
-
-    /// Rebase's "Plan the commits first…" button, as last drawn (tests).
+    /// Rebase's "Plan the commits first…" button, which its box draws (tests).
     #[cfg(test)]
     pub fn plan_first_button(&self) -> Option<egui::Id> {
-        self.plan_first
+        matches!(self.form.draft, Action::Rebase { .. }).then(plan_first_id)
     }
 
     /// The draft's plan is in and neither the dialog nor the plan refused it.
     fn ready(&self) -> bool {
         self.form.refusal().is_none()
-            && matches!(&self.planned, Some((a, Ok(_))) if *a == self.form.draft)
+            && !self.refreshed
+            && matches!(&self.planned, Some((at, Ok(_))) if *at == self.drafted)
     }
 
     /// The plan's rows ([`plan_rows`]), and Delete backup's line.
@@ -1057,36 +958,8 @@ impl ActionDialog {
         out
     }
 
-    /// The plan's rows in egui ([`ActionDialog::plan_lines`]), a heading's lines indented.
-    fn plan_ui(&self, ui: &mut egui::Ui) {
-        let error = ui.visuals().error_fg_color;
-        let rows = self.plan_lines();
-        let mut k = 0;
-        while k < rows.len() {
-            if rows[k].under {
-                let end = (k..rows.len()).find(|&i| !rows[i].under);
-                let end = end.unwrap_or(rows.len());
-                ui.indent(("sopen-git-plan", k), |ui| {
-                    for row in &rows[k..end] {
-                        ui.add(egui::Label::new(row.text.as_str()).wrap());
-                    }
-                });
-                k = end;
-                continue;
-            }
-            let row = &rows[k];
-            let text = match row.ink {
-                Ink::Error => RichText::new(row.text.as_str()).color(error),
-                Ink::Weak => RichText::new(row.text.as_str()).weak(),
-                Ink::Text => RichText::new(row.text.as_str()),
-            };
-            ui.add(egui::Label::new(text).wrap());
-            k += 1;
-        }
-    }
-
     // -----------------------------------------------------------------------------------------
-    // In cells (X4-dialogs).
+    // In cells.
 
     /// The box on `grid` with `controls` (the form's, [`controls`]), and whether it stands whole
     /// there: if not, it says so first ([`TOO_SHORT`]) and its Run is off.
@@ -1126,7 +999,7 @@ impl ActionDialog {
         let mut run = Button::new("Run", run_id());
         run.on = fits && self.ready();
         let mut buttons = vec![run, Button::new("Cancel", cancel_id())];
-        // 03 §7.1: Rebase offers the planner (its form is egui's until X4-dialogs2).
+        // 03 §7.1: Rebase offers the planner, which names the merges it would flatten.
         if matches!(self.form.draft, Action::Rebase { .. }) {
             buttons.push(Button::new(PLAN_FIRST, plan_first_id()));
         }
@@ -1142,17 +1015,24 @@ impl ActionDialog {
     /// What a pass paints as the dialog stands now, the box `fits` its grid or not.
     fn painted(&self, fits: bool) -> Painting {
         Painting {
-            draft: self.form.draft.clone(),
-            plan: self.plan_lines(),
+            revision: self.revision,
             runs: fits && self.ready(),
         }
     }
 
-    /// One pass in cells (see the module's notes).
-    fn cells_ui(&mut self, ctx: &egui::Context, grid: Grid, planner: Planner) -> Option<DialogEnd> {
+    /// One pass on `grid` (the panels'; see the module's notes): Esc and Enter are taken before
+    /// its controls see them (Shift+Enter is a message field's new line); `planner` plans the
+    /// draft again whenever an option changed it.
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid, planner: Planner) -> Option<DialogEnd> {
         if self.replan(planner) {
             ctx.request_repaint();
         }
+        // A pass whose input may change a control: the draft as it began, to tell whether it did
+        // (a pass without such input copies nothing and changes nothing).
+        let before = may_change(ctx).then(|| {
+            copying(&self.form.draft);
+            (self.form.draft.clone(), self.form.dont_ask)
+        });
         let escape = ctx.input_mut(|i| keys::take(i, Key::Escape, Mods::None));
         let began = ctx.memory(|m| m.focused());
         let mut controls = controls(&self.form, cells::ambiguous_wide(ctx));
@@ -1168,6 +1048,8 @@ impl ActionDialog {
         if std::mem::replace(&mut self.laid_once, true) {
             let painting = self.painted(fits);
             self.screen.painted(painting);
+        } else {
+            fresh_fields(ctx, &controls, &mut self.form);
         }
         // The form's first text field takes the keyboard when it shows anew, or while nothing
         // has it.
@@ -1179,6 +1061,9 @@ impl ActionDialog {
         let (run, cancel, plan_first) = (run_id(), cancel_id(), plan_first_id());
         let mut by_id: Vec<(egui::Id, Input)> =
             (controls.iter_mut()).filter_map(Control::input).collect();
+        // The fields edit the form's own texts in place.
+        let texts = texts(&mut self.form).into_iter();
+        by_id.extend(texts.map(|(n, text)| (field_id(n), Input::Text(text))));
         // The buttons take the kit's presses, in the pass's order (F-kit-tab).
         by_id.extend([run, cancel, plan_first].map(|b| (b, Input::Button)));
         let inputs = Inputs {
@@ -1188,7 +1073,14 @@ impl ActionDialog {
         };
         let pass = kit::show(ctx, cells_id(), &layout, inputs);
         let now = ctx.memory(|m| m.focused());
-        apply(&mut self.form, &controls);
+        if let Some((draft, dont_ask)) = before {
+            apply(&mut self.form, &controls);
+            copying(&draft);
+            if draft != self.form.draft || dont_ask != self.form.dont_ask {
+                self.drafted += 1;
+                self.revision += 1;
+            }
+        }
         // The options as this pass left them, planned: the next pass shows it.
         if self.replan(planner) {
             ctx.request_repaint();
@@ -1233,6 +1125,35 @@ impl ActionDialog {
         None
     }
 }
+
+#[cfg(test)]
+thread_local! {
+    /// The bytes of drafts' texts the dialogs' passes copied or compared on this thread.
+    static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The bytes of drafts' texts copied or compared since the last call (a test's bound on a pass).
+#[cfg(test)]
+pub(super) fn copied() -> usize {
+    COPIED.with(|c| c.replace(0))
+}
+
+/// Counts a copy or a comparison of `draft`'s texts — its message — ([`copied`], in the tests).
+#[cfg(test)]
+fn copying(draft: &Action) {
+    let bytes = match draft {
+        Action::Commit { message, .. } | Action::Stash { message, .. } => message.len(),
+        Action::Amend { message }
+        | Action::Tag { message, .. }
+        | Action::MoveTag { message, .. } => message.as_ref().map_or(0, String::len),
+        _ => 0,
+    };
+    COPIED.with(|c| c.set(c.get() + bytes));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn copying(_: &Action) {}
 
 /// A row of a plan's part: its text, its ink, and whether it is a line under a heading.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1336,7 +1257,7 @@ pub(super) fn plan_part(rows: Vec<PlanRow>, grid: Grid, width: usize, top: usize
 /// A Space there is dropped too, with its text, which a button or a choice the keyboard is
 /// leaving would take (fix-check) — unless the pass began on a text field (`!on_text`), which
 /// types it and whose Tab the kit already keeps any other control from pressing (review of X4-find).
-fn take_enters(ctx: &egui::Context, arrows_move: bool, on_text: bool) -> Vec<bool> {
+pub(super) fn take_enters(ctx: &egui::Context, arrows_move: bool, on_text: bool) -> Vec<bool> {
     let arrow = |key: &Key| {
         matches!(
             key,
@@ -1448,190 +1369,6 @@ pub fn step_line(step: &Step) -> String {
 // ---------------------------------------------------------------------------------------------
 // The forms.
 
-/// A choice among `options` (one of them chosen): whether it changed.
-fn one_of<T: PartialEq + Copy>(
-    ui: &mut egui::Ui,
-    heading: &str,
-    value: &mut T,
-    options: &[(T, &str)],
-) -> bool {
-    let mut changed = false;
-    ui.horizontal_wrapped(|ui| {
-        ui.label(heading);
-        for (option, word) in options {
-            if chrome::choice(ui, *value == *option, word).clicked() && *value != *option {
-                *value = *option;
-                changed = true;
-            }
-        }
-    });
-    changed
-}
-
-/// An option on or off.
-fn toggle(ui: &mut egui::Ui, on: &mut bool, word: &str) {
-    if chrome::choice(ui, *on, word).clicked() {
-        *on = !*on;
-    }
-}
-
-/// A one-line text field: whether it was laid out (it can have the typing).
-fn field(ui: &mut egui::Ui, heading: &str, text: &mut String, n: usize) -> bool {
-    ui.horizontal(|ui| {
-        ui.label(heading);
-        ui.add(
-            chrome::field(text)
-                .id(field_id(n))
-                .desired_width(ui.available_width()),
-        );
-    });
-    true
-}
-
-/// A message field: several lines, Shift+Enter a new line (Enter runs the dialog). Whether the
-/// owner changed it this pass.
-fn message(ui: &mut egui::Ui, heading: &str, text: &mut String, n: usize) -> bool {
-    ui.label(heading);
-    ui.add(
-        egui::TextEdit::multiline(text)
-            .id(field_id(n))
-            .text_color(chrome::PALETTE.field_text)
-            .desired_rows(4)
-            .desired_width(ui.available_width())
-            .return_key(egui::KeyboardShortcut::new(
-                egui::Modifiers::SHIFT,
-                Key::Enter,
-            )),
-    )
-    .changed()
-}
-
-/// One name among `names`.
-fn pick_name(ui: &mut egui::Ui, heading: &str, value: &mut String, names: &[String]) -> bool {
-    let mut changed = false;
-    ui.horizontal_wrapped(|ui| {
-        ui.label(heading);
-        for name in names {
-            if chrome::choice(ui, value == name, name).clicked() && value != name {
-                *value = name.clone();
-                changed = true;
-            }
-        }
-    });
-    changed
-}
-
-/// Any of `names`, each on or off, in `names`' order.
-fn pick_names(ui: &mut egui::Ui, heading: &str, chosen: &mut Vec<String>, names: &[String]) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(heading);
-        for name in names {
-            let on = chosen.contains(name);
-            if chrome::choice(ui, on, name).clicked() {
-                if on {
-                    chosen.retain(|c| c != name);
-                } else {
-                    chosen.push(name.clone());
-                    chosen.sort_by_key(|c| names.iter().position(|n| n == c));
-                }
-            }
-        }
-    });
-}
-
-/// None (`none`) or one of `names`.
-fn pick_optional(
-    ui: &mut egui::Ui,
-    heading: &str,
-    value: &mut Option<String>,
-    none: &str,
-    names: &[String],
-) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(heading);
-        if chrome::choice(ui, value.is_none(), none).clicked() {
-            *value = None;
-        }
-        for name in names {
-            if chrome::choice(ui, value.as_deref() == Some(name), name).clicked() {
-                *value = Some(name.clone());
-            }
-        }
-    });
-}
-
-/// A merge's parent (`-m <n>`, 1…n) when a commit is a merge.
-fn parent(ui: &mut egui::Ui, mainline: &mut Option<u32>, parents: usize) {
-    if parents < 2 {
-        return;
-    }
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Parent");
-        for n in 1..=parents as u32 {
-            if chrome::choice(ui, *mainline == Some(n), &n.to_string()).clicked() {
-                *mainline = Some(n);
-            }
-        }
-    });
-}
-
-/// `pull`'s how (03 §7.3).
-fn pull_how(ui: &mut egui::Ui, how: &mut PullHow) {
-    let mut kind = match how {
-        PullHow::Merge { .. } => 0,
-        PullHow::Rebase => 1,
-        PullHow::FastForwardOnly => 2,
-    };
-    if one_of(
-        ui,
-        "How",
-        &mut kind,
-        &[(0, "merge"), (1, "rebase"), (2, "fast-forward only")],
-    ) {
-        *how = match kind {
-            0 => PullHow::default(),
-            1 => PullHow::Rebase,
-            _ => PullHow::FastForwardOnly,
-        };
-    }
-    if let PullHow::Merge { no_ff, squash } = how {
-        ui.horizontal_wrapped(|ui| {
-            toggle(ui, no_ff, "Never fast-forward");
-            toggle(ui, squash, "Squash");
-        });
-    }
-}
-
-/// `merge`'s options (03 §7.1).
-fn merge_options(ui: &mut egui::Ui, o: &mut MergeOptions) {
-    one_of(
-        ui,
-        "Fast-forward",
-        &mut o.fast_forward,
-        &[
-            (FastForward::WhenPossible, "when possible"),
-            (FastForward::Never, "never"),
-            (FastForward::Only, "only"),
-        ],
-    );
-    one_of(
-        ui,
-        "On conflicts prefer",
-        &mut o.prefer,
-        &[
-            (Prefer::Nothing, "nothing"),
-            (Prefer::Ours, "ours"),
-            (Prefer::Theirs, "theirs"),
-        ],
-    );
-    ui.horizontal_wrapped(|ui| {
-        toggle(ui, &mut o.squash, "Squash");
-        toggle(ui, &mut o.no_commit, "Don't commit");
-        toggle(ui, &mut o.allow_unrelated, "Allow unrelated histories");
-        toggle(ui, &mut o.no_verify, "Skip hooks");
-    });
-}
-
 /// What a backup's subject is called in the restore dialog.
 fn subject_text(subject: &Subject) -> String {
     match subject {
@@ -1655,24 +1392,97 @@ fn value_text(value: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The forms in cells (X4-dialogs: 03 §7.6–§7.7's and a restore's).
+// The forms in cells (X4-dialogs: 03 §7.6–§7.7's and a restore's; X4-dialogs2: §7.1–§7.5's).
+
+/// Whether the pass's input may change a control of a dialog: anything but the pointer's
+/// moves, the wheel (it scrolls), the window's focus, zoom and rotation, a change of modifiers, a
+/// copy and a key's release.
+fn may_change(ctx: &egui::Context) -> bool {
+    ctx.input(|i| {
+        (i.events.iter()).any(|e| {
+            !matches!(
+                e,
+                egui::Event::PointerMoved(_)
+                    | egui::Event::MouseMoved(_)
+                    | egui::Event::PointerGone
+                    | egui::Event::MouseWheel { .. }
+                    | egui::Event::WindowFocused(_)
+                    | egui::Event::Zoom(_)
+                    | egui::Event::Rotate(_)
+                    | egui::Event::ModifiersChanged(_)
+                    | egui::Event::Copy
+                    | egui::Event::Key { pressed: false, .. }
+            )
+        })
+    })
+}
+
+/// The form's texts its fields edit in place, by field number: the draft's own (a message, a name,
+/// a URL) and the form's (`archive`'s path, a remote's push URL, `edit-remote`'s fetch URL) —
+/// exactly the fields [`controls`] shows.
+fn texts(form: &mut Form) -> Vec<(usize, &mut String)> {
+    let Form {
+        draft, text, url, ..
+    } = form;
+    match draft {
+        Action::Commit { message, .. } | Action::Stash { message, .. } => vec![(0, message)],
+        Action::Amend { message: Some(m) }
+        | Action::MoveTag {
+            message: Some(m), ..
+        } => {
+            vec![(0, m)]
+        }
+        Action::AddRemote { name, url: u, .. } => vec![(0, name), (1, u), (2, text)],
+        Action::EditRemote { now, .. } => vec![(0, &mut now.name), (1, url), (2, text)],
+        Action::User { name, email, .. } => vec![(0, name), (1, email)],
+        Action::Tag { name, message, .. } => {
+            let mut all = vec![(0, name)];
+            all.extend(message.as_mut().map(|m| (1, m)));
+            all
+        }
+        Action::Branch { name, .. }
+        | Action::CheckoutRemote { name, .. }
+        | Action::StashBranch { name, .. } => vec![(0, name)],
+        Action::Rename { to, .. } => vec![(0, to)],
+        Action::Archive { .. } => vec![(0, text)],
+        _ => Vec::new(),
+    }
+}
+
+/// The dialog has just opened: each of its fields starts afresh — caret, selection and undo —
+/// whatever an earlier dialog left under the same ids (the git dialogs reuse their fields' ids
+/// across actions): a message with its caret at its start (the kit's rule for a message field), a
+/// one-line field with its caret at its end, as egui puts a new one's (found by X4-quick).
+fn fresh_fields(ctx: &egui::Context, controls: &[Control], form: &mut Form) {
+    use egui::text::{CCursor, CCursorRange};
+    use egui::text_edit::TextEditState;
+    let texts = texts(form);
+    for control in controls {
+        let mut state = TextEditState::default();
+        match control {
+            Control::Message { n, .. } => state.store(ctx, field_id(*n)),
+            Control::Field { n, .. } => {
+                let text = (texts.iter())
+                    .find(|(k, _)| k == n)
+                    .map_or("", |(_, t)| t.as_str());
+                let end = CCursor::new(text.chars().count());
+                state.cursor.set_char_range(Some(CCursorRange::one(end)));
+                state.store(ctx, field_id(*n));
+            }
+            _ => {}
+        }
+    }
+}
 
 /// A control of a form in cells and its value this pass: copied from the form ([`controls`]),
-/// given to the kit by its id ([`Control::input`]) and written back ([`apply`]).
+/// given to the kit by its id ([`Control::input`]) and written back ([`apply`]) — a field's text
+/// is the form's own, which the field edits in place ([`texts`]).
 #[derive(Debug)]
 enum Control {
     /// The form's one-line field `n`.
-    Field {
-        label: &'static str,
-        n: usize,
-        text: String,
-    },
+    Field { label: &'static str, n: usize },
     /// The form's message field `n` (Shift+Enter a new line).
-    Message {
-        label: &'static str,
-        n: usize,
-        text: String,
-    },
+    Message { label: &'static str, n: usize },
     /// The form's row of choices `row`, one of several: the chosen one.
     One {
         label: &'static str,
@@ -1680,13 +1490,15 @@ enum Control {
         words: Vec<String>,
         at: Option<usize>,
     },
-    /// The form's row of choices `row`, any of several: each on or off.
+    /// The form's row of choices `row`, any of several, after `label` (empty: none): each on or
+    /// off.
     Any {
+        label: &'static str,
         row: usize,
         words: Vec<String>,
         on: Vec<bool>,
     },
-    /// A line of the form (a restore entry's state).
+    /// A line of the form (a restore entry's state, how many commits a pick takes).
     Note(String),
 }
 
@@ -1711,8 +1523,10 @@ impl Control {
                 choices: words.clone(),
                 many: false,
             },
-            Control::Any { row, words, .. } => Part::Choices {
-                label: String::new(),
+            Control::Any {
+                label, row, words, ..
+            } => Part::Choices {
+                label: label.to_string(),
                 id: row_id(*row),
                 choices: words.clone(),
                 many: true,
@@ -1721,15 +1535,12 @@ impl Control {
         }
     }
 
-    /// Its state for the kit, by its part's id.
+    /// Its state for the kit, by its part's id (a field's is the form's text: [`texts`]).
     fn input(&mut self) -> Option<(egui::Id, Input<'_>)> {
         match self {
-            Control::Field { n, text, .. } | Control::Message { n, text, .. } => {
-                Some((field_id(*n), Input::Text(text)))
-            }
             Control::One { row, at, .. } => Some((row_id(*row), Input::One(at))),
             Control::Any { row, on, .. } => Some((row_id(*row), Input::Any(on))),
-            Control::Note(_) => None,
+            Control::Field { .. } | Control::Message { .. } | Control::Note(_) => None,
         }
     }
 
@@ -1746,8 +1557,29 @@ fn words(all: &[&str]) -> Vec<String> {
     all.iter().map(|w| w.to_string()).collect()
 }
 
+/// Merge's fast-forward, its "on conflicts prefer", Reset's mode and Archive's format, in the order
+/// their choices show them.
+const FAST_FORWARDS: [FastForward; 3] = [
+    FastForward::WhenPossible,
+    FastForward::Never,
+    FastForward::Only,
+];
+const PREFERS: [Prefer; 3] = [Prefer::Nothing, Prefer::Ours, Prefer::Theirs];
+const MODES: [ResetMode; 4] = [
+    ResetMode::Soft,
+    ResetMode::Mixed,
+    ResetMode::Keep,
+    ResetMode::Hard,
+];
+const FORMATS: [ArchiveFormat; 2] = [ArchiveFormat::Zip, ArchiveFormat::Tar];
+
+/// Where `value` is among `all`.
+fn index<T: PartialEq>(all: &[T], value: &T) -> Option<usize> {
+    all.iter().position(|v| v == value)
+}
+
 /// The controls of `form`'s options in cells, with their values now (none for a form without
-/// options, or one egui draws); `wide`: for an ambiguous-wide terminal ([`restore_controls`]).
+/// options); `wide`: for an ambiguous-wide terminal ([`restore_controls`]).
 fn controls(form: &Form, wide: bool) -> Vec<Control> {
     let one = |label, row, all: &[String], value: &str| Control::One {
         label,
@@ -1755,15 +1587,60 @@ fn controls(form: &Form, wide: bool) -> Vec<Control> {
         words: all.to_vec(),
         at: all.iter().position(|w| w == value),
     };
-    let field = |label, n, text: &str| Control::Field {
-        label,
-        n,
-        text: text.to_string(),
-    };
+    let field = |label, n| Control::Field { label, n };
     let any = |row, all: &[&str], on: &[bool]| Control::Any {
+        label: "",
         row,
         words: words(all),
         on: on.to_vec(),
+    };
+    let pick = |label, row, all: &[&str], at: Option<usize>| Control::One {
+        label,
+        row,
+        words: words(all),
+        at,
+    };
+    // None (`none`, first) or one of `names`.
+    let optional = |label, row, none: &str, names: &[String], value: Option<&str>| Control::One {
+        label,
+        row,
+        words: (std::iter::once(none.to_string()))
+            .chain(names.iter().cloned())
+            .collect(),
+        at: match value {
+            None => Some(0),
+            Some(v) => names.iter().position(|n| n == v).map(|k| k + 1),
+        },
+    };
+    // Any of `names`, each in `chosen` on.
+    let several = |label, row, names: &[String], chosen: &[String]| Control::Any {
+        label,
+        row,
+        words: names.to_vec(),
+        on: names.iter().map(|n| chosen.contains(n)).collect(),
+    };
+    // A merge's parent (`-m <n>`, 1…n) when a commit is a merge.
+    let parent = |mainline: Option<u32>| {
+        (form.parents > 1).then(|| Control::One {
+            label: "Parent",
+            row: 0,
+            words: (1..=form.parents).map(|n| n.to_string()).collect(),
+            at: mainline.and_then(|n| (n as usize).checked_sub(1)),
+        })
+    };
+    // `pull`'s how (03 §7.3) and, with merge, its two options.
+    let how = |how: PullHow| {
+        let kind = match how {
+            PullHow::Merge { .. } => 0,
+            PullHow::Rebase => 1,
+            PullHow::FastForwardOnly => 2,
+        };
+        let all = ["merge", "rebase", "fast-forward only"];
+        let mut out = vec![pick("How", 0, &all, Some(kind))];
+        if let PullHow::Merge { no_ff, squash } = how {
+            out.push(any(1, &["Never fast-forward", "Squash"], &[no_ff, squash]));
+        }
+        out
     };
     let scopes = |local: &str, scope: ConfigScope| Control::One {
         label: "Where",
@@ -1776,14 +1653,11 @@ fn controls(form: &Form, wide: bool) -> Vec<Control> {
     }
     match &form.draft {
         Action::Commit {
-            message,
-            amend,
-            no_verify,
+            amend, no_verify, ..
         } => vec![
             Control::Message {
                 label: "Message",
                 n: 0,
-                text: message.clone(),
             },
             any(
                 0,
@@ -1798,20 +1672,18 @@ fn controls(form: &Form, wide: bool) -> Vec<Control> {
                 words: words(&["keep its message", "edit it"]),
                 at: Some(usize::from(message.is_some())),
             }];
-            if let Some(m) = message {
+            if message.is_some() {
                 all.push(Control::Message {
                     label: "New message",
                     n: 0,
-                    text: m.clone(),
                 });
             }
             all
         }
         Action::Stash {
-            message,
-            include_untracked,
+            include_untracked, ..
         } => vec![
-            field("Message", 0, message),
+            field("Message", 0),
             any(0, &["Include untracked files"], &[*include_untracked]),
         ],
         Action::ResetChanges { hard } => vec![Control::One {
@@ -1835,31 +1707,192 @@ fn controls(form: &Form, wide: bool) -> Vec<Control> {
         Action::PruneRemote { remote } | Action::DeleteRemote { remote } => {
             vec![one("Remote", 0, &form.remotes, remote)]
         }
-        Action::AddRemote {
-            name,
-            url,
-            fetch_now,
-            ..
-        } => vec![
-            field("Name", 0, name),
-            field("Fetch URL", 1, url),
-            field("Push URL (blank: the fetch URL)", 2, &form.text),
+        Action::AddRemote { fetch_now, .. } => vec![
+            field("Name", 0),
+            field("Fetch URL", 1),
+            field("Push URL (blank: the fetch URL)", 2),
             any(0, &["Fetch now"], &[*fetch_now]),
         ],
-        Action::EditRemote { was, now } => vec![
+        Action::EditRemote { was, .. } => vec![
             one("Remote", 0, &form.remotes, &was.name),
-            field("Name", 0, &now.name),
-            field("Fetch URL", 1, &form.url),
-            field("Push URL (blank: the fetch URL)", 2, &form.text),
+            field("Name", 0),
+            field("Fetch URL", 1),
+            field("Push URL (blank: the fetch URL)", 2),
         ],
-        Action::User { name, email, scope } => vec![
-            field("Name", 0, name),
-            field("Email", 1, email),
+        Action::User { scope, .. } => vec![
+            field("Name", 0),
+            field("Email", 1),
             scopes("for this repository", *scope),
         ],
         Action::UserRemove { scope } => vec![scopes("this repository", *scope)],
         Action::Restore { entries, .. } => restore_controls(entries, wide),
-        // The forms egui draws until X4-dialogs2 (`form_ui`).
+        // 03 §7.1–§7.5 (X4-dialogs2).
+        Action::Tag { message, push, .. } => {
+            let kind = Some(usize::from(message.is_none()));
+            let mut all = vec![
+                field("Name", 0),
+                pick("Kind", 0, &["annotated", "lightweight"], kind),
+            ];
+            if message.is_some() {
+                all.push(Control::Message {
+                    label: "Message",
+                    n: 1,
+                });
+            }
+            let push = push.as_deref();
+            all.push(optional("Push to", 1, "no remote", &form.remotes, push));
+            all
+        }
+        Action::Branch { checkout, .. } => {
+            vec![field("Name", 0), any(0, &["Check it out"], &[*checkout])]
+        }
+        Action::MoveBranch { branch, .. } => vec![one("Branch", 0, &form.names, branch)],
+        Action::Checkout { .. } => {
+            vec![any(
+                0,
+                &["Don't ask again in this window"],
+                &[form.dont_ask],
+            )]
+        }
+        Action::Pick {
+            commits,
+            mainline,
+            record_origin,
+            no_commit,
+        } => {
+            let mut all = Vec::new();
+            if commits.len() > 1 {
+                let n = commits.len();
+                all.push(Control::Note(format!("{n} commits, oldest first")));
+            }
+            all.extend(parent(*mainline));
+            let on = [*record_origin, *no_commit];
+            all.push(any(1, &["Record origin (-x)", "Don't commit"], &on));
+            all
+        }
+        Action::Revert { commits, mainline } => {
+            let mut all = Vec::new();
+            if commits.len() > 1 {
+                let n = commits.len();
+                all.push(Control::Note(format!("{n} commits, newest first")));
+            }
+            all.extend(parent(*mainline));
+            all
+        }
+        Action::Merge { options: o, .. } => {
+            let ff = index(&FAST_FORWARDS, &o.fast_forward);
+            let prefer = index(&PREFERS, &o.prefer);
+            let all = [
+                "Squash",
+                "Don't commit",
+                "Allow unrelated histories",
+                "Skip hooks",
+            ];
+            let on = [o.squash, o.no_commit, o.allow_unrelated, o.no_verify];
+            vec![
+                pick("Fast-forward", 0, &["when possible", "never", "only"], ff),
+                pick(
+                    "On conflicts prefer",
+                    1,
+                    &["nothing", "ours", "theirs"],
+                    prefer,
+                ),
+                any(2, &all, &on),
+            ]
+        }
+        Action::Rebase { options: o, .. } => {
+            let mut all = vec!["Ignore dates", "Stash my changes for it"];
+            let mut on = vec![o.ignore_date, o.autostash];
+            if form.update_refs {
+                all.push("Move other branches along");
+                on.push(o.update_refs);
+            }
+            vec![any(0, &all, &on)]
+        }
+        Action::Reset { mode, .. } => {
+            let all = ["soft", "mixed", "keep", "hard"];
+            vec![pick("Mode", 0, &all, index(&MODES, mode))]
+        }
+        Action::Archive { format, .. } => vec![
+            pick("Format", 0, &["zip", "tar"], index(&FORMATS, format)),
+            field("Save to", 0),
+        ],
+        Action::Rename { .. } => vec![field("New name", 0)],
+        Action::DeleteBranch { force, remotes, .. } => {
+            let mut all = vec![any(0, &["Force"], &[*force])];
+            if !form.remotes.is_empty() {
+                all.push(several("Also delete it on", 1, &form.remotes, remotes));
+            }
+            all
+        }
+        Action::Push {
+            remotes,
+            options,
+            overwrite,
+            ..
+        } => {
+            let all = [
+                "Set upstream",
+                "Overwrite the remote branch, with lease",
+                "Skip hooks",
+            ];
+            let on = [options.set_upstream, *overwrite, options.no_verify];
+            vec![
+                several("Remotes", 0, &form.remotes, remotes),
+                any(1, &all, &on),
+            ]
+        }
+        Action::CheckoutRemote {
+            remote,
+            branch,
+            name,
+            pull,
+        } => {
+            let mut all = vec![field("Local name", 0)];
+            if form.locals.contains(name) {
+                let taken =
+                    format!("{name} exists: check it out and pull {remote}/{branch} into it");
+                all.push(Control::Note(taken));
+                all.extend(how(pull.unwrap_or(form.how)));
+            }
+            all
+        }
+        Action::FetchInto { force, .. } => {
+            vec![any(0, &["Force, when it is not a fast-forward"], &[*force])]
+        }
+        Action::Pull { how: h, .. } => how(*h),
+        Action::DeleteTag { remote, .. } => {
+            let remote = remote.as_deref();
+            vec![optional("Also on", 0, "no remote", &form.remotes, remote)]
+        }
+        Action::PushTag {
+            remotes, replace, ..
+        } => {
+            let all = ["Replace the remote's tag when it differs, with lease"];
+            vec![
+                several("Remotes", 0, &form.remotes, remotes),
+                any(1, &all, &[*replace]),
+            ]
+        }
+        Action::MoveTag { tag, message, .. } => {
+            let on = [message.is_some()];
+            let mut all = vec![
+                one("Tag", 0, &form.names, tag),
+                any(1, &["Keep it annotated with its message"], &on),
+            ];
+            if message.is_some() {
+                all.push(Control::Message {
+                    label: "Message",
+                    n: 0,
+                });
+            }
+            all
+        }
+        Action::StashApply { index: i, .. } | Action::StashPop { index: i, .. } => {
+            vec![any(0, &["Restore the index too (--index)"], &[*i])]
+        }
+        Action::StashBranch { .. } => vec![field("Name", 0)],
+        // The actions without options have their confirmation alone.
         _ => Vec::new(),
     }
 }
@@ -1888,6 +1921,7 @@ fn restore_controls(entries: &[RestoreEntry], wide: bool) -> Vec<Control> {
             on.push(e.replace);
         }
         out.push(Control::Any {
+            label: "",
             row: k,
             words: all,
             on,
@@ -1905,16 +1939,9 @@ fn restore_controls(entries: &[RestoreEntry], wide: bool) -> Vec<Control> {
     out
 }
 
-/// `controls`, as the pass left them, written back into `form`'s draft (and what it keeps).
+/// `controls`, as the pass left them, written back into `form`'s draft (and what it keeps); its
+/// texts the fields edited in place ([`texts`]).
 fn apply(form: &mut Form, controls: &[Control]) {
-    let text = |n: usize| {
-        controls.iter().find_map(|c| match c {
-            Control::Field { n: k, text, .. } | Control::Message { n: k, text, .. } if *k == n => {
-                Some(text.clone())
-            }
-            _ => None,
-        })
-    };
     let one = |row: usize| {
         controls.iter().find_map(|c| match c {
             Control::One { row: k, at, .. } if *k == row => *at,
@@ -1932,33 +1959,69 @@ fn apply(form: &mut Form, controls: &[Control]) {
             *to = value;
         }
     }
+    // `pull`'s how from its row of three (`kind`) and, while it was merge, its two options.
+    fn pull_how(how: &mut PullHow, kind: Option<usize>, no_ff: Option<bool>, squash: Option<bool>) {
+        let was_merge = matches!(how, PullHow::Merge { .. });
+        match kind {
+            Some(0) if !was_merge => *how = PullHow::default(),
+            Some(1) => *how = PullHow::Rebase,
+            Some(2) => *how = PullHow::FastForwardOnly,
+            _ => {}
+        }
+        if let (
+            true,
+            PullHow::Merge {
+                no_ff: n,
+                squash: s,
+            },
+        ) = (was_merge, how)
+        {
+            set(n, no_ff);
+            set(s, squash);
+        }
+    }
     let scope = |row| one(row).map(|k| [ConfigScope::Local, ConfigScope::Global][k.min(1)]);
     let Form {
         draft,
         remotes,
+        names,
+        locals,
+        tags,
+        update_refs,
         kept,
-        text: push_text,
+        text: field_text,
+        dont_ask,
         known: urls,
+        how: kept_how,
         url: fetch_text,
         url_touched,
         push_touched,
         ..
     } = form;
     let remote = |row| one(row).and_then(|k| remotes.get(k)).cloned();
+    let name = |row| one(row).and_then(|k| names.get(k)).cloned();
+    // None (the first choice) or one of the remotes.
+    let optional = |row| one(row).map(|k| k.checked_sub(1).and_then(|k| remotes.get(k)).cloned());
+    // Any of the remotes, in their order; those of a row not shown as `chosen` has them.
+    let several = |row, chosen: &[String]| -> Vec<String> {
+        (remotes.iter().enumerate())
+            .filter(|&(k, r)| any(row, k).unwrap_or(chosen.contains(r)))
+            .map(|(_, r)| r.clone())
+            .collect()
+    };
+    let parent = |mainline: &mut Option<u32>| {
+        if let Some(k) = one(0) {
+            *mainline = u32::try_from(k + 1).ok();
+        }
+    };
     match draft {
         Action::Commit {
-            message,
-            amend,
-            no_verify,
+            amend, no_verify, ..
         } => {
-            set(message, text(0));
             set(amend, any(0, 0));
             set(no_verify, any(0, 1));
         }
         Action::Amend { message: m } => {
-            if let (Some(m), Some(typed)) = (m.as_mut(), text(0)) {
-                *m = typed;
-            }
             // A message kept while "keep its message" is chosen, so "edit it" brings it back.
             let edit = one(0) == Some(1);
             if edit && m.is_none() {
@@ -1968,12 +2031,8 @@ fn apply(form: &mut Form, controls: &[Control]) {
             }
         }
         Action::Stash {
-            message,
-            include_untracked,
-        } => {
-            set(message, text(0));
-            set(include_untracked, any(0, 0));
-        }
+            include_untracked, ..
+        } => set(include_untracked, any(0, 0)),
         Action::ResetChanges { hard } => set(hard, one(0).map(|k| k == 1)),
         Action::Clean { folders } => set(folders, any(0, 0)),
         Action::Fetch { prune, prune_tags } => {
@@ -1991,15 +2050,11 @@ fn apply(form: &mut Form, controls: &[Control]) {
         }
         Action::PruneRemote { remote: r } | Action::DeleteRemote { remote: r } => set(r, remote(0)),
         Action::AddRemote {
-            name,
-            url,
             push_url,
             fetch_now,
+            ..
         } => {
-            set(name, text(0));
-            set(url, text(1));
-            set(push_text, text(2));
-            *push_url = Some(push_text.trim().to_string()).filter(|u| !u.is_empty());
+            *push_url = Some(field_text.trim().to_string()).filter(|u| !u.is_empty());
             set(fetch_now, any(0, 0));
         }
         Action::EditRemote { was, now } => {
@@ -2009,17 +2064,14 @@ fn apply(form: &mut Form, controls: &[Control]) {
                 *was = known(urls, &chosen);
                 *now = was.clone();
                 *fetch_text = was.url.clone();
-                *push_text = was.push_url.clone().unwrap_or_default();
+                *field_text = was.push_url.clone().unwrap_or_default();
                 (*url_touched, *push_touched) = (false, false);
                 return;
             }
-            set(&mut now.name, text(0));
-            if let Some(typed) = text(1).filter(|t| t != fetch_text) {
-                (*fetch_text, *url_touched) = (typed, true);
-            }
-            if let Some(typed) = text(2).filter(|t| t != push_text) {
-                (*push_text, *push_touched) = (typed, true);
-            }
+            // The fields edited the name and the URLs in place: a URL field the owner changed from
+            // the URL as it is set is touched from then on.
+            *url_touched |= *fetch_text != was.url;
+            *push_touched |= field_text.as_str() != was.push_url.as_deref().unwrap_or("");
             // A field left alone is the URL as it is set: `now` keeps `was`'s (masked) value, so
             // the plan writes nothing for it (03 §3.7); a changed one is the URL as typed.
             now.url = match url_touched {
@@ -2027,19 +2079,11 @@ fn apply(form: &mut Form, controls: &[Control]) {
                 false => was.url.clone(),
             };
             now.push_url = match push_touched {
-                true => Some(push_text.trim().to_string()).filter(|u| !u.is_empty()),
+                true => Some(field_text.trim().to_string()).filter(|u| !u.is_empty()),
                 false => was.push_url.clone(),
             };
         }
-        Action::User {
-            name,
-            email,
-            scope: s,
-        } => {
-            set(name, text(0));
-            set(email, text(1));
-            set(s, scope(0));
-        }
+        Action::User { scope: s, .. } => set(s, scope(0)),
         Action::UserRemove { scope: s } => set(s, scope(0)),
         Action::Restore { entries, .. } => {
             for (k, e) in entries.iter_mut().enumerate() {
@@ -2049,132 +2093,71 @@ fn apply(form: &mut Form, controls: &[Control]) {
                 }
             }
         }
-        _ => {}
-    }
-}
-
-/// The options of the form's draft in egui (03 §7.1–§7.5's, until X4-dialogs2), edited in place;
-/// whether a text field was laid out.
-fn form_ui(ui: &mut egui::Ui, form: &mut Form) -> bool {
-    let Form {
-        draft,
-        remotes,
-        names,
-        locals,
-        parents,
-        tags,
-        update_refs,
-        kept,
-        text,
-        dont_ask,
-        how: kept_how,
-        ..
-    } = form;
-    let mut typing = false;
-    match draft {
+        // 03 §7.1–§7.5 (X4-dialogs2): the fields edited their texts in place; this pass's choices
+        // first, then what they make.
         Action::Tag {
-            name,
-            message: m,
-            push,
-            ..
+            message: m, push, ..
         } => {
-            typing = field(ui, "Name", name, 0);
-            let mut on = m.is_some();
-            if one_of(
-                ui,
-                "Kind",
-                &mut on,
-                &[(true, "annotated"), (false, "lightweight")],
-            ) {
-                if on {
-                    *m = Some(std::mem::take(kept));
-                } else {
-                    *kept = m.take().unwrap_or_default();
-                }
+            // A message kept while "lightweight" is chosen, so "annotated" brings it back.
+            match one(0) {
+                Some(0) if m.is_none() => *m = Some(std::mem::take(kept)),
+                Some(1) if m.is_some() => *kept = m.take().unwrap_or_default(),
+                _ => {}
             }
-            if let Some(m) = m {
-                message(ui, "Message", m, 1);
-            }
-            pick_optional(ui, "Push to", push, "no remote", remotes);
+            set(push, optional(1));
         }
-        Action::Branch { name, checkout, .. } => {
-            typing = field(ui, "Name", name, 0);
-            toggle(ui, checkout, "Check it out");
-        }
-        Action::MoveBranch { branch, .. } => {
-            pick_name(ui, "Branch", branch, names);
-        }
-        Action::Checkout { .. } => toggle(ui, dont_ask, "Don't ask again in this window"),
+        Action::Branch { checkout, .. } => set(checkout, any(0, 0)),
+        Action::MoveBranch { branch, .. } => set(branch, name(0)),
+        Action::Checkout { .. } => set(dont_ask, any(0, 0)),
         Action::Pick {
-            commits,
             mainline,
             record_origin,
             no_commit,
+            ..
         } => {
-            if commits.len() > 1 {
-                ui.label(format!("{} commits, oldest first", commits.len()));
-            }
-            parent(ui, mainline, *parents);
-            ui.horizontal_wrapped(|ui| {
-                toggle(ui, record_origin, "Record origin (-x)");
-                toggle(ui, no_commit, "Don't commit");
-            });
+            parent(mainline);
+            set(record_origin, any(1, 0));
+            set(no_commit, any(1, 1));
         }
-        Action::Revert { commits, mainline } => {
-            if commits.len() > 1 {
-                ui.label(format!("{} commits, newest first", commits.len()));
-            }
-            parent(ui, mainline, *parents);
-        }
-        Action::Merge { options, .. } => merge_options(ui, options),
-        Action::Rebase { options, .. } => {
-            ui.horizontal_wrapped(|ui| {
-                toggle(ui, &mut options.ignore_date, "Ignore dates");
-                toggle(ui, &mut options.autostash, "Stash my changes for it");
-                if *update_refs {
-                    toggle(ui, &mut options.update_refs, "Move other branches along");
-                }
-            });
-        }
-        Action::Reset { mode, .. } => {
-            one_of(
-                ui,
-                "Mode",
-                mode,
-                &[
-                    (ResetMode::Soft, "soft"),
-                    (ResetMode::Mixed, "mixed"),
-                    (ResetMode::Keep, "keep"),
-                    (ResetMode::Hard, "hard"),
-                ],
+        Action::Revert { mainline, .. } => parent(mainline),
+        Action::Merge { options: o, .. } => {
+            set(
+                &mut o.fast_forward,
+                one(0).and_then(|k| FAST_FORWARDS.get(k)).copied(),
             );
+            set(&mut o.prefer, one(1).and_then(|k| PREFERS.get(k)).copied());
+            set(&mut o.squash, any(2, 0));
+            set(&mut o.no_commit, any(2, 1));
+            set(&mut o.allow_unrelated, any(2, 2));
+            set(&mut o.no_verify, any(2, 3));
         }
-        Action::Archive { format, to, .. } => {
-            let was = *format;
-            if one_of(
-                ui,
-                "Format",
-                format,
-                &[(ArchiveFormat::Zip, "zip"), (ArchiveFormat::Tar, "tar")],
-            ) {
-                let old = format!(".{}", extension(was));
-                if let Some(stem) = text.strip_suffix(&old) {
-                    *text = format!("{stem}.{}", extension(*format));
-                }
+        Action::Rebase { options: o, .. } => {
+            set(&mut o.ignore_date, any(0, 0));
+            set(&mut o.autostash, any(0, 1));
+            if *update_refs {
+                set(&mut o.update_refs, any(0, 2));
             }
-            typing = field(ui, "Save to", text, 0);
-            *to = PathBuf::from(text.trim());
         }
-        Action::Rename { to, .. } => typing = field(ui, "New name", to, 0),
+        Action::Reset { mode, .. } => set(mode, one(0).and_then(|k| MODES.get(k)).copied()),
+        Action::Archive { format, to, .. } => {
+            // Another format: the path's extension follows it.
+            let chosen = one(0).and_then(|k| FORMATS.get(k)).copied();
+            if let Some(chosen) = chosen.filter(|f| *f != *format) {
+                let old = format!(".{}", extension(*format));
+                if let Some(stem) = field_text.strip_suffix(&old) {
+                    *field_text = format!("{stem}.{}", extension(chosen));
+                }
+                *format = chosen;
+            }
+            *to = PathBuf::from(field_text.trim());
+        }
         Action::DeleteBranch {
             force,
             remotes: chosen,
             ..
         } => {
-            toggle(ui, force, "Force");
-            if !remotes.is_empty() {
-                pick_names(ui, "Also delete it on", chosen, remotes);
-            }
+            set(force, any(0, 0));
+            *chosen = several(1, chosen);
         }
         Action::Push {
             remotes: chosen,
@@ -2182,78 +2165,62 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form) -> bool {
             overwrite,
             ..
         } => {
-            pick_names(ui, "Remotes", chosen, remotes);
-            ui.horizontal_wrapped(|ui| {
-                toggle(ui, &mut options.set_upstream, "Set upstream");
-                toggle(ui, overwrite, "Overwrite the remote branch, with lease");
-                toggle(ui, &mut options.no_verify, "Skip hooks");
-            });
+            *chosen = several(0, chosen);
+            set(&mut options.set_upstream, any(1, 0));
+            set(overwrite, any(1, 1));
+            set(&mut options.no_verify, any(1, 2));
         }
-        Action::CheckoutRemote {
-            remote,
-            branch,
-            name,
-            pull,
-        } => {
-            typing = field(ui, "Local name", name, 0);
-            if locals.contains(name) {
+        Action::CheckoutRemote { name: n, pull, .. } => {
+            if locals.contains(n) {
+                // The pull into the branch of that name, its how kept while the name is not.
                 let how = pull.get_or_insert(*kept_how);
-                ui.label(format!(
-                    "{name} exists: check it out and pull {remote}/{branch} into it"
-                ));
-                pull_how(ui, how);
+                pull_how(how, one(0), any(1, 0), any(1, 1));
                 *kept_how = *how;
             } else {
                 *pull = None;
             }
         }
-        Action::FetchInto { force, .. } => {
-            toggle(ui, force, "Force, when it is not a fast-forward")
-        }
-        Action::Pull { how, .. } => pull_how(ui, how),
-        Action::DeleteTag { remote, .. } => {
-            pick_optional(ui, "Also on", remote, "no remote", remotes)
-        }
+        Action::FetchInto { force, .. } => set(force, any(0, 0)),
+        Action::Pull { how, .. } => pull_how(how, one(0), any(1, 0), any(1, 1)),
+        Action::DeleteTag { remote: r, .. } => set(r, optional(0)),
         Action::PushTag {
             remotes: chosen,
             replace,
             ..
         } => {
-            pick_names(ui, "Remotes", chosen, remotes);
-            toggle(
-                ui,
-                replace,
-                "Replace the remote's tag when it differs, with lease",
-            );
+            *chosen = several(0, chosen);
+            set(replace, any(1, 0));
         }
         Action::MoveTag {
             tag, message: m, ..
         } => {
-            // Each tag keeps its own message (03 §7.4): a choice loads the chosen tag's.
-            if pick_name(ui, "Tag", tag, names) {
-                *m = tags.annotated_message(tag);
-            }
-            let mut on = m.is_some();
-            toggle(ui, &mut on, "Keep it annotated with its message");
-            if on != m.is_some() {
-                *m = on.then(|| tags.message_of(tag));
-            }
-            if let Some(text) = m {
-                if message(ui, "Message", text, 0) {
-                    tags.edited.insert(tag.clone(), text.clone());
+            // Each tag keeps its own message (03 §7.4): this pass's typing is the message of the
+            // tag shown as it began, kept as that tag's before another is chosen.
+            if let Some(m) = m.as_ref() {
+                let known = (tags.edited.get(tag)).or(tags.read.get(tag));
+                if known.map_or("", String::as_str) != m {
+                    tags.edited.insert(tag.clone(), m.clone());
                 }
-                typing = true;
+            }
+            let shown_on = m.is_some();
+            let turned = any(1, 0).is_some_and(|on| on != shown_on);
+            if let Some(chosen) = name(0).filter(|t| *t != *tag) {
+                *m = tags.annotated_message(&chosen);
+                *tag = chosen;
+            }
+            // "Keep it annotated" turned this pass: the chosen tag's state turned.
+            if turned {
+                *m = match m {
+                    Some(_) => None,
+                    None => Some(tags.message_of(tag)),
+                };
             }
         }
-        Action::StashApply { index, .. } | Action::StashPop { index, .. } => {
-            toggle(ui, index, "Restore the index too (--index)")
+        Action::StashApply { index: i, .. } | Action::StashPop { index: i, .. } => {
+            set(i, any(0, 0))
         }
-        Action::StashBranch { name, .. } => typing = field(ui, "Name", name, 0),
-        // 03 §7.6–§7.7's forms and a restore's are cells (`controls`); the actions without
-        // options have their confirmation alone.
         _ => {}
     }
-    typing
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2284,24 +2251,69 @@ pub fn status_text(what: &str, outcome: &Outcome) -> String {
 
 /// The error dialog of a run that failed (03 §3.8). Everything it shows is masked (03 §3.7),
 /// whoever made the text: a URL the owner typed is masked here as in the log.
+///
+/// In cells (X4-dialogs2): the box titled with the action holds, in rows that scroll, each step —
+/// its word in a column of its own, two blanks before its line (the line wrapped under itself),
+/// a failed step's row in the error colour — then, a blank row apart, the failed command's text
+/// whole, a row a line, its tabs at every eighth cell and its control characters escaped; under
+/// them the command line in the weak colour, the warning in the error colour or the backup line,
+/// `[ OK ]` and the hint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultDialog {
     /// The action.
     title: String,
     /// Each step's outcome and line, in order.
     steps: Vec<(StepOutcome, String)>,
-    /// The failed command's text — git's stderr, else stdout, else its ending — whole, and its
-    /// command line as the log keeps it.
-    error: Option<(String, Option<String>)>,
+    /// The failed command's text — git's stderr, else stdout, else its ending — whole, a line
+    /// each as shown ([`shown_line`]), and its command line as the log keeps it.
+    error: Option<(Vec<String>, Option<String>)>,
     /// The group written before the first step, whatever came after.
     backup: Option<String>,
     /// The run's warning (`Outcome::warning`: `backup <stamp> incomplete: …`), said in the
     /// error colour in place of the backup's undo line.
     warning: Option<String>,
+    /// The first of its rows that scroll shown.
+    top: usize,
 }
 
 fn result_id() -> egui::Id {
     egui::Id::unique("sopen-git-result")
+}
+
+fn ok_id() -> egui::Id {
+    result_id().with("ok")
+}
+
+/// The result's nominal width in cells, egui's.
+const RESULT_NOMINAL: usize = 80;
+
+/// The cells a step's word takes, two blanks after the longest (`not run`).
+const STEP_WORD: usize = 9;
+
+/// What the result says Enter and Esc do.
+const RESULT_HINT: &str = "Enter or Esc closes";
+
+/// A line of a command's text as a row of cells shows it: tabs to the next multiple of eight
+/// cells, control characters escaped (`\u{7}`), as the details pane shows a message.
+fn shown_line(line: &str) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut out = String::with_capacity(line.len());
+    let mut column = 0;
+    for g in line.graphemes(true) {
+        if g == "\t" {
+            let n = 8 - column % 8;
+            out.extend(std::iter::repeat_n(' ', n));
+            column += n;
+        } else if g.chars().any(char::is_control) {
+            let at = out.len();
+            out.extend(g.chars().flat_map(char::escape_default));
+            column += out.len() - at;
+        } else {
+            out.push_str(g);
+            column += cells::width(g);
+        }
+    }
+    out
 }
 
 impl ResultDialog {
@@ -2335,10 +2347,11 @@ impl ResultDialog {
                 .collect(),
             error: done.map(|d| {
                 let line = mask_credentials(&d.entry.line);
-                (mask_credentials(&d.error_text()), Some(line))
+                (Self::lines(&mask_credentials(&d.error_text())), Some(line))
             }),
             backup: outcome.backup.clone(),
             warning,
+            top: 0,
         })
     }
 
@@ -2348,68 +2361,205 @@ impl ResultDialog {
         ResultDialog {
             title: title.to_string(),
             steps: Vec::new(),
-            error: Some((mask_credentials(text), command_line.map(mask_credentials))),
+            error: Some((
+                Self::lines(&mask_credentials(text)),
+                command_line.map(mask_credentials),
+            )),
             backup: None,
             warning: None,
+            top: 0,
         }
     }
 
-    /// The cells of `grid` (the panels') the result covers, its box and its shadow, for the panel
-    /// and the other side to blank (10 §17, X4-graph's seam): none while egui draws it, until
-    /// X4-dialogs2.
-    pub fn covers(&self, _grid: &Grid) -> Vec<Cells> {
-        Vec::new()
+    /// `text`'s lines as rows show them ([`shown_line`]), its blank lines at the end left out.
+    fn lines(text: &str) -> Vec<String> {
+        text.trim_end().split('\n').map(shown_line).collect()
     }
 
-    /// One pass on `grid` (the panels', where it stands once it is in cells); `true` once Enter,
-    /// Esc, OK or a click outside closed it.
-    pub fn ui(&mut self, ctx: &egui::Context, _grid: Grid) -> bool {
+    /// The box on `grid` (see the type's notes).
+    fn layout(&self, grid: Grid) -> kit::Layout {
+        let width = kit::inside_width(grid.cols, RESULT_NOMINAL, RESULT_NOMINAL);
+        let mut rows = Vec::new();
+        for (outcome, line) in &self.steps {
+            let ink = match outcome {
+                StepOutcome::Failed => Ink::Error,
+                _ => Ink::Text,
+            };
+            let word = outcome_word(*outcome);
+            let room = width.saturating_sub(STEP_WORD);
+            let wrapped = super::details::wrap_cells(&shown_line(line), room);
+            for (k, part) in wrapped.into_iter().enumerate() {
+                let lead = match k {
+                    0 => format!("{word:<width$}", width = STEP_WORD),
+                    _ => " ".repeat(STEP_WORD),
+                };
+                rows.push((format!("{lead}{}", part.trim_end()), ink));
+            }
+        }
+        if let Some((lines, _)) = &self.error {
+            if !rows.is_empty() {
+                rows.push((String::new(), Ink::Text));
+            }
+            for line in lines {
+                let wrapped = super::details::wrap_cells(line, width);
+                rows.extend(
+                    wrapped
+                        .into_iter()
+                        .map(|r| (r.trim_end().to_string(), Ink::Text)),
+                );
+            }
+        }
+        let mut parts = Vec::new();
+        if !rows.is_empty() {
+            let most = plan_most(grid.rows);
+            parts.push(Part::Scroll {
+                rows,
+                most,
+                top: self.top,
+            });
+        }
+        if let Some((_, Some(line))) = &self.error {
+            parts.push(Part::Text(line.clone(), Ink::Weak));
+        }
+        if let Some(warning) = &self.warning {
+            parts.extend([Part::Blank, Part::Text(warning.clone(), Ink::Error)]);
+        } else if let Some(stamp) = &self.backup {
+            parts.extend([Part::Blank, Part::Text(backup_line(stamp), Ink::Text)]);
+        }
+        parts.extend([
+            Part::Blank,
+            Part::Buttons(vec![Button::new("OK", ok_id())]),
+            Part::Text(RESULT_HINT.to_string(), Ink::Weak),
+        ]);
+        kit::layout(grid, &self.title, RESULT_NOMINAL, &parts)
+    }
+
+    /// The cells of `grid` (the panels') the result covers, its box and its shadow, for the panel
+    /// and the other side to blank (10 §17, X4-graph's seam).
+    pub fn covers(&self, grid: &Grid) -> Vec<Cells> {
+        self.layout(*grid).covers()
+    }
+
+    /// One pass on `grid` (the panels'); `true` once Enter, Esc, OK or a click outside closed it.
+    /// Its rows scroll by the wheel over the box and the scroll bar on its border.
+    pub fn ui(&mut self, ctx: &egui::Context, grid: Grid) -> bool {
         let close = ctx.input_mut(|i| {
             keys::take(i, Key::Enter, Mods::None) | keys::take(i, Key::Escape, Mods::None)
         });
-        let width = width(ctx, 80.0);
-        let room = (ctx.content_rect().height() * 0.5).max(6.0 * chrome::CELL.y);
-        let mut ok = false;
-        let response = chrome::dialog(ctx, result_id(), &self.title, |ui| {
-            ui.set_width(width);
-            let error = ui.visuals().error_fg_color;
-            for (outcome, line) in &self.steps {
-                ui.horizontal(|ui| {
-                    let word = outcome_word(*outcome);
-                    let word = match outcome {
-                        StepOutcome::Failed => RichText::new(word).color(error),
-                        _ => RichText::new(word),
-                    };
-                    ui.add_sized(
-                        egui::vec2(8.0 * chrome::CELL.x, chrome::CELL.y),
-                        egui::Label::new(word),
-                    );
-                    ui.add(egui::Label::new(line.as_str()).wrap());
-                });
-            }
-            if let Some((text, line)) = &self.error {
-                ui.add_space(chrome::CELL.y / 2.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("sopen-git-result-text")
-                    .max_height(room)
-                    .show(ui, |ui| {
-                        ui.add(egui::Label::new(text.as_str()).wrap());
-                    });
-                if let Some(line) = line {
-                    ui.add(egui::Label::new(RichText::new(line.as_str()).weak()).wrap());
-                }
-            }
-            if let Some(warning) = &self.warning {
-                ui.add_space(chrome::CELL.y / 2.0);
-                ui.add(egui::Label::new(RichText::new(warning.as_str()).color(error)).wrap());
-            } else if let Some(stamp) = &self.backup {
-                ui.add_space(chrome::CELL.y / 2.0);
-                ui.label(backup_line(stamp));
-            }
-            ui.add_space(chrome::CELL.y / 2.0);
-            ok = ui.button("OK").clicked();
-            ui.label(RichText::new("Enter or Esc closes").weak());
-        });
-        close || ok || response.should_close()
+        let layout = self.layout(grid);
+        let inputs = Inputs {
+            top: Some(&mut self.top),
+            by_id: vec![(ok_id(), Input::Button)],
+            ..Inputs::default()
+        };
+        let pass = kit::show(ctx, result_id(), &layout, inputs);
+        close || pass.clicked(ok_id()) || pass.modal.should_close()
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// "Stop git?" (03 §3.4).
+
+fn stop_id() -> egui::Id {
+    egui::Id::unique("sopen-git-stop")
+}
+
+fn stop_yes_id() -> egui::Id {
+    stop_id().with("yes")
+}
+
+/// "Stop git?"'s `[ No ]`.
+pub(super) fn stop_no_id() -> egui::Id {
+    stop_id().with("no")
+}
+
+/// What stopping a write may leave (03 §3.4).
+const STOP_WHY: &str = "It may stop between steps; the panel then shows the state it left.";
+
+/// What "Stop git?" says Enter and Esc do.
+pub(super) const STOP_HINT: &str = "Enter stops it · Esc lets it run";
+
+/// The question's nominal width in cells: it is as wide as its widest line.
+const STOP_NOMINAL: usize = 40;
+
+/// What "Stop git?" keeps between passes, in the context's memory (the panel holds only the
+/// write's words): what the screen showed it asking about ([`cells::OnScreen`]), the pass it was
+/// last laid out in and over which write — a question not laid out in the pass before, or over
+/// another write, starts afresh, laid out unseen first.
+#[derive(Debug, Clone, Default)]
+struct Stop {
+    screen: cells::OnScreen<String>,
+    laid: Option<u64>,
+    what: String,
+}
+
+/// The question over the write `what` on `grid` (the panels').
+fn stop_layout(grid: Grid, what: &str) -> kit::Layout {
+    let parts = [
+        Part::Text(format!("{what} is still running."), Ink::Text),
+        Part::Text(STOP_WHY.to_string(), Ink::Text),
+        Part::Blank,
+        Part::Buttons(vec![
+            Button::new("Yes, stop it", stop_yes_id()),
+            Button::new("No", stop_no_id()),
+        ]),
+        Part::Text(STOP_HINT.to_string(), Ink::Weak),
+    ];
+    kit::layout(grid, "Stop git?", STOP_NOMINAL, &parts)
+}
+
+/// The cells of `grid` (the panels') "Stop git?" over `what` covers, its box and its shadow, for
+/// the panel and the other side to blank (10 §17, X4-graph's seam).
+pub(super) fn stop_covers(grid: &Grid, what: &str) -> Vec<Cells> {
+    stop_layout(*grid, what).covers()
+}
+
+/// "Stop git?" (03 §3.4) over the write `what`, one pass on `grid` (the panels'): `Some(true)` on
+/// Enter or Yes, `Some(false)` on Esc, No or a click outside. It comes up on its own over a write
+/// the owner pressed Esc for, so it stops only what the screen showed it asking about — not in its
+/// first pass, laid out unseen, nor in a pass the terminal did not print — and its Enters and
+/// Spaces go to its buttons as an action dialog's do ([`take_enters`]).
+pub(super) fn stop_question(ctx: &egui::Context, grid: Grid, what: &str) -> Option<bool> {
+    let kept = stop_id().with("kept");
+    let pass_nr = ctx.cumulative_pass_nr();
+    let mut stop: Stop = ctx.data(|d| d.get_temp(kept)).unwrap_or_default();
+    if stop.laid.is_none_or(|nr| nr + 1 < pass_nr) || stop.what != what {
+        stop = Stop {
+            what: what.to_string(),
+            ..Stop::default()
+        };
+    }
+    let seen = stop.screen.start(ctx).cloned();
+    if stop.laid.replace(pass_nr).is_some() {
+        stop.screen.painted(what.to_string());
+    }
+    ctx.data_mut(|d| d.insert_temp(kept, stop));
+    let escape = ctx.input_mut(|i| keys::take(i, Key::Escape, Mods::None));
+    let began = ctx.memory(|m| m.focused());
+    // Only buttons: an arrow moves the keyboard among them.
+    let enters = take_enters(ctx, began.is_some(), false);
+    let (yes, no) = (stop_yes_id(), stop_no_id());
+    let inputs = Inputs {
+        by_id: vec![(yes, Input::Button), (no, Input::Button)],
+        ..Inputs::default()
+    };
+    let pass = kit::show(ctx, stop_id(), &stop_layout(grid, what), inputs);
+    let now = ctx.memory(|m| m.focused());
+    let mut answer_no = escape || pass.clicked(no) || pass.modal.should_close();
+    let mut answer_yes = pass.clicked(yes);
+    for after_tab in enters {
+        match if after_tab { now } else { began } {
+            Some(id) if id == no => answer_no = true,
+            _ => answer_yes = true,
+        }
+    }
+    let answer = match answer_no {
+        true => Some(false),
+        false => (answer_yes && seen.as_deref() == Some(what)).then_some(true),
+    };
+    // Answered: asked again, even in the very next pass, it starts afresh.
+    if answer.is_some() {
+        ctx.data_mut(|d| d.remove::<Stop>(kept));
+    }
+    answer
 }

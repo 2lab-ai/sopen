@@ -288,7 +288,7 @@ fn g_s1_reset_hard_is_backed_up_and_cmd_z_undoes_it() {
     g.idle(2);
     g.menu("Reset the current branch here…");
     assert_eq!(g.dialog_id(), Some(ActionId::Reset));
-    g.click("hard");
+    g.click("( ) hard");
     g.until_quiet("the hard reset's reads");
     // The dialog grew with its reads: its area takes the new size over the next passes.
     g.idle(4);
@@ -666,7 +666,8 @@ fn g_s5_a_held_lock_fails_with_gits_message_and_stays() {
     g.ready_in_git();
     g.menu("Stage all");
     assert!(
-        g.painted("failed") && g.shows("index.lock"),
+        // The lock's path wraps by cells, anywhere (10 §6): its rows read as one text.
+        g.painted("failed") && g.texts().concat().contains("index.lock"),
         "{:#?}",
         g.texts()
     );
@@ -1029,7 +1030,7 @@ fn g_s2_an_overwrite_push_after_another_push_is_refused_stale() {
     g.label_to("►main");
     g.menu("Push…");
     assert_eq!(g.dialog_id(), Some(ActionId::Push));
-    g.click("Overwrite the remote branch, with lease");
+    g.click("[ ] Overwrite the remote branch, with lease");
     g.until_quiet("the overwrite's reads");
     assert!(
         matches!(
@@ -1082,7 +1083,7 @@ fn g_s7_two_push_urls_that_disagree_refuse_the_overwrite() {
     g.bar_to("rewritten");
     g.label_to("►main");
     g.menu("Push…");
-    g.click("Overwrite the remote branch, with lease");
+    g.click("[ ] Overwrite the remote branch, with lease");
     g.until_quiet("the overwrite's reads");
     g.run();
     assert!(g.painted("failed"), "{:#?}", g.texts());
@@ -1323,7 +1324,7 @@ fn a_failing_read_leaves_the_plan_refused() {
     g.fx.drv.resize(1000.0, 1400.0);
     g.idle(2);
     g.menu("Reset the current branch here…");
-    g.click("hard");
+    g.click("( ) hard");
     g.until_quiet("the reads, one failing");
     g.idle(4);
     assert!(

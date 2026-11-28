@@ -9,15 +9,15 @@ use super::in_progress::{self, BannerView, Pressed};
 use super::log_view::{self, LogEnd, LogView};
 use super::menu::{self, Menu, MenuEnd, Target};
 use crate::git::actions::{
-    Action, ActionId, Confirmation, Outcome, Overwrite, Plan, Proceed, PushOptions, Refused,
-    Remote, RemoteChange, Repo, ResetMode, Seen, Step, StepOutcome, StepResult,
+    Action, ActionId, Confirmation, Overwrite, Plan, Proceed, PushOptions, Refused, Remote,
+    RemoteChange, Repo, ResetMode, Seen, Step,
 };
 use crate::git::backup::{self as backup, Manifest, Record, RestoreEntry, RestoreHow, Value};
 use crate::git::model::{
     Backup, BackupKind, BackupRef, BranchStatus, Change, CommitRow, GitVersion, Head, InProgress,
     ObjectType, Oid, RefKind, RefLabel, StashRow, Status, StatusEntry, StatusState,
 };
-use crate::git::runner::{Class, Done, Ending, GitCommand, LogEntry};
+use crate::git::runner::{Class, Ending, GitCommand, LogEntry};
 use crate::gui::browser::keys::{self, Context};
 use crate::gui::chrome::PALETTE;
 use crate::gui::testkit::{self, Driver};
@@ -821,14 +821,14 @@ fn the_dialog_shows_every_part_of_the_confirmation() {
         fx.assert_shows(text);
     }
     let lost = fx.drv.find_text("push loses this").unwrap();
-    let option = fx.drv.find_text("Set upstream").unwrap();
+    let option = fx.drv.find_text("[X] Set upstream").unwrap();
     let command = fx.drv.find_text("git push").unwrap();
     assert!(lost.top() < option.top(), "the lost line first (§8.1)");
     assert!(
         option.top() < command.top(),
         "the options before the commands"
     );
-    fx.assert_shows(&dialogs::remote_warning(&RemoteChange {
+    let warning = dialogs::remote_warning(&RemoteChange {
         remote: "origin".into(),
         refname: "refs/heads/feature".into(),
         change: Overwrite::Replace {
@@ -838,7 +838,11 @@ fn the_dialog_shows_every_part_of_the_confirmation() {
             set_upstream: true,
             no_verify: false,
         },
-    }));
+    });
+    // Wider than the box (76 cells inside, 10 §6): it wraps by cells at a blank.
+    let texts = fx.drv.texts_starting_with("");
+    let joined: Vec<String> = texts.into_iter().map(|(_, t)| t).collect();
+    assert!(joined.join(" ").contains(&warning), "{joined:#?}");
     assert_eq!(
         dialogs::remote_warning(&RemoteChange {
             remote: "origin".into(),
@@ -888,7 +892,7 @@ fn every_option_change_plans_again() {
     let before = asked().len();
     fx.idle();
     assert_eq!(asked().len(), before, "nothing changed: not planned again");
-    fx.click("hard");
+    fx.click("( ) hard");
     assert_eq!(
         asked().last(),
         Some(&Action::Reset {
@@ -1038,7 +1042,7 @@ fn no_confirmation_runs_at_once() {
         fake,
     ));
     let mut fx = with_dialog(d, fake);
-    fx.click("Don't ask again in this window");
+    fx.click("[ ] Don't ask again in this window");
     fx.press(Key::Enter);
     assert_eq!(
         fx.host.dialog_ends,
@@ -1166,7 +1170,7 @@ fn a_restore_never_writes_over_anything_unless_chosen() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The result dialog (03 §3.8, §8.3).
+// A log entry (03 §3.7): the log's tests', and the result dialog's (`tests_x4_dialogs2.rs`).
 
 pub(super) fn entry(line: &str, ending: Ending, stderr: &str, secs: u64) -> LogEntry {
     LogEntry {
@@ -1180,96 +1184,6 @@ pub(super) fn entry(line: &str, ending: Ending, stderr: &str, secs: u64) -> LogE
         stdout_bytes: 0,
         stderr: stderr.into(),
     }
-}
-
-fn done(line: &str, code: i32, stderr: &str) -> Done {
-    Done {
-        ending: Ending::Exit(code),
-        stdout: Vec::new(),
-        stdout_cut: false,
-        stderr: stderr.into(),
-        entry: entry(line, Ending::Exit(code), stderr, 0),
-    }
-}
-
-fn outcome(failed: bool) -> Outcome {
-    let push = "git push --progress origin refs/heads/b:refs/heads/b";
-    let error = "error: failed to push some refs to 'origin'\nhint: fetch first";
-    let (code, stderr) = if failed { (1, error) } else { (0, "") };
-    let (second, third) = if failed {
-        (StepOutcome::Failed, StepOutcome::NotRun)
-    } else {
-        (StepOutcome::Done, StepOutcome::Done)
-    };
-    Outcome {
-        steps: vec![
-            StepResult {
-                line: "backup".into(),
-                outcome: StepOutcome::Done,
-                ran: vec![done("git update-ref --stdin", 0, "")],
-            },
-            StepResult {
-                line: push.into(),
-                outcome: second,
-                ran: vec![done(push, code, stderr)],
-            },
-            StepResult {
-                line: "git branch -d b".into(),
-                outcome: third,
-                ran: Vec::new(),
-            },
-        ],
-        backup: Some("20261123T102405Z".into()),
-    }
-}
-
-/// A failed step (03 §3.8): the dialog titled with the action lists each step `done`, `failed`
-/// or `not run`, holds git's stderr whole and the log entry's command line, and the backup line;
-/// Enter or Esc closes it. Every step done: no dialog, the status row's line.
-#[test]
-fn the_result_dialog_lists_each_step_and_the_error() {
-    assert!(ResultDialog::of("Delete branch b", &outcome(false)).is_none());
-    assert_eq!(
-        dialogs::status_text("Deleted branch b", &outcome(false)),
-        "Deleted branch b · backup 20261123T102405Z · Ctrl/⌘+Z undoes"
-    );
-    let mut quiet_outcome = outcome(false);
-    quiet_outcome.backup = None;
-    assert_eq!(
-        dialogs::status_text("Fetched", &quiet_outcome),
-        "Fetched",
-        "no backup, no undo"
-    );
-
-    let result = ResultDialog::of("Delete branch b", &outcome(true)).expect("a step failed");
-    let mut fx = Fx::new(Host {
-        result: Some(result),
-        ..Host::default()
-    });
-    assert!(fx.dialog_box());
-    fx.assert_shows("Delete branch b");
-    for word in ["done", "failed", "not run"] {
-        fx.assert_shows(word);
-    }
-    fx.assert_shows("git branch -d b");
-    fx.assert_shows("error: failed to push some refs to 'origin'\nhint: fetch first");
-    fx.assert_shows("git push --progress origin refs/heads/b:refs/heads/b");
-    fx.assert_shows("backup 20261123T102405Z · Ctrl/⌘+Z undoes");
-    fx.press(Key::Enter);
-    assert_eq!(fx.host.results_closed, 1);
-
-    let mut fx = Fx::new(Host {
-        result: Some(ResultDialog::error(
-            "Backups",
-            "fatal: not a git repository",
-            Some("git for-each-ref refs/sopen-backup/"),
-        )),
-        ..Host::default()
-    });
-    fx.assert_shows("fatal: not a git repository");
-    fx.assert_shows("git for-each-ref refs/sopen-backup/");
-    fx.press(Key::Escape);
-    assert_eq!(fx.host.results_closed, 1);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1693,141 +1607,4 @@ fn a_url_without_credentials_behaves_as_before() {
     let (_, now) = ran(&mut fx);
     assert_eq!(now.url, "https://example.com/y.git");
     assert_eq!(now.push_url, None);
-}
-
-// ---------------------------------------------------------------------------------------------
-// Review round 1 (PR #81).
-
-/// Move tag keeps the chosen tag's own message (03 §7.4): switching from annotated `alpha` to
-/// annotated `beta` loads beta's, never alpha's; an annotated tag whose message is not loaded is
-/// refused; a lightweight tag moves lightweight; an edit stays with its tag.
-#[test]
-fn move_tag_keeps_the_chosen_tags_own_message() {
-    let mut r = repo();
-    r.refs.retain(|l| l.kind != RefKind::Tag);
-    r.refs.extend([
-        tag("alpha", 'a', true),
-        tag("beta", 'b', true),
-        tag("gamma", 'a', true),
-        tag("light", 'a', false),
-    ]);
-    let prefill = Prefill {
-        tag_messages: [("alpha", "release alpha"), ("beta", "release beta")]
-            .into_iter()
-            .map(|(t, m)| (t.to_string(), m.to_string()))
-            .collect(),
-        // A commit message meant for another dialog is never a tag's.
-        message: Some("a commit message".into()),
-        ..Prefill::default()
-    };
-    let bar = Target::Commit {
-        commit: commit('c', &['b'], "c"),
-        marked: Vec::new(),
-    };
-    let open = || dialog(ActionDialog::open(A::MoveTag, &bar, &r, &prefill, fake));
-    let move_tag = |tag: &str, message: Option<&str>| Action::MoveTag {
-        tag: tag.into(),
-        to: oid('c'),
-        message: message.map(str::to_string),
-    };
-    let d = open();
-    assert_eq!(d.draft(), &move_tag("alpha", Some("release alpha")));
-
-    // alpha → beta: Run carries beta's message.
-    let mut fx = with_dialog(open(), fake);
-    fx.assert_shows("release alpha");
-    fx.click("beta");
-    fx.assert_shows("release beta");
-    assert!(!fx.shows("release alpha"));
-    fx.press(Key::Enter);
-    assert_eq!(
-        fx.host.dialog_ends,
-        [DialogEnd::Run {
-            action: move_tag("beta", Some("release beta")),
-            dont_ask_again: false
-        }]
-    );
-
-    // gamma's message is not loaded: refused, never alpha's text.
-    let mut fx = with_dialog(open(), fake);
-    fx.click("gamma");
-    let why = format!("gamma: {}", dialogs::NOT_LOADED);
-    fx.assert_shows(&why);
-    assert_eq!(
-        fx.drv.painted_colors_of(&why),
-        Some(vec![PALETTE.dialog_error])
-    );
-    fx.press(Key::Enter);
-    assert!(fx.host.dialog_ends.is_empty(), "Run is off");
-    assert_eq!(
-        fx.host.dialog.as_ref().unwrap().draft(),
-        &move_tag("gamma", Some(""))
-    );
-    // Moving it lightweight instead is not refused.
-    fx.click("Keep it annotated with its message");
-    assert!(!fx.shows(&why));
-    fx.press(Key::Enter);
-    assert_eq!(
-        fx.host.dialog_ends,
-        [DialogEnd::Run {
-            action: move_tag("gamma", None),
-            dont_ask_again: false
-        }]
-    );
-
-    // A lightweight tag moves lightweight; an edit to alpha stays alpha's across a switch.
-    let mut fx = with_dialog(open(), fake);
-    let field = fx.drv.find_text("release alpha").unwrap().right_center();
-    fx.drv.click(&mut fx.host, field + egui::vec2(-1.0, 0.0));
-    type_text(&mut fx, " v2");
-    fx.click("light");
-    assert_eq!(
-        fx.host.dialog.as_ref().unwrap().draft(),
-        &move_tag("light", None)
-    );
-    fx.click("alpha");
-    fx.press(Key::Enter);
-    assert_eq!(
-        fx.host.dialog_ends,
-        [DialogEnd::Run {
-            action: move_tag("alpha", Some("release alpha v2")),
-            dont_ask_again: false
-        }]
-    );
-
-    // A new tag starts with an empty message, not the prefill's commit message.
-    let d = dialog(ActionDialog::open(A::Tag, &bar, &r, &prefill, fake));
-    assert!(matches!(d.draft(), Action::Tag { message: Some(m), .. } if m.is_empty()));
-}
-
-/// The result dialog masks whatever it shows (03 §3.7), a URL the owner typed included.
-#[test]
-fn the_result_dialog_masks_credentials() {
-    let secret = "https://ada:s3cret@example.com/x.git";
-    let masked = "https://ada:***@example.com/x.git";
-    let mut failed = outcome(true);
-    failed.steps[1].line = format!("git remote add origin {secret}");
-    failed.steps[1].ran[0].entry.line = format!("git remote add origin {secret}");
-    failed.steps[1].ran[0].stderr = format!("fatal: remote origin already exists: {secret}");
-    let fx = Fx::new(Host {
-        result: Some(ResultDialog::of("Add a remote", &failed).unwrap()),
-        ..Host::default()
-    });
-    fx.assert_shows(&format!("git remote add origin {masked}"));
-    fx.assert_shows(&format!("fatal: remote origin already exists: {masked}"));
-    let texts = fx.drv.texts_starting_with("");
-    assert!(
-        !texts.iter().any(|(_, t)| t.contains("s3cret")),
-        "{texts:?}"
-    );
-    let fx = Fx::new(Host {
-        result: Some(ResultDialog::error(
-            "Edit a remote",
-            &format!("fatal: could not read {secret}"),
-            Some(&format!("git remote set-url origin {secret}")),
-        )),
-        ..Host::default()
-    });
-    fx.assert_shows(&format!("fatal: could not read {masked}"));
-    fx.assert_shows(&format!("git remote set-url origin {masked}"));
 }
