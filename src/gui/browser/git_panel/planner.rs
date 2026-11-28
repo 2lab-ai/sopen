@@ -433,6 +433,8 @@ pub struct QuickDialog {
     repo: Repo,
     /// The draft's revision: one more each time its fields or options change it.
     drafted: u64,
+    /// Which dialog it is ([`super::DraftKey`]): another at the same draft revision is not it.
+    serial: u64,
     /// A planner run's option changed the draft this pass (the next [`QuickDialog::update`]
     /// counts it).
     opted: bool,
@@ -532,9 +534,10 @@ fn model_bytes(model: &Model) -> usize {
 
 /// A quick edit's dialog's edit. Every copy of it counts its message's bytes ([`copy_of`]),
 /// wherever it is made: a `clone()` of the draft that comes back in a pass is seen (X4-quick
-/// fix-check), not only the copies the dialog says it makes.
+/// fix-check), not only the copies the dialog says it makes — the integration's too, which holds
+/// it as this, never as a bare `Edit` (F-git-drafted).
 #[derive(Debug)]
-struct Draft(Edit);
+pub struct Draft(Edit);
 
 impl Clone for Draft {
     fn clone(&self) -> Self {
@@ -732,6 +735,7 @@ impl QuickDialog {
             refused,
             repo: repo.clone(),
             drafted: 0,
+            serial: super::dialog_serial(),
             opted: false,
             planned: None,
             shows: Shows::default(),
@@ -766,6 +770,17 @@ impl QuickDialog {
     /// The edit as the options make it now (while the dialog refuses it, as it last was).
     pub fn draft(&self) -> &Edit {
         &self.draft
+    }
+
+    /// The draft as the integration holds it: a copy of it counts ([`Draft`]).
+    pub fn held_draft(&self) -> &Draft {
+        &self.draft
+    }
+
+    /// Which dialog it is and its draft's revision, as `(serial, revision)`: what the integration
+    /// checks the draft's reads by, never a copy of it ([`super::DraftKey`], F-git-drafted).
+    pub fn draft_revision(&self) -> (u64, u64) {
+        (self.serial, self.drafted)
     }
 
     /// The plan of the draft, as last planned.
@@ -1409,12 +1424,22 @@ impl PlannerView {
         }
     }
 
-    /// While the run's confirmation is up (Cmd/Ctrl+Enter): the edit it plans, for the reads
-    /// its plan needs (`rebase::needs`), which the integration makes and hands back through
-    /// [`PlannerView::set_repo`].
-    pub fn run_draft(&self) -> Option<Edit> {
+    /// While the run's confirmation is up (Cmd/Ctrl+Enter): the edit it plans — its draft, the
+    /// model with the run's options, which the pane leaves alone while it is up — for the reads its
+    /// plan needs (`rebase::needs`), which the integration makes and hands back through
+    /// [`PlannerView::set_repo`]. Borrowed, as [`Draft`]: a copy of it counts (F-git-drafted).
+    pub fn run_draft(&self) -> Option<&Draft> {
         match &self.inner {
-            Some(Inner::Run(_)) => Some(Edit::Plan(self.model.clone())),
+            Some(Inner::Run(d)) => Some(d.held_draft()),
+            _ => None,
+        }
+    }
+
+    /// While the run's confirmation is up: which dialog it is and its draft's revision
+    /// ([`QuickDialog::draft_revision`]).
+    pub fn run_revision(&self) -> Option<(u64, u64)> {
+        match &self.inner {
+            Some(Inner::Run(d)) => Some(d.draft_revision()),
             _ => None,
         }
     }
