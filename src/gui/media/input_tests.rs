@@ -184,6 +184,61 @@ fn drag_on_the_frame_sets_the_crop_in_source_pixels() {
     assert_eq!(fx.win.crop(), None);
 }
 
+/// F-click-slop: a handle on the picture's edge takes a press on its outer half, painted in the
+/// frame's margin outside the picture. With the crop drawn past the right edge, a press two
+/// points right of the edge, on the E handle, and a drag 40 points left narrow the crop (egui's
+/// 5-point reach used to carry that press to a response over the picture alone).
+#[test]
+fn a_press_on_a_handles_outer_half_outside_the_picture_resizes_the_crop() {
+    let Some(mut fx) = fixture() else { return };
+    let (a, b) = (
+        fx.at(100.0, 60.0),
+        fx.at(320.0, 180.0) + Vec2::new(30.0, 0.0),
+    );
+    fx.drv.drag(&mut fx.win, PointerButton::Primary, a, b);
+    assert_eq!(
+        fx.win.crop(),
+        Some([100, 60, 220, 120]),
+        "to the right edge"
+    );
+    let from = fx.at(320.0, 120.0) + Vec2::new(2.0, 0.0);
+    let disp = fx.win.map.expect("frame drawn").disp;
+    assert!(
+        !disp.contains(from),
+        "outside the picture: {from:?} {disp:?}"
+    );
+    let to = from - Vec2::new(40.0, 0.0);
+    fx.drv.drag(&mut fx.win, PointerButton::Primary, from, to);
+    let [x, y, w, h] = fx.win.crop().expect("the crop kept");
+    assert_eq!(
+        (x, y, h),
+        (100, 60, 120),
+        "the E handle moves the right edge alone"
+    );
+    assert!(w < 220, "narrower: {w}");
+}
+
+/// The frame's black margin beside the picture is the crop's outside, as the image window's
+/// (both take the frame's whole inside, F-click-slop): with a crop up, a drag from the margin
+/// left of the picture draws a new crop from the edge, the press clamped onto the picture; a
+/// click on the margin right of it, past the handles' reach, clears the crop.
+#[test]
+fn the_margin_beside_the_picture_starts_a_crop_from_its_edge_and_a_click_there_clears_it() {
+    let Some(mut fx) = fixture() else { return };
+    let (a, b) = (fx.at(100.0, 60.0), fx.at(200.0, 150.0));
+    fx.drv.drag(&mut fx.win, PointerButton::Primary, a, b);
+    assert_eq!(fx.win.crop(), Some([100, 60, 100, 90]));
+    let disp = fx.win.map.expect("frame drawn").disp;
+    // Three points into the frame's four-point margin (`panel.shrink(4.0)`).
+    let left = Pos2::new(disp.left() - 3.0, fx.at(0.0, 100.0).y);
+    let to = fx.at(80.0, 160.0);
+    fx.drv.drag(&mut fx.win, PointerButton::Primary, left, to);
+    assert_eq!(fx.win.crop(), Some([0, 100, 80, 60]), "from the left edge");
+    let right = Pos2::new(disp.right() + 3.0, fx.at(0.0, 120.0).y);
+    fx.drv.click(&mut fx.win, right);
+    assert_eq!(fx.win.crop(), None, "a click on the margin clears it");
+}
+
 /// A 90°-rotated source shows 240×320; the crop is drawn and kept in those pixels.
 #[test]
 fn crop_on_a_rotated_source_is_in_displayed_pixels() {

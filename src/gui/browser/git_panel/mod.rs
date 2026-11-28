@@ -1521,6 +1521,21 @@ impl GitView {
         self.other_dialog_up() || self.planner.as_ref().is_some_and(|p| p.dialog_up())
     }
 
+    /// Whether this pass's draw may open a box of the panel's after a side drawn before the panel
+    /// was painted (F-menu-own): a choice in the open menu (its dialog), a right click on a row
+    /// (the row's menu), or a key after text typed into Find (an Esc there hands the pass's rest
+    /// to [`keys`] in the draw, F10 the menu). The browser keeps that side's paints in those
+    /// passes alone (`cells::keep`).
+    pub fn may_open_in_draw(&self, ctx: &egui::Context) -> bool {
+        let pressed = || {
+            let key = |e: &egui::Event| matches!(e, egui::Event::Key { pressed: true, .. });
+            ctx.input(|i| i.events.iter().any(key))
+        };
+        self.menu.is_some()
+            || ctx.input(|i| i.pointer.secondary_clicked())
+            || (self.find.is_some() && pressed())
+    }
+
     /// The cells of `grid` (the panels') the panel's open dialogs cover, their boxes and shadows,
     /// each as its own file says ([`menu::HistoryMenu::covers`], …: nothing while egui draws it):
     /// the panel blanks them, and the other side's list, preview or tree
@@ -2393,7 +2408,14 @@ impl GitView {
 
     /// S3's modals for one pass on `grid` (the panels'; each takes its keys before anything else
     /// sees them): the menu, the action dialog, the result, "Stop git?"; the clipboard's text.
-    fn modals(&mut self, ctx: &egui::Context, grid: Grid) -> Vec<GitAction> {
+    /// `blank`: blanks the panel's cells under a box before that box is drawn, where the panel
+    /// painted them before `modals` ran (F-menu-own).
+    fn modals(
+        &mut self,
+        ctx: &egui::Context,
+        grid: Grid,
+        blank: &mut dyn FnMut(&[Cells]),
+    ) -> Vec<GitAction> {
         if let Some(text) = self.to_copy.take() {
             ctx.copy_text(text);
         }
@@ -2419,9 +2441,21 @@ impl GitView {
                 None => Vec::new(),
             };
             // The dialog a choice opened, in the same pass: the menu handed it what the pass held
-            // after the choosing Enter, typed text in its place (X4-menu).
+            // after the choosing Enter, typed text in its place (X4-menu). The panel painted its
+            // cells with the menu's covers blanked, so the cells this dialog covers are blanked
+            // and painted again first, the dialog over them (F-menu-own). Drawing it from the
+            // next pass instead would carry the rest of this pass's keys across a pass and blank,
+            // on a side drawn after the panel, cells under a dialog not drawn yet; painting the
+            // panel after `modals` would record its cells after its dialogs' in every pass a
+            // dialog is up.
             if self.menu.is_none() && (self.quick.is_some() || self.dialog.is_some()) {
-                asked.extend(self.modals(ctx, grid));
+                let covers = match (&self.quick, &self.dialog) {
+                    (Some(quick), _) => quick.covers(&grid),
+                    (None, Some(dialog)) => dialog.covers(&grid),
+                    (None, None) => Vec::new(),
+                };
+                blank(&covers);
+                asked.extend(self.modals(ctx, grid, blank));
             }
             return asked;
         }
@@ -3081,6 +3115,73 @@ fn leave_to_egui(buf: &mut Buffer, r: Cells) {
     }
 }
 
+/// `covers` blanked in `buf`, cells of a side `painter` has painted this pass (the panel's, or
+/// one the browser kept), and what that changed painted over that painting (F-menu-own): the
+/// side's body first under each cell that changed and under the rest of a wide glyph it held, so
+/// no half of a glyph painted before shows, then those cells alone, in a buffer over just them —
+/// every other cell of it empty, which leaves what is under it (`cells::paint`, `term::compose`),
+/// and no finder takes it for the side's. Only changed cells are painted again, which is what
+/// leaves a viewer's cells inside a preview's frame alone: the frame's own cells under the viewer
+/// are blanks in the body colour (`cells::frame` fills its side), so blanking changes none of them
+/// and nothing is painted over the viewer's layer. The rule that skips a cell `buf` left without
+/// a colour of its own guards only such cells — those left to egui (`leave_to_egui`).
+fn blank_over(painter: &egui::Painter, grid: &Grid, buf: &mut Buffer, covers: &[Cells], body: Pen) {
+    let before = buf.clone();
+    for r in covers {
+        cells::fill(buf, *r, body);
+    }
+    let a = buf.area;
+    let mut runs: Vec<Cells> = Vec::new();
+    for y in a.top()..a.bottom() {
+        let mut x = a.left();
+        while x < a.right() {
+            let own = matches!(before[(x, y)].bg, ratatui_core::style::Color::Rgb(..));
+            if !own || before[(x, y)] == buf[(x, y)] {
+                x += 1;
+                continue;
+            }
+            let wide = cells::width(before[(x, y)].symbol()).max(1) as u16;
+            let end = (x + wide).min(a.right());
+            match runs.last_mut() {
+                Some(run) if run.y == y && run.right() >= x => run.width = end - run.x,
+                _ => runs.push(Cells::new(x, y, end - x, 1)),
+            }
+            x = end;
+        }
+    }
+    let Some(first) = runs.first().copied() else {
+        return;
+    };
+    let mut patch = Buffer::empty(runs.iter().fold(first, |all, r| all.union(*r)));
+    for r in &runs {
+        painter.rect_filled(grid.rect(*r), 0.0, body.bg);
+        for x in r.left()..r.right() {
+            patch[(x, r.y)] = buf[(x, r.y)].clone();
+        }
+    }
+    cells::paint(painter, grid.origin, &patch, None);
+}
+
+/// `covers` blanked on the other side of `grid` than `side`, the panel's, where that side was
+/// painted before the panel this pass (F-menu-own): it read the panel's covers then
+/// (`Browser::git_covered`), before a box the panel's draw opened, and the browser kept what it
+/// painted (`cells::keep`) — its layer of cells over its whole side, on `painter`'s egui layer —
+/// which [`blank_over`] blanks as the panel's own. A side painted after the panel reads the
+/// covers with that box in them.
+fn blank_beside(painter: &egui::Painter, grid: &Grid, side: Cells, covers: &[Cells], body: Pen) {
+    let beside: Vec<Cells> = (cells::halves(grid.all()).into_iter())
+        .filter(|h| *h != side)
+        .collect();
+    let ctx = painter.ctx();
+    for l in cells::kept(ctx) {
+        let theirs = beside.contains(&l.buf.area) && l.origin == grid.origin;
+        if theirs && l.layer == painter.layer_id() {
+            let on = egui::Painter::new(ctx.clone(), l.layer, l.clip);
+            blank_over(&on, grid, &mut l.buf.clone(), covers, body);
+        }
+    }
+}
+
 /// The git panel at cells `side` of `grid` (the panels' grid, between the title and status
 /// rows), in cells (10 §4, X4-graph): its frame titled with the top level, the find row or the
 /// column heads, the visible rows with their lanes, nodes and labels, the bar, the details pane
@@ -3102,6 +3203,8 @@ pub fn draw(
 ) -> Vec<GitAction> {
     let mut asked = Vec::new();
     let ctx = ui.ctx().clone();
+    // A menu opened in the body this pass is drawn over a side painted before it (F-menu-own).
+    let menu_before = view.menu.is_some();
     // While another dialog has the keyboard — another panel's, the list's question, the tree —
     // no dialog of this panel's reads a key or text this pass (X4-menu fix-check): those are that
     // dialog's. Taken before the body, which draws the planner's own dialogs and the log's entry
@@ -3342,6 +3445,11 @@ pub fn draw(
         cells::fill(&mut buf, r, body);
     }
     cells::paint(&painter, grid.origin, &buf, caret);
+    // A menu the body opened this pass (a right click on a row, F10 after Find's Esc): `own` held
+    // it, the other side's cells under it are blanked from what the browser kept.
+    if let Some(menu) = view.menu.as_ref().filter(|_| !menu_before) {
+        blank_beside(&painter, grid, side, &menu.covers(grid), body);
+    }
     // The dialogs, over everything, on the panels' grid (with no key while `kept` or `held` holds
     // them). The filters and the history search under another's dialog or one of `modals`' have
     // neither the keyboard — they take none for their field, which would leave the dialog in
@@ -3378,7 +3486,13 @@ pub fn draw(
         ctx.input_mut(|i| i.events.extend(held));
     }
     cells::set_covered(&ctx, elsewhere);
-    asked.extend(view.modals(&ctx, *grid));
+    // Under a dialog a menu choice opens in `modals`: the panel's own cells, and the other side's
+    // ([`blank_beside`]).
+    let mut blank = |covers: &[Cells]| {
+        blank_over(&painter, grid, &mut buf, covers, body);
+        blank_beside(&painter, grid, side, covers, body);
+    };
+    asked.extend(view.modals(&ctx, *grid, &mut blank));
     // Not a value from before `draw` restored: nothing outside `draw` sets the flag, so each pass
     // of the panel's starts from `false` (an `OnScreen` asked outside it, as the Backups list's
     // keys ask, reads `false`).

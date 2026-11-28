@@ -291,11 +291,19 @@ fn plan_title(planned: Option<&Result<Plan, Refused>>) -> Option<String> {
 
 /// `author`'s options (03 §7.8.1), and the planner's `A`: as typed, the date as its field's text.
 #[derive(Debug, Clone)]
-struct AuthorForm {
-    name: String,
-    email: String,
-    date: String,
-    committer: CommitterDate,
+pub(super) struct AuthorForm {
+    pub(super) name: String,
+    pub(super) email: String,
+    pub(super) date: String,
+    pub(super) committer: CommitterDate,
+}
+
+/// What is typed in a dialog with fields — a quick edit's, the planner's message or author —
+/// as a switch carries it (10 §7.4, v3; `state`'s).
+#[derive(Clone, Copy)]
+pub(super) enum Typed<'a> {
+    Message(&'a str),
+    Author(&'a AuthorForm),
 }
 
 impl AuthorForm {
@@ -513,6 +521,13 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn copied() -> usize {
     COPIED.with(|c| c.replace(0))
+}
+
+/// `text`, a message a dialog holds, copied — for the switch's state — its bytes counted
+/// ([`copying`]).
+pub(super) fn copy_text(text: &str) -> String {
+    copying(text.len());
+    text.to_string()
 }
 
 /// `edit`, copied: its messages' bytes counted ([`copying`]) — a planner run's, its model's
@@ -789,6 +804,40 @@ impl QuickDialog {
     /// The plan of the draft, as last planned.
     pub fn planned(&self) -> Option<&Result<Plan, Refused>> {
         self.planned.as_ref().map(|(_, p)| p)
+    }
+
+    /// What is typed in it (10 §7.4, v3): reword's or squash's message, or author's fields; none
+    /// in a dialog with no field (a confirmation, a message it refuses).
+    pub(super) fn typed(&self) -> Option<Typed<'_>> {
+        match (&self.message, &self.author) {
+            (Some(m), _) => Some(Typed::Message(m)),
+            (None, Some(f)) => Some(Typed::Author(f)),
+            (None, None) => None,
+        }
+    }
+
+    /// A switch's typing given to it, opened here as its key opens it (v3): its message or
+    /// author's fields — `Err` names the field it has not here (a message it refuses) — and
+    /// then as just opened: its fields afresh and nothing of it on the screen, so no Run or Enter
+    /// runs it before the owner has seen it here.
+    pub(super) fn give(&mut self, typed: Typed) -> Result<(), &'static str> {
+        let missing = match (typed, &mut self.message, &mut self.author) {
+            (Typed::Message(text), Some(m), _) => {
+                copying(text.len());
+                text.clone_into(m);
+                None
+            }
+            (Typed::Author(form), _, Some(f)) => {
+                f.clone_from(form);
+                None
+            }
+            (Typed::Message(_), None, _) => Some("its message"),
+            (Typed::Author(_), _, None) => Some("its author"),
+        };
+        (self.laid_once, self.typing, self.changed) = (false, false, false);
+        (self.composing, self.screen) = (None, cells::OnScreen::default());
+        self.revision += 1;
+        missing.map_or(Ok(()), Err)
     }
 
     /// A refresh came while the dialog is open: the draft is planned again against `repo`.
@@ -1457,13 +1506,33 @@ impl PlannerView {
         self.shown.take()
     }
 
-    /// One of its own dialogs with fields is open — the message, the author — whose typing a switch
-    /// does not carry (10 §7.4, v2).
-    pub fn typing(&self) -> bool {
-        matches!(
-            self.inner,
-            Some(Inner::Message { .. } | Inner::Author { .. })
-        )
+    /// Its own dialog with fields and its row, as a switch carries it (10 §7.4, v3): the message's
+    /// or the author's.
+    pub(super) fn typed(&self) -> Option<(&Oid, Typed<'_>)> {
+        match self.inner.as_ref()? {
+            Inner::Message { commit, text, .. } => Some((commit, Typed::Message(text))),
+            Inner::Author { commit, form, .. } => Some((commit, Typed::Author(form))),
+            Inner::Ask | Inner::Run(_) => None,
+        }
+    }
+
+    /// A switch's dialog of the pane's given to the planner given here (v3): on `commit`'s row, the
+    /// bar put there and the dialog opened as Enter (a message) or `A` (an author) opens it, then
+    /// what was typed in it — afresh, its first pass to come. `Err`: the row is not in the plan
+    /// here, or opens no message there (its verb takes none, or it refuses the commit's).
+    pub(super) fn give_typed(&mut self, commit: &Oid, typed: Typed) -> Result<(), &'static str> {
+        let at = (self.model.rows.iter()).position(|r| r.commit.row.oid == *commit);
+        self.scroll.to(at.ok_or("its row is not in the plan here")?);
+        match typed {
+            Typed::Message(_) => self.edit_message(),
+            Typed::Author(_) => self.edit_author(),
+        }
+        match (typed, &mut self.inner) {
+            (Typed::Message(text), Some(Inner::Message { text: t, .. })) => text.clone_into(t),
+            (Typed::Author(form), Some(Inner::Author { form: f, .. })) => f.clone_from(form),
+            _ => return Err("its row opens no such dialog here"),
+        }
+        Ok(())
     }
 
     /// A switch's plan given to the planner opened here on this host's range (10 §7.4, v2):

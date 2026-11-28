@@ -226,6 +226,25 @@ fn escape_clears_and_a_handle_drag_resizes() {
     assert_eq!(fx.rect(), None);
 }
 
+/// The black margin beside the image is the rectangle's outside, as the media window's (both
+/// take the frame's whole inside, F-click-slop): with a rectangle up, a drag from the margin
+/// left of the image draws a new one from the edge, the press clamped onto the image; a click on
+/// the margin right of it, past the handles' reach, clears the rectangle.
+#[test]
+fn the_margin_beside_the_image_starts_a_rectangle_from_its_edge_and_a_click_there_clears_it() {
+    let mut fx = open();
+    fx.select((40.0, 30.0), (100.0, 80.0));
+    assert_eq!(fx.rect(), Some([40, 30, 60, 50]));
+    let disp = fx.win.map.expect("drawn").disp;
+    let left = Pos2::new(disp.left() - 3.0, fx.at(0.0, 50.0).y);
+    let to = fx.at(30.0, 100.0);
+    fx.drv.drag(&mut fx.win, PointerButton::Primary, left, to);
+    assert_eq!(fx.rect(), Some([0, 50, 30, 50]), "from the left edge");
+    let right = Pos2::new(disp.right() + 3.0, fx.at(0.0, 80.0).y);
+    fx.drv.click(&mut fx.win, right);
+    assert_eq!(fx.rect(), None, "a click on the margin clears it");
+}
+
 /// The save the last input started has finished. A small save can finish within the passes
 /// that delivered the key or click, so "started" is the job running or its result already in.
 fn wait_for_save(fx: &mut Fixture) {

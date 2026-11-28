@@ -1,7 +1,8 @@
 //! X2-switch's question about the git panel before the switch to another machine (10 §7.4,
 //! Tensions "§7.4's 'an open dialog with its typed text' vs the git panel's dialogs"), as v2
-//! (X4-state) leaves it: a git dialog the state carries asks nothing; the planner's plan goes
-//! with the switch and asks first, as unsaved edits do — Switch · Cancel.
+//! (X4-state) and v3 (X4-state2, a history edit's own dialog) leave it: a git dialog the state
+//! carries asks nothing; the planner's plan goes with the switch and asks first, as unsaved edits
+//! do — Switch · Cancel.
 
 use super::s2::{small, Gx};
 use super::*;

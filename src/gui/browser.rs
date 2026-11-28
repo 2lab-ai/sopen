@@ -725,7 +725,7 @@ enum Ask {
     /// Unsaved edits in the viewer: `Save the changes to host:/abs before switching to HOST?`.
     Unsaved,
     /// The planner's plan, which goes with the switch and asks first as unsaved edits do, and
-    /// what is typed in a git dialog the state does not carry (10 §7.4, v2).
+    /// what of the git panels the state does not carry (10 §7.4).
     Git,
 }
 
@@ -2781,6 +2781,12 @@ impl Browser {
                 return;
             }
         }
+        // In a pass the right side's git panel may open a box in its draw (a choice in its menu, a
+        // right click, a key after Find's typing), the pass's paints are kept, and the panel
+        // blanks the left side, painted before it, under that box from them (F-menu-own,
+        // `git_panel::draw`). Not for a panel on the left, which the right side follows; most
+        // passes have none of these.
+        cells::keep(&ctx, self.git_may_open_on_the_right(&ctx));
         for (i, side) in cells::halves(grid.all()).into_iter().enumerate() {
             match self.shown.as_ref().map(|s| s[i].clone()) {
                 Some(view::Content::Preview(_)) => {
@@ -2800,6 +2806,7 @@ impl Browser {
                 _ => self.panel_cells(ui, i, &grid, side),
             }
         }
+        cells::keep(&ctx, false);
     }
 
     /// The status row: a running fetch with its progress, a listing, a running file operation
@@ -3083,12 +3090,13 @@ impl Browser {
         })
     }
 
-    /// What of the git panels the switch to `to` asks about first (10 §7.4, v2), as the
-    /// question says it: the plan of a planner on screen, which goes with the switch and asks
-    /// first as unsaved edits do; everything the state does not carry, in one sentence — a
-    /// panel's not on screen (its plan, its dialog), what is typed in a history edit's own dialog,
-    /// what is chosen in a restore's; and a given state's git panels still being put back, which a
-    /// switch now sends as they came.
+    /// What of the git panels the switch to `to` asks about first (10 §7.4), as the question says
+    /// it: the plan of a planner on screen, which goes with the switch and asks first as unsaved
+    /// edits do; everything the state does not carry, in one sentence — a panel's not on screen
+    /// (its plan, its dialog), what is chosen in a restore's, and of the dialogs that hold
+    /// something typed — one of a panel crosses, the one in front (a history edit's own too, from
+    /// v3) — each behind it, and the one in front when it is too long to carry; and a given
+    /// state's git panels still being put back, which a switch now sends as they came.
     fn git_dropped(&self, to: &str) -> Option<String> {
         // The panels the state carries, by the rule its parts go by (`git_carried`).
         let carried = self.git_carried();

@@ -29,10 +29,12 @@ changes: a folder still opens in a window.
   changes to … before switching to …?` — Save, Save As… (it switches once that has landed),
   Discard (the file opens there as stored, and the edits here are dropped once its window hands back — kept here if it never does) or Cancel; and the planner's
   plan asks first, saying it goes with the switch (Switch · Cancel). The git panel goes with it too
-  — its bar, marks, details pane, filters, Find's text, an action's dialog, the filters' or the
-  history search with what is typed in them — and the tree's bar and the folders opened or closed
-  in it, of the panels on screen; what is typed in a history edit's own dialog, what is chosen in a
-  restore's, and a plan or dialog of a panel not on screen do not cross, and the question says so.
+  — its bar, marks, details pane, filters, Find's text and one dialog with what is typed in it, the
+  one in front: an action's, a history edit's own (Reword's, Squash's, Author and date's, the
+  planner's message and author), the filters' or the history search — and the tree's bar and the
+  folders opened or closed in it, of the panels on screen; a dialog behind the one in front, one
+  too long to carry, what is chosen in a restore's, and a plan or dialog of a panel not on screen
+  do not cross, and the question names them.
   Every way the other side can end — sopen not installed there, a usage error from an older
   sopen, ssh not reaching it, a refused save — is one line on the status row, and the terminal
   lists again.

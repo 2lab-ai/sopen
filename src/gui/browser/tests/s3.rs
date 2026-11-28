@@ -3343,11 +3343,11 @@ fn f_git_listq_a_result_over_the_planners_question_takes_no_key_from_it() {
 // F-git-covered: F12's question before a switch is another dialog to the git panel's, as the
 // list's question and another panel's dialog are: what a git dialog paints under one is not what
 // the screen showed of it, and what the integration would open waits for it. The question comes up
-// over a git dialog when the switch's state does not carry what the dialog holds (10 §7.4, v2; the
+// over a git dialog when the switch's state does not carry what the dialog holds (10 §7.4, v3; the
 // rule is `GitView::untaken`, said by `Browser::git_dropped`) — what is chosen in a restore's
-// dialog, what is typed in a quick edit's, for two — and over the planner, whose plan goes with
-// the switch. A dialog the state carries, or a confirmation a run's end opens again, switches
-// with no question.
+// dialog, or what is typed in a dialog behind the one that crosses — and over the planner, whose
+// plan goes with the switch. A dialog the state carries (a quick edit's typing too, from v3), or
+// a confirmation a run's end opens again, switches with no question.
 
 /// The switch's question with `line` in it is up (its box wraps the line: the texts joined).
 fn the_switch_asks(g: &Gx, line: &str) {
@@ -3422,12 +3422,13 @@ fn f_git_covered_a_restore_under_the_switchs_question_runs_nothing() {
     );
 }
 
-/// F-git-covered: the twin with a quick edit's dialog — Reword of HEAD, its message typed — under
-/// F12's question, which asks first: what is typed in it is not carried. The same `[Esc, Enter]`
-/// runs nothing; once a printed pass showed it with the keyboard, Enter rewords.
+/// F-git-covered: the twin with a quick edit's dialog — the planner's run's confirmation (what is
+/// typed in Reword's crosses with the switch from v3, X4-state2, and asks nothing; the plan asks)
+/// — under F12's question, which asks first. The same `[Esc, Enter]` runs nothing; once a printed
+/// pass showed it with the keyboard, Enter runs the plan.
 #[test]
 fn f_git_covered_a_quick_edit_under_the_switchs_question_runs_nothing() {
-    use crate::git::rebase::{Edit, Quick};
+    use crate::git::rebase::Edit;
     let git = git_or_skip!();
     let repo = Repo::new(&git);
     for (k, name) in ["base", "A", "B"].into_iter().enumerate() {
@@ -3436,31 +3437,29 @@ fn f_git_covered_a_quick_edit_under_the_switchs_question_runs_nothing() {
     }
     let mut g = Gx::new(repo);
     g.ready_in_git();
-    g.bar_to("B");
-    g.f(Key::F2);
-    let reword = |g: &Gx| {
-        matches!(
-            g.view().edit_draft(),
-            Some(Edit::Quick(Quick::Reword { .. }))
-        )
-    };
+    g.bar_to("base");
+    g.cmd(Key::E);
+    g.idle(2);
+    g.until_quiet("the planner's range");
+    // B, the top row, dropped; then the run's confirmation.
+    g.fx.typed("d");
+    g.idle(2);
+    g.with(Key::Enter, Modifiers::COMMAND);
+    g.idle(2);
+    g.until_quiet("the run's plan");
+    let confirming = |g: &Gx| matches!(g.view().edit_draft(), Some(Edit::Plan(_)));
     assert!(
-        reword(&g),
-        "the reword's dialog: {:?}",
+        confirming(&g),
+        "the run's confirmation: {:?}",
         g.view().edit_draft()
     );
-    g.cmd(Key::A);
-    g.idle(1);
-    g.fx.typed("B, reworded");
-    g.idle(2);
-    g.until_quiet("the reword's plan");
     let head = g.repo.rev("HEAD");
     let subject = |g: &Gx| g.repo.run(&["log", "-1", "--format=%s"]).trim().to_string();
     assert_eq!(g.fx.b.before_switch("box"), Before::Held, "it asks first");
     g.idle(2);
     the_switch_asks(
         &g,
-        "What is typed in the history edit's dialog is not carried to box: switching drops it.",
+        "The planner's unsaved plan goes with the switch to box.",
     );
     let ctx = g.fx.drv.ctx.clone();
     g.fx.drv
@@ -3473,7 +3472,7 @@ fn f_git_covered_a_quick_edit_under_the_switchs_question_runs_nothing() {
     g.idle(2);
     g.until_quiet("anything the Enter ran");
     assert_eq!(
-        (g.repo.rev("HEAD"), reword(&g)),
+        (g.repo.rev("HEAD"), confirming(&g)),
         (head, true),
         "the Enter ran nothing ({})",
         g.status()
@@ -3481,10 +3480,10 @@ fn f_git_covered_a_quick_edit_under_the_switchs_question_runs_nothing() {
     g.fx.drv
         .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
     g.idle(2);
-    g.until_quiet("the reword's run");
+    g.until_quiet("the plan's run");
     assert_eq!(
         subject(&g),
-        "B, reworded",
+        "A",
         "the control: shown with the keyboard, its Enter runs ({})",
         g.status()
     );

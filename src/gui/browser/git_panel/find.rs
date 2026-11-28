@@ -290,16 +290,9 @@ pub(super) fn field(
         ctx.memory_mut(|m| m.surrender_focus(id));
     }
     let at = Placed::of(cells);
-    // The row's own rect under the field and the toggle, laid first so both stand over it: egui
-    // gives a click a few points off a widget to it when nothing is under the pointer, so a
-    // click on the blank before the toggle, or on `Find`, would turn the toggle.
-    if !cells.is_empty() {
-        ui.interact(
-            grid.rect(cells),
-            panel.with("sopen-git-find-row"),
-            Sense::CLICK,
-        );
-    }
+    // Nothing under the field and the toggle: a click reaches only the rect it falls in (the
+    // skin's `interact_radius` is 0; F-click-slop), so one on the blank before the toggle, or on
+    // `Find`, turns nothing.
     kit::field(ui, grid, at.field, id, &mut find.text, |e| {
         e.lock_focus(true)
     });

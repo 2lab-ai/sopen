@@ -396,8 +396,9 @@ pub(super) const PAINTS_CELLS: bool = true;
 /// `grid`. Only the rows on screen are drawn; the wheel scrolls them by `CELL.y`, the bar stays.
 /// Each row is an `interact` rect at its cells, its id the log's panel's ([`LogView::in_panel`]:
 /// two repositories' panels draw into one `ui`), sensing clicks alone (`Sense::CLICK`, never the
-/// keyboard's focus), over one more under them all (`backups::blank_clicks`): a click on a blank
-/// moves no bar; a click puts the bar on its entry, a double click on one entry shows it whole (the browser's
+/// keyboard's focus), and nothing under them: a click reaches only the rect it falls in (the
+/// skin's `interact_radius` is 0; F-click-slop), so a click on a blank moves no bar; a click puts
+/// the bar on its entry, a double click on one entry shows it whole (the browser's
 /// `second_click`, the pair the entry itself, in the log's panel, never its place: an entry logged
 /// between the two clicks moves the rows, and another repository's panel drawn where this one
 /// stood shows the same entries at the same cells). At no cells (a panel too short for its parts)
@@ -455,15 +456,9 @@ pub fn draw(
     let range = view.scroll.range(len);
     let shown = range.start..range.end.min(range.start + usize::from(list.height));
     let mut clicked = None;
-    // Under the rows, the log's cells, the frame's border either side and egui's reach below them
-    // (the frame's rule): a click on a blank of them moves no bar (egui gives a click a few points
-    // off a widget to it where nothing is under the pointer).
     // The log's panel's ids, never its column's: egui gives a release to the id it pressed, so
     // another repository's panel drawn where this one stood took a click pressed here (F-git-ids).
     let panel = view.panel;
-    let under = panel.with("sopen-git-log-under");
-    let blank = super::backups::blank_clicks(ui, grid, area);
-    ui.interact(blank, under, Sense::CLICK);
     for (n, k) in shown.enumerate() {
         let y = list.y + n as u16;
         let row = Cells::new(list.x, y, list.width, 1);

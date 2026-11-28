@@ -646,8 +646,7 @@ fn the_lists_wheel_and_clicks_go_by_cells() {
 }
 
 /// A click on a button asks for its action; one on the blank between two buttons, beside them or
-/// on the hint presses nothing (egui gives a click near a widget to it when nothing is under the
-/// pointer).
+/// on the hint presses nothing, nor does one two points above or below a button's cells.
 #[test]
 fn a_click_between_the_buttons_presses_nothing() {
     let mut fx = backups_fx(1000.0, 400.0, records());
@@ -1872,6 +1871,183 @@ fn another_context_has_shown_nothing_yet() {
     assert!(b.press(Key::Enter).is_empty(), "nothing on B's screen yet");
     let both = two_branches()[0].group.refs[..2].to_vec();
     assert_eq!(b.press(Key::Enter), [GitAction::ShowBackup(both)]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// F-click-slop: a click on a blank of a part, in the host alone and over the browser's
+// background.
+
+/// The browser's background under a host, as `Browser::panels_ui` lays it (`browser.rs:2754`):
+/// a focusable rect over everything the host draws, laid first, given egui's keyboard each pass
+/// it has not got it — what a click on a blank of a git panel falls on in the browser.
+pub(super) struct Behind<'a, W>(pub(super) &'a mut W);
+
+impl<W: Window> Window for Behind<'_, W> {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let id = egui::Id::unique("sopen-test-browser-background");
+        let back = ui.interact(ui.max_rect(), id, egui::Sense::click());
+        if ui.ctx().memory(|m| m.focused()) != Some(id) {
+            back.request_focus();
+        }
+        self.0.ui(ui);
+    }
+
+    fn ready(&self) -> bool {
+        self.0.ready()
+    }
+}
+
+/// A click at `at` in `win` — one pass's move, press and release, or three passes — past
+/// egui's double-click time since the last, and one pass after it.
+pub(super) fn click_once<W: Window>(
+    drv: &mut crate::gui::testkit::Driver,
+    win: &mut W,
+    at: Pos2,
+    one_pass: bool,
+) {
+    drv.idle(win, 30);
+    match one_pass {
+        true => drv.frame(win, click_events(at), Modifiers::NONE),
+        false => drv.click(win, at),
+    }
+    drv.idle(win, 1);
+}
+
+/// What a click may change in the fixture's panel: its cells, its dialog, which widget has egui's
+/// keyboard.
+fn panel_state(fx: &Fx) -> (Vec<Vec<Seen>>, bool, Option<egui::Id>) {
+    let focus = fx.drv.ctx.memory(|m| m.focused());
+    (panel(fx).seen(), fx.view().dialog_up(), focus)
+}
+
+/// Each of `points` (named) clicked in `fx`, alone or over the browser's background, as one pass
+/// and as three: the ones that changed the panel's cells, its dialog or egui's keyboard, or asked
+/// for anything.
+fn blank_clicks_changing(fx: &mut Fx, behind: bool, points: &[(&str, Pos2)]) -> Vec<String> {
+    let mut wrong = vec![];
+    for &(what, at) in points {
+        for one_pass in [true, false] {
+            let pass = |fx: &mut Fx| match behind {
+                true => fx.drv.idle(&mut Behind(&mut fx.host), 1),
+                false => fx.idle(),
+            };
+            pass(fx);
+            let before = panel_state(fx);
+            match behind {
+                true => click_once(&mut fx.drv, &mut Behind(&mut fx.host), at, one_pass),
+                false => click_once(&mut fx.drv, &mut fx.host, at, one_pass),
+            }
+            let asked = fx.take();
+            let after = panel_state(fx);
+            let how = if one_pass { "one pass" } else { "three passes" };
+            if after != before || !asked.is_empty() {
+                let (cells, dialog) = (after.0 != before.0, after.1 != before.1);
+                let keyboard = format!("{:?} → {:?}", before.2, after.2);
+                wrong.push(format!(
+                    "{what} ({how}, behind {behind}): cells {cells}, dialog {dialog}, keyboard \
+                     {keyboard}, asked {asked:?}"
+                ));
+            }
+        }
+    }
+    wrong
+}
+
+/// F-click-slop: with no rect of the list's under its parts, a click on a blank of the Backups
+/// list changes nothing — between two buttons, beside one, on the hint, a point above and below
+/// a button, on the frame's border beside a line, on a row with no line — no action, the same
+/// cells, the keyboard where it was, in a host alone and over the browser's background (egui's
+/// hit test reaches only the rect a click falls in: the background's in the browser, whose
+/// response only asks for the keyboard).
+#[test]
+fn a_click_on_a_blank_of_the_backups_list_changes_nothing() {
+    for behind in [false, true] {
+        let mut fx = backups_fx(1000.0, 400.0, records());
+        let g = grid_of(&fx);
+        let foot = foot_y(g.rows);
+        let cell_rect = |x: u16, y: u16| g.rect(Cells::new(x, y, 1, 1));
+        let (show, delete) = (button_x(&fx, "Show"), button_x(&fx, "Delete"));
+        let last = (FIRST_Y..foot)
+            .take_while(|&y| !text(&fx, y, 1, g.cols - 1).trim().is_empty())
+            .last()
+            .expect("a line");
+        assert!(last + 1 < foot - 1, "a row with no line under the last");
+        let points = [
+            (
+                "a point into the gap after Restore",
+                cell_rect(show - 2, foot).left_center() + Vec2::new(1.0, 0.0),
+            ),
+            ("the gap's last cell", cell_rect(show - 1, foot).center()),
+            (
+                "a point after Delete",
+                cell_rect(delete + 10, foot).left_center() + Vec2::new(1.0, 0.0),
+            ),
+            ("the hint", cell_rect(delete + 20, foot).center()),
+            (
+                "a point above Show",
+                cell_rect(show + 3, foot).center_top() - Vec2::new(0.0, 1.0),
+            ),
+            (
+                "a point under Show",
+                cell_rect(show + 3, foot).center_bottom() + Vec2::new(0.0, 1.0),
+            ),
+            (
+                "the left border",
+                cell_rect(1, FIRST_Y).left_center() - Vec2::new(1.0, 0.0),
+            ),
+            (
+                "the right border",
+                cell_rect(g.cols - 2, FIRST_Y).right_center() + Vec2::new(1.0, 0.0),
+            ),
+            (
+                "a point under the last line",
+                cell_rect(20, last).center_bottom() + Vec2::new(0.0, 1.0),
+            ),
+            ("a row with no line", cell_rect(20, last + 2).center()),
+        ];
+        let wrong = blank_clicks_changing(&mut fx, behind, &points);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert!(fx.view().backups().is_some(), "the list still open");
+    }
+}
+
+/// F-click-slop: as the Backups list's, a click on a blank of the command log changes nothing —
+/// on the frame's border beside an entry, a point under the last entry, a row with no entry.
+#[test]
+fn a_click_on_a_blank_of_the_log_changes_nothing() {
+    for behind in [false, true] {
+        let mut fx = log_fx(1000.0, 300.0, entries(3));
+        let g = grid_of(&fx);
+        let cell_rect = |x: u16, y: u16| g.rect(Cells::new(x, y, 1, 1));
+        let last = FIRST_Y + 2;
+        assert!(
+            !text(&fx, last, 1, g.cols - 1).trim().is_empty(),
+            "the last entry's row"
+        );
+        assert!(
+            text(&fx, last + 1, 1, g.cols - 1).trim().is_empty(),
+            "no entry under it"
+        );
+        let points = [
+            (
+                "the left border",
+                cell_rect(1, FIRST_Y).left_center() - Vec2::new(1.0, 0.0),
+            ),
+            (
+                "the right border",
+                cell_rect(g.cols - 2, FIRST_Y + 1).right_center() + Vec2::new(1.0, 0.0),
+            ),
+            (
+                "a point under the last entry",
+                cell_rect(20, last).center_bottom() + Vec2::new(0.0, 1.0),
+            ),
+            ("a row with no entry", cell_rect(20, last + 2).center()),
+        ];
+        let wrong = blank_clicks_changing(&mut fx, behind, &points);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        let log = fx.view().log.as_ref().expect("the log still open");
+        assert_eq!(LogView::whole(log), None, "no entry shown whole");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

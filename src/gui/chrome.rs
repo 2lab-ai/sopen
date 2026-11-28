@@ -487,7 +487,7 @@ pub fn visuals() -> egui::Visuals {
 }
 
 /// The skin's sizes on top of egui's: every text style at [`FONT_SIZE`], buttons one cell tall
-/// with half a cell between controls.
+/// with half a cell between controls, and a click only for the control under it.
 pub fn style(s: &mut egui::Style) {
     s.visuals = visuals();
     for font in s.text_styles.values_mut() {
@@ -497,6 +497,16 @@ pub fn style(s: &mut egui::Style) {
     s.spacing.button_padding = Vec2::new(2.0, 0.0);
     s.spacing.interact_size.y = CELL.y;
     s.spacing.slider_width = 60.0;
+    // egui's hit test gives a click that no widget holds to the nearest one up to this far off
+    // (5 points by default): on the 8×16 grid, into the next cell — a click a point into the
+    // blank beside a button pressed it, one on a list's border put the bar on that line, and in
+    // the terminal, whose click is its cell's centre four points from the cells left and right of
+    // it, one on the blank between two buttons pressed the one laid last (F-click-slop). In the
+    // window a click may fall anywhere in a cell, so any reach crosses into a neighbour: none. A
+    // click lands only on the control whose cells hold it, in the window and in `sopen --tui`
+    // alike (both take the skin through `install`); every control is whole cells, so the
+    // smallest — a scroll bar's ↑, a one-cell thumb — keeps its own cell.
+    s.interaction.interact_radius = 0.0;
 }
 
 /// Puts the skin into a window's context: the fonts, the dark theme whatever the system's, the
