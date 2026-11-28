@@ -2350,6 +2350,9 @@ impl Browser {
         let mut under = self.ops.covered(grid);
         under.extend(self.git_covered(grid, Some(i)));
         let view = &mut self.git.panels[i].view;
+        // The keyboard is the panel's as `git_keys` gives it: not while a dialog of the list's or
+        // the tree holds it, since Find takes its Enter and Esc in the pass itself (X4-find).
+        let active = active && !self.ops.holds_keyboard() && self.tree.is_none();
         let mut actions = git_panel::draw(ui, grid, cells, view, active, &under);
         if self.ops.holds_keyboard() || self.tree.is_some() {
             actions.clear();

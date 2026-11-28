@@ -614,6 +614,20 @@ pub(crate) fn find(
                 });
                 if let Some(row) = row {
                     events.remove(at);
+                    // The text the key typed goes with it — a Space's blank, the next event as
+                    // egui-winit and the terminal's translator send them — so no field or later
+                    // lookup reads it as typed (X4-find: a Space marked a row and typed a blank
+                    // into the Find a letter after it opened).
+                    // One character, as typed: `Key::from_name` reads names too (`Space`).
+                    let typed = |e: &Event| match e {
+                        Event::Text(t) if t.chars().count() == 1 => {
+                            egui::Key::from_name(t) == Some(key)
+                        }
+                        _ => false,
+                    };
+                    if events.get(at).is_some_and(typed) {
+                        events.remove(at);
+                    }
                     return Some(row.command);
                 }
             }
@@ -1323,6 +1337,39 @@ mod tests {
         let (got, left) = looked_up(List, vec![press(K::A, SHIFT), Event::Text("A".into())]);
         assert_eq!(got, [C::Jump('A')]);
         assert_eq!(left, vec![press(K::A, SHIFT)]);
+    }
+
+    /// A key a row takes takes the text it typed with it (X4-find): Space then `a` in one frame of
+    /// the git context marks the row and finds `a`, no blank left for a field — while a blank no
+    /// key typed, and a text the key did not type, stay theirs.
+    #[test]
+    fn a_key_taken_takes_its_typed_text() {
+        let all = |context: Context, mut events: Vec<Event>| {
+            let mut got = Vec::new();
+            while let Some(c) = find(&mut events, context, ALL_SLICES) {
+                got.push(c);
+            }
+            (got, events)
+        };
+        let space = vec![press(K::Space, NONE), Event::Text(" ".into())];
+        let mut frame = space.clone();
+        frame.push(Event::Text("a".into()));
+        let (got, left) = all(Git, frame);
+        assert_eq!(got, [C::Mark, C::FindWith('a')]);
+        assert!(left.is_empty(), "{left:?}");
+        // A blank alone (an input method's, a paste of keys) is no key's.
+        let (got, left) = all(Git, vec![Event::Text(" ".into())]);
+        assert_eq!((got, left), (vec![], vec![Event::Text(" ".into())]));
+        // A text after the key that the key did not type stays.
+        let (got, left) = all(Git, vec![press(K::Space, NONE), Event::Text("b".into())]);
+        assert_eq!(got, [C::Mark, C::FindWith('b')]);
+        assert!(left.is_empty());
+        let (got, left) = all(List, space);
+        assert_eq!(
+            (got, left),
+            (vec![C::Select], vec![]),
+            "the list's Space too"
+        );
     }
 
     /// The help screen's names, one text on every machine (10 T27): Cmd/Ctrl as `Ctrl/⌘`, the

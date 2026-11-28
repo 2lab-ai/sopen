@@ -730,12 +730,11 @@ fn rows_with_subject(subject: &str) -> Vec<Row> {
     super::tests::rows_of(commits, true)
 }
 
-/// A part egui still draws (Find's field) has its cells left to `term::compose` — no glyph, no
-/// colour — so a terminal shows a hand-off box exactly there, inside the frame; the graph, the
-/// rules and the foot stay cells. The details pane and the banner are cells since X4-pane: no box
-/// where the pane is, and the banner over Find's row is cells, Find's row alone a box.
+/// Every part of the git panel is cells (the details pane and the banner since X4-pane, Find's
+/// field since X4-find): the composed terminal shows no hand-off box inside the frame, the pane
+/// open or the banner over Find's row; the graph, the rules and the foot stay cells.
 #[test]
-fn a_part_egui_draws_is_a_box_inside_the_frame() {
+fn every_part_of_the_panel_is_cells_with_no_box() {
     let mut fx = Fx::new(1000.0, 600.0, fixture_view());
     let g = grid_of(&fx);
     let compose = |fx: &Fx| {
@@ -766,7 +765,7 @@ fn a_part_egui_draws_is_a_box_inside_the_frame() {
     assert_eq!(boxes, Vec::<Cells>::new(), "no box where the pane is");
     fx.press(Key::Escape);
     fx.press(Key::Escape);
-    // Find's field under the banner: a box of its row alone, the banner cells.
+    // The banner above Find's field: both cells, no box.
     fx.view_mut().banner = Some(in_progress::BannerView::new("rebase in progress", vec![]));
     fx.typed("x");
     assert!(fx.view().find_text().is_some());
@@ -774,8 +773,8 @@ fn a_part_egui_draws_is_a_box_inside_the_frame() {
     let boxes: Vec<Cells> = compose(&fx).into_iter().filter(|r| r.y < g.rows).collect();
     assert_eq!(
         boxes,
-        [Cells::new(1, 1 + rows, g.cols - 2, 1)],
-        "Find: one box of its row"
+        Vec::<Cells>::new(),
+        "the banner and Find's row are cells"
     );
     assert!(line(&fx, 1).contains("rebase in progress"), "the banner");
     assert!(

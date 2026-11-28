@@ -2591,11 +2591,14 @@ fn a_repaint_asked_for_ages_away_is_no_deadline() {
     assert_eq!(*b.asked.lock().unwrap(), None);
 }
 
-/// The terminal's input on a pty this test owns: quiet, then ready with a key, then — the
-/// terminal's side closed, as a hang-up — an error at once, never a wait or a spin (crossterm's
-/// own reader loops on a hung-up terminal's empty reads without returning).
-#[test]
-fn a_terminal_that_hung_up_is_an_error_at_once() {
+/// A pty of the test's own, `(master, slave)`, both ends close-on-exec: a child another test
+/// thread spawns afterwards does not inherit them. One that held the master would hold the
+/// terminal's side open, and so a hang-up off, until it exits (the 1 s watchdog child of
+/// `a_window_receipt_that_stalls_after_its_dump_ends_at_the_deadline`). This narrows the leak, it
+/// does not end it: a child spawned from openpty's open of the master through the `fcntl` here
+/// inherits both ends, and a forked one (a `pre_exec`) holds every descriptor, close-on-exec ones
+/// included, until its exec.
+fn pty() -> (libc::c_int, libc::c_int) {
     let (mut master, mut slave) = (-1, -1);
     // SAFETY: two out-pointers to live ints; no name, termios or size asked for.
     let made = unsafe {
@@ -2607,7 +2610,26 @@ fn a_terminal_that_hung_up_is_an_error_at_once() {
             std::ptr::null_mut(),
         )
     };
-    assert_eq!(made, 0, "openpty");
+    assert_eq!(made, 0, "openpty: {}", io::Error::last_os_error());
+    for fd in [master, slave] {
+        // SAFETY: fcntl on a descriptor openpty just returned.
+        let set = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        assert_ne!(set, -1, "FD_CLOEXEC: {}", io::Error::last_os_error());
+    }
+    (master, slave)
+}
+
+/// The terminal's input on a pty this test owns: quiet, then ready with a key, then — the
+/// terminal's side closed, as a hang-up — an error at once, never a wait or a spin (crossterm's
+/// own reader loops on a hung-up terminal's empty reads without returning). At once is under
+/// half the wait (a minute's wait, so under 30 s): waiting it out takes the whole minute. The
+/// slack mitigates [`pty`]'s leak, it does not remove it: a child of another test that holds the
+/// master — inherited in the window from openpty's open through the `fcntl`, or forked and not
+/// yet at its exec — delays the hang-up until it exits or execs, which the bound covers within
+/// 30 s.
+#[test]
+fn a_terminal_that_hung_up_is_an_error_at_once() {
+    let (master, slave) = pty();
     let quiet = wait_input(slave, Duration::from_millis(50)).unwrap();
     assert_eq!(quiet, Input::Quiet);
     // SAFETY: writes from a live buffer to the master this test opened (a line: the pty reads
@@ -2622,8 +2644,10 @@ fn a_terminal_that_hung_up_is_an_error_at_once() {
     unsafe { libc::read(slave, byte.as_mut_ptr().cast(), byte.len()) };
     // SAFETY: closes the master this test opened: the terminal's side is gone.
     unsafe { libc::close(master) };
+    let wait = Duration::from_secs(60);
     let at = Instant::now();
-    let gone = wait_input(slave, Duration::from_secs(5));
+    let gone = wait_input(slave, wait);
+    let took = at.elapsed();
     // SAFETY: closes the slave this test opened.
     unsafe { libc::close(slave) };
     assert!(
@@ -2631,11 +2655,7 @@ fn a_terminal_that_hung_up_is_an_error_at_once() {
             .is_err_and(|e| e.kind() == io::ErrorKind::BrokenPipe),
         "{gone:?}"
     );
-    assert!(
-        at.elapsed() < Duration::from_secs(1),
-        "at once: {:?}",
-        at.elapsed()
-    );
+    assert!(took < wait / 2, "at once: {took:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3191,18 +3211,7 @@ fn ts6_the_probe_reads_where_the_cursor_stands_after_a_box_line() {
         ),
     ];
     for (answer, wide) in cases {
-        let (mut master, mut slave) = (-1, -1);
-        // SAFETY: two out-pointers to live ints; no name, termios or size asked for.
-        let made = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(made, 0, "openpty");
+        let (master, slave) = pty();
         // SAFETY: the slave this test opened; a zeroed termios is overwritten by tcgetattr.
         unsafe {
             let mut t: libc::termios = std::mem::zeroed();
@@ -3917,18 +3926,7 @@ fn ts6_a_names_glyphs_stay_as_written_and_a_short_run_shows_the_cut() {
 /// come in the same round trip.
 #[test]
 fn ts6_the_probe_takes_the_last_report_before_the_attributes() {
-    let (mut master, mut slave) = (-1, -1);
-    // SAFETY: two out-pointers to live ints; no name, termios or size asked for.
-    let made = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    assert_eq!(made, 0, "openpty");
+    let (master, slave) = pty();
     // SAFETY: the slave this test opened; a zeroed termios is overwritten by tcgetattr.
     unsafe {
         let mut t: libc::termios = std::mem::zeroed();
@@ -4137,18 +4135,7 @@ fn a_window_receipt_that_stalls_after_its_dump_ends_at_the_deadline() {
 /// first, then the report and the kitty flags, in one read, is still read whole.
 #[test]
 fn ts6_the_probe_reads_the_answers_after_the_attributes_in_the_same_read() {
-    let (mut master, mut slave) = (-1, -1);
-    // SAFETY: two out-pointers to live ints; no name, termios or size asked for.
-    let made = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    assert_eq!(made, 0, "openpty");
+    let (master, slave) = pty();
     // SAFETY: the slave this test opened; a zeroed termios is overwritten by tcgetattr.
     unsafe {
         let mut t: libc::termios = std::mem::zeroed();
