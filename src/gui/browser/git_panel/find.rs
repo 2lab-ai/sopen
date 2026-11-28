@@ -79,6 +79,17 @@ impl Find {
         }
     }
 
+    /// Find opened with `text` and `case` as a switch carried them (10 §7.4), the bar on row
+    /// `origin`: its matches made for them, so the bar stays where it is.
+    pub fn given(text: String, case: bool, origin: usize) -> Find {
+        let matched = Some((text.clone(), case));
+        Find {
+            case,
+            matched,
+            ..Find::new(text, origin)
+        }
+    }
+
     /// The rows or their labels were replaced (a load, a refresh, a filter): match them again —
     /// not a change of the text, so the bar stays where it is (03 §5).
     pub fn reset(&mut self) {
@@ -557,6 +568,18 @@ impl SearchQuery {
 }
 
 impl SearchDialog {
+    /// The dialog over `query` as a switch carried it (10 §7.4), opened afresh: each field's caret
+    /// at its end, nothing to undo, nothing of it on screen yet.
+    pub fn given(ctx: &egui::Context, query: SearchQuery) -> SearchDialog {
+        for (k, text) in query.texts().into_iter().enumerate() {
+            super::planner::fresh_line(ctx, search_field_id(k), text);
+        }
+        SearchDialog {
+            query,
+            ..SearchDialog::default()
+        }
+    }
+
     /// The box on `grid` as the dialog stands: [`TOO_SMALL`] first while a filled field has no
     /// cells, Search off then; the fields under labels padded to the widest, so they line up,
     /// where a field still keeps [`SEARCH_FIELD_FEWEST`] cells after them; the note cut to one

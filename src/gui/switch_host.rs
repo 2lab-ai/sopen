@@ -64,14 +64,22 @@ pub struct Sent(SwitchState);
 
 /// The state on the first line of `input` (the other side writes it, then holds the input open):
 /// `Err` with the line that says why it is refused — a newer `v` with §7.4's, no line, one that
-/// does not read — before anything is opened (10 §7.3: a usage error, exit 2).
+/// does not read, one past the bound the other way's cue has (`forward::STATE_LINE_MAX`, 64 MiB:
+/// read no further) — before anything is opened (10 §7.3: a usage error, exit 2).
 pub fn read_state(input: &mut impl BufRead) -> Result<Sent, String> {
+    let max = crate::forward::STATE_LINE_MAX;
     let mut line = String::new();
-    let read = input
+    let read = (input.by_ref().take(max as u64 + 1))
         .read_line(&mut line)
         .map_err(|e| format!("cannot read the switch's state: {e}"))?;
     if read == 0 {
         return Err("the input ended before the switch's state".to_string());
+    }
+    if read > max {
+        return Err(format!(
+            "{SENDER} sent a switch state too long to read (over {} MiB)",
+            max >> 20
+        ));
     }
     let line = line.strip_suffix('\n').unwrap_or(&line);
     let line = line.strip_suffix('\r').unwrap_or(line);
@@ -683,9 +691,19 @@ pub(crate) fn run_on(
         )
     })?;
     match handed.take() {
-        Some(state) => cues
-            .borrow_mut()
-            .say(&format!("{STATE_CUE} {}", state.line())),
+        // What the other side would refuse is left out, said, and the rest handed back: a state
+        // it cannot read would lose all of it (X4-state's review).
+        Some(state) => {
+            // The line's budget: the terminal's bound on a state's cue, the cue and its blank
+            // taken off (`forward::STATE_LINE_MAX`).
+            let budget = crate::forward::STATE_LINE_MAX - STATE_CUE.len() - 1;
+            let state = state.fit(budget);
+            for line in &state.said {
+                eprintln!("sopen: {line}");
+            }
+            cues.borrow_mut()
+                .say(&format!("{STATE_CUE} {}", state.line()))
+        }
         // Closed for the input's end — while hidden eframe closes it unasked: let go here.
         None if !scripted && watched.ended() => cues.borrow_mut().let_go(),
         None => {}

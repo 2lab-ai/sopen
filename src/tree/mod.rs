@@ -1060,6 +1060,46 @@ impl Tree {
         }
     }
 
+    /// The folders the owner opened (`true`) or closed with → and ←, by path, sorted: what a
+    /// switch carries (10 §7.4, v2).
+    pub fn touched(&self) -> Vec<(String, bool)> {
+        let nodes = self.ids.values().map(|&k| &self.nodes[k]);
+        let mut out: Vec<_> = (nodes.filter(|n| n.touched))
+            .map(|n| (n.path.clone(), n.open))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The folders `wanted` (each a path and whether it opens) opened or closed as → or ← would,
+    /// once a listing has brought them: for each, whether it was (a switch's state put back, v2).
+    /// Found through one map of the tree's paths, the listings asked for at once.
+    pub fn touch(&mut self, wanted: &[(&str, bool)]) -> Vec<bool> {
+        let slots: Vec<Option<usize>> = {
+            let by_path: HashMap<&str, usize> = (self.ids.values())
+                .map(|&k| (self.nodes[k].path.as_str(), k))
+                .collect();
+            (wanted.iter())
+                .map(|(p, _)| by_path.get(p).copied())
+                .collect()
+        };
+        for (&slot, &(_, open)) in slots.iter().zip(wanted) {
+            let Some(i) = slot else {
+                continue;
+            };
+            let n = &mut self.nodes[i];
+            let opens = open && !n.open && !n.link;
+            (n.open, n.touched) = (open && !n.link, true);
+            if opens && !n.digest.as_ref().is_some_and(|d| d.complete) {
+                self.list_with(i, 0, true);
+            }
+        }
+        if slots.iter().any(Option::is_some) {
+            self.pump();
+        }
+        slots.iter().map(Option::is_some).collect()
+    }
+
     /// Whether the chain `head..=end` holds `node`.
     fn chain_holds(&self, head: usize, end: usize, node: usize) -> bool {
         let mut at = head;

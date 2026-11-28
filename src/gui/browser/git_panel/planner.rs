@@ -332,7 +332,7 @@ impl AuthorForm {
 
 /// The one-line field `id` opened afresh — nothing selected, nothing to undo — its caret at the
 /// end of `text`, as egui puts a new field's (every field opens afresh, X4-dialogs2).
-fn fresh_line(ctx: &egui::Context, id: egui::Id, text: &str) {
+pub(super) fn fresh_line(ctx: &egui::Context, id: egui::Id, text: &str) {
     use egui::text::{CCursor, CCursorRange};
     let mut state = egui::text_edit::TextEditState::default();
     let end = CCursor::new(text.chars().count());
@@ -1450,6 +1450,34 @@ impl PlannerView {
     /// once.
     pub fn take_shown(&mut self) -> Option<(Edit, Plan)> {
         self.shown.take()
+    }
+
+    /// One of its own dialogs with fields is open — the message, the author — whose typing a switch
+    /// does not carry (10 §7.4, v2).
+    pub fn typing(&self) -> bool {
+        matches!(
+            self.inner,
+            Some(Inner::Message { .. } | Inner::Author { .. })
+        )
+    }
+
+    /// A switch's plan given to the planner opened here on this host's range (10 §7.4, v2):
+    /// `change` makes it of the model read (`Err`: it does not fit, and the planner stays as
+    /// read), the bar on `bar`'s row, `--update-refs` only where this host's git offers it.
+    pub fn give(
+        &mut self,
+        change: impl FnOnce(&mut Model) -> Result<(), String>,
+        bar: Option<&Oid>,
+    ) -> Result<(), String> {
+        let mut model = self.model.clone();
+        change(&mut model)?;
+        model.update_refs &= self.repo.version.at_least(2, 38);
+        self.model = model;
+        let at = bar.and_then(|b| (self.model.rows.iter()).position(|r| r.commit.row.oid == *b));
+        if let Some(k) = at {
+            self.scroll.to(k);
+        }
+        Ok(())
     }
 
     /// The pane's note: the last op's refusal, or what a key does.

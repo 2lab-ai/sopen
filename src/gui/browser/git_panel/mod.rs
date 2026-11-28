@@ -41,6 +41,7 @@ mod lanes;
 mod log_view;
 mod menu;
 mod planner;
+mod state;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -2725,8 +2726,8 @@ impl GitView {
         self.dialog.as_ref()?.plan_first_button()
     }
 
-    /// The planner's model as its keys have made it, while it is open (tests).
-    #[cfg_attr(not(test), allow(dead_code))] // Only the tests use it.
+    /// The planner's model as its keys have made it, while it is open: what the switch's
+    /// question asks about (`Browser::git_dropped`), and the tests'.
     pub fn planner_model(&self) -> Option<&Model> {
         self.planner.as_ref().map(|p| p.model())
     }

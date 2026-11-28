@@ -518,6 +518,21 @@ impl Dialog {
         dialog
     }
 
+    /// Its choices not applied yet and its type-to-filter text: what a switch carries (10 §7.4).
+    pub fn taken(&self) -> (&Filters, &str) {
+        (&self.filters, &self.typed)
+    }
+
+    /// A switch's choices and text given to it, opened afresh here: the list narrowed to them,
+    /// the field opened afresh (its caret at its end, nothing to undo), nothing of it on screen.
+    pub fn give(&mut self, ctx: &egui::Context, filters: Filters, typed: String) {
+        (self.filters, self.typed) = (filters, typed);
+        self.narrow();
+        self.rows = self.branch_rows();
+        (self.made, self.revision) = (self.made + 1, self.revision + 1);
+        super::planner::fresh_line(ctx, typed_id(), &self.typed);
+    }
+
     /// The branches the typed text leaves, worked out again only when it changed: whether they
     /// changed.
     fn narrow(&mut self) -> bool {

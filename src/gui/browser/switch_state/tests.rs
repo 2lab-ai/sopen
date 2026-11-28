@@ -148,11 +148,11 @@ fn root() -> (tempfile::TempDir, String) {
     (tmp, root.to_str().unwrap().to_string())
 }
 
-/// The state through its line: one line, `"v":1` first, read back as it was.
-fn through_the_line(state: &SwitchState) -> SwitchState {
+/// The state through its line: one line, `"v":2` first, read back as it was.
+pub(crate) fn through_the_line(state: &SwitchState) -> SwitchState {
     let line = state.line();
     assert!(!line.contains('\n'), "one line: {line}");
-    assert!(line.starts_with(r#"{"v":1,"#), "{line}");
+    assert!(line.starts_with(r#"{"v":2,"#), "{line}");
     let read = read(&line, "HOST").expect("its own line reads");
     assert_eq!(&read, state, "{line}");
     read
@@ -423,7 +423,15 @@ fn rooted_tree(b: &mut Browser, home: &str) -> TreePool {
     let p = pool.clone();
     let connect: crate::gui::browser::TreeConnect =
         Arc::new(move |_| Ok((LocalFs::tree_with(disk.clone(), p.clone()), None)));
-    b.set_tree_connect(connect, "switch-state-tree");
+    // The tree's cache keeps a host's home: a label of the home's own, so two tests rooted at
+    // two homes never take each other's (`tree::cache::home`).
+    let label = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        home.hash(&mut h);
+        format!("switch-state-tree-{:08x}", h.finish() as u32)
+    };
+    b.set_tree_connect(connect, &label);
     b.whole_sizes = true;
     TreePool(pool)
 }
@@ -449,8 +457,9 @@ fn the_keyboard_in_the_git_panel_crosses() {
 }
 
 /// A v1 line without its optional fields, and with a field this sopen does not know (ignored,
-/// §7.4), reads with their defaults; `"v": 2` is refused with §7.4's line, naming who sent it,
-/// and `"v": 0` — no sopen wrote one: v1 is the first — with its own.
+/// §7.4), reads with their defaults — v2's among them — as a v2 state; `"v": 3` is refused with
+/// §7.4's line, naming who sent it, and `"v": 0` — no sopen wrote one: v1 is the first — with
+/// its own.
 #[test]
 fn a_sparse_line_reads_and_other_versions_are_refused() {
     let line = r#"{"v":1,"panels":[{"folder":"/a"},{"folder":"/b","bar":"x"}],"later":[1,2]}"#;
@@ -466,7 +475,7 @@ fn a_sparse_line_reads_and_other_versions_are_refused() {
     assert_eq!(
         state,
         SwitchState {
-            v: 1,
+            v: 2,
             host: None,
             mode: Mode::Preview,
             active: 0,
@@ -474,11 +483,14 @@ fn a_sparse_line_reads_and_other_versions_are_refused() {
             git_focus: false,
             dialog: None,
             viewer: None,
+            tree: None,
+            git: Vec::new(),
+            said: Vec::new(),
         }
     );
     assert_eq!(
-        read(r#"{"v":2,"panels":"a later shape"}"#, "laptop"),
-        Err("laptop sent switch state v2; this sopen reads up to v1 — update one of them".into())
+        read(r#"{"v":3,"panels":"a later shape"}"#, "laptop"),
+        Err("laptop sent switch state v3; this sopen reads up to v2 — update one of them".into())
     );
     let zero = r#"{"v":0,"panels":[{"folder":"/a"},{"folder":"/b"}]}"#;
     assert_eq!(
@@ -506,7 +518,7 @@ fn paths_are_rewritten_out_and_back_by_the_callers_map() {
         pin: pin.map(str::to_string),
     };
     let here = SwitchState {
-        v: 1,
+        v: 2,
         host: None,
         mode: Mode::Dual,
         active: 1,
@@ -529,6 +541,9 @@ fn paths_are_rewritten_out_and_back_by_the_callers_map() {
             wrap: Some(true),
             revision: false,
         }),
+        tree: None,
+        git: Vec::new(),
+        said: Vec::new(),
     };
     let out_map = |source: &str| {
         crate::forward::source_for("laptop", source, Some("mac.local"), |p| Ok(p.to_string()))
@@ -955,4 +970,499 @@ fn the_pass_a_dialog_reopens_in_confirms_nothing() {
             );
         }
     }
+}
+
+/// v2 (X4-state): the tree with a folder the owner opened (→ on `wide`, whose six subfolders keep
+/// it closed by itself, 05 §5) and one the owner closed (← on `nest`, which opened by itself), the
+/// bar on `wide`: the tree given opens and closes them so — without them its folders are as 05 §5
+/// leaves them — the bar on the same folder, the same cells.
+#[test]
+fn the_trees_opened_and_closed_folders_and_its_bar_cross() {
+    let (_tmp, root) = root();
+    for inner in ["one", "two"] {
+        std::fs::create_dir_all(format!("{root}/nest/{inner}")).unwrap();
+    }
+    for n in 0..6 {
+        std::fs::create_dir_all(format!("{root}/wide/w{n}")).unwrap();
+    }
+    let mut a = Side::new(&root, None);
+    let _pa = rooted_tree(&mut a.b, &root);
+    a.settle();
+    a.key(Key::F10);
+    a.settle();
+    let names = |s: &Side| -> Vec<String> {
+        let t = s.b.tree.as_ref().expect("the tree");
+        t.view.rows.iter().map(|r| r.name.clone()).collect()
+    };
+    let shown = names(&a);
+    assert!(
+        shown.contains(&"one".to_string()),
+        "nest opened by itself: {shown:?}"
+    );
+    assert!(!shown.contains(&"w0".to_string()), "wide closed: {shown:?}");
+    let to = |s: &mut Side, name: &str| {
+        let t = s.b.tree.as_mut().unwrap();
+        let at = t.view.rows.iter().position(|r| r.name == name).unwrap();
+        t.view.bar = at;
+    };
+    to(&mut a, "nest");
+    a.key(Key::ArrowLeft);
+    a.settle();
+    to(&mut a, "wide");
+    a.key(Key::ArrowRight);
+    a.settle();
+    let shown = names(&a);
+    assert!(shown.contains(&"w0".to_string()) && !shown.contains(&"one".to_string()));
+    let before = a.cells();
+    let state = a.take();
+    let tree = state.tree.clone().expect("the tree's part");
+    assert_eq!(tree.bar, Some(format!("{root}/wide")));
+    assert_eq!(
+        tree.folders,
+        [
+            TreeFolder {
+                path: format!("{root}/nest"),
+                open: false
+            },
+            TreeFolder {
+                path: format!("{root}/wide"),
+                open: true
+            },
+        ]
+    );
+    let mut b = Side::new(&root, None);
+    let _pb = rooted_tree(&mut b.b, &root);
+    b.b.give_state(through_the_line(&state)).unwrap();
+    b.settle();
+    // `wide`, open from the start here, shows the size the tree's cache holds (`~`, and its
+    // colour), as a folder opened before its scan does; the owner opened it after its scan. The
+    // rows otherwise the same.
+    let text = |receipt: &str| rows(receipt).replace('~', " ");
+    same_screen(&text(&before), &text(&b.cells()));
+    assert_eq!(b.take(), state);
+}
+
+/// v2: what comes over ssh is checked where it comes in — a commit that is not a full id, an
+/// action, a verb, an order or a committer date sopen has not, a tree folder or a repository that
+/// is not absolute, one repository's part twice, two parts with a dialog or a plan open (one git
+/// dialog at a time) — and a v1 line with none of v2's fields reads with their defaults.
+#[test]
+fn v2s_parts_are_checked_where_they_come_in() {
+    let panels = r#""panels":[{"folder":"/a"},{"folder":"/b"}]"#;
+    let git = |part: &str| format!(r#"{{"v":2,{panels},"git":[{{"top":"/a",{part}}}]}}"#);
+    let id = "0123456789".repeat(4);
+    let row = |verb: &str, author: &str| {
+        format!(r#"{{"commit":"{id}","verb":"{verb}","message":null,"author":{author}}}"#)
+    };
+    let plan = |row: String| {
+        git(&format!(
+            r#""plan":{{"base":null,"rows":[{row}],"autostash":false,"update_refs":false,"bar":null}}"#
+        ))
+    };
+    let author =
+        r#"{"name":"A","email":"a@b","seconds":1,"offset_minutes":0,"committer":"tomorrow"}"#;
+    let search = r#""dialog":{"search":{"fields":["","","","","",""],"case":false}}"#;
+    for bad in [
+        git(r#""bar":{"commit":"HEAD~1"}"#),
+        git(r#""marks":[{"stash":"--output=x"}]"#),
+        git(r#""details":{"subject":{"row":{"commit":"abc"}},"keyboard":true}"#),
+        git(r#""dialog":{"action":{"id":"rm-rf","on":"repository","texts":[],"choices":[]}}"#),
+        plan(row("exec", "null")),
+        plan(row("pick", author)),
+        git(
+            r#""filters":{"branches":null,"hidden_remotes":[],"tags":true,"stashes":true,"first_parent":false,"order":"newest","reflog":false}"#,
+        ),
+        format!(r#"{{"v":2,{panels},"git":[{{"top":"repo"}}]}}"#),
+        format!(r#"{{"v":2,{panels},"git":[{{"top":"/a"}},{{"top":"/a"}}]}}"#),
+        format!(r#"{{"v":2,{panels},"git":[{{"top":"/a",{search}}},{{"top":"/b",{search}}}]}}"#),
+        format!(r#"{{"v":2,{panels},"tree":{{"bar":"wide","folders":[]}}}}"#),
+        format!(
+            r#"{{"v":2,{panels},"tree":{{"folders":[{{"path":"/a/ok","open":true}},{{"path":"rel","open":false}}]}}}}"#
+        ),
+    ] {
+        assert!(read(&bad, "HOST").is_err(), "{bad}");
+    }
+    assert!(read(&plan(row("squash", "null")), "HOST").is_ok());
+    // A commit id is 40 or 64 lowercase hex digits, nothing else (`Oid::parse`).
+    let hex = "0123456789abcdef".repeat(5);
+    let bar = |c: &str| git(&format!(r#""bar":{{"commit":"{c}"}}"#));
+    for c in [
+        &hex[..39],
+        &hex[..41],
+        &hex[..63],
+        &hex[..65],
+        &hex[..40].to_uppercase(),
+    ] {
+        assert!(read(&bar(c), "HOST").is_err(), "{c}");
+    }
+    for c in [format!("{}\\n", &hex[..39]), format!("{}g", &hex[..39])] {
+        assert!(read(&bar(&c), "HOST").is_err(), "{c}");
+    }
+    for c in [&hex[..40], &hex[..64]] {
+        assert!(read(&bar(c), "HOST").is_ok(), "{c}");
+    }
+    // A plan is the planner's pane, not a dialog: one panel's plan and dialog, two panels' plans.
+    let both = format!(
+        r#"{{"v":2,{panels},"git":[{{"top":"/a",{search},"plan":{{"base":null,"rows":[],"autostash":false,"update_refs":false,"bar":null}}}},{{"top":"/b","plan":{{"base":null,"rows":[],"autostash":false,"update_refs":false,"bar":null}}}}]}}"#
+    );
+    assert!(read(&both, "HOST").is_ok(), "{both}");
+    let v1 = read(&format!(r#"{{"v":1,{panels}}}"#), "HOST").expect("a v1 line");
+    assert_eq!((v1.v, v1.tree, v1.git), (2, None, Vec::new()));
+    // A v2 tree without its later fields: their defaults.
+    let tree = read(
+        &format!(r#"{{"v":2,{panels},"tree":{{"bar":"/a/x","folders":[]}}}}"#),
+        "HOST",
+    );
+    let tree = tree.expect("a v2 tree").tree.expect("its tree");
+    assert_eq!(
+        (tree.bar.as_deref(), tree.hidden, tree.at),
+        (Some("/a/x"), false, 0)
+    );
+}
+
+/// A list past its bound is refused while the line is parsed, under the line's own 64 MiB and
+/// with the bound's line — no list of it built whole first (`capped`).
+#[test]
+fn a_list_past_its_bound_is_refused_as_it_is_read() {
+    let marks = vec![r#""uncommitted""#; 10_001].join(",");
+    let line = format!(
+        r#"{{"v":2,"panels":[{{"folder":"/a"}},{{"folder":"/b"}}],"git":[{{"top":"/a","marks":[{marks}]}}]}}"#
+    );
+    let refused = read(&line, "HOST").unwrap_err();
+    assert!(
+        refused.contains("more than the 10000 marks a state holds"),
+        "{refused}"
+    );
+    let names = vec![r#""n""#; 1_000_001].join(",");
+    let line =
+        format!(r#"{{"v":1,"panels":[{{"folder":"/a","selected":[{names}]}},{{"folder":"/b"}}]}}"#);
+    assert!(line.len() < 8 << 20, "well under the line's bound");
+    let refused = read(&line, "HOST").unwrap_err();
+    assert!(
+        refused.contains("more than the 1000000 entries a state holds"),
+        "{refused}"
+    );
+}
+
+/// v2's bounds (`bound`): one past each is refused where the line comes in — marks, a text, a
+/// name, plan rows, tree folders, three git panels.
+#[test]
+fn v2s_bounds_are_held_where_the_line_comes_in() {
+    let base = line(r#"{"v":2,"panels":[{"folder":"/a"},{"folder":"/b"}],"git":[{"top":"/a"}]}"#);
+    let refused = |state: &SwitchState| read(&state.line(), "HOST").is_err();
+    let id = || GitRow::Commit("0123456789".repeat(4));
+    let mut marks = base.clone();
+    marks.git[0].marks = vec![id(); 10_000];
+    assert!(!refused(&marks), "ten thousand marks");
+    marks.git[0].marks.push(id());
+    assert!(refused(&marks), "one more");
+    let mut find = base.clone();
+    let text = "x".repeat(8 << 20);
+    find.git[0].find = Some(GitFind { text, case: false });
+    assert!(!refused(&find), "8 MiB of Find");
+    find.git[0].find.as_mut().unwrap().text.push('x');
+    assert!(refused(&find), "a byte more");
+    let mut label = base.clone();
+    let on = GitTarget::Label(format!("refs/heads/{}", "n".repeat(4096)));
+    label.git[0].dialog = Some(GitDialog::Action {
+        id: "rename".into(),
+        on,
+        texts: vec![],
+        choices: vec![],
+    });
+    assert!(refused(&label), "a refname past PATH_MAX");
+    let mut plan = base.clone();
+    let row = GitPlanRow {
+        commit: "0123456789".repeat(4),
+        verb: "pick".into(),
+        message: None,
+        author: None,
+    };
+    plan.git[0].plan = Some(GitPlan {
+        base: None,
+        rows: vec![row; 20_001],
+        autostash: false,
+        update_refs: false,
+        bar: None,
+    });
+    assert!(refused(&plan), "plan rows");
+    let mut tree = base.clone();
+    let folder = TreeFolder {
+        path: "/a/f".into(),
+        open: true,
+    };
+    tree.tree = Some(TreeState {
+        bar: None,
+        hidden: false,
+        at: 0,
+        folders: vec![folder; 100_001],
+    });
+    assert!(refused(&tree), "tree folders");
+    let mut three = base.clone();
+    three.git = ["/a", "/b", "/c"]
+        .map(|top| GitState {
+            top: top.into(),
+            ..base.git[0].clone()
+        })
+        .to_vec();
+    assert!(refused(&three), "a git panel a side at most");
+}
+
+/// The budget HOST's line is fit to: the terminal's bound on a state's cue, less the cue.
+fn budget() -> usize {
+    crate::forward::STATE_LINE_MAX - crate::gui::switch_host::STATE_CUE.len() - 1
+}
+
+/// HOST's own state made one the terminal reads (`fit`, X4-state's review): a part past a bound
+/// is left out and said in the state's own `said`, the rest kept; a second git dialog left out; a
+/// state within its bounds as it is.
+#[test]
+fn hosts_state_is_fit_before_it_goes_back() {
+    let base = line(
+        r#"{"v":2,"panels":[{"folder":"/a"},{"folder":"/b"}],"git":[{"top":"/a"},{"top":"/b"}]}"#,
+    );
+    assert_eq!(
+        base.clone().fit(budget()),
+        base,
+        "within its bounds: as it is"
+    );
+    let mut state = base.clone();
+    state.git[0].marks = vec![GitRow::Uncommitted; 10_001];
+    let search = || GitDialog::Search {
+        fields: Default::default(),
+        case: false,
+    };
+    state.git[1].dialog = Some(search());
+    state.tree = Some(TreeState {
+        bar: Some("relative".into()),
+        hidden: false,
+        at: 0,
+        folders: vec![],
+    });
+    let fit = state.fit(budget());
+    let said = &fit.said;
+    let tops: Vec<&str> = fit.git.iter().map(|g| g.top.as_str()).collect();
+    assert_eq!(tops, ["/b"], "{said:?}");
+    assert!(
+        fit.git[0].dialog.is_some() && fit.tree.is_none(),
+        "{said:?}"
+    );
+    assert_eq!(said.len(), 2, "{said:?}");
+    assert!(
+        said[1].starts_with("the git panel of /a is left out: "),
+        "{said:?}"
+    );
+    let back = read(&fit.line(), "HOST").expect("read");
+    assert_eq!(&back.said, said, "carried for the reader's status row");
+    let mut two = base.clone();
+    two.git[0].dialog = Some(search());
+    two.git[1].dialog = Some(search());
+    let fit = two.fit(budget());
+    assert!(
+        fit.git[0].dialog.is_some() && fit.git[1].dialog.is_none(),
+        "{:?}",
+        fit.said
+    );
+    assert!(read(&fit.line(), "HOST").is_ok());
+}
+
+/// The whole line within its budget (X4-state's fix-check): parts each within their bounds
+/// whose line together passes 64 MiB lose the plan first, then the dialog — said — and the line
+/// then fits and reads; so does one whose bytes fit but whose JSON, escaped, does not.
+#[test]
+fn hosts_line_is_fit_to_its_budget_whole() {
+    let mut state =
+        line(r#"{"v":2,"panels":[{"folder":"/a"},{"folder":"/b"}],"git":[{"top":"/a"}]}"#);
+    let row = GitPlanRow {
+        commit: "0123456789".repeat(4),
+        verb: "reword".into(),
+        message: Some("m".into()),
+        author: None,
+    };
+    state.git[0].plan = Some(GitPlan {
+        base: None,
+        rows: vec![row],
+        autostash: false,
+        update_refs: false,
+        bar: None,
+    });
+    let texts = (0..9)
+        .map(|field| GitText {
+            field,
+            text: "x".repeat(8 << 20),
+        })
+        .collect();
+    state.git[0].dialog = Some(GitDialog::Action {
+        id: "commit".into(),
+        on: GitTarget::Uncommitted,
+        texts,
+        choices: vec![],
+    });
+    assert!(state.check().is_ok(), "each part within its bounds");
+    let fit = state.fit(budget());
+    assert!(
+        fit.git[0].plan.is_none() && fit.git[0].dialog.is_none(),
+        "{:?}",
+        fit.said
+    );
+    assert_eq!(fit.said.len(), 2, "{:?}", fit.said);
+    assert!(
+        fit.said
+            .iter()
+            .all(|l| l.ends_with("the line would pass 64 MiB")),
+        "{:?}",
+        fit.said
+    );
+    assert!(fit.line().len() <= budget());
+    assert!(read(&fit.line(), "HOST").is_ok());
+
+    // 11 MiB of text, escaped to 66 MiB (`\u0001` a byte).
+    let mut escaped =
+        line(r#"{"v":2,"panels":[{"folder":"/a"},{"folder":"/b"}],"git":[{"top":"/a"}]}"#);
+    let control = |n: usize| "\u{1}".repeat(n);
+    escaped.git[0].find = Some(GitFind {
+        text: control(8 << 20),
+        case: false,
+    });
+    let filters = GitFilters {
+        branches: None,
+        hidden_remotes: vec![],
+        tags: true,
+        stashes: true,
+        first_parent: false,
+        order: GitOrder::Date,
+        reflog: false,
+    };
+    escaped.git[0].dialog = Some(GitDialog::Filters {
+        filters,
+        typed: control(3 << 20),
+    });
+    assert!(escaped.check().is_ok());
+    let fit = escaped.fit(budget());
+    assert!(
+        fit.git[0].dialog.is_none() && fit.git[0].find.is_some(),
+        "{:?}",
+        fit.said
+    );
+    assert!(fit.line().len() <= budget());
+}
+
+/// HOST reads the sender's line no further than the other way's bound (64 MiB): one longer is
+/// refused, before anything is opened.
+#[test]
+fn a_line_past_its_bound_is_refused_unread() {
+    let mut endless = std::io::BufReader::new(std::io::repeat(b'x'));
+    let refused = crate::gui::switch_host::read_state(&mut endless).err();
+    assert_eq!(
+        refused.as_deref(),
+        Some("the sender sent a switch state too long to read (over 64 MiB)")
+    );
+}
+
+/// A tree taller than the grid, the bar four rows up from the foot of the screen after the owner
+/// scrolled: the tree given puts it on the same folder, as far down the screen — the same cells.
+#[test]
+fn a_tall_trees_bar_keeps_its_place_on_screen() {
+    let (_tmp, root) = root();
+    for n in 0..40 {
+        std::fs::create_dir_all(format!("{root}/d{n:02}")).unwrap();
+    }
+    let mut a = Side::new(&root, None);
+    let _pa = rooted_tree(&mut a.b, &root);
+    a.settle();
+    a.key(Key::F10);
+    a.settle();
+    {
+        let t = a.b.tree.as_mut().unwrap();
+        t.view.bar = t.view.rows.iter().position(|r| r.name == "d30").unwrap();
+    }
+    a.key(Key::ArrowDown);
+    for _ in 0..4 {
+        a.key(Key::ArrowUp);
+    }
+    a.settle();
+    let before = a.cells();
+    let state = a.take();
+    let tree = state.tree.clone().unwrap();
+    assert!(tree.at > 0, "{tree:?}");
+    let t = a.b.tree.as_ref().unwrap();
+    assert!(t.view.top > 0, "scrolled");
+    let mut b = Side::new(&root, None);
+    let _pb = rooted_tree(&mut b.b, &root);
+    b.b.give_state(through_the_line(&state)).unwrap();
+    b.settle();
+    let text = |receipt: &str| rows(receipt).replace('~', " ");
+    same_screen(&text(&before), &text(&b.cells()));
+}
+
+/// The tree's bar on a folder's `· N hidden folders` row crosses on that row; a bar on a folder
+/// not here is said, the tree's own bar left where it is.
+#[test]
+fn the_trees_bar_on_a_hidden_row_crosses_and_a_gone_one_is_said() {
+    let (_tmp, root) = root();
+    std::fs::create_dir_all(format!("{root}/h/.secret")).unwrap();
+    std::fs::create_dir_all(format!("{root}/h/v")).unwrap();
+    let mut a = Side::new(&root, None);
+    let _pa = rooted_tree(&mut a.b, &root);
+    a.settle();
+    a.key(Key::F10);
+    a.settle();
+    {
+        let t = a.b.tree.as_mut().unwrap();
+        let at = t
+            .view
+            .rows
+            .iter()
+            .position(|r| r.name.starts_with("· 1 hidden"));
+        t.view.bar = at.expect("h's hidden row");
+    }
+    a.drv.idle(&mut a.b, 2);
+    let state = a.take();
+    let tree = state.tree.clone().unwrap();
+    assert_eq!(
+        (tree.bar.as_deref(), tree.hidden),
+        (Some(format!("{root}/h").as_str()), true)
+    );
+    let mut b = Side::new(&root, None);
+    let _pb = rooted_tree(&mut b.b, &root);
+    b.b.give_state(through_the_line(&state)).unwrap();
+    b.settle();
+    let bar =
+        b.b.tree
+            .as_ref()
+            .and_then(|t| t.view.bar_row())
+            .map(|r| r.name.clone());
+    assert_eq!(bar.as_deref(), Some("· 1 hidden folder"));
+
+    let mut gone = state.clone();
+    gone.tree.as_mut().unwrap().bar = Some(format!("{root}/gone"));
+    let mut c = Side::new(&root, None);
+    let _pc = rooted_tree(&mut c.b, &root);
+    c.b.give_state(through_the_line(&gone)).unwrap();
+    c.settle();
+    let said = c.b.status_line().text;
+    assert!(
+        said.contains(&format!(
+            "the tree's bar was on {root}/gone, which is not here"
+        )),
+        "{said}"
+    );
+}
+
+/// What the sender left out of its own state (`fit`'s lines, carried in the line) is said on the
+/// reader's status row once the state is back.
+#[test]
+fn what_the_sender_left_out_is_said_here() {
+    let (_tmp, root) = root();
+    let mut state = line(&format!(
+        r#"{{"v":2,"panels":[{{"folder":"{root}"}},{{"folder":"{root}"}}]}}"#
+    ));
+    state.said =
+        vec!["the git panel of /x: its plan is left out: the line would pass 64 MiB".into()];
+    let (b, _) = given(&root, None, through_the_line(&state));
+    let said = b.b.status_line().text;
+    assert!(
+        said.starts_with("the git panel of /x: its plan is left out"),
+        "{said}"
+    );
 }
