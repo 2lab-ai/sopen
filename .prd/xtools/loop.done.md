@@ -397,3 +397,63 @@ Eight PRs merged and shipped one by one, each prerelease installed on the Mac an
 | CH-update | ✅ done 2026-11-27 | Owner message 25: `sopen channel [stable|preview]` and `sopen update` (01 A18, §4b; #162) | coder |
 | WV-B | ✅ done 2026-11-27 | 09 §12: the Linux web engine (#163) | coder |
 | WV-E2 | ✅ done 2026-11-27 | 09 §12, owner message 26: the address window by default on every route (#164) | coder |
+
+## R1 (part 11) — the git panel in cells, closed 2026-11-28
+
+Thirteen PRs merged and shipped one by one, each prerelease installed on the Mac and the Linux host. With them every part of the git panel is drawn in cells in the window and in `sopen --tui`, except the planner's own dialogs (X4-planner2).
+
+- **X4-graph** (#166): the panel's frame and graph in cells, and every X4 unit's test file.
+- **X4-planner** (#168): the history planner's pane — rows, bar, scroll bar, note, buttons and keys' hint.
+- **X4-pane** (#170): the details pane and the in-progress banner; a click on a step's button is the step's key.
+- **X4-dialogs** (#171): the action dialog through the kit. What runs is what the screen showed: the TUI skips a pass while input waits, so every guard keeps the painting of the last pass that reached the screen (`cells::OnScreen`); a second move of the keyboard in one pass drops the Enters and Spaces after it.
+- **X4-find** (#173): Find's field with its `Aa` toggle and the history search.
+- **X4-lists** (#174): the command log, its entry shown whole, and the Backups list; a restore runs only from a list that was on screen.
+- **X4-menu** (#175): the menu (F10, Shift+F10, a right click) and the filters (Ctrl+K). One git dialog at a time across panels side by side: the keyboard follows the open dialog, and an integration's dialog waits in its channel.
+- **X4-dialogs2** (#177): every other action's form, the result dialog and "Stop git?" in cells; egui's action dialog is deleted. "Stop git?" asks about one run by its id and its Yes stops that run alone.
+- **X4-quick** (#178): the quick edits' dialogs — Reword, Squash, Author and date, the plan's confirmation. `OnScreen` now tags each painting with its frame and its context, so a dialog not drawn in the last printed frame counts as unseen; a click or a keyboard move ends an input method's composition.
+- **The Linux address window** (#167): its failures say their line once.
+- **CI** (#169): the build jobs' limit is 60 minutes; macOS runners took 8 to 21 minutes for the same suite in one day, and #168's check was cancelled four times at 30.
+- **Test fixes:** the hung-up terminal test no longer shares its pty with other tests' children (#172); a stand-in program written by a test is started through the busy retry, and the busy tests wait for a refusal (#176).
+- **Receipts** (Mac, `--here`, an empty `SOPEN_CONFIG`, a private tmux): the window's `SOPEN_CELLS` and `sopen --tui`'s are byte-identical for each X4 unit's screens, on fixtures with Hangul names and messages:
+  - the graph at 160×40 and a 90×30 side; the planner at 160×40;
+  - the pane at 160×40 and 100×30, the uncommitted row and an edit stop's banner;
+  - F7's Commit typed in Hangul, a restore's dialog, Fetch's and Edit a remote's forms; Merge's and Push's dialogs and a refused Check out's result;
+  - Find and the search typed in Hangul;
+  - the Backups list at three sizes (the log and its entry only in the in-test harness: their run times differ between two processes);
+  - F10 on a merge, the repository's menu, also at an edit stop, and the filters;
+  - F2 Reword, F8 Drop, a Hangul Reword, Author and date, and Squash.
+- **Reviews:** two engines per unit (GPT and Claude), then one fix-check; the orchestrator verified the last fixes at their lines. Found and fixed, among others: a guard that trusted a painting from before a gap; a pass that copied a whole message (63 MB in ten idle passes for a 1 MiB Amend message, now none); a hidden box that blanked real cells; a stop question that outlived its write, then one matched by its words; an input method's composition left open by a click; a run's end dropped while a dialog waited (`try_recv` in a match whose arm waited).
+- **Merging:** after X4-find merged, X4-lists' head merged cleanly with main but did not build; the merge script now refuses a head that does not contain main.
+- **Prereleases:**
+  - preview-2026-11-27-1026-f32f8056e6cc (part 10's ledger);
+  - preview-2026-11-27-1426-9364048679ec (X4-graph);
+  - preview-2026-11-27-1822-70714d3f0f79 (the Linux address window);
+  - preview-2026-11-27-2041-4aa73975f1d6 (CI 60 minutes);
+  - preview-2026-11-27-2141-b2c764b692db (X4-planner);
+  - preview-2026-11-27-2226-90f8850f6963 (X4-pane);
+  - preview-2026-11-27-2300-7eebce300b46 (X4-dialogs);
+  - preview-2026-11-27-2331-1330e4bcbee0 (the hung-up terminal test);
+  - preview-2026-11-28-0003-2393cd66cefd (X4-find);
+  - preview-2026-11-28-0034-dcd6860b39c3 (the busy-stub fix);
+  - preview-2026-11-28-0110-c12cde9f06fe (X4-lists);
+  - preview-2026-11-28-0158-acfe74614909 (X4-menu);
+  - preview-2026-11-28-0259-5f96aead6154 (X4-dialogs2);
+  - preview-2026-11-28-0403-ee259ab2146f (X4-quick).
+
+### Closed rows
+
+| ID | Status | What | Who |
+|---|---|---|---|
+| X4-graph | ✅ done 2026-11-27 | 10 §17: the git panel's frame and graph in cells (#166) | coder |
+| F-wv-linux | ✅ done 2026-11-27 | The Linux address window's failures say their line once (#167) | coder |
+| F-ci-limit | ✅ done 2026-11-27 | The build jobs' limit is 60 minutes (#169) | orchestrator |
+| X4-planner | ✅ done 2026-11-27 | 10 §17: the history planner's pane in cells (#168) | coder |
+| X4-pane | ✅ done 2026-11-27 | 10 §17: the details pane and the banner in cells (#170) | coder |
+| X4-dialogs | ✅ done 2026-11-27 | 10 §17: the action dialog in cells; what runs is what the screen showed (#171) | coder |
+| F-hungup | ✅ done 2026-11-27 | The hung-up terminal test's pty is close-on-exec (#172) | coder |
+| X4-find | ✅ done 2026-11-28 | 10 §17: Find and the history search in cells (#173) | coder |
+| F-txtbsy | ✅ done 2026-11-28 | A just-written stand-in starts through the busy retry; busy tests wait for a refusal (#176) | coder |
+| X4-lists | ✅ done 2026-11-28 | 10 §17: the command log and the Backups list in cells (#174) | coder |
+| X4-menu | ✅ done 2026-11-28 | 10 §17: the menu and the filters in cells, one git dialog at a time (#175) | coder |
+| X4-dialogs2 | ✅ done 2026-11-28 | 10 §17: every git dialog in cells, egui's action dialog gone (#177) | coder |
+| X4-quick | ✅ done 2026-11-28 | 10 §17: the quick edits' dialogs in cells; `OnScreen` by frame and context (#178) | coder |

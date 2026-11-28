@@ -95,7 +95,7 @@ use eframe::egui;
 // through `keys` since its dialogs moved to `dialogs.rs` (X4-dialogs2).
 #[cfg(test)]
 use eframe::egui::Key;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// A row of the graph by what it draws: the bar across a reload, the marks and the details pane
 /// name it, never a row index (the uncommitted row coming or going shifts every index, 03 §5).
@@ -451,8 +451,17 @@ pub struct GitView {
     /// The plan the dialog showed for the action it returned: what runs (S3-A: its backup
     /// verifies the values the owner confirmed).
     confirmed: Option<(Action, Plan)>,
-    /// A run's error dialog, a read's failure, a tag's details (03 §3.8, §7.4).
+    /// The result up: a run's error dialog, a read's failure, a tag's details (03 §3.8, §7.4).
+    /// It stays until the owner closes it; one that comes meanwhile waits (F-git-outcome).
     result: Option<dialogs::ResultDialog>,
+    /// The results that came while one was up, oldest first: each comes up once the one before
+    /// it closes. At most [`RESULTS_WAITING`].
+    waiting: VecDeque<dialogs::ResultDialog>,
+    /// Which result is up and what the screen showed of it.
+    result_screen: ResultScreen,
+    /// The waiting results dropped since a result last came up ([`RESULTS_WAITING`]): the next
+    /// one to come up says how many.
+    results_dropped: usize,
     /// "Stop git?" over a write running for 10 s (03 §3.4): the action's words, and the id of the
     /// run it asks about.
     stop_question: Option<(String, u64)>,
@@ -480,6 +489,59 @@ pub struct GitView {
     /// while egui draws it, so the blanking is proved through these until their units land.
     #[cfg(test)]
     pub test_covers: Vec<Cells>,
+}
+
+/// The results that wait behind the one up (F-git-outcome). While a result is up it has the
+/// keyboard, so what can still come is the end of a write queued before it (one runs at a time)
+/// or of a read asked for before it — a handful; each can hold the last 64 KiB of a command's
+/// stderr (`runner::STDERR_KEPT`), so eight hold half a mebibyte of it at most. Past them the
+/// oldest waiting goes, so the newest, the one "delete anyway?" may answer (03 §7.2), is always
+/// kept; the next result to come up — the one that came right after those dropped — says how
+/// many were not shown and that the command log (Cmd/Ctrl+L, 03 §3.7) has the commands that ran
+/// (a run that never ran one, `RunEnd::NotRun`, left none there), and the status row keeps the
+/// latest run's words.
+const RESULTS_WAITING: usize = 8;
+
+/// What the screen showed of the result up (F-git-outcome), by the rule an action's dialog and
+/// "Stop git?" follow (`dialogs.rs`): each result that comes up takes a serial of its own,
+/// is laid out unseen first — and again after a pass it was not drawn in (behind the menu or an
+/// action's dialog) — and Enter, Esc, OK or a click outside close it only once the screen showed
+/// it ([`cells::OnScreen`]). So a press meant for the result before it, in the same pass or in a
+/// burst the terminal did not print, closes nothing: it would go unread.
+#[derive(Debug, Default)]
+struct ResultScreen {
+    /// The result up's serial: the painting the screen is compared by.
+    serial: u64,
+    /// The pass it was last laid out in.
+    laid: Option<u64>,
+    screen: cells::OnScreen<u64>,
+}
+
+impl ResultScreen {
+    /// Another result is up: nothing of it shown yet.
+    fn next(&mut self) {
+        self.serial += 1;
+        self.laid = None;
+    }
+
+    /// At the start of the result's pass: whether the screen shows it. The pass paints it where
+    /// it can be seen once it was laid out in the pass before — any other pass before, later or
+    /// earlier (a switch between the window and the terminal, which count their passes apart),
+    /// lays it out unseen again. A pass that lays it out unseen asks for the next, which paints
+    /// it, so the screen can show it before the owner's next press.
+    fn shown(&mut self, ctx: &egui::Context) -> bool {
+        let pass = ctx.cumulative_pass_nr();
+        if self.laid.is_some_and(|nr| nr + 1 != pass) {
+            self.laid = None;
+        }
+        let seen = self.screen.start(ctx) == Some(&self.serial);
+        if self.laid.replace(pass).is_some() {
+            self.screen.painted(self.serial);
+        } else {
+            ctx.request_repaint();
+        }
+        seen
+    }
 }
 
 impl RowKey {
@@ -551,6 +613,9 @@ impl GitView {
             dialog: None,
             confirmed: None,
             result: None,
+            waiting: VecDeque::new(),
+            result_screen: ResultScreen::default(),
+            results_dropped: 0,
             stop_question: None,
             backups: None,
             log: None,
@@ -1563,11 +1628,15 @@ impl GitView {
     }
 
     /// A run ended (03 §3.8, §8.3): the error dialog when a step failed or the backup is
-    /// incomplete (S3-A's `Outcome::warning`, said there in place of the undo line); the status
-    /// row's words — `<what> · backup <stamp> · Cmd/Ctrl+Z undoes`, or the warning in the error
-    /// colour.
+    /// incomplete (S3-A's `Outcome::warning`, said there in place of the undo line), waiting
+    /// behind a result up ([`GitView::show_result`]). The status row says this run's words
+    /// whatever result is up: `<title>: failed` in the error colour when a step failed, else
+    /// `<what> · backup <stamp> · Cmd/Ctrl+Z undoes`, or the warning in the error colour. A run
+    /// with no dialog leaves a result up as it is (F-git-outcome).
     pub fn show_outcome(&mut self, title: &str, what: &str, outcome: &Outcome) -> Status {
-        self.result = dialogs::ResultDialog::of(title, outcome);
+        if let Some(result) = dialogs::ResultDialog::of(title, outcome) {
+            self.show_result(result);
+        }
         let failed = outcome
             .steps
             .iter()
@@ -1579,9 +1648,26 @@ impl GitView {
         }
     }
 
-    /// A text in a dialog of its own: a read's failure, a tag's details (03 §3.8, §7.4).
+    /// A text in a dialog of its own: a read's failure, a tag's details (03 §3.8, §7.4), waiting
+    /// behind a result up ([`GitView::show_result`]).
     pub fn show_text(&mut self, title: &str, text: &str, command_line: Option<&str>) {
-        self.result = Some(dialogs::ResultDialog::error(title, text, command_line));
+        self.show_result(dialogs::ResultDialog::error(title, text, command_line));
+    }
+
+    /// `result` up, or — while one is up, which stays until the owner closes it — waiting behind
+    /// it, in the order they came (F-git-outcome); past [`RESULTS_WAITING`] the oldest waiting
+    /// goes, counted for the next one to come up.
+    fn show_result(&mut self, result: dialogs::ResultDialog) {
+        if self.result.is_none() {
+            self.result = Some(result);
+            self.result_screen.next();
+            return;
+        }
+        if self.waiting.len() >= RESULTS_WAITING {
+            self.waiting.pop_front();
+            self.results_dropped += 1;
+        }
+        self.waiting.push_back(result);
     }
 
     /// "Stop git?" (03 §3.4) over the write `what`, the run of id `run`, running for 10 s.
@@ -1620,9 +1706,13 @@ impl GitView {
     }
 
     /// A second dialog for an action git refused (03 §7.2: `delete-branch`'s "not fully merged":
-    /// the same action, forced), in place of the error dialog.
+    /// the same action, forced), in place of the error dialog it answers: the newest result,
+    /// which the run's end has just put up or set waiting — never a result up before it
+    /// (F-git-outcome).
     pub fn confirm_again(&mut self, action: Action) -> Vec<GitAction> {
-        self.result = None;
+        if self.waiting.pop_back().is_none() {
+            self.result = None;
+        }
         self.confirm(action)
     }
 
@@ -2259,8 +2349,17 @@ impl GitView {
             };
         }
         if let Some(result) = &mut self.result {
-            if result.ui(ctx, grid) {
-                self.result = None;
+            // Closed only once the screen showed it ([`ResultScreen`]); the next one waiting comes
+            // up, drawn from the next pass, saying how many before it were dropped
+            // (F-git-outcome).
+            let seen = self.result_screen.shown(ctx);
+            if result.ui(ctx, grid) && seen {
+                self.result = self.waiting.pop_front();
+                self.result_screen.next();
+                let dropped = std::mem::take(&mut self.results_dropped);
+                if let Some(next) = &mut self.result {
+                    next.say_dropped(dropped);
+                }
             }
             return Vec::new();
         }

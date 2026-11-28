@@ -296,6 +296,14 @@ into their last value, goes to the command's log entry.
 - An action of several steps stops at the first failing step; the dialog lists each step's outcome
   (`done` / `failed` / `not run`), and the panel refreshes, since earlier steps may have changed things.
 - `index.lock` held by another git: git's own message is shown; sopen never removes a lock file.
+- A result stays up until it is closed (F-git-outcome). A later run's error dialog, or a read's
+  failure, waits behind it and comes up when it closes, in the order they came. A run with no
+  dialog changes only the status row, which always says the latest run's words. At most 8 wait:
+  past them the oldest waiting goes, and the next one to come up says, in the error colour, `<n>
+  earlier results not shown — the command log (Cmd/Ctrl+L) has the commands that ran` (§3.7: a
+  run that never ran a command, "Nothing ran", has none there). A result closes
+  by Enter, Esc, OK or a click outside only once the screen has shown it; until then a press
+  closes nothing.
 
 ## 4. The graph
 
