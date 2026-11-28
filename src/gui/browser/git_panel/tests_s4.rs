@@ -1225,7 +1225,9 @@ fn enter_edits_the_message_of_a_reword_or_squash_row() {
     fx.press(Key::Enter);
     assert!(fx.pane().dialog_up());
     assert!(fx.dialog_box());
-    fx.retype(&find('e').message, "new");
+    // The field has the keyboard as it opens: all of it typed over (the pane shows `fifth` too).
+    fx.key(Key::A, testkit::command(false));
+    fx.type_text("new");
     fx.key(Key::Enter, Modifiers::SHIFT);
     fx.type_text("body");
     fx.press(Key::Enter);
@@ -1257,7 +1259,12 @@ fn enter_edits_the_message_of_a_reword_or_squash_row() {
     let count = ops().len();
     fx.press(Key::Enter);
     let group = rebase::squash_message(&find('b').message, &find('c').message);
-    fx.assert_shows(&group);
+    assert_eq!(
+        group,
+        "second\n\nbody of second\n\nthird\n\nbody of third\n"
+    );
+    // A row of the field each of its lines, the older message above.
+    assert!(fx.top_of("body of second") < fx.top_of("body of third"));
     fx.press(Key::Escape);
     assert!(!fx.pane().dialog_up());
     assert_eq!(ops().len(), count, "Esc changed nothing");
@@ -1279,7 +1286,7 @@ fn a_sets_the_author_and_dates_and_marks_the_row() {
     fx.assert_shows("Ada");
     fx.assert_shows("ada@example.com");
     fx.assert_shows("2026-11-11 18:24:00 +0900");
-    fx.click("now");
+    fx.click("( ) now");
     fx.press(Key::Enter);
     assert_eq!(
         ops().last(),
@@ -1293,7 +1300,7 @@ fn a_sets_the_author_and_dates_and_marks_the_row() {
     );
     assert_eq!(fx.top_of("A"), fx.top_of("dddddddd"));
     fx.type_text("a");
-    fx.click(planner::OWN_AUTHOR);
+    fx.click(&format!("[ {} ]", planner::OWN_AUTHOR));
     assert_eq!(
         ops().last(),
         Some(&Op::Author {
@@ -1328,7 +1335,11 @@ fn esc_closes_and_asks_only_when_something_changed() {
     fx.press(Key::Escape);
     assert!(fx.host.planner_ends.is_empty(), "it asks first");
     assert!(fx.dialog_box());
-    fx.assert_shows(planner::ASK_CLOSE);
+    // Wrapped by cells in its box: its first row.
+    let asked = fx
+        .drv
+        .text_starting_with("Close the planner and lose its changes?");
+    assert!(planner::ASK_CLOSE.starts_with(&asked.expect("the question")));
     fx.press(Key::Escape);
     assert!(fx.host.planner_ends.is_empty(), "Esc keeps planning");
     assert!(
@@ -1448,10 +1459,13 @@ fn the_run_shows_its_confirmation_and_runs_only_what_it_shows() {
     fx.key(key, mods);
     let mut m = fx.pane().model().clone();
     fx.assert_shows(&describe(&Edit::Plan(m.clone())));
-    fx.click(planner::AUTOSTASH);
+    let autostash = format!("[ ] {}", planner::AUTOSTASH);
+    fx.click(&autostash);
     m.autostash = true;
     let shown = describe(&Edit::Plan(m.clone()));
-    fx.assert_shows(&shown);
+    // Wrapped by cells in the box: its first row.
+    let first = fx.drv.text_starting_with("plan --autostash pick eeeeeeee,");
+    assert!(shown.starts_with(&first.expect("the plan of the model shown")));
     assert_eq!(edits().last(), Some(&Edit::Plan(m.clone())));
     fx.press(Key::Enter);
     assert_eq!(fx.host.planner_ends, [PlannerEnd::Run(Edit::Plan(m))]);
@@ -1463,7 +1477,7 @@ fn the_run_shows_its_confirmation_and_runs_only_what_it_shows() {
     fx.key(key, mods);
     fx.press(Key::Enter);
     assert!(fx.host.planner_ends.is_empty());
-    fx.click(planner::AUTOSTASH);
+    fx.click(&autostash);
     assert!(!fx.shows(problem));
     fx.press(Key::Enter);
     assert!(matches!(
