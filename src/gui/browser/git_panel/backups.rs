@@ -25,7 +25,6 @@ use crate::gui::cells::{self, Buffer, Cells, Grid, Pen};
 use crate::gui::chrome;
 use crate::gui::chrome::git::LOOK;
 use eframe::egui::{self, Sense};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// The list's header (03 §8.2: "`git push --mirror` would publish them (the Backups list's
@@ -71,15 +70,10 @@ pub struct BackupsView {
     /// waits): nothing for a pass that painted no bar's line (an empty list, the bar scrolled off
     /// the rows by the wheel, a panel too short for the list).
     screen: cells::OnScreen<Arc<Ends>>,
-    /// The frame the screen was last asked about ([`BackupsView::on_screen`]) and its answer.
-    asked: Option<(Frame, Option<Arc<Ends>>)>,
     /// The bar's line's [`Ends`] as last made, kept while it is of the same line of the same
     /// records: a pass copies no ref.
     ends: Option<Arc<Ends>>,
 }
-
-/// A frame of a context: its context's mark ([`context_mark`]) and its number.
-type Frame = (u64, u64);
 
 /// What the line under the bar asks for: its Restore, its Show and its Delete.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,7 +152,6 @@ impl BackupsView {
             scroll: Scroll::default(),
             revision: 0,
             screen: cells::OnScreen::default(),
-            asked: None,
             ends: None,
         }
     }
@@ -260,22 +253,14 @@ impl BackupsView {
     }
 
     /// What the screen shows of the bar's line in this frame of `ctx`: what the last frame that
-    /// reached it painted (`cells::OnScreen::start`, taken once a frame — the keys and the draw
-    /// ask in turn, and a frame can run two passes, egui's discarded one first, while
-    /// `cells::set_presented` says what became of the frame; its last pass's painting is the
-    /// frame's). A frame that did not draw the list at all (not shown, or in a panel too short
-    /// for it) left no bar on screen, nor has another context's screen (a switch between the
-    /// window and the terminal moves the panel): after one, nothing until a frame has painted.
+    /// reached it painted (`cells::OnScreen::start`, which answers once a frame — the keys and the
+    /// draw ask in turn, and a frame can run two passes, egui's discarded one first; its last
+    /// pass's painting is the frame's). A frame that did not draw the list at all (not shown, or
+    /// in a panel too short for it) left no bar on screen, nor has another context's screen (a
+    /// switch between the window and the terminal moves the panel): after one, nothing until a
+    /// frame has painted — `OnScreen` tags each painting with its frame and context.
     fn on_screen(&mut self, ctx: &egui::Context) -> Option<Arc<Ends>> {
-        let (mark, frame) = (context_mark(ctx), ctx.cumulative_frame_nr());
-        match &self.asked {
-            Some((at, shown)) if *at == (mark, frame) => return shown.clone(),
-            Some(((m, f), _)) if *m == mark && *f + 1 == frame => {}
-            _ => self.screen = cells::OnScreen::default(),
-        }
-        let shown = self.screen.start(ctx).cloned();
-        self.asked = Some(((mark, frame), shown.clone()));
-        shown
+        self.screen.start(ctx).cloned()
     }
 
     /// `act` on the line under the bar, in a pass of `ctx`, only if it asks for exactly what it
@@ -303,14 +288,6 @@ fn hint() -> String {
         "Enter Show · {}Z Restore · F8 Delete · Esc closes",
         Mods::Command.prefix()
     )
-}
-
-/// A number of `ctx`'s own, the same in each of its frames and another in any other context: the
-/// window's and the terminal's count their frames apart.
-fn context_mark(ctx: &egui::Context) -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let id = egui::Id::unique("sopen-git-backups-context");
-    ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || NEXT.fetch_add(1, Ordering::Relaxed)))
 }
 
 /// The keys' hint in `room` cells: as many of its keys as fit, whole and in order — none rather
