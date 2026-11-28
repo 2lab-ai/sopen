@@ -667,6 +667,11 @@ pub struct ActionDialog {
     repo: Repo,
     /// The draft's revision last planned, and its plan.
     planned: Option<(u64, Result<Plan, Refused>)>,
+    /// How many plans were made after its first: with the form's own refusal, what its plan's
+    /// rows are made of ([`ActionDialog::plan_lines`]).
+    plans: u64,
+    /// Its plan's rows as the kit's, kept while their plan and the form's refusal stay.
+    kept: KeptPlan<(u64, Option<String>)>,
     /// A refresh came: the draft is planned again against the new [`Repo`].
     refreshed: bool,
     /// The draft's revision: it moves whenever a pass changes the draft or Check out's "Don't ask
@@ -857,6 +862,8 @@ impl ActionDialog {
     fn with(form: Form, repo: &Repo, planned: Result<Plan, Refused>) -> Opened {
         Opened::Dialog(Box::new(ActionDialog {
             planned: Some((0, planned)),
+            plans: 0,
+            kept: KeptPlan::default(),
             refreshed: false,
             drafted: 0,
             serial: super::dialog_serial(),
@@ -998,6 +1005,7 @@ impl ActionDialog {
             let shown = self.plan_shown();
             let plan = planner(&self.form.draft, &self.repo);
             (self.planned, self.refreshed) = (Some((self.drafted, plan)), false);
+            self.plans += 1;
             if self.plan_shown() != shown {
                 self.revision += 1;
             }
@@ -1074,16 +1082,16 @@ impl ActionDialog {
     }
 
     /// The box on `grid` with `controls`: the lost line first, then the options, the plan in rows
-    /// that scroll ([`plan_part`]), the buttons and the hint; as wide as its widest text by 10
-    /// §6's rule. Not `fits`: [`TOO_SHORT`] before all of it, Run off.
+    /// that scroll (kept, [`KeptPlan`]), the buttons and the hint; as wide as its widest text by
+    /// 10 §6's rule. Not `fits`: [`TOO_SHORT`] before all of it, Run off.
     fn laid(&self, grid: Grid, controls: &[Control], fits: bool) -> kit::Layout {
         let title = self.title();
         let lost = self.confirmation().and_then(|c| c.loses.clone());
-        let plan = self.plan_lines();
-        let wanted = (plan_wants(&plan))
-            .max(lost.as_deref().map_or(0, cells::width))
-            .max(cells::width(&title) + 2);
-        let width = kit::inside_width(grid.cols, NOMINAL, wanted);
+        let others = lost.as_deref().map_or(0, cells::width);
+        let others = others.max(cells::width(&title) + 2);
+        let key = (self.plans, self.form.refusal());
+        let width_for = |wants: usize| kit::inside_width(grid.cols, NOMINAL, wants.max(others));
+        let plan = (self.kept).part(key, || self.plan_lines(), width_for, grid, self.plan_top);
         let mut parts = Vec::new();
         if !fits {
             parts.push(Part::Text(TOO_SHORT.to_string(), Ink::Error));
@@ -1095,7 +1103,7 @@ impl ActionDialog {
             parts.extend(controls.iter().map(Control::part));
             parts.push(Part::Blank);
         }
-        if let Some(part) = plan_part(plan, grid, width, self.plan_top) {
+        if let Some(part) = plan {
             parts.extend([part, Part::Blank]);
         }
         let mut run = Button::new("Run", run_id());
@@ -1326,30 +1334,86 @@ pub(super) fn plan_rows(
 
 /// How many cells a box wants inside for `rows` to stand whole, a heading's lines two cells in:
 /// a box at least this wide ([`kit::inside_width`]) holds [`plan_part`]'s rows.
-pub(super) fn plan_wants(rows: &[PlanRow]) -> usize {
+fn plan_wants(rows: &[PlanRow]) -> usize {
     (rows.iter())
         .map(|r| cells::width(&r.text) + if r.under { 2 } else { 0 })
         .max()
         .unwrap_or(0)
 }
 
-/// `rows` as the kit's rows that scroll in a box `width` cells inside on `grid`, from row `top`:
-/// a heading's lines two cells in, wrapped there (a long line goes on two cells in), at most
-/// [`plan_most`] of them on screen; none for no rows.
-pub(super) fn plan_part(rows: Vec<PlanRow>, grid: Grid, width: usize, top: usize) -> Option<Part> {
-    let rows: Vec<(String, Ink)> = (rows.into_iter())
+/// `rows` as the kit's rows that scroll in a box `width` cells inside: a heading's lines two cells
+/// in, wrapped there (a long line goes on two cells in); none for no rows.
+fn plan_part(rows: &[PlanRow], width: usize) -> Option<Arc<kit::Wrapped>> {
+    let rows: Vec<(String, Ink)> = (rows.iter())
         .flat_map(|r| match r.under {
             true => (kit::wrap(&r.text, width.saturating_sub(2)).into_iter())
                 .map(|row| (format!("  {row}"), r.ink))
                 .collect(),
-            false => vec![(r.text, r.ink)],
+            false => vec![(r.text.clone(), r.ink)],
         })
         .collect();
-    (!rows.is_empty()).then(|| Part::Scroll {
-        rows,
-        most: plan_most(grid.rows),
-        top,
-    })
+    (!rows.is_empty()).then(|| kit::Wrapped::new(rows))
+}
+
+/// A plan's rows as its dialog keeps them between passes (F-dialog-wrap): what its box wants for
+/// them ([`plan_wants`]) and the kit's rows that scroll made of them ([`plan_part`]) for the width
+/// they were made for — made again only when what the rows are made of (the dialog's `K`) or that
+/// width changes, so a pass that changes nothing copies, wraps and measures none of them.
+#[derive(Debug)]
+pub(super) struct KeptPlan<K>(std::cell::RefCell<Option<Kept<K>>>);
+
+impl<K> Default for KeptPlan<K> {
+    fn default() -> Self {
+        Self(std::cell::RefCell::new(None))
+    }
+}
+
+#[derive(Debug)]
+struct Kept<K> {
+    key: K,
+    wants: usize,
+    /// The rows as the kit's, and the width they were made for: none for no rows.
+    made: Option<(usize, Option<Arc<kit::Wrapped>>)>,
+}
+
+impl<K: PartialEq> KeptPlan<K> {
+    /// The rows `key` names — `rows` makes them, called only when they are not kept — in a box
+    /// whose inside `width_for` gives for the cells they want: the kit's rows that scroll on
+    /// `grid` from row `top`, at most [`plan_most`] of them on screen; none for no rows.
+    pub(super) fn part<R: AsRef<[PlanRow]>>(
+        &self,
+        key: K,
+        rows: impl FnOnce() -> R,
+        width_for: impl FnOnce(usize) -> usize,
+        grid: Grid,
+        top: usize,
+    ) -> Option<Part> {
+        let mut make = Some(rows);
+        let mut made = None;
+        let mut kept = self.0.borrow_mut();
+        if kept.as_ref().is_none_or(|k| k.key != key) {
+            let rows = make.take().map(|f| f());
+            let wants = rows.as_ref().map_or(0, |r| plan_wants(r.as_ref()));
+            *kept = Some(Kept {
+                key,
+                wants,
+                made: None,
+            });
+            made = rows;
+        }
+        let kept = kept.as_mut()?;
+        let width = width_for(kept.wants);
+        if kept.made.as_ref().is_none_or(|(at, _)| *at != width) {
+            let rows = made.or_else(|| make.take().map(|f| f()));
+            kept.made = Some((width, rows.and_then(|r| plan_part(r.as_ref(), width))));
+        }
+        let rows = kept.made.as_ref().and_then(|(_, rows)| rows.clone())?;
+        Some(Part::Wrapped {
+            rows,
+            most: plan_most(grid.rows),
+            top,
+        })
+    }
 }
 
 /// The pass's presses of Enter with no modifiers, taken out of its input in order, each saying
@@ -2407,9 +2471,12 @@ pub struct ResultDialog {
     dropped: usize,
     /// The first of its rows that scroll shown.
     top: usize,
-    /// Its rows that scroll as last wrapped, and the width they were wrapped to: `covers` and
-    /// each pass wrap nothing again until the width changes (X4-dialogs2, round 1).
-    wrapped: std::cell::RefCell<Option<(usize, Wrapped)>>,
+    /// Its box as last laid out, and the grid and `dropped` it was laid out for: what it says
+    /// changes only by `dropped` ([`ResultDialog::say_dropped`]) and where it scrolls comes in
+    /// through the kit's `Inputs::top`, so `covers` and each pass lay out and wrap nothing again
+    /// until the grid changes (X4-dialogs2, round 1) — its rows that scroll shared, its failed
+    /// command line of up to 64 KiB wrapped once (F-dialog-wrap).
+    laid: std::cell::RefCell<Option<(Grid, usize, Arc<kit::Layout>)>>,
 }
 
 /// Two results are equal by what they say and where they scroll, the rows either keeps wrapped
@@ -2424,7 +2491,7 @@ impl PartialEq for ResultDialog {
             warning,
             dropped,
             top,
-            wrapped: _,
+            laid: _,
         } = self;
         (title, steps, error, backup, warning, dropped, top)
             == (
@@ -2440,9 +2507,6 @@ impl PartialEq for ResultDialog {
 }
 
 impl Eq for ResultDialog {}
-
-/// A result's rows that scroll, wrapped to a width: each its text and its ink.
-type Wrapped = Arc<Vec<(String, Ink)>>;
 
 fn result_id() -> egui::Id {
     egui::Id::unique("sopen-git-result")
@@ -2529,7 +2593,7 @@ impl ResultDialog {
             warning,
             dropped: 0,
             top: 0,
-            wrapped: Default::default(),
+            laid: Default::default(),
         })
     }
 
@@ -2547,7 +2611,7 @@ impl ResultDialog {
             warning: None,
             dropped: 0,
             top: 0,
-            wrapped: Default::default(),
+            laid: Default::default(),
         }
     }
 
@@ -2562,20 +2626,10 @@ impl ResultDialog {
         text.trim_end().split('\n').map(shown_line).collect()
     }
 
-    /// The rows that scroll in a box `width` cells inside: the ones kept for that width, else
-    /// wrapped and kept.
-    fn rows(&self, width: usize) -> Wrapped {
-        if let Some((at, rows)) = &*self.wrapped.borrow() {
-            if *at == width {
-                return rows.clone();
-            }
-        }
-        let rows = Arc::new(self.wrap(width));
-        *self.wrapped.borrow_mut() = Some((width, rows.clone()));
-        rows
-    }
-
-    /// The rows that scroll, wrapped to `width` (see the type's notes).
+    /// The rows that scroll, wrapped to `width` (see the type's notes) — the box's inside, which
+    /// the kit gives the result whatever its texts want (its nominal 80 is past the kit's widest);
+    /// the kit wraps them at it once more and keeps them so, a step's row on a box narrower than
+    /// its word and a glyph going on under itself.
     fn wrap(&self, width: usize) -> Vec<(String, Ink)> {
         let mut rows = Vec::new();
         for (outcome, line) in &self.steps {
@@ -2610,15 +2664,28 @@ impl ResultDialog {
         rows
     }
 
-    /// The box on `grid` (see the type's notes).
-    fn layout(&self, grid: Grid) -> kit::Layout {
+    /// The box on `grid` (see the type's notes): the one kept for that grid and `dropped`, else
+    /// laid out and kept.
+    fn layout(&self, grid: Grid) -> Arc<kit::Layout> {
+        if let Some((at, dropped, layout)) = &*self.laid.borrow() {
+            if (*at, *dropped) == (grid, self.dropped) {
+                return layout.clone();
+            }
+        }
+        let layout = Arc::new(self.lay_out(grid));
+        *self.laid.borrow_mut() = Some((grid, self.dropped, layout.clone()));
+        layout
+    }
+
+    /// The box on `grid`, laid out afresh.
+    fn lay_out(&self, grid: Grid) -> kit::Layout {
         let width = kit::inside_width(grid.cols, RESULT_NOMINAL, RESULT_NOMINAL);
-        let rows = self.rows(width);
+        let rows = kit::Wrapped::new(self.wrap(width));
         let mut parts = Vec::new();
-        if !rows.is_empty() {
+        if !rows.rows().is_empty() {
             let most = plan_most(grid.rows);
-            parts.push(Part::Scroll {
-                rows: rows.to_vec(),
+            parts.push(Part::Wrapped {
+                rows,
                 most,
                 top: self.top,
             });

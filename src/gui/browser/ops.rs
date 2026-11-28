@@ -677,6 +677,9 @@ pub struct ReportView {
     title: String,
     head: String,
     report: Report,
+    /// Its rows that scroll, made once: an item a row, a blank row and the notes (F-dialog-wrap:
+    /// the kit wraps them once a width, so a pass copies none of them).
+    rows: Arc<dialog::Wrapped>,
     /// The first of its rows that scroll on screen.
     top: usize,
 }
@@ -722,9 +725,26 @@ impl ReportView {
         } else {
             format!("{what}: {}", counts.join(" · "))
         };
+        // An item a row — a failure in the error colour, one not reached in the weak one — and
+        // the notes after a blank row.
+        let mut rows: Vec<(String, Ink)> = (report.items.iter())
+            .map(|item| {
+                let ink = match item.outcome {
+                    ItemOutcome::Failed(_) => Ink::Error,
+                    ItemOutcome::NotReached => Ink::Weak,
+                    _ => Ink::Text,
+                };
+                (item_line(item), ink)
+            })
+            .collect();
+        if !report.notes.is_empty() {
+            rows.push((String::new(), Ink::Text));
+            rows.extend(report.notes.iter().map(|n| (n.clone(), Ink::Text)));
+        }
         Self {
             title: format!("{title} report"),
             head,
+            rows: dialog::Wrapped::new(rows),
             report,
             top: 0,
         }
@@ -743,25 +763,11 @@ impl ReportView {
     /// not reached in the weak one — and the notes after a blank row, sixteen rows at most on
     /// screen (the wheel scrolls them), then Close.
     fn layout(&self, grid: Grid) -> Layout {
-        let mut rows: Vec<(String, Ink)> = (self.report.items.iter())
-            .map(|item| {
-                let ink = match item.outcome {
-                    ItemOutcome::Failed(_) => Ink::Error,
-                    ItemOutcome::NotReached => Ink::Weak,
-                    _ => Ink::Text,
-                };
-                (item_line(item), ink)
-            })
-            .collect();
-        if !self.report.notes.is_empty() {
-            rows.push((String::new(), Ink::Text));
-            rows.extend(self.report.notes.iter().map(|n| (n.clone(), Ink::Text)));
-        }
         let parts = [
             Part::Text(self.head.clone(), Ink::Text),
             Part::Blank,
-            Part::Scroll {
-                rows,
+            Part::Wrapped {
+                rows: self.rows.clone(),
                 most: 16,
                 top: self.top,
             },
@@ -2190,6 +2196,7 @@ mod tests {
     //! browser's own `panel_cells`, its keys and its bar are S1-E's and not exercised here. The
     //! engine is a stand-in [`Run`].
 
+    mod f_dialog_wrap;
     mod s6;
     mod x1b;
     mod x4kit;

@@ -1846,6 +1846,151 @@ fn x4d2_the_result_wraps_once_a_width() {
     assert_eq!(walked(), 0);
 }
 
+/// F-dialog-wrap: the result hands its kept rows to the kit shared, never a copy. With 64 KiB of
+/// stderr, ten idle passes — each laying it out twice, for its covers and its painting — copy no
+/// byte of its rows, measure none and draw only those the box shows; the wheel, two notches in
+/// one pass, scrolls them as before.
+#[test]
+fn x4d2_the_result_copies_no_rows_a_pass() {
+    use crate::gui::browser::ops::dialog::work;
+    let stderr: String = (0..1200)
+        .map(|k| format!("remote: line {k:04} of a long refusal\twith words that wrap\n"))
+        .collect();
+    assert!(stderr.len() >= 64 << 10, "{}", stderr.len());
+    let push = "git push --progress origin refs/heads/b:refs/heads/b";
+    let failed = Outcome {
+        steps: vec![StepResult {
+            line: push.into(),
+            outcome: StepOutcome::Failed,
+            ran: vec![done(push, 1, &stderr)],
+        }],
+        backup: None,
+    };
+    let mut fx = Fx::result(ResultDialog::of("Push", &failed).expect("a step failed"));
+    work::take();
+    fx.idle(10);
+    let done = work::take();
+    assert_eq!(done.copied, 0, "bytes of rows copied: {done:?}");
+    assert_eq!(done.measured, 0, "rows measured: {done:?}");
+    // The rows the box shows: the step's, the blank under it and the first lines of stderr.
+    let shown = 2
+        + (rows(&fx.boxed()).iter())
+            .filter(|r| r.contains("remote: line"))
+            .count();
+    assert!(
+        shown > 6 && done.drawn <= 10 * shown,
+        "{shown} rows shown: {done:?}"
+    );
+    // Two notches in one pass: six rows down — the step's row, the blank under it and the first
+    // four lines of stderr go up past the box's top.
+    let first = place(&fx.boxed(), "remote: line 0000");
+    fx.drv
+        .move_to(&mut fx.host, at_cell(first.x + 5, first.y + 1));
+    let notch = Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, -1.0),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
+        modifiers: Modifiers::NONE,
+    };
+    fx.frame(vec![notch.clone(), notch]);
+    let all = fx.shown();
+    assert!(!all.contains("remote: line 0003 "), "{all}");
+    assert!(all.contains("remote: line 0004 "), "{all}");
+    same_in_a_terminal(&fx.drv);
+}
+
+/// F-dialog-wrap (round 1): the result keeps its box for its grid. A failed command line of 64 KiB
+/// (`MAX_ARGS`, its paths batched) is wrapped once, not on each of a pass's two layouts: ten idle
+/// passes wrap fewer than 4096 graphemes and copy and measure no row, and the line still shows.
+#[test]
+fn x4d2_a_64_kib_command_line_is_wrapped_once_for_its_grid() {
+    use crate::gui::browser::ops::dialog::work;
+    let mut line = String::from("git add --");
+    let mut k = 0;
+    while line.len() < 64 * 1024 {
+        line.push_str(&format!(" dir/file-{k:05}.txt"));
+        k += 1;
+    }
+    let failed = Outcome {
+        steps: vec![StepResult {
+            line: line.clone(),
+            outcome: StepOutcome::Failed,
+            ran: vec![done(&line, 1, "fatal: x")],
+        }],
+        backup: None,
+    };
+    let mut fx = Fx::result(ResultDialog::of("Add", &failed).expect("a step failed"));
+    work::take();
+    fx.idle(10);
+    let idle = work::take();
+    // No layout again: no row measured (`Wrapped::new` measures each), wrapped or copied.
+    assert_eq!(idle.measured, 0, "{idle:?}");
+    assert!(idle.wrapped < 4096 && idle.copied == 0, "{idle:?}");
+    let all = fx.shown();
+    assert!(all.contains("git add -- dir/file-00000.txt"), "{all}");
+}
+
+/// F-dialog-wrap: on a box narrower than a step's word and a glyph (sixteen columns, eight cells
+/// inside), the step's line goes on under it, a glyph a row each after a row of blanks — as the
+/// kit wrapped the rows it was given before they came shared: nothing of it is cut at the edge.
+#[test]
+fn x4d2_a_step_wider_than_a_narrow_box_goes_on_under_itself() {
+    let failed = Outcome {
+        steps: vec![StepResult {
+            line: "git gc".into(),
+            outcome: StepOutcome::Failed,
+            ran: vec![done("git gc", 1, "x")],
+        }],
+        backup: None,
+    };
+    let result = ResultDialog::of("Gc", &failed).expect("a step failed");
+    let fx = Fx::over(Over::Result(result), 16, 30);
+    let l = fx.boxed();
+    let at = place(&l, "failed");
+    let (a, seen) = (l.buf.area, l.seen());
+    let inside = |y: u16| -> String {
+        let row = &seen[usize::from(y - a.y)];
+        let cells = (at.x..at.x + 8).map(|x| row[usize::from(x - a.x)].symbol.as_str());
+        cells.collect::<String>().trim_end().to_string()
+    };
+    let shown: Vec<String> = (0..12).map(|k| inside(at.y + k)).collect();
+    let want = ["failed", "g", "", "i", "", "t", "", "g", "", "c", "", "x"];
+    assert_eq!(shown, want, "{:#?}", rows(&l));
+    same_in_a_terminal(&fx.drv);
+}
+
+/// F-dialog-wrap: an action's plan of 500 rows reaches the kit kept and shared: ten idle passes —
+/// each laying the box out for its covers and its painting — copy, wrap and measure none of its
+/// rows, and draw only those the box shows; the rows still show, a change's line under its
+/// heading.
+#[test]
+fn x4d2_a_long_plan_copies_no_rows_a_pass() {
+    use crate::gui::browser::ops::dialog::work;
+    fn long(action: &Action, repo: &Repo) -> Result<Plan, Refused> {
+        let mut p = fake(action, repo)?;
+        if let Some(c) = &mut p.confirm {
+            c.changes = (0..500)
+                .map(|k| format!("refs/heads/b{k:03}: 11111111 → 22222222, a line that wraps"))
+                .collect();
+        }
+        Ok(p)
+    }
+    let opened = ActionDialog::open(A::Merge, &on_commit(), &dirty(), &Prefill::default(), long);
+    let mut fx = Fx::new(dialog(opened));
+    fx.host.planner = long;
+    work::take();
+    fx.idle(10);
+    let done = work::take();
+    assert_eq!((done.copied, done.measured), (0, 0), "{done:?}");
+    assert!(done.drawn > 0 && done.drawn <= 10 * 30, "{done:?}");
+    assert!(
+        fx.shown().contains("  refs/heads/b000: 11111111"),
+        "{}",
+        fx.shown()
+    );
+}
+
 /// Two results of the same run are equal whatever either has wrapped: the rows it keeps are no
 /// part of it (the fix-check).
 #[test]

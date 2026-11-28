@@ -359,7 +359,61 @@ fn graphemes<'a>(span: &'a Span<'a>) -> impl Iterator<Item = (&'a str, usize)> +
 
 /// How many cells `text` takes when it is put into a buffer.
 pub fn width(text: &str) -> usize {
-    graphemes(&Span::raw(text)).map(|(_, w)| w).sum()
+    graphemes(&Span::raw(text))
+        .map(|(_, w)| w)
+        .inspect(|_| measured::add())
+        .sum()
+}
+
+/// The graphemes [`width`] measured on this thread, whoever asked (a test's bound on a walk);
+/// past the budget a test sets it panics, so a walk that would take minutes fails at once.
+#[cfg(test)]
+pub(crate) mod measured {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MEASURED: Cell<usize> = const { Cell::new(0) };
+        static BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// The graphemes measured since the last call.
+    pub fn take() -> usize {
+        MEASURED.with(|m| m.replace(0))
+    }
+
+    /// At most `most` until the guard it gives is dropped — on a panic inside the bounded call
+    /// too, so no bound is left set on the thread.
+    pub fn budget(most: usize) -> Budget {
+        BUDGET.with(|b| b.set(Some(most)));
+        Budget(())
+    }
+
+    /// A budget set ([`budget`]): dropped, there is none.
+    #[must_use = "the budget ends when this is dropped"]
+    pub struct Budget(());
+
+    impl Drop for Budget {
+        fn drop(&mut self) {
+            BUDGET.with(|b| b.set(None));
+        }
+    }
+
+    pub(super) fn add() {
+        let now = MEASURED.with(|m| {
+            m.set(m.get() + 1);
+            m.get()
+        });
+        if let Some(most) = BUDGET.with(Cell::get) {
+            assert!(now <= most, "over the budget of {most} graphemes measured");
+        }
+    }
+}
+
+/// [`width`]'s count outside the tests: none.
+#[cfg(not(test))]
+mod measured {
+    #[inline(always)]
+    pub(super) fn add() {}
 }
 
 /// The cells a symbol already in a buffer takes: ratatui-core's measure, without its debug

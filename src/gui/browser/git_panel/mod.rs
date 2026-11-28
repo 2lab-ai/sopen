@@ -1546,7 +1546,9 @@ impl GitView {
         } else if let Some((what, _)) = &self.stop_question {
             out.extend(stop_covers(grid, what));
         }
-        if let Some(log) = &self.log {
+        // Under the planner the body is the planner's: the log, and an entry it shows whole, are
+        // not drawn, so they cover nothing (F-dialog-wrap, round 1).
+        if let (Some(log), None) = (&self.log, &self.planner) {
             out.extend(log.covers(grid));
         }
         if let Some(p) = &self.planner {
