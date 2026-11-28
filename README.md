@@ -158,8 +158,11 @@ From `sopen --tui` with a target, `F12` opens the window on `<host>`'s screen at
 selections, dialog and viewer, and closing it there (or `F12` there) brings the terminal back with
 whatever was done in it. Meanwhile the terminal waits, dimmed; `Ctrl+C` there ends the window on
 `<host>` — or leaves it open if it has unsaved edits. Unsaved edits here are asked about first
-(Save, Save As…, Discard, Cancel), so is an open git dialog (it does not cross yet), and a running
-copy or save is waited for. `<host>` reaches this machine's files by its own ssh.
+(Save, Save As…, Discard, Cancel), so is the plan of a git planner on screen (it goes with the
+switch, as that panel's bar, marks, filters, Find's text and an action's, the filters' or the
+history search's dialog with what is typed in it do; what is typed in a history edit's own dialog,
+what is chosen in a restore's, and a panel not on screen do not cross, and the question says so),
+and a running copy or save is waited for. `<host>` reaches this machine's files by its own ssh.
 Details: [docs/target.md](docs/target.md) and [docs/urls.md](docs/urls.md).
 
 ## From the command line: `sopen cut`, `sopen stems`

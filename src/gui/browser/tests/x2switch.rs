@@ -1,7 +1,7 @@
 //! X2-switch's question about the git panel before the switch to another machine (10 §7.4,
-//! Tensions "§7.4's 'an open dialog with its typed text' vs the git panel's dialogs"): the state
-//! carries nothing of a git dialog or the planner's plan yet (X4 does), so with one open the
-//! switch asks first — what it drops, Switch · Cancel.
+//! Tensions "§7.4's 'an open dialog with its typed text' vs the git panel's dialogs"), as v2
+//! (X4-state) leaves it: a git dialog the state carries asks nothing; the planner's plan goes
+//! with the switch and asks first, as unsaved edits do — Switch · Cancel.
 
 use super::s2::{small, Gx};
 use super::*;
@@ -12,10 +12,10 @@ fn has(g: &Gx, text: &str) -> bool {
     g.fx.drv.texts().iter().any(|(_, _, t)| t.contains(text))
 }
 
-/// The commit dialog open with a message typed: the switch asks first, naming what it drops.
-/// Cancel stays — the dialog and its text as they were; Switch lets it go, and only then.
+/// The commit dialog open with a message typed: the state carries it (v2), so the switch asks
+/// nothing and goes.
 #[test]
-fn a_git_dialog_open_asks_before_the_switch() {
+fn a_git_dialog_open_asks_nothing_before_the_switch() {
     let Some(git) = fixture::git() else {
         return;
     };
@@ -26,33 +26,11 @@ fn a_git_dialog_open_asks_before_the_switch() {
     g.f(Key::F7);
     g.fx.typed("half a message");
     g.idle(2);
-    assert_eq!(g.fx.b.before_switch("box"), Before::Held);
-    g.idle(2);
-    assert!(has(&g, "is not carried to box"), "{:#?}", g.fx.drv.texts());
-    assert!(has(&g, "a commit message"), "names what is dropped");
-    assert!(g.fx.drv.find_text("[ Switch ]").is_some());
-    g.fx.drv.click_text_on_top(&mut g.fx.b, "[ Cancel ]");
-    g.idle(2);
-    assert!(!has(&g, "is not carried to box"), "Cancel closes it");
-    assert!(!g.fx.b.switch_due(), "and stays");
-    assert!(has(&g, "half a message"), "the dialog as it was");
-    // Typed text goes to the dialog again, not to a question.
-    g.fx.typed(", and more");
-    g.idle(2);
-    assert!(has(&g, "half a message, and more"));
-    assert_eq!(g.fx.b.before_switch("box"), Before::Held, "asked again");
-    g.idle(2);
-    // Under the question, typing reaches nothing behind it.
-    g.fx.typed("x");
-    g.idle(2);
-    assert!(!has(&g, "and morex"), "the dialog behind takes no keys");
-    g.fx.drv.click_text_on_top(&mut g.fx.b, "[ Switch ]");
-    g.idle(1);
-    assert!(g.fx.b.switch_due(), "Switch lets it go");
+    assert!(has(&g, "half a message"), "{:#?}", g.fx.drv.texts());
     assert_eq!(g.fx.b.before_switch("box"), Before::Go);
 }
 
-/// The planner open: its plan is what the switch drops; Cancel keeps it.
+/// The planner open: its plan goes with the switch, and the switch asks first; Cancel keeps it.
 #[test]
 fn the_planners_plan_asks_before_the_switch() {
     let Some(git) = fixture::git() else {
@@ -76,7 +54,10 @@ fn the_planners_plan_asks_before_the_switch() {
     assert_eq!(g.fx.b.before_switch("box"), Before::Held);
     g.idle(2);
     assert!(
-        has(&g, "The planner's unsaved plan is not carried to box"),
+        has(
+            &g,
+            "The planner's unsaved plan goes with the switch to box."
+        ),
         "{:#?}",
         g.fx.drv.texts()
     );
@@ -116,7 +97,9 @@ fn a_write_left_by_a_closed_viewer_holds_the_switch() {
 }
 
 /// Unsaved edits in the viewer and the planner's plan: two questions in a row — Discard, then
-/// Switch — and the switch goes, Discard's answer with it; neither asks again.
+/// Switch — and the switch goes, Discard's answer with it; neither asks again. The planner's panel
+/// is not on screen then (the list's bar on `0.bin`, its viewer open): the state does not carry
+/// it, and the question says the plan is dropped (X4-state's review).
 #[test]
 fn discard_then_switch_goes_after_both_questions() {
     let Some(git) = fixture::git() else {
@@ -162,7 +145,17 @@ fn discard_then_switch_goes_after_both_questions() {
         "the plan asks next"
     );
     g.idle(2);
-    assert!(has(&g, "The planner's unsaved plan is not carried to box"));
+    let texts = g.fx.drv.texts();
+    let said: Vec<&str> = texts.iter().map(|(_, _, t)| t.as_str()).collect();
+    let said = said.join(" ");
+    let dropped = "The unsaved plan of a planner not on screen is not carried to box: switching \
+                   drops it.";
+    assert!(said.contains(dropped), "{said}");
+    let state = g.fx.b.take_state(&g.fx.drv.ctx);
+    assert!(
+        state.git.iter().all(|p| p.plan.is_none()),
+        "the state carries no plan"
+    );
     g.fx.drv.click_text_on_top(&mut g.fx.b, "[ Switch ]");
     g.idle(1);
     assert!(g.fx.b.switch_due());

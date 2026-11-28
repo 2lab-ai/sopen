@@ -690,6 +690,9 @@ pub struct ActionDialog {
     screen: cells::OnScreen<Painting>,
     /// A pass has laid the box out (the next one paints where it can be seen).
     laid_once: bool,
+    /// The action and target [`ActionDialog::open`] opened it as, when it has options: what a
+    /// switch carries (10 §7.4, v2).
+    origin: Option<(ActionId, Target)>,
 }
 
 /// What a pass of an action's dialog painted: the revision of what it showed — the draft, its
@@ -794,7 +797,14 @@ impl ActionDialog {
             }
             return Self::with(form, repo, planned);
         }
-        Self::start(form, repo, planner)
+        let options = form.options;
+        match Self::start(form, repo, planner) {
+            Opened::Dialog(mut d) if options => {
+                d.origin = Some((id, target.clone()));
+                Opened::Dialog(d)
+            }
+            opened => opened,
+        }
     }
 
     /// The dialog of an action built elsewhere, with no options: the banner's steps
@@ -855,7 +865,99 @@ impl ActionDialog {
             changed: false,
             screen: cells::OnScreen::default(),
             laid_once: false,
+            origin: None,
         }))
+    }
+
+    /// What a switch carries of it (10 §7.4, v2), opened by [`ActionDialog::open`] with options:
+    /// the action and target, its fields' texts by number and its rows of choices by number,
+    /// each with the words chosen (a word, never its place in a list another host reads).
+    #[allow(clippy::type_complexity)]
+    pub fn taken(
+        &self,
+    ) -> Option<(
+        ActionId,
+        &Target,
+        Vec<(usize, String)>,
+        Vec<(usize, Vec<String>)>,
+    )> {
+        let (id, target) = self.origin.as_ref()?;
+        // Only what `texts` reads of the form is copied, then moved out of the copy: a scripted
+        // run takes the state every pass.
+        let mut form = Form::fixed(self.form.draft.clone(), String::new(), false);
+        (form.text, form.url) = (self.form.text.clone(), self.form.url.clone());
+        let local = machine_local(&self.form.draft);
+        let texts = (texts(&mut form).into_iter())
+            .filter(|(n, _)| !local.contains(n))
+            .map(|(n, t)| (n, std::mem::take(t)))
+            .collect();
+        let chosen = |words: Vec<String>, on: &dyn Fn(usize) -> bool| {
+            (words.into_iter().enumerate())
+                .filter(|(k, _)| on(*k))
+                .map(|(_, w)| w)
+                .collect()
+        };
+        let choices = (controls(&self.form, false).into_iter())
+            .filter_map(|c| match c {
+                Control::One { row, words, at, .. } => {
+                    Some((row, chosen(words, &|k| Some(k) == at)))
+                }
+                Control::Any { row, words, on, .. } => Some((row, chosen(words, &|k| on[k]))),
+                _ => None,
+            })
+            .collect();
+        Some((*id, target, texts, choices))
+    }
+
+    /// A switch's choices and texts given to it, opened here as its key opens it (v2): the
+    /// choices row by row as they show (one may show another), each by its words — `Err` is a
+    /// word this host does not offer, and that row stays as it opened — then the texts of the
+    /// fields they leave. Its fields open afresh and nothing of it has reached the screen, so no
+    /// Run or Enter runs it before the owner has seen it here.
+    pub fn give(
+        &mut self,
+        given: &[(usize, String)],
+        choices: &[(usize, Vec<String>)],
+    ) -> Result<(), String> {
+        let mut missing = None;
+        for _ in 0..3 {
+            let mut controls = controls(&self.form, false);
+            for c in &mut controls {
+                let (row, words) = match c {
+                    Control::One { row, words, .. } | Control::Any { row, words, .. } => {
+                        (*row, words.clone())
+                    }
+                    _ => continue,
+                };
+                let Some((_, chosen)) = choices.iter().find(|(k, _)| *k == row) else {
+                    continue;
+                };
+                if let Some(w) = chosen.iter().find(|w| !words.contains(w)) {
+                    missing = Some(w.clone());
+                    continue;
+                }
+                match c {
+                    Control::One { at, .. } => *at = words.iter().position(|w| chosen.contains(w)),
+                    Control::Any { on, .. } => {
+                        *on = words.iter().map(|w| chosen.contains(w)).collect()
+                    }
+                    _ => {}
+                }
+            }
+            apply(&mut self.form, &controls);
+        }
+        let local = machine_local(&self.form.draft);
+        for (n, text) in texts(&mut self.form) {
+            if let Some((_, t)) = given.iter().find(|(k, _)| *k == n && !local.contains(k)) {
+                text.clone_from(t);
+            }
+        }
+        let now = controls(&self.form, false);
+        apply(&mut self.form, &now);
+        (self.drafted, self.revision) = (self.drafted + 1, self.revision + 1);
+        (self.laid_once, self.typing, self.changed) = (false, false, false);
+        self.screen = cells::OnScreen::default();
+        missing.map_or(Ok(()), Err)
     }
 
     /// The action as the options make it now.
@@ -1443,6 +1545,16 @@ fn texts(form: &mut Form) -> Vec<(usize, &mut String)> {
         Action::Rename { to, .. } => vec![(0, to)],
         Action::Archive { .. } => vec![(0, text)],
         _ => Vec::new(),
+    }
+}
+
+/// The fields of `draft`'s form whose text names a place on the machine that shows the window —
+/// Archive's path, in its download folder: a switch never carries them and never gives them, so
+/// the receiver's own default stands.
+fn machine_local(draft: &Action) -> &'static [usize] {
+    match draft {
+        Action::Archive { .. } => &[0],
+        _ => &[],
     }
 }
 

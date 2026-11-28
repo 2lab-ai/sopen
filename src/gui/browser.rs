@@ -635,6 +635,11 @@ struct TreeSide {
     fs_seen: HashMap<crate::tree::RowId, u64>,
 }
 
+/// Whether a tree row is a folder's `· N hidden folders` row (its path is its folder's).
+fn hidden_row(kind: &crate::tree::RowKind) -> bool {
+    matches!(kind, crate::tree::RowKind::Hidden(_))
+}
+
 /// The tree's model, once its worker is made (a remote one connects first).
 enum TreeModel {
     Connecting(Receiver<Result<TreeWorker>>),
@@ -719,8 +724,8 @@ impl Answered {
 enum Ask {
     /// Unsaved edits in the viewer: `Save the changes to host:/abs before switching to HOST?`.
     Unsaved,
-    /// The git panel's open dialog or the planner's plan, which the state does not carry yet
-    /// (Tensions; X4 carries them).
+    /// The planner's plan, which goes with the switch and asks first as unsaved edits do, and
+    /// what is typed in a git dialog the state does not carry (10 §7.4, v2).
     Git,
 }
 
@@ -2132,6 +2137,82 @@ impl Browser {
         self.moved_at = None;
     }
 
+    /// The tree's part of the switch's state (10 §7.4, v2), once it has rows: its bar's folder,
+    /// where the bar is on screen, and the folders the owner opened or closed.
+    pub(super) fn tree_part(&self) -> Option<switch_state::TreeState> {
+        let t = self.tree.as_ref().filter(|t| t.rows_given)?;
+        let TreeModel::Open(model) = &t.model else {
+            return None;
+        };
+        let bar = t.view.bar_row().map(|r| r.id);
+        let rows = model.rows();
+        let bar = rows.into_iter().find(|r| Some(tree::view_id(r.id)) == bar);
+        let hidden = bar.as_ref().is_some_and(|r| hidden_row(&r.kind));
+        Some(switch_state::TreeState {
+            bar: bar.map(|r| r.path),
+            hidden,
+            at: t.view.bar.saturating_sub(t.view.top),
+            folders: (model.touched().into_iter())
+                .map(|(path, open)| switch_state::TreeFolder { path, open })
+                .collect(),
+        })
+    }
+
+    /// `part` given to the tree opened for it, a step a pass: each folder opened or closed once a
+    /// listing has brought it; then, once 05 §5 is done (it may centre the bar) and no listing of
+    /// those is on its way, the bar on its folder's row (or that folder's `· N hidden folders`
+    /// one), as far down the screen as it was. `true` once that is done; a folder no listing
+    /// brings is left as the tree has it; a bar that finds no row here is said in `said`.
+    pub(super) fn give_tree_part(
+        &mut self,
+        part: &mut switch_state::TreeState,
+        said: &mut Vec<String>,
+    ) -> bool {
+        let Some(t) = self.tree.as_mut() else {
+            return true;
+        };
+        let TreeModel::Open(model) = &mut t.model else {
+            return false;
+        };
+        if !t.rows_given {
+            return false;
+        }
+        let before = part.folders.len();
+        let wanted: Vec<(&str, bool)> = (part.folders.iter())
+            .map(|f| (f.path.as_str(), f.open))
+            .collect();
+        let mut applied = model.touch(&wanted).into_iter();
+        part.folders.retain(|_| !applied.next().unwrap_or(false));
+        if part.folders.len() < before || !model.built() || !t.built_seen || model.owner_busy() {
+            return false;
+        }
+        part.folders.clear();
+        let Some(path) = &part.bar else {
+            return true;
+        };
+        let rows = model.rows();
+        let on =
+            |hidden: bool| (rows.iter()).find(|r| r.path == *path && hidden_row(&r.kind) == hidden);
+        let row = on(part.hidden).or_else(|| on(false));
+        let shown = show(self.label.as_deref(), path);
+        let line = match row {
+            Some(row) => {
+                t.view.put_bar(tree::view_id(row.id));
+                t.view.top = t.view.bar.saturating_sub(part.at);
+                (hidden_row(&row.kind) != part.hidden).then(|| {
+                    format!("the tree's bar is on {shown}: its hidden folders' row is not here")
+                })
+            }
+            None => Some(format!("the tree's bar was on {shown}, which is not here")),
+        };
+        // Said on the tree's own status row too, which stands over the browser's while it is open.
+        if let Some(line) = line {
+            t.said = Some(Status::error(line.clone()));
+            said.push(line);
+        }
+        true
+    }
+
     /// Closes the tree (Esc, F10, Enter): every listing and scan stops, nothing is waited for;
     /// its connect and a link's resolution still running are told (their flags), so neither
     /// builds or calls anything more; the side shows its list as it was and the other side
@@ -2898,8 +2979,9 @@ impl Browser {
 
     /// The switch to another machine, `to`, asks the browser first (10 §7.4): a job that writes
     /// makes it wait (`waiting for <it>…` on the status row); unsaved edits in the viewer ask
-    /// `Save the changes to host:/abs before switching to HOST?`; the git panel's open dialog or
-    /// the planner's plan, which the state does not carry, asks whether to switch without it.
+    /// `Save the changes to host:/abs before switching to HOST?`; the planner's plan, which goes
+    /// with the switch, asks too, as does what is typed in a git dialog the state does not carry
+    /// ([`Browser::git_dropped`]). An open git dialog the state carries asks nothing.
     /// Held, it is asked for again once what held it is over ([`Browser::switch_due`]) and
     /// decided anew; asked again while held, nothing new happens.
     pub(crate) fn before_switch(&mut self, to: &str) -> Before {
@@ -2924,7 +3006,7 @@ impl Browser {
             SwitchStep::Waiting(what)
         } else if !answered.unsaved && self.viewer_hold() == crate::views::Hold::Unsaved {
             SwitchStep::Asking(Ask::Unsaved, None)
-        } else if !answered.git && self.git_dropped().is_some() {
+        } else if !answered.git && self.git_dropped(to).is_some() {
             SwitchStep::Asking(Ask::Git, None)
         } else {
             self.discarding = answered.unsaved;
@@ -3001,17 +3083,47 @@ impl Browser {
         })
     }
 
-    /// What of the git panels the switch's state does not carry and would drop (10 §7.4,
-    /// Tensions): the planner's plan, or a dialog with what is typed in it.
-    fn git_dropped(&self) -> Option<&'static str> {
-        let panels = &self.git.panels;
-        if panels.iter().any(|p| p.view.planner_model().is_some()) {
-            return Some("The planner's unsaved plan");
+    /// What of the git panels the switch to `to` asks about first (10 §7.4, v2), as the
+    /// question says it: the plan of a planner on screen, which goes with the switch and asks
+    /// first as unsaved edits do; everything the state does not carry, in one sentence — a
+    /// panel's not on screen (its plan, its dialog), what is typed in a history edit's own dialog,
+    /// what is chosen in a restore's; and a given state's git panels still being put back, which a
+    /// switch now sends as they came.
+    fn git_dropped(&self, to: &str) -> Option<String> {
+        // The panels the state carries, by the rule its parts go by (`git_carried`).
+        let carried = self.git_carried();
+        let views =
+            || (self.git.panels.iter().enumerate()).map(|(i, p)| (carried.contains(&i), &p.view));
+        let plan = (views().any(|(carried, v)| carried && v.planner_model().is_some()))
+            .then(|| format!("The planner's unsaved plan goes with the switch to {to}."));
+        let mut dropped: Vec<&str> = Vec::new();
+        for what in views().flat_map(|(carried, v)| v.untaken(carried)) {
+            if !dropped.contains(&what) {
+                dropped.push(what);
+            }
         }
-        panels.iter().any(|p| p.view.dialog_up()).then_some(
-            "The git panel's open dialog, and what is typed in it (a commit message, a tag's or \
-             a branch's name),",
-        )
+        let capital = |text: &str| {
+            let mut chars = text.chars();
+            chars
+                .next()
+                .map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
+        };
+        let dropped = match dropped.as_slice() {
+            [] => None,
+            [one] => Some(format!(
+                "{} is not carried to {to}: switching drops it.",
+                capital(one)
+            )),
+            [rest @ .., last] => Some(format!(
+                "{} and {last} are not carried to {to}: switching drops them.",
+                capital(&rest.join(", "))
+            )),
+        };
+        let giving = (self.git_giving()).then(|| {
+            "The git panel is still being put back: switching now sends it as it came.".to_string()
+        });
+        let lines: Vec<String> = [plan, dropped, giving].into_iter().flatten().collect();
+        (!lines.is_empty()).then(|| lines.join(" "))
     }
 
     /// A held switch's part of a pass, before anything else of it: the job waited for has ended,
@@ -3035,7 +3147,7 @@ impl Browser {
                 // Saved, saving, or the viewer left, meanwhile: decided anew.
                 _ => SwitchStep::Due,
             }),
-            SwitchStep::Asking(Ask::Git, keyboard) => Some(match self.git_dropped() {
+            SwitchStep::Asking(Ask::Git, keyboard) => Some(match self.git_dropped(&to) {
                 Some(_) => SwitchStep::Asking(Ask::Git, keyboard),
                 None => SwitchStep::Due,
             }),
@@ -3110,7 +3222,8 @@ impl Browser {
     ///   state has come back and been given ([`Browser::take_discard`],
     ///   [`Browser::discard_viewer`]); Cancel stays. Two questions in a row (unsaved edits, then a
     ///   git plan) keep both answers ([`Switching::answered`]).
-    /// - The git panel's dialog or plan: what is dropped, and Switch · Cancel.
+    /// - The planner's plan, which goes with the switch, and what is typed in a git dialog the
+    ///   state does not carry, which it drops: Switch · Cancel.
     fn switch_question(&mut self, ctx: &egui::Context, area: Rect, keys: Vec<egui::Event>) {
         use ops::dialog::{self, Button, Ink, Inputs, Part};
         let Some((to, ask, keyboard, mut answered)) = self.switching.as_ref().and_then(|s| match s
@@ -3139,12 +3252,13 @@ impl Browser {
                 (SWITCH_TITLE.to_string(), text, buttons)
             }
             Ask::Git => {
-                let what = self.git_dropped().unwrap_or("The git panel's open dialog");
+                let Some(text) = self.git_dropped(&to) else {
+                    return;
+                };
                 let buttons = vec![
                     Button::new("Switch", id.with("switch")),
                     Button::new("Cancel", id.with("cancel")),
                 ];
-                let text = format!("{what} is not carried to {to}: switching drops it.");
                 (format!("Switch to {to}"), text, buttons)
             }
         };

@@ -866,7 +866,7 @@ struct SwitchHeard {
 
 /// The longest line read that is a state's cue (`sopen-xtools-state ` and its JSON): a state can
 /// pass [`OUT_LINE_MAX`] (select-all in a folder of tens of thousands of names).
-const STATE_LINE_MAX: usize = 64 << 20;
+pub(crate) const STATE_LINE_MAX: usize = 64 << 20;
 
 /// Reads `from` to its end a line at a time (`\n`; a line split across reads is one), each given
 /// to `line` with whether it passed its bound: `max` of the line so far says how long it may be;
