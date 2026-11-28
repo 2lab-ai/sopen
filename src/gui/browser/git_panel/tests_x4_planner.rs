@@ -521,13 +521,22 @@ fn clicks_go_by_cells_with_keys_in_the_same_pass() {
     assert_eq!(verb_of(&fx, 0), Verb::Pick);
     assert_eq!(bar_of(&fx), 0);
     assert_eq!(cell(&fx, 40, 2).bg, Some(PALETTE.bar));
-    // The heads, the empty rows below the range, the frame's title: nothing (egui takes a click
-    // up to 5 points off a widget for it, so the frame's sides are not cells of their own here).
+    // The heads, the empty rows below the range, the frame's title: nothing.
     for (x, y) in [(40, 1), (40, 12), (40, 0)] {
         let p = centre(&fx, x, y);
         fx.drv.frame(&mut fx.host, click_events(p), Modifiers::NONE);
         fx.idle();
         assert_eq!(bar_of(&fx), 0, "a click at ({x}, {y})");
+    }
+    // The frame's sides beside row 3 (cell row 5), two points in from the row's cells: nothing
+    // either — egui reaches no row past its cells (F-click-slop; its 5-point reach took them).
+    let cols = grid_of(&fx).cols;
+    assert_eq!(cell(&fx, 0, 5).symbol, "║", "the frame's left side");
+    let off = Vec2::new(chrome::CELL.x / 2.0 + 2.0, 0.0);
+    for p in [centre(&fx, 1, 5) - off, centre(&fx, cols - 2, 5) + off] {
+        fx.drv.frame(&mut fx.host, click_events(p), Modifiers::NONE);
+        fx.idle();
+        assert_eq!(bar_of(&fx), 0, "a click at {p:?}");
     }
 }
 

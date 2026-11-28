@@ -4537,7 +4537,9 @@ impl MediaWindow {
         };
         let disp = super::fit(panel.shrink(4.0), self.media.shape().unwrap_or(src));
         let map = Map { disp, src };
-        let resp = ui.allocate_rect(disp, Sense::click_and_drag());
+        // Over the whole frame inside, as the image window's: a handle on the picture's edge is
+        // painted half outside it, and a click reaches only the rect it falls in (F-click-slop).
+        let resp = ui.allocate_rect(panel, Sense::click_and_drag());
         painter.image(
             tex.id(),
             disp,

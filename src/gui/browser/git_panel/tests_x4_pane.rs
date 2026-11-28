@@ -453,6 +453,75 @@ fn clicks_and_double_clicks_on_the_pane_go_by_cells() {
     );
 }
 
+/// F-click-slop: a click on a cell beside the pane's lines is no line's, however near — on the
+/// frame's left border, on the scroll bar right of them (its track and its ↑), on the graph's rule
+/// above the first and the foot's rule under the last, each two points or half a point in from
+/// the line's cell (egui's 5-point `interact_radius` gave it to the line: X4-pane's review) —
+/// the bar stays and the keyboard stays the graph's. The control: a line's own cell takes a
+/// click half a point in from its edge.
+#[test]
+fn a_click_beside_the_panes_lines_moves_no_bar() {
+    // A message long enough that a line stands on every row of the pane.
+    let message: String = (0..60).map(|k| format!("line {k:02}\n")).collect();
+    let mut fx = with_pane(1000.0, 800.0, merge_details(&message));
+    let p = pane_cells(&fx);
+    fx.press(Key::Home);
+    fx.press(Key::Escape);
+    let pane = |fx: &Fx| {
+        let pane = fx.view().pane.as_ref().unwrap();
+        (pane.keyboard, pane.scroll.bar)
+    };
+    // The graph's keyboard, the bar on the first line, the pane from its top.
+    let before = pane(&fx);
+    assert_eq!(before, (false, 0));
+    assert_eq!(read(&fx, p.x, p.y, "Commit"), "Commit");
+    let line = |y: u16| grid_of(&fx).rect(Cells::new(p.x, y, p.width, 1));
+    let (third, first, last) = (line(p.y + 3), line(p.y), line(p.bottom() - 1));
+    assert_eq!(cell(&fx, p.right(), p.y).symbol, "↑", "the scroll bar");
+    let (y, x) = (third.center().y, first.center().x);
+    let mut wrong = vec![];
+    for (what, at) in [
+        ("the left border", Pos2::new(third.left() - 2.0, y)),
+        ("the left border", Pos2::new(third.left() - 0.5, y)),
+        ("the scroll bar", Pos2::new(third.right() + 2.0, y)),
+        ("the scroll bar", Pos2::new(third.right() + 0.5, y)),
+        ("its ↑", Pos2::new(first.right() + 2.0, first.top() + 2.0)),
+        ("the rule above", Pos2::new(x, first.top() - 2.0)),
+        ("the rule above", Pos2::new(x, first.top() - 0.5)),
+        ("the rule under", Pos2::new(x, last.bottom() + 2.0)),
+    ] {
+        // Past egui's double-click time since the last click.
+        fx.drv.idle(&mut fx.host, 30);
+        let events = click_events(at);
+        fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+        fx.idle();
+        if pane(&fx) != before {
+            wrong.push(format!("{what} at {at:?}: (keyboard, bar) {:?}", pane(&fx)));
+        }
+        fx.drv.idle(&mut fx.host, 30);
+        fx.drv.click(&mut fx.host, at);
+        if pane(&fx) != before {
+            wrong.push(format!("{what} at {at:?}, three passes: {:?}", pane(&fx)));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(fx.take().is_empty(), "nothing asked for");
+    // The control: the third line takes a click half a point in from its left and right edges.
+    fx.drv.idle(&mut fx.host, 30);
+    let events = click_events(Pos2::new(third.left() + 0.5, y));
+    fx.drv.frame(&mut fx.host, events, Modifiers::NONE);
+    fx.idle();
+    assert_eq!(pane(&fx), (true, 3), "a line's own cell");
+    fx.drv.idle(&mut fx.host, 30);
+    let at = Pos2::new(last.right() - 0.5, last.center().y);
+    fx.drv.click(&mut fx.host, at);
+    assert_eq!(
+        pane(&fx),
+        (true, usize::from(p.height) - 1),
+        "the last row's line"
+    );
+}
+
 /// 10 §10, T38: in an ambiguous-wide terminal the pane's own `√` and a rename's `→` are §10's
 /// stand-ins, at the source; a `→` in a path is content and stays.
 #[test]
@@ -945,38 +1014,84 @@ fn the_banner_buttons_never_take_the_keyboard() {
     );
 }
 
-/// R1 S3: a click on the blank between two buttons presses neither — in a host with nothing
-/// behind the banner too, where egui's slop would give it to the nearer button.
+/// R1 S3, F-click-slop: a click on a blank of the banner's first row presses nothing and leaves
+/// egui's keyboard where it was — the blank between its two buttons (its centre, a point in
+/// from each), a point before `[ Continue ]`, the state's text — in a host with nothing behind
+/// the banner and over the browser's background. The control: a click on each button presses
+/// it.
 #[test]
 fn a_click_between_two_buttons_presses_none() {
     use super::tests_s3::{Fx as S3, Host as S3Host};
-    let mut fx = S3::new(S3Host {
-        banner: Some(BannerView::new(
-            "MERGE of feature · 1 conflict",
-            vec![Proceed::Continue, Proceed::Abort],
-        )),
-        ..S3Host::default()
-    });
-    let abort = fx.drv.find_text("[ Abort ]").expect("the button");
-    // The blank cell left of `[ Abort ]`, at its centre.
-    let gap = Pos2::new(abort.left() - chrome::CELL.x / 2.0, abort.center().y);
-    fx.drv.click(&mut fx.host, gap);
-    fx.idle();
-    assert_eq!(
-        fx.host.pressed,
-        Vec::<Pressed>::new(),
-        "the blank presses nothing"
-    );
-    // On the state's text: nothing either — a control, the state being far past egui's 5-point
-    // slop from any button.
-    let state = fx.drv.find_text("MERGE of feature · 1 conflict").unwrap();
-    fx.drv.idle(&mut fx.host, 30);
-    fx.drv.click(&mut fx.host, state.center());
-    assert_eq!(
-        fx.host.pressed,
-        Vec::<Pressed>::new(),
-        "the state presses nothing"
-    );
+    use super::tests_x4_lists::{click_once, Behind};
+    for behind in [false, true] {
+        let mut fx = S3::new(S3Host {
+            banner: Some(BannerView::new(
+                "MERGE of feature · 1 conflict",
+                vec![Proceed::Continue, Proceed::Abort],
+            )),
+            ..S3Host::default()
+        });
+        let abort = fx.drv.find_text("[ Abort ]").expect("the button");
+        let next = fx.drv.find_text("[ Continue ]").expect("the button");
+        let state = fx.drv.find_text("MERGE of feature · 1 conflict").unwrap();
+        assert_eq!(
+            abort.left() - next.right(),
+            chrome::CELL.x,
+            "one blank cell apart"
+        );
+        let y = abort.center().y;
+        let points = [
+            (
+                "the gap's centre",
+                Pos2::new(abort.left() - chrome::CELL.x / 2.0, y),
+            ),
+            ("a point after Continue", Pos2::new(next.right() + 1.0, y)),
+            ("a point before Abort", Pos2::new(abort.left() - 1.0, y)),
+            ("a point before Continue", Pos2::new(next.left() - 1.0, y)),
+            ("the state", state.center()),
+        ];
+        let mut wrong = vec![];
+        for (what, at) in points {
+            for one_pass in [true, false] {
+                match behind {
+                    true => fx.drv.idle(&mut Behind(&mut fx.host), 1),
+                    false => fx.idle(),
+                }
+                let keyboard = fx.drv.ctx.memory(|m| m.focused());
+                match behind {
+                    true => click_once(&mut fx.drv, &mut Behind(&mut fx.host), at, one_pass),
+                    false => click_once(&mut fx.drv, &mut fx.host, at, one_pass),
+                }
+                let now = fx.drv.ctx.memory(|m| m.focused());
+                let pressed = std::mem::take(&mut fx.host.pressed);
+                if !pressed.is_empty() || now != keyboard {
+                    let how = if one_pass { "one pass" } else { "three passes" };
+                    wrong.push(format!(
+                        "{what} ({how}, behind {behind}): {pressed:?}, {keyboard:?} → {now:?}"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // The control: each button takes its click.
+        for (button, step) in [(next, Proceed::Continue), (abort, Proceed::Abort)] {
+            match behind {
+                true => click_once(
+                    &mut fx.drv,
+                    &mut Behind(&mut fx.host),
+                    button.center(),
+                    true,
+                ),
+                false => click_once(&mut fx.drv, &mut fx.host, button.center(), true),
+            }
+            let pressed = std::mem::take(&mut fx.host.pressed);
+            assert_eq!(
+                pressed,
+                [Pressed::Proceed(Action::Proceed(step))],
+                "{step:?}"
+            );
+        }
+    }
 }
 
 /// Fix check: a click on a pane's line pressed before the banner grows a row and released after

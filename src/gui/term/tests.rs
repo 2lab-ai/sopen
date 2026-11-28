@@ -4175,5 +4175,76 @@ fn ts6_a_box_line_beside_a_wide_glyph_in_a_name_stays_as_written() {
     }
 }
 
+/// F-click-slop's stand-in screen: two buttons one blank cell apart on row 1 (`[ A ]` at cells
+/// 2–6, `[ B ]` at 8–12) and a scroll bar's ↑, thumb and ↓ down column 20, each sensing clicks
+/// alone, nothing under them; what each click landed on, by name.
+#[derive(Default)]
+struct Targets {
+    clicked: Vec<&'static str>,
+}
+
+impl super::Window for Targets {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let p = chrome::PALETTE;
+        let grid = cells::Grid::over(ui.max_rect());
+        let mut buf = Buffer::empty(grid.all());
+        cells::fill(&mut buf, grid.all(), Pen::new(p.text, p.back));
+        let pen = Pen::new(p.dialog_text, p.dialog_back);
+        for (name, at, label) in [
+            ("A", Cells::new(2, 1, 5, 1), "[ A ]"),
+            ("B", Cells::new(8, 1, 5, 1), "[ B ]"),
+            ("up", Cells::new(20, 1, 1, 1), "↑"),
+            ("thumb", Cells::new(20, 2, 1, 1), "■"),
+            ("down", Cells::new(20, 3, 1, 1), "↓"),
+        ] {
+            cells::put(&mut buf, at.x, at.y, label, usize::from(at.width), pen);
+            let id = egui::Id::unique(("sopen-term-test-slop", name));
+            if ui.interact(grid.rect(at), id, egui::Sense::CLICK).clicked() {
+                self.clicked.push(name);
+            }
+        }
+        cells::paint(ui.painter(), grid.origin, &buf, None);
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
+
+/// F-click-slop through the terminal: a click is its cell's centre, four points from the cells
+/// left and right of it, so egui's 5-point `interact_radius` gave a click on the blank between
+/// two buttons to the one laid last, and one on the cell beside a button or a scroll bar's
+/// column to it. In the skin, none: the gap, the cells beside `[ A ]` and `[ B ]` and those
+/// beside each of the scroll bar's ↑, thumb and ↓ press nothing (each a centre four points from a
+/// control: the cells above and below a control, eight points off, were never reached); each
+/// button, at its first and last cell, and each one-cell target takes the click on its own cell.
+#[test]
+fn a_click_in_the_terminal_lands_only_on_its_cells_control() {
+    let tape = Tape::default();
+    {
+        let mut s = tape.0.borrow_mut();
+        s.size = (40, 10);
+        // A move first: egui hit-tests a press against the pass before's widgets, so a click read
+        // with the first pass would land on none whatever its place.
+        s.events.push_back(mouse(MouseEventKind::Moved, 30, 8));
+        let misses = [(1, 1), (7, 1), (13, 1), (19, 1), (21, 2), (19, 3), (21, 3)];
+        let hits = [(2, 1), (6, 1), (8, 1), (12, 1), (20, 1), (20, 2), (20, 3)];
+        for (x, y) in misses.into_iter().chain(hits) {
+            s.events.extend(click(x, y));
+        }
+        s.stop = Some(libc::SIGTERM);
+    }
+    let mut b = Backend::new(tape.clone(), Bytes::default(), skin(), true);
+    let mut no_switch = |_: &mut Backend<Tape, Bytes>| -> io::Result<Option<String>> { Ok(None) };
+    let mut targets = Targets::default();
+    let end = b.run(&mut targets, &mut no_switch).unwrap();
+    assert_eq!(end, End::Signal(libc::SIGTERM));
+    assert_eq!(
+        targets.clicked,
+        ["A", "A", "B", "B", "up", "thumb", "down"],
+        "the misses pressed nothing, each hit its own control"
+    );
+}
+
 mod questions;
 mod text;
