@@ -440,6 +440,9 @@ pub struct GitView {
     unasked: bool,
     /// The menu of the object under the bar, with a commit's history row (S4).
     menu: Option<menu::HistoryMenu>,
+    /// Another panel's dialog is up (two repositories' panels side by side): this one opens none
+    /// and takes no click until it closes, one dialog at a time (X4-menu round 1).
+    dialog_elsewhere: bool,
     dialog: Option<Box<dialogs::ActionDialog>>,
     /// The plan the dialog showed for the action it returned: what runs (S3-A: its backup
     /// verifies the values the owner confirmed).
@@ -539,6 +542,7 @@ impl GitView {
             undo: None,
             unasked: false,
             menu: None,
+            dialog_elsewhere: false,
             dialog: None,
             confirmed: None,
             result: None,
@@ -865,6 +869,9 @@ impl GitView {
     pub fn status_line(&self) -> Status {
         if let Some(menu) = &self.menu {
             return Status::info(menu_hint(menu));
+        }
+        if self.filters_dialog.is_some() {
+            return Status::info(filters::HINT);
         }
         if let Some(said) = self.said.as_ref().or(self.status.as_ref()) {
             return said.clone();
@@ -1338,6 +1345,11 @@ impl GitView {
             return Some(GitAction::MoreRows);
         }
         None
+    }
+
+    /// Whether another panel's dialog is up: the integration says so before each pass.
+    pub fn set_dialog_elsewhere(&mut self, up: bool) {
+        self.dialog_elsewhere = up;
     }
 
     /// A dialog is up — the filters', history search's, S3's menu, action dialog, result, "Stop
@@ -2158,10 +2170,15 @@ impl GitView {
             ctx.copy_text(text);
         }
         if let Some(menu) = &mut self.menu {
-            return match menu.ui(ctx, grid) {
+            let mut asked = match menu.ui(ctx, grid) {
                 Some(menu::HistoryMenuEnd::Menu(menu::MenuEnd::Chose { id, target })) => {
                     self.menu = None;
                     self.act(id, target)
+                }
+                // A key line of the repository's menu (10 T17): as its key runs it.
+                Some(menu::HistoryMenuEnd::Menu(menu::MenuEnd::Key(command))) => {
+                    self.menu = None;
+                    self.run(ctx, command)
                 }
                 Some(menu::HistoryMenuEnd::Menu(menu::MenuEnd::Cancel)) => {
                     self.menu = None;
@@ -2173,6 +2190,12 @@ impl GitView {
                 }
                 None => Vec::new(),
             };
+            // The dialog a choice opened, in the same pass: the menu handed it what the pass held
+            // after the choosing Enter, typed text in its place (X4-menu).
+            if self.menu.is_none() && (self.quick.is_some() || self.dialog.is_some()) {
+                asked.extend(self.modals(ctx, grid));
+            }
+            return asked;
         }
         if let Some(quick) = &mut self.quick {
             return match quick.ui(ctx, grid, planner::PLAN) {
@@ -2673,7 +2696,7 @@ fn menu_hint(history: &menu::HistoryMenu) -> String {
         },
         Target::Repository => "the repository".to_string(),
     };
-    match menu.items().len() + history.history().len() {
+    match history.lines() {
         0 => format!("Menu of {of}: nothing to do · Esc closes"),
         n => format!("Menu of {of}: {n} items · ↑ ↓ choose · Enter runs · Esc closes"),
     }
@@ -2851,7 +2874,9 @@ pub fn draw(
     let layout = Layout::of(inner, banner_rows, view.pane.is_some() && !listing);
     let pane_keyboard = view.pane.as_ref().is_some_and(|p| p.keyboard);
     let list_active = active && !pane_keyboard && !view.dialog_up();
-    let dialog = view.dialog_up();
+    // A dialog of this panel's, or of another panel's beside it: no click or right click here
+    // opens one or acts (one dialog at a time, X4-menu round 1).
+    let dialog = view.dialog_up() || view.dialog_elsewhere;
     // The cells egui draws (the parts not in cells yet), and Find's caret.
     let mut eguis: Vec<Cells> = Vec::new();
     let mut caret = None;
@@ -2890,7 +2915,7 @@ pub fn draw(
         if view.planner.is_some() {
             // The planner over the body (03 §7.8.2): its keys first while it has the keyboard and
             // no other dialog is up, then the pane, then its own dialog.
-            let pane_active = active && !view.other_dialog_up();
+            let pane_active = active && !view.other_dialog_up() && !view.dialog_elsewhere;
             let end = view.planner.as_mut().and_then(|p| {
                 planner::draw(
                     ui,
@@ -2907,7 +2932,9 @@ pub fn draw(
             }
             asked.extend(view.planner_end(end));
         } else if let Some(log) = &mut view.log {
-            log_view::draw(ui, grid, at.listing, &mut buf, log, active && !dialog);
+            clicks_off(ui, dialog, |ui| {
+                log_view::draw(ui, grid, at.listing, &mut buf, log, active && !dialog)
+            });
             if !log_view::PAINTS_CELLS {
                 eguis.push(at.listing);
             }
@@ -2942,7 +2969,7 @@ pub fn draw(
                 if !details::PAINTS_CELLS {
                     eguis.push(with_border(pane_cells));
                 }
-                if let Some((line, twice)) = clicked {
+                if let Some((line, twice)) = clicked.filter(|_| !dialog) {
                     pane.keyboard = true;
                     pane.scroll.to(line);
                     if twice {
@@ -3007,13 +3034,15 @@ pub fn draw(
         ui.set_clip_rect(grid.rect(none));
         let ui = &mut ui;
         if view.planner.is_some() {
-            let pane_active = active && !view.other_dialog_up();
+            let pane_active = active && !view.other_dialog_up() && !view.dialog_elsewhere;
             let end = view.planner.as_mut().and_then(|p| {
                 planner::draw(ui, grid, none, &mut buf, p, pane_active, &planner::SEAMS)
             });
             asked.extend(view.planner_end(end));
         } else if let Some(log) = &mut view.log {
-            log_view::draw(ui, grid, none, &mut buf, log, active && !dialog);
+            clicks_off(ui, dialog, |ui| {
+                log_view::draw(ui, grid, none, &mut buf, log, active && !dialog)
+            });
         } else if view.backups.is_some() {
         } else if view.find.is_some() && view.search.is_none() {
             let typing = active && !dialog;
@@ -3037,7 +3066,10 @@ pub fn draw(
         cells::fill(&mut buf, r, body);
     }
     cells::paint(&painter, grid.origin, &buf, caret);
-    // The dialogs, over everything, on the panels' grid.
+    // The dialogs, over everything, on the panels' grid. While another dialog has the keyboard —
+    // another panel's, the list's question — they read no key or text this pass (X4-menu
+    // fix-check): those are that dialog's.
+    let kept = view.dialog_elsewhere.then(|| take_keys(&ctx));
     if let Some(dialog) = &mut view.filters_dialog {
         match dialog.ui(&ctx, *grid) {
             Some(filters::DialogEnd::Apply(f)) => {
@@ -3065,7 +3097,41 @@ pub fn draw(
         }
     }
     asked.extend(view.modals(&ctx, *grid));
+    if let Some(kept) = kept {
+        ctx.input_mut(|i| i.events.extend(kept));
+    }
     asked
+}
+
+/// `f` in `ui`, its clicks off while `off` — a dialog up, this panel's or another panel's beside
+/// it: the command log's rows act on nothing then, not only where egui's modal lies over them
+/// (X4-menu). egui reports no click to a disabled `Ui`'s widgets; the log paints cells into the
+/// panel's buffer, which a disabled `Ui` does not dim, and its own entry shown whole is a modal of
+/// its own.
+fn clicks_off<R>(ui: &mut egui::Ui, off: bool, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    match off {
+        true => ui.add_enabled_ui(false, f).inner,
+        false => f(ui),
+    }
+}
+
+/// The pass's keys and typed text, taken out of its input to be put back after the dialogs.
+fn take_keys(ctx: &egui::Context) -> Vec<egui::Event> {
+    ctx.input_mut(|i| {
+        let (keys, rest) = std::mem::take(&mut i.events).into_iter().partition(|e| {
+            matches!(
+                e,
+                egui::Event::Key { .. }
+                    | egui::Event::Text(_)
+                    | egui::Event::Ime(_)
+                    | egui::Event::Copy
+                    | egui::Event::Cut
+                    | egui::Event::Paste(_)
+            )
+        });
+        i.events = rest;
+        keys
+    })
 }
 
 /// Find's field at cells `cells` of `grid` (the heads' row, none in a panel too short for its

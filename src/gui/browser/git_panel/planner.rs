@@ -1622,7 +1622,11 @@ fn paint(
         let resp = ui.interact(
             grid.rect(row_cells),
             ui.scope_id().with(("sopen-git-planner-row", k)),
-            Sense::click(),
+            if active && view.inner.is_none() {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
         );
         if resp.clicked() {
             clicked_row = Some(k);
@@ -1656,7 +1660,8 @@ fn paint(
             if c + w <= chars {
                 let at = Cells::new(x(c), y, w as u16, 1);
                 let id = ui.scope_id().with(salt);
-                if ui.interact(grid.rect(at), id, Sense::click()).clicked() {
+                // Acts only while nothing else's dialog is up (`active` carries it: X4-menu).
+                if ui.interact(grid.rect(at), id, Sense::click()).clicked() && active {
                     clicked = Some(foot);
                 }
                 // egui's button colours: black on cyan, the bar's when it has the focus (10 §6).

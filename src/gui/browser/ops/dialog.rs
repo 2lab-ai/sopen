@@ -136,7 +136,6 @@ pub enum Part {
     /// a click on a row, or Space or Enter, chooses the bar's row ([`Shown::chosen`]). Its rows
     /// are shared ([`Rows`]), measured once: a pass copies and measures none of them, and draws
     /// only those it shows.
-    #[cfg_attr(not(test), allow(dead_code))] // X4-menu uses it; the tests till then.
     List {
         rows: Arc<Rows>,
         id: egui::Id,
@@ -171,7 +170,6 @@ pub struct Row {
 }
 
 impl Row {
-    #[cfg_attr(not(test), allow(dead_code))] // X4-menu uses it; the tests till then.
     pub fn new(label: &str, key: &str) -> Self {
         Self {
             label: label.to_string(),
@@ -190,7 +188,6 @@ pub struct Rows {
 }
 
 impl Rows {
-    #[cfg_attr(not(test), allow(dead_code))] // X4-menu uses it; the tests till then.
     pub fn new(all: Vec<Row>) -> Arc<Self> {
         let widest = all.iter().map(row_wants).max().unwrap_or(0);
         Arc::new(Self { all, widest })
@@ -825,7 +822,6 @@ impl Shown {
 
     /// The rows of the list `id` chosen this pass, in order: a click on one, or Space or Enter
     /// on its bar — each the row the bar was on then.
-    #[cfg_attr(not(test), allow(dead_code))] // X4-menu uses it; the tests till then.
     pub fn chosen(&self, id: egui::Id) -> Vec<usize> {
         (self.chosen.iter())
             .filter(|(list, _)| *list == id)
