@@ -25,6 +25,7 @@ use crate::gui::browser::switch_state::{
     GitFind, GitOrder, GitPlan, GitPlanRow, GitRow, GitState, GitSubject, GitTarget, GitText,
 };
 use eframe::egui;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 fn row(key: &RowKey) -> GitRow {
@@ -451,9 +452,12 @@ impl GitView {
     /// of a panel the state does not carry (`carried` false: not on screen), its planner's plan and
     /// its open dialog; of one it carries, what is chosen in a restore's, the front dialog's typing
     /// when it is past what a state holds (`fit` leaves it out), and what is typed or chosen in
-    /// each dialog behind the one that crosses ([`GitView::holding`]).
-    pub fn untaken(&self, carried: bool) -> Vec<&'static str> {
+    /// each dialog behind the one that crosses ([`GitView::holding`]); of either, each run's
+    /// question asked again and waiting (F-git-own-two: no state holds one).
+    pub fn untaken(&self, carried: bool) -> Vec<Cow<'static, str>> {
         use crate::git::actions::Action;
+        let questions = (self.waiting_questions())
+            .map(|title| Cow::Owned(format!("the question {title} asks again")));
         if !carried {
             let plan = self
                 .planner
@@ -461,7 +465,8 @@ impl GitView {
                 .then_some("the unsaved plan of a planner not on screen");
             let dialog =
                 (self.dialog_up()).then_some("the open dialog of a git panel not on screen");
-            return plan.into_iter().chain(dialog).collect();
+            let fixed = plan.into_iter().chain(dialog).map(Cow::Borrowed);
+            return fixed.chain(questions).collect();
         }
         let restore =
             |d: &super::dialogs::ActionDialog| matches!(d.draft(), Action::Restore { .. });
@@ -473,7 +478,8 @@ impl GitView {
             .filter(|_| !self.carried_whole())
             .map(|h| h.too_long());
         let behind = holding.iter().skip(1).map(|h| h.named());
-        restore.into_iter().chain(front).chain(behind).collect()
+        let fixed = restore.into_iter().chain(front).chain(behind);
+        fixed.map(Cow::Borrowed).chain(questions).collect()
     }
 
     /// Whether the dialog that crosses ([`GitView::dialog_part`]'s) is within what a state holds

@@ -3104,8 +3104,14 @@ impl Browser {
             || (self.git.panels.iter().enumerate()).map(|(i, p)| (carried.contains(&i), &p.view));
         let plan = (views().any(|(carried, v)| carried && v.planner_model().is_some()))
             .then(|| format!("The planner's unsaved plan goes with the switch to {to}."));
-        let mut dropped: Vec<&str> = Vec::new();
-        for what in views().flat_map(|(carried, v)| v.untaken(carried)) {
+        // And what the owner asked for that waits, held behind a dialog or on its way
+        // (F-git-own-two).
+        let asked = (self.git.panels.iter()).flat_map(|p| p.asked_untaken());
+        let mut dropped: Vec<std::borrow::Cow<str>> = Vec::new();
+        for what in views()
+            .flat_map(|(carried, v)| v.untaken(carried))
+            .chain(asked)
+        {
             if !dropped.contains(&what) {
                 dropped.push(what);
             }
@@ -3120,7 +3126,7 @@ impl Browser {
             [] => None,
             [one] => Some(format!(
                 "{} is not carried to {to}: switching drops it.",
-                capital(one)
+                capital(one.as_ref())
             )),
             [rest @ .., last] => Some(format!(
                 "{} and {last} are not carried to {to}: switching drops them.",
@@ -3443,7 +3449,7 @@ impl Window for Browser {
                 .tree
                 .as_ref()
                 .is_some_and(|t| !t.settled(self.whole_sizes))
-            || self.git.busy();
+            || self.git_busy();
         if working {
             ctx.request_repaint_after(Duration::from_millis(100));
         }

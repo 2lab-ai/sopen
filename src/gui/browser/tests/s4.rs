@@ -1701,11 +1701,12 @@ fn f_git_drafted_idle_passes_copy_no_draft_at_the_host() {
 }
 
 /// F-git-drafted: two dialogs whose drafts stand at the same revision are told apart by which
-/// dialog each is. A quick edit's confirmation put in the place of another, with no pass without
-/// a dialog between (`reconfirm_edit`), gets its own reads: Reword of `four` reads `cat-file
-/// commit <four>`, then Reword of `three` in its place reads `cat-file commit <three>`.
+/// dialog each is. A quick edit's confirmation asked again while another is up (`reconfirm_edit`)
+/// waits for it (F-git-own-two) and opens at the first poll after Esc closes it, so no poll sees
+/// the panel without a dialog between the two; it gets its own reads: Reword of `four` reads
+/// `cat-file commit <four>`, then Reword of `three` after it reads `cat-file commit <three>`.
 #[test]
-fn f_git_drafted_a_dialog_in_the_place_of_another_reads_its_own() {
+fn f_git_drafted_a_dialog_right_after_another_reads_its_own() {
     let git = git_or_skip!();
     let mut repo = five(&git);
     let log = repo.tmp.path().join("raw.log");
@@ -1736,13 +1737,14 @@ fn f_git_drafted_a_dialog_in_the_place_of_another_reads_its_own() {
     g.idle(4);
     assert!(!g.shows("not read yet"), "{:#?}", g.texts());
     assert_eq!((asked(&four), asked(&three)), (1, 0));
-    // In its place, at the same revision (neither was typed in), in the same snapshot.
+    // After it, at the same revision (neither was typed in), in the same snapshot.
     let commit = crate::git::model::Oid::parse(&three).unwrap();
     let edit = Edit::Quick(crate::git::rebase::Quick::Reword {
         commit,
         message: "three, again".into(),
     });
-    g.panel_mut().view.reconfirm_edit(edit.clone());
+    g.panel_mut().view.reconfirm_edit("Reword", edit.clone());
+    g.key(Key::Escape);
     g.idle(2);
     g.until_quiet("its own reads");
     g.idle(4);
