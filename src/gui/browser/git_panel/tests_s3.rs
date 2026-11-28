@@ -343,8 +343,9 @@ impl Window for Host {
                     let top = crate::gui::cells::Cells::new(all.x, all.y, all.width, h);
                     body =
                         crate::gui::cells::Cells::new(all.x, all.y + h, all.width, all.height - h);
+                    let panel = egui::Id::unique("sopen-git-test-panel");
                     self.pressed
-                        .extend(in_progress::draw(ui, &grid, top, &mut buf, b));
+                        .extend(in_progress::draw(ui, &grid, top, &mut buf, b, panel));
                 }
                 if let Some(v) = &mut self.backups {
                     let end = backups::draw(ui, &grid, body, &mut buf, v, !modal, &[]);

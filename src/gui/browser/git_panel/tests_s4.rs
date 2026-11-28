@@ -402,12 +402,14 @@ impl Window for Host {
                     let h = u16::try_from(b.rows()).unwrap_or(u16::MAX).min(all.height);
                     let top = Cells::new(all.x, all.y, all.width, h);
                     body = Cells::new(all.x, all.y + h, all.width, all.height - h);
+                    let panel = egui::Id::unique("sopen-git-test-panel");
                     match &self.stop {
-                        Some(stop) => self
-                            .stop_ends
-                            .extend(in_progress::draw_stop(ui, &grid, top, &mut buf, b, stop)),
+                        Some(stop) => self.stop_ends.extend(in_progress::draw_stop(
+                            ui, &grid, top, &mut buf, b, stop, panel,
+                        )),
                         None => self.stop_ends.extend(
-                            in_progress::draw(ui, &grid, top, &mut buf, b).map(StopEnd::Banner),
+                            in_progress::draw(ui, &grid, top, &mut buf, b, panel)
+                                .map(StopEnd::Banner),
                         ),
                     }
                 }
