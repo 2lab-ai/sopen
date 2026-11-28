@@ -745,7 +745,27 @@ fn text_typed_after_a_key_that_opens_a_dialog_reaches_it() {
         }
         fx.idle();
         assert!(pane(&fx).dialog_up(), "split {split}: the message dialog");
-        assert!(shown(&fx, &typed), "split {split}: {:#?}", fx.drv.texts());
+        // The box's rows in order: under the field's label each line of the message a row.
+        let titled = |l: &Arc<Layer>| {
+            let a = l.buf.area;
+            (a.top()..a.bottom()).any(|y| cells::row_text(&l.buf, y).0.contains(": its message"))
+        };
+        let boxed = (cells::layers(&fx.drv.ctx).into_iter())
+            .find(titled)
+            .expect("the message dialog's box");
+        let a = boxed.buf.area;
+        let rows: Vec<String> = (a.top()..a.bottom())
+            .map(|y| cells::row_text(&boxed.buf, y).0)
+            .collect();
+        let mut from = rows
+            .iter()
+            .position(|r| r.contains("Message"))
+            .expect("its label")
+            + 1;
+        for line in typed.lines().filter(|l| !l.is_empty()) {
+            let k = rows[from..].iter().position(|r| r.contains(line));
+            from += k.unwrap_or_else(|| panic!("split {split}: {line:?} in {rows:#?}")) + 1;
+        }
         fx.press(Key::Enter);
         assert!(!pane(&fx).dialog_up(), "split {split}: Enter keeps it");
         let row = &pane(&fx).model().rows[0];
@@ -894,12 +914,14 @@ fn enter_text_and_enter_in_one_pass_keep_the_text() {
     assert_eq!(kept, Some(format!("{message}x")));
 }
 
-/// As built until X4-planner2's dialogs read presses in the pass's order: the egui dialog takes
-/// its own Enter and Esc before its field reads the pass's text, so text typed after them in the
-/// same pass is read as typed before them — Enter, Enter and `d`: the `d` in the message kept;
-/// Enter, Esc and `d`: nothing kept, the `d` dropped; `a`, Enter and `d`: the author `Ann Leed`.
+/// The pane's dialogs read the pass's keys in its order (X4-planner2): a dialog reads what came
+/// after the key that opened it up to its first Enter or Esc, and once that key closed it what
+/// follows is the pane's — Enter, Enter and `d`: the message kept as it was, then the row dropped;
+/// Enter, Esc and `d`: nothing kept, the row dropped; `a`, Enter and `d`: the author kept as it was
+/// (no mark), the row dropped. What came before the closing key is the dialog's and only its:
+/// Enter, `d` and Enter keep the message with the `d`, the row still a reword.
 #[test]
-fn the_egui_dialogs_take_their_enter_and_esc_before_the_passs_text() {
+fn the_dialogs_read_their_keys_in_the_passs_order() {
     let message = format!(
         "{}\n\nbody of 7\n",
         "커밋 7: 한글 제목과 an English subject"
@@ -909,10 +931,7 @@ fn the_egui_dialogs_take_their_enter_and_esc_before_the_passs_text() {
         fx.idle();
     };
     let keyed = |key: Key| key_events(key, Modifiers::NONE);
-    for (second, kept) in [
-        (Key::Enter, Some(format!("{message}d"))),
-        (Key::Escape, None),
-    ] {
+    for (second, kept) in [(Key::Enter, Some(message.clone())), (Key::Escape, None)] {
         let mut fx = with_planner(1000.0, 500.0, plain(6));
         fx.typed("r");
         let mut events = keyed(Key::Enter);
@@ -921,11 +940,7 @@ fn the_egui_dialogs_take_their_enter_and_esc_before_the_passs_text() {
         pass(&mut fx, events);
         assert!(!pane(&fx).dialog_up(), "{second:?}");
         assert_eq!(pane(&fx).model().rows[0].message, kept, "{second:?}");
-        assert_eq!(
-            verb_of(&fx, 0),
-            Verb::Reword,
-            "{second:?}: the d set no verb"
-        );
+        assert_eq!(verb_of(&fx, 0), Verb::Drop, "{second:?}: the pane's d");
     }
     let mut fx = with_planner(1000.0, 500.0, plain(6));
     let mut events = vec![Event::Text("a".into())];
@@ -933,11 +948,22 @@ fn the_egui_dialogs_take_their_enter_and_esc_before_the_passs_text() {
     events.push(Event::Text("d".into()));
     pass(&mut fx, events);
     assert!(!pane(&fx).dialog_up());
-    let author = pane(&fx).model().rows[0]
-        .author
-        .as_ref()
-        .map(|a| a.name.clone());
-    assert_eq!(author.as_deref(), Some("Ann Leed"));
+    assert_eq!(pane(&fx).model().rows[0].author, None, "kept as it was");
+    assert_eq!(verb_of(&fx, 0), Verb::Drop, "the pane's d");
+    let mut fx = with_planner(1000.0, 500.0, plain(6));
+    fx.typed("r");
+    let mut events = keyed(Key::Enter);
+    events.push(Event::Text("d".into()));
+    events.extend(keyed(Key::Enter));
+    pass(&mut fx, events);
+    assert!(!pane(&fx).dialog_up());
+    let kept = pane(&fx).model().rows[0].message.clone();
+    assert_eq!(kept, Some(format!("{message}d")));
+    assert_eq!(
+        verb_of(&fx, 0),
+        Verb::Reword,
+        "the d was the message's alone"
+    );
 }
 
 /// A dialog of the pane's opens with each field's caret at the end of its text, whatever caret

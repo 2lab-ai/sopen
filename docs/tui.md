@@ -47,13 +47,13 @@ changes: a folder still opens in a window.
   - the git panel's menu (F10, Shift+F10 or a right click: every action of what is under the bar, and in the repository's menu each Ctrl+Shift key of the panel's, which a terminal without the kitty protocol cannot send);
   - the git panel's filters (Ctrl+K);
   - the git panel's action dialogs, their result (and a read's failure, a tag's details) and "Stop git?" (their fields, choices, plan and buttons);
-  - a commit's quick edit's dialog (Reword's and Squash's message, Author and date's fields, Drop's and the rest of the history row's: its plan and buttons).
+  - a commit's quick edit's dialog (Reword's and Squash's message, Author and date's fields, Drop's and the rest of the history row's: its plan and buttons);
+  - the git panel's history planner's own dialogs (a row's message, the author and dates, Esc's question and the run's confirmation: their fields, options, plan and buttons).
 - **Not drawn in the terminal yet**, each a box saying `F12 shows it in the window` (inside the git
   panel's frame for its parts; a click on it is F12):
   - the preview of a picture, a video or a sound, and the info card;
   - the other viewers;
-  - the viewers' dialogs;
-  - the planner's own dialogs.
+  - the viewers' dialogs.
 - **Keys**: where the terminal offers the kitty keyboard protocol sopen turns it on and every key
   arrives as in the window. Elsewhere Ctrl+digits and some Ctrl+Shift chords cannot arrive, so
   **Alt+1…0 are F1…F10** (on a Mac the terminal must send Option as Alt). Ctrl is the window's

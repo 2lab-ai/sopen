@@ -1627,6 +1627,23 @@ pub fn message(ui: &mut egui::Ui, grid: &Grid, at: Cells, id: egui::Id, text: &m
     view.store(&ctx, id);
 }
 
+/// The message field `id` opened afresh before its first lay, its caret before character `caret`
+/// of its text: what [`message`] does for a field it did not lay in the pass before — nothing to
+/// undo or selected, its rows following the caret — with the caret where the caller puts it, so
+/// what is typed in that very pass lands there (the planner's message opens at its end, X4-planner2).
+pub fn open_message(ctx: &egui::Context, id: egui::Id, caret: usize) {
+    let mut state = egui::text_edit::TextEditState::default();
+    let at = egui::text::CCursorRange::one(egui::text::CCursor::new(caret));
+    state.cursor.set_char_range(Some(at));
+    state.store(ctx, id);
+    let laid = Some(ctx.cumulative_pass_nr().saturating_sub(1));
+    MessageView {
+        laid,
+        ..MessageView::default()
+    }
+    .store(ctx, id);
+}
+
 /// A row of a message field's text: its bytes in the text, the characters before it, and whether
 /// a `\n` ends it. Its glyphs are not kept: its bytes are cut again where they are wanted.
 #[derive(Debug, Clone)]

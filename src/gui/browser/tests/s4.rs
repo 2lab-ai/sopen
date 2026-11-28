@@ -285,7 +285,7 @@ fn g_h1_one_planner_run_of_every_verb_through_the_window() {
     g.key(Key::Tab);
     g.idle(1);
     g.replace_typed("bea@example.com");
-    g.click("now");
+    g.click("( ) now");
     g.key(Key::Enter);
     g.idle(2);
     assert!(!g.view().dialog_up(), "{:#?}", g.texts());
@@ -1091,7 +1091,7 @@ fn g_h5_update_refs_moves_a_branch_and_undo_puts_both_back() {
     g.with(Key::Enter, Modifiers::COMMAND);
     g.idle(2);
     g.until_quiet("the run's reads");
-    g.click(git_panel::UPDATE_REFS);
+    g.click(&format!("[ ] {}", git_panel::UPDATE_REFS));
     g.until_quiet("the run's reads, branches moved");
     g.idle(4);
     assert!(

@@ -51,7 +51,6 @@ use crate::git::runner::mask_credentials;
 use crate::gui::browser::keys::{self, Mods};
 use crate::gui::browser::ops::dialog::{self as kit, Button, Ink, Input, Inputs, Part};
 use crate::gui::cells::{self, Cells, Grid};
-use crate::gui::chrome;
 use eframe::egui::{self, Key};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -768,15 +767,6 @@ pub(super) const CHANGED: &str = "the plan changed — Enter runs it · Esc canc
 /// entries scroll).
 pub(super) const TOO_SHORT: &str =
     "the window is too short for all of it: make it taller to run it";
-
-/// An egui dialog's width (the log's entry's and the planner's, until their units): `cells`
-/// cells, within the window.
-pub(super) fn width(ctx: &egui::Context, cells: f32) -> f32 {
-    let room = ctx.content_rect().width() - 8.0 * chrome::CELL.x;
-    (cells * chrome::CELL.x)
-        .min(room)
-        .max(20.0 * chrome::CELL.x)
-}
 
 impl ActionDialog {
     /// The dialog of `id` on `target` — the menu's choice, or an F-key's action — at its
