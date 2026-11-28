@@ -1380,8 +1380,8 @@ impl Browser {
     pub(super) fn poll_panel(&mut self, ctx: &egui::Context, i: usize) {
         self.poll_actions(ctx, i);
         // The load's reads — after a quick `split`, whose Split's confirmation opens with them,
-        // only while no other panel's dialog is up (X4-menu fix-check, rule 2).
-        let wait = self.git.panels[i].split_next && self.git_dialog_up(Some(i));
+        // only while no other dialog has the keyboard (X4-menu fix-check, rule 2; `git_waits`).
+        let wait = self.git.panels[i].split_next && self.git_waits(i);
         let read = (self.git.panels[i].read.as_ref())
             .filter(|_| !wait)
             .and_then(|r| r.pending.rx.try_recv().ok());
@@ -2341,6 +2341,9 @@ impl Browser {
             return;
         };
         let rect = grid.rect(cells);
+        // The list's question or the tree has the keyboard: read once, for each use below, so
+        // what the panel reads and what it carries out agree (F-git-listq).
+        let (list_holds, tree) = (self.ops.holds_keyboard(), self.tree.is_some());
         let pressed = ui.input(|inp| {
             inp.pointer.any_pressed()
                 && inp
@@ -2352,12 +2355,7 @@ impl Browser {
         // pass began or now; its box may lie over this half — a press here moves the keyboard
         // nowhere. A press on the panel whose dialog it is keeps the keyboard there.
         let held = ups.iter().any(|&j| j != i) || self.git_dialog_up(Some(i));
-        if pressed
-            && !held
-            && !self.ops.holds_keyboard()
-            && self.tree.is_none()
-            && self.listing.is_empty()
-        {
+        if pressed && !held && !list_holds && !tree && self.listing.is_empty() {
             if side != 1 - self.active {
                 // The other side's list had the keyboard: it is the origin list now.
                 self.active = 1 - side;
@@ -2370,18 +2368,27 @@ impl Browser {
         // after this pass's dialogs have opened or closed (`GitView::covered`).
         let mut under = self.ops.covered(grid);
         under.extend(self.git_covered(grid, Some(i)));
-        // Another panel's dialog up, or the list's question: this one opens none, takes no click
-        // and its dialogs read no key.
-        let elsewhere = held || self.ops.holds_keyboard();
+        // Another panel's dialog up, the list's question, or the tree, whose other side stays as
+        // it was until it closes (05 §1): this one opens none, takes no click and its dialogs
+        // read no key.
+        let elsewhere = held || list_holds || tree;
         let view = &mut self.git.panels[i].view;
         view.set_dialog_elsewhere(elsewhere);
         // The keyboard is the panel's as `git_keys` gives it: not while a dialog of the list's or
         // the tree holds it, since Find takes its Enter and Esc in the pass itself (X4-find).
-        let active = active && !self.ops.holds_keyboard() && self.tree.is_none();
-        let mut actions = git_panel::draw(ui, grid, cells, view, active, &under);
-        if self.ops.holds_keyboard() || self.tree.is_some() {
-            actions.clear();
-        }
+        let active = active && !list_holds && !tree;
+        // What the draw asks for is carried out, never dropped (F-git-listq): with `elsewhere`
+        // set nothing of the panel's own acts and its dialogs read no key, so what comes back is
+        // a dialog's own end — a click egui gives the dialog in front — or a page the graph asks
+        // for (`ask_more`, which marks it asked). A dialog closes itself as it returns its end
+        // (`GitView::modals`), so the host cannot refuse that end afterwards: dropping it closed
+        // the dialog without its run. (The integration opens none in front of the list's question
+        // or beside the tree, `git_waits`; a pass in which any dialog slot of a shown panel
+        // changed drops its keys, and the keyboard follows a dialog up before any key is read
+        // (`Browser::ui`), so no F10 of the list's opens the tree beside one; egui still gives a
+        // git dialog the click of the pass a question arrives in, the question drawn after the
+        // panels: what runs is what showed.)
+        let actions = git_panel::draw(ui, grid, cells, view, active, &under);
         let ctx = ui.ctx().clone();
         self.git_actions(&ctx, i, actions);
     }
@@ -2451,12 +2458,29 @@ impl Browser {
         self.git.focus = true;
     }
 
+    /// Each shown panel's dialog slots (`GitView::fronts`), for the pass to compare across its
+    /// git pass (`Browser::ui`, F-git-listq).
+    pub(super) fn git_fronts(&self) -> Vec<(usize, [(bool, u64); git_panel::Front::KINDS])> {
+        (self.git_shown().into_iter())
+            .map(|i| (i, self.git.panels[i].view.fronts()))
+            .collect()
+    }
+
     /// Whether a dialog of a git panel on screen is up (`GitView::dialog_up`: a menu, the
     /// filters, an action's dialog, the log's entry, …), panel `except`'s left out.
     pub(super) fn git_dialog_up(&self, except: Option<usize>) -> bool {
         (self.git_shown().into_iter())
             .filter(|&i| Some(i) != except)
             .any(|i| self.git.panels[i].view.dialog_up())
+    }
+
+    /// Whether what the integration would open in panel `i` waits in its channel (X4-menu
+    /// fix-check, rule 2): while another shown panel's dialog is up, or the list's question or
+    /// the tree has the keyboard — each another dialog to this panel, as `git_ui`'s `elsewhere`
+    /// (F-git-listq) — so no git dialog opens in front of the list's question, where it would take
+    /// the pointer while an Enter answered the question behind it, or beside the tree.
+    pub(super) fn git_waits(&self, i: usize) -> bool {
+        self.git_dialog_up(Some(i)) || self.ops.holds_keyboard() || self.tree.is_some()
     }
 }
 
@@ -3491,12 +3515,12 @@ impl Browser {
     /// dialog's reads, the Backups list, a restore's entries, a tag's details; and the command
     /// log handed again when the runner logged more.
     pub(super) fn poll_actions(&mut self, ctx: &egui::Context, i: usize) {
-        // One dialog at a time (X4-menu fix-check, rule 2): while another shown panel's dialog is
-        // up, nothing that may open a dialog here is heard — a run's end (its result, a
-        // confirmation again, the Commit after a squash, "delete anyway?"), a prefill, a history
+        // One dialog at a time (X4-menu fix-check, rule 2): while another dialog has the keyboard
+        // (`git_waits`), nothing that may open a dialog here is heard — a run's end (its result,
+        // a confirmation again, the Commit after a squash, "delete anyway?"), a prefill, a history
         // edit's range, the Backups list, a restore's entries, a tag's details. They stay in
         // their channels and open once that dialog closes, the keyboard following them.
-        let wait = self.git_dialog_up(Some(i));
+        let wait = self.git_waits(i);
         let mut ended = Vec::new();
         // Not received at all while it waits: a receive would take the end off its channel.
         if !wait {

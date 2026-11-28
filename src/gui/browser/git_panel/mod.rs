@@ -95,7 +95,7 @@ use eframe::egui;
 // through `keys` since its dialogs moved to `dialogs.rs` (X4-dialogs2).
 #[cfg(test)]
 use eframe::egui::Key;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// A row of the graph by what it draws: the bar across a reload, the marks and the details pane
 /// name it, never a row index (the uncommitted row coming or going shifts every index, 03 §5).
@@ -451,11 +451,25 @@ pub struct GitView {
     /// The plan the dialog showed for the action it returned: what runs (S3-A: its backup
     /// verifies the values the owner confirmed).
     confirmed: Option<(Action, Plan)>,
-    /// A run's error dialog, a read's failure, a tag's details (03 §3.8, §7.4).
+    /// The result up: a run's error dialog, a read's failure, a tag's details (03 §3.8, §7.4).
+    /// It stays until the owner closes it; one that comes meanwhile waits (F-git-outcome).
     result: Option<dialogs::ResultDialog>,
+    /// The results that came while one was up, oldest first: each comes up once the one before
+    /// it closes. At most [`RESULTS_WAITING`].
+    waiting: VecDeque<dialogs::ResultDialog>,
+    /// Which result is up and what the screen showed of it.
+    result_screen: ResultScreen,
+    /// The waiting results dropped since a result last came up ([`RESULTS_WAITING`]): the next
+    /// one to come up says how many.
+    results_dropped: usize,
     /// "Stop git?" over a write running for 10 s (03 §3.4): the action's words, and the id of the
     /// run it asks about.
     stop_question: Option<(String, u64)>,
+    /// Each dialog slot's serial, by [`Front`]: bumped whenever the slot is set or cleared other
+    /// than by the owner's own key in that dialog (those come in the pass's draw), so
+    /// [`GitView::fronts`] tells a dialog replaced by another of its kind — a result by the next —
+    /// from the one that was up (F-git-listq).
+    front_serials: [u64; Front::KINDS],
     /// The Backups list in the body (Cmd/Ctrl+B, 03 §8.2).
     backups: Option<backups::BackupsView>,
     /// The command log in the body (Cmd/Ctrl+L, 03 §3.7).
@@ -480,6 +494,80 @@ pub struct GitView {
     /// while egui draws it, so the blanking is proved through these until their units land.
     #[cfg(test)]
     pub test_covers: Vec<Cells>,
+}
+
+/// A dialog slot of a panel's (F-git-listq): the planner's own dialogs and the log's entry shown
+/// whole in the body, the filters, the history search, the menu, a quick edit's, an action's, the
+/// result, "Stop git?" ([`GitView::fronts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Front {
+    Planner,
+    Entry,
+    Filters,
+    Search,
+    Menu,
+    Quick,
+    Dialog,
+    Result,
+    Stop,
+}
+
+impl Front {
+    /// How many slots there are.
+    pub const KINDS: usize = 9;
+}
+
+/// The results that wait behind the one up (F-git-outcome). While a result is up it has the
+/// keyboard, so what can still come is the end of a write queued before it (one runs at a time)
+/// or of a read asked for before it — a handful; each can hold the last 64 KiB of a command's
+/// stderr (`runner::STDERR_KEPT`), so eight hold half a mebibyte of it at most. Past them the
+/// oldest waiting goes, so the newest, the one "delete anyway?" may answer (03 §7.2), is always
+/// kept; the next result to come up — the one that came right after those dropped — says how
+/// many were not shown and that the command log (Cmd/Ctrl+L, 03 §3.7) has the commands that ran
+/// (a run that never ran one, `RunEnd::NotRun`, left none there), and the status row keeps the
+/// latest run's words.
+const RESULTS_WAITING: usize = 8;
+
+/// What the screen showed of the result up (F-git-outcome), by the rule an action's dialog and
+/// "Stop git?" follow (`dialogs.rs`): each result that comes up takes a serial of its own,
+/// is laid out unseen first — and again after a pass it was not drawn in (behind the menu or an
+/// action's dialog) — and Enter, Esc, OK or a click outside close it only once the screen showed
+/// it ([`cells::OnScreen`]). So a press meant for the result before it, in the same pass or in a
+/// burst the terminal did not print, closes nothing: it would go unread.
+#[derive(Debug, Default)]
+struct ResultScreen {
+    /// The result up's serial: the painting the screen is compared by.
+    serial: u64,
+    /// The pass it was last laid out in.
+    laid: Option<u64>,
+    screen: cells::OnScreen<u64>,
+}
+
+impl ResultScreen {
+    /// Another result is up: nothing of it shown yet.
+    fn next(&mut self) {
+        self.serial += 1;
+        self.laid = None;
+    }
+
+    /// At the start of the result's pass: whether the screen shows it. The pass paints it where
+    /// it can be seen once it was laid out in the pass before — any other pass before, later or
+    /// earlier (a switch between the window and the terminal, which count their passes apart),
+    /// lays it out unseen again. A pass that lays it out unseen asks for the next, which paints
+    /// it, so the screen can show it before the owner's next press.
+    fn shown(&mut self, ctx: &egui::Context) -> bool {
+        let pass = ctx.cumulative_pass_nr();
+        if self.laid.is_some_and(|nr| nr + 1 != pass) {
+            self.laid = None;
+        }
+        let seen = self.screen.start(ctx) == Some(&self.serial);
+        if self.laid.replace(pass).is_some() {
+            self.screen.painted(self.serial);
+        } else {
+            ctx.request_repaint();
+        }
+        seen
+    }
 }
 
 impl RowKey {
@@ -551,7 +639,11 @@ impl GitView {
             dialog: None,
             confirmed: None,
             result: None,
+            waiting: VecDeque::new(),
+            result_screen: ResultScreen::default(),
+            results_dropped: 0,
             stop_question: None,
+            front_serials: [0; Front::KINDS],
             backups: None,
             log: None,
             to_copy: None,
@@ -806,6 +898,7 @@ impl GitView {
     pub fn open_filters(&mut self) {
         // The dialog has the typing: Find, which would keep it, closes.
         self.find = None;
+        self.bump(Front::Filters);
         self.filters_dialog = Some(filters::Dialog::new(
             &self.filters,
             &self.refs,
@@ -1116,6 +1209,7 @@ impl GitView {
         }
         match command {
             Command::HistorySearch => {
+                self.bump(Front::Search);
                 self.search_dialog = Some(find::SearchDialog::default());
                 return Vec::new();
             }
@@ -1357,6 +1451,34 @@ impl GitView {
         self.dialog_elsewhere = up;
     }
 
+    /// Every dialog slot of the panel's, by [`Front`]: whether it is up, and its serial
+    /// (F-git-listq). The integration compares them across its own pass (`Browser::ui`): a slot
+    /// that opened, was replaced (by another of its kind too: the serial) or closed there holds
+    /// what the owner's keys of that pass were not pressed at — whichever of the panel's dialogs
+    /// those keys would reach, so no order of precedence between them is guessed at.
+    pub fn fronts(&self) -> [(bool, u64); Front::KINDS] {
+        let planner = self.planner.as_ref().is_some_and(|p| p.dialog_up());
+        let entry = self.log.as_ref().is_some_and(|l| l.whole().is_some());
+        // In `Front`'s order.
+        let up = [
+            planner,
+            entry,
+            self.filters_dialog.is_some(),
+            self.search_dialog.is_some(),
+            self.menu.is_some(),
+            self.quick.is_some(),
+            self.dialog.is_some(),
+            self.result.is_some(),
+            self.stop_question.is_some(),
+        ];
+        std::array::from_fn(|k| (up[k], self.front_serials[k]))
+    }
+
+    /// Slot `kind` set or cleared: its serial moves on ([`GitView::fronts`]).
+    fn bump(&mut self, kind: Front) {
+        self.front_serials[kind as usize] += 1;
+    }
+
     /// A dialog is up — the filters', history search's, S3's menu, action dialog, result, "Stop
     /// git?", the log's whole entry, S4's quick edit dialog and the planner's own (its message,
     /// author, question and run): it has the keyboard (its own Enter and Esc), and Esc is its.
@@ -1534,6 +1656,7 @@ impl GitView {
             None => self.backups = Some(backups::BackupsView::new(records)),
         }
         self.log = None;
+        self.bump(Front::Entry);
     }
 
     /// The Backups list's groups as it shows them (`None` while it is closed).
@@ -1546,6 +1669,7 @@ impl GitView {
         // Its keys are its own: Find, which would keep Enter and Esc, closes (X4-find).
         self.find = None;
         self.log = Some(log_view::LogView::new(entries));
+        self.bump(Front::Entry);
         self.backups = None;
     }
 
@@ -1557,17 +1681,23 @@ impl GitView {
 
     /// The log's entries again, while it shows (its bar stays on its entry).
     pub fn set_log(&mut self, entries: Vec<LogEntry>) {
+        // No slot changes here: the entry shown whole is found again by itself, or goes (its
+        // slot's up flag says so, `GitView::fronts`).
         if let Some(log) = &mut self.log {
             log.set_entries(entries);
         }
     }
 
     /// A run ended (03 §3.8, §8.3): the error dialog when a step failed or the backup is
-    /// incomplete (S3-A's `Outcome::warning`, said there in place of the undo line); the status
-    /// row's words — `<what> · backup <stamp> · Cmd/Ctrl+Z undoes`, or the warning in the error
-    /// colour.
+    /// incomplete (S3-A's `Outcome::warning`, said there in place of the undo line), waiting
+    /// behind a result up ([`GitView::show_result`]). The status row says this run's words
+    /// whatever result is up: `<title>: failed` in the error colour when a step failed, else
+    /// `<what> · backup <stamp> · Cmd/Ctrl+Z undoes`, or the warning in the error colour. A run
+    /// with no dialog leaves a result up as it is (F-git-outcome).
     pub fn show_outcome(&mut self, title: &str, what: &str, outcome: &Outcome) -> Status {
-        self.result = dialogs::ResultDialog::of(title, outcome);
+        if let Some(result) = dialogs::ResultDialog::of(title, outcome) {
+            self.show_result(result);
+        }
         let failed = outcome
             .steps
             .iter()
@@ -1579,14 +1709,33 @@ impl GitView {
         }
     }
 
-    /// A text in a dialog of its own: a read's failure, a tag's details (03 §3.8, §7.4).
+    /// A text in a dialog of its own: a read's failure, a tag's details (03 §3.8, §7.4), waiting
+    /// behind a result up ([`GitView::show_result`]).
     pub fn show_text(&mut self, title: &str, text: &str, command_line: Option<&str>) {
-        self.result = Some(dialogs::ResultDialog::error(title, text, command_line));
+        self.show_result(dialogs::ResultDialog::error(title, text, command_line));
+    }
+
+    /// `result` up, or — while one is up, which stays until the owner closes it — waiting behind
+    /// it, in the order they came (F-git-outcome); past [`RESULTS_WAITING`] the oldest waiting
+    /// goes, counted for the next one to come up.
+    fn show_result(&mut self, result: dialogs::ResultDialog) {
+        if self.result.is_none() {
+            self.result = Some(result);
+            self.result_screen.next();
+            self.bump(Front::Result);
+            return;
+        }
+        if self.waiting.len() >= RESULTS_WAITING {
+            self.waiting.pop_front();
+            self.results_dropped += 1;
+        }
+        self.waiting.push_back(result);
     }
 
     /// "Stop git?" (03 §3.4) over the write `what`, the run of id `run`, running for 10 s.
     pub fn ask_stop(&mut self, what: String, run: u64) {
         self.stop_question = Some((what, run));
+        self.bump(Front::Stop);
     }
 
     /// "Stop git?" goes once the run it asks about no longer runs — `runs` says whether the run of
@@ -1598,6 +1747,7 @@ impl GitView {
             .is_some_and(|(_, id)| !runs(*id))
         {
             self.stop_question = None;
+            self.bump(Front::Stop);
         }
     }
 
@@ -1609,7 +1759,10 @@ impl GitView {
             return Vec::new();
         };
         match dialogs::ActionDialog::confirm(action, repo, dialogs::PLAN) {
-            dialogs::Opened::Dialog(dialog) => self.dialog = Some(dialog),
+            dialogs::Opened::Dialog(dialog) => {
+                self.dialog = Some(dialog);
+                self.bump(Front::Dialog);
+            }
             dialogs::Opened::Run(action) => {
                 let what = menu::label(action.id()).trim_end_matches('…');
                 self.said = Some(Status::info(format!("{what}: run it again")));
@@ -1620,9 +1773,14 @@ impl GitView {
     }
 
     /// A second dialog for an action git refused (03 §7.2: `delete-branch`'s "not fully merged":
-    /// the same action, forced), in place of the error dialog.
+    /// the same action, forced), in place of the error dialog it answers: the newest result,
+    /// which the run's end has just put up or set waiting — never a result up before it
+    /// (F-git-outcome).
     pub fn confirm_again(&mut self, action: Action) -> Vec<GitAction> {
-        self.result = None;
+        if self.waiting.pop_back().is_none() {
+            self.result = None;
+            self.bump(Front::Result);
+        }
         self.confirm(action)
     }
 
@@ -1898,6 +2056,7 @@ impl GitView {
             dialogs::Opened::Run(action) => vec![GitAction::Run(action)],
             dialogs::Opened::Dialog(dialog) => {
                 self.dialog = Some(dialog);
+                self.bump(Front::Dialog);
                 Vec::new()
             }
         }
@@ -1930,6 +2089,7 @@ impl GitView {
                 Vec::new()
             }
             (A::Search, _) => {
+                self.bump(Front::Search);
                 self.search_dialog = Some(find::SearchDialog::default());
                 Vec::new()
             }
@@ -2067,6 +2227,7 @@ impl GitView {
         };
         if let Some(repo) = &self.repo {
             self.menu = Some(menu::HistoryMenu::new(target, eligible, repo));
+            self.bump(Front::Menu);
         }
     }
 
@@ -2101,11 +2262,13 @@ impl GitView {
                 Command::Bar(_) | Command::Details | Command::Back => {
                     if log.run(command) == Some(log_view::LogEnd::Close) {
                         self.log = None;
+                        self.bump(Front::Entry);
                     }
                     Vec::new()
                 }
                 Command::Log => {
                     self.log = None;
+                    self.bump(Front::Entry);
                     Vec::new()
                 }
                 Command::Backups => vec![GitAction::Backups],
@@ -2259,8 +2422,19 @@ impl GitView {
             };
         }
         if let Some(result) = &mut self.result {
-            if result.ui(ctx, grid) {
-                self.result = None;
+            // Closed only once the screen showed it ([`ResultScreen`]); the next one waiting comes
+            // up, drawn from the next pass, saying how many before it were dropped
+            // (F-git-outcome).
+            let seen = self.result_screen.shown(ctx);
+            if result.ui(ctx, grid) && seen {
+                self.result = self.waiting.pop_front();
+                self.result_screen.next();
+                // The owner's own close, in the draw: each result keeps a serial of its own.
+                self.bump(Front::Result);
+                let dropped = std::mem::take(&mut self.results_dropped);
+                if let Some(next) = &mut self.result {
+                    next.say_dropped(dropped);
+                }
             }
             return Vec::new();
         }
@@ -2490,6 +2664,7 @@ impl GitView {
         match planner::QuickDialog::open(id, this, below, repo, planner::PLAN) {
             planner::QuickOpened::Dialog(dialog) => {
                 self.quick = Some(dialog);
+                self.bump(Front::Quick);
                 Vec::new()
             }
             planner::QuickOpened::Run(edit) => vec![GitAction::RunEdit(edit)],
@@ -2504,6 +2679,7 @@ impl GitView {
         };
         self.find = None;
         self.planner = Some(planner::PlannerView::new(model, repo));
+        self.bump(Front::Planner);
     }
 
     /// The open action dialog's "Plan the commits first…" button, when it draws one (tests).
@@ -2531,11 +2707,13 @@ impl GitView {
             None => Vec::new(),
             Some(planner::PlannerEnd::Close) => {
                 self.planner = None;
+                self.bump(Front::Planner);
                 Vec::new()
             }
             Some(planner::PlannerEnd::Run(edit)) => {
                 let shown = self.planner.as_mut().and_then(|p| p.take_shown());
                 self.planner = None;
+                self.bump(Front::Planner);
                 self.confirmed_edit = shown.filter(|(e, _)| *e == edit);
                 vec![GitAction::RunEdit(edit)]
             }
@@ -2551,6 +2729,7 @@ impl GitView {
         match planner::QuickDialog::confirm(edit, repo, planner::PLAN) {
             planner::QuickOpened::Dialog(dialog) => {
                 self.quick = Some(dialog);
+                self.bump(Front::Quick);
                 Vec::new()
             }
             planner::QuickOpened::Run(edit) => vec![GitAction::RunEdit(edit)],
@@ -2574,7 +2753,10 @@ impl GitView {
             return;
         };
         match planner::QuickDialog::confirm(edit, repo, planner::PLAN) {
-            planner::QuickOpened::Dialog(dialog) => self.quick = Some(dialog),
+            planner::QuickOpened::Dialog(dialog) => {
+                self.quick = Some(dialog);
+                self.bump(Front::Quick);
+            }
             planner::QuickOpened::Run(_) | planner::QuickOpened::Planner(_) => {
                 self.said = Some(Status::info("the history edit: run it again"));
             }
@@ -2849,6 +3031,11 @@ pub fn draw(
 ) -> Vec<GitAction> {
     let mut asked = Vec::new();
     let ctx = ui.ctx().clone();
+    // While another dialog has the keyboard — another panel's, the list's question, the tree —
+    // no dialog of this panel's reads a key or text this pass (X4-menu fix-check): those are that
+    // dialog's. Taken before the body, which draws the planner's own dialogs and the log's entry
+    // shown whole (F-git-listq), and put back after the panel's other dialogs.
+    let kept = view.dialog_elsewhere.then(|| take_keys(&ctx));
     let p = chrome::PALETTE;
     let look = chrome::git::LOOK;
     let title = if view.filters.is_default() {
@@ -3041,7 +3228,8 @@ pub fn draw(
         } else if view.backups.is_some() {
         } else if view.find.is_some() && view.search.is_none() {
             let typing = active && !dialog;
-            asked.extend(find_ui(ui, grid, none, &mut buf, view, typing, &mut caret).0);
+            let modes = (typing, dialog);
+            asked.extend(find_ui(ui, grid, none, &mut buf, view, modes, &mut caret).0);
         }
     }
     for r in eguis {
@@ -3061,10 +3249,7 @@ pub fn draw(
         cells::fill(&mut buf, r, body);
     }
     cells::paint(&painter, grid.origin, &buf, caret);
-    // The dialogs, over everything, on the panels' grid. While another dialog has the keyboard —
-    // another panel's, the list's question — they read no key or text this pass (X4-menu
-    // fix-check): those are that dialog's.
-    let kept = view.dialog_elsewhere.then(|| take_keys(&ctx));
+    // The dialogs, over everything, on the panels' grid (with no key while `kept` holds them).
     if let Some(dialog) = &mut view.filters_dialog {
         match dialog.ui(&ctx, *grid) {
             Some(filters::DialogEnd::Apply(f)) => {
@@ -3140,14 +3325,15 @@ fn take_keys(ctx: &egui::Context) -> Vec<egui::Event> {
 /// pass types into it in order and its cells show what it holds (fix-check: `[x, Esc, y, z]` lost
 /// the z, the row blank for that pass) — the same id at the same cells again, which egui takes for
 /// one widget seen twice, no clash. Its caret in `caret`; what the keys ask, and whether an Esc
-/// left Find closed.
+/// left Find closed. `dialog`: a dialog of the panel's, or another's beside it, is up — the `Aa`
+/// toggle takes no click then (F-git-listq review).
 fn find_ui(
     ui: &mut egui::Ui,
     grid: &Grid,
     cells: Cells,
     buf: &mut Buffer,
     view: &mut GitView,
-    typing: bool,
+    (typing, dialog): (bool, bool),
     caret: &mut Option<cells::Position>,
 ) -> (Vec<GitAction>, bool) {
     let ctx = ui.ctx().clone();
@@ -3163,7 +3349,7 @@ fn find_ui(
             false => Default::default(),
         };
         if let Some(find) = &mut view.find {
-            *caret = find::field(ui, grid, cells, buf, find, typing, key);
+            *caret = find::field(ui, grid, cells, buf, find, (typing, dialog), key);
         }
         asked.extend(view.find_jump());
         let mut closed = false;
@@ -3213,7 +3399,7 @@ fn graph_ui(
     let mut asked = Vec::new();
     let mut heads = Some(at.head);
     if view.find.is_some() && view.search.is_none() {
-        let (found, closed) = find_ui(ui, grid, at.head, buf, view, typing, caret);
+        let (found, closed) = find_ui(ui, grid, at.head, buf, view, (typing, dialog), caret);
         asked.extend(found);
         if closed {
             // An Esc after what was typed closed it: this pass's cells show the heads.

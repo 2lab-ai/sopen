@@ -2330,3 +2330,940 @@ fn x4_menu_a_runs_end_waits_for_the_other_panels_dialog_and_is_heard() {
     assert_eq!(g.b().git_focused(), Some(ia), "with the keyboard");
     drop(tx);
 }
+
+// ---------------------------------------------------------------------------------------------
+// F-git-listq: while the list's question or the tree has the keyboard, what the git panel reads
+// and what it carries out agree.
+
+/// A tree whose worker is never made while it is open: its side says it reads the tree, Enter,
+/// Space, Esc and the letters are its keys (05 §1), and its connect returns once it closes (at
+/// most 30 s).
+fn a_tree_that_waits(g: &mut Gx) {
+    let connect: TreeConnect = Arc::new(|closed: &AtomicBool| {
+        let t = Instant::now();
+        while !closed.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        bail!("the test's tree, closed")
+    });
+    g.fx.b.set_tree_connect(connect, "f-git-listq");
+}
+
+/// A press and a release of `key`, as one pass's events.
+fn pressed(key: Key) -> Vec<egui::Event> {
+    [true, false]
+        .map(|pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        })
+        .to_vec()
+}
+
+/// A hard reset to `light` started in panel `i` with no confirmation shown, as a run begun before
+/// the list's question or the tree took the keyboard: its plan asks for one, so the run's end
+/// opens it again (`RunEnd::Confirm`) — a dialog the integration opens. HEAD, and `light`.
+fn a_reset_starts(g: &mut Gx, i: usize) -> (String, String) {
+    g.fx.drv.resize(1000.0, 1400.0);
+    g.idle(2);
+    let (head, light) = (g.repo.rev("HEAD"), g.repo.rev("light"));
+    let action = Action::Reset {
+        to: crate::git::model::Oid::parse(&light).unwrap(),
+        mode: crate::git::actions::ResetMode::Hard,
+    };
+    let ctx = g.fx.drv.ctx.clone();
+    g.fx.b.start_action(&ctx, i, action);
+    (head, light)
+}
+
+/// Passes until panel `i`'s first run has sent its end (its worker ended), or its end was heard.
+fn its_end_sent(g: &mut Gx, i: usize) {
+    g.until("the run's worker", move |b| {
+        (b.git.panels[i].running.first())
+            .is_none_or(|r| r.worker.as_ref().is_some_and(|w| w.is_finished()))
+    });
+    g.idle(2);
+}
+
+/// Passes until panel `i`'s confirmation of the reset is up with its reads in, and painted.
+fn the_confirmation_is_up(g: &mut Gx, i: usize) {
+    g.until("the confirmation again", move |b| {
+        let p = &b.git.panels[i];
+        p.running.is_empty()
+            && !p.dialog_reading()
+            && p.view.draft().map(Action::id) == Some(ActionId::Reset)
+    });
+    g.idle(4);
+    assert!(
+        g.shows("git reset --hard "),
+        "the confirmation: {:#?}",
+        g.texts()
+    );
+}
+
+/// [`a_reset_starts`], then its confirmation is up ([`the_confirmation_is_up`]), nothing run.
+fn a_confirmation_opens(g: &mut Gx, i: usize) -> (String, String) {
+    let (head, light) = a_reset_starts(g, i);
+    the_confirmation_is_up(g, i);
+    assert_eq!(g.repo.rev("HEAD"), head, "nothing ran yet");
+    (head, light)
+}
+
+/// Passes until panel `i` runs nothing; HEAD then, and the open dialog's action id.
+fn after_the_run(g: &mut Gx, i: usize) -> (String, Option<ActionId>) {
+    g.until("the run", move |b| !b.git.panels[i].acting());
+    g.idle(2);
+    let id = g.b().git.panels[i].view.draft().map(Action::id);
+    (g.repo.rev("HEAD"), id)
+}
+
+/// F-git-listq: the tree has the keyboard and the other side stays as it was, frozen, until the
+/// tree closes (05 §1), so the git panel beside it opens no dialog, as under the list's question
+/// (X4-menu): a right click on its rows opens no menu — in the pass whose F10 opens the tree (the
+/// list's keys come before the panels' draw) and after it. Its menu's choice and the dialog that
+/// choice opened were what the panel's dropped actions lost. Once the tree closes, the right
+/// click opens the row's menu as ever.
+#[test]
+fn f_git_listq_the_panel_beside_the_tree_opens_no_menu() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.wait_for_the_panel();
+    a_tree_that_waits(&mut g);
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let p = row_on_the_right(&g, "third");
+    let mut events = pressed(Key::F10);
+    events.extend(clicked_at(p, egui::PointerButton::Secondary));
+    g.fx.drv.frame(&mut g.fx.b, events, Modifiers::NONE);
+    g.idle(2);
+    assert!(g.b().tree.is_some(), "F10 opened the tree");
+    assert_eq!(g.shown()[1], g.git(), "the git panel beside it");
+    assert!(
+        !g.b().git.panels[i].view.dialog_up(),
+        "no menu in the pass the tree opened: {:#?}",
+        g.texts()
+    );
+    g.fx.drv.frame(
+        &mut g.fx.b,
+        clicked_at(p, egui::PointerButton::Secondary),
+        Modifiers::NONE,
+    );
+    g.idle(2);
+    assert!(
+        !g.b().git.panels[i].view.dialog_up(),
+        "no menu beside the tree: {:#?}",
+        g.texts()
+    );
+    g.key(Key::Escape);
+    g.idle(2);
+    assert!(g.b().tree.is_none(), "Esc closed the tree");
+    let p = row_on_the_right(&g, "third");
+    g.fx.drv.frame(
+        &mut g.fx.b,
+        clicked_at(p, egui::PointerButton::Secondary),
+        Modifiers::NONE,
+    );
+    g.idle(2);
+    assert!(
+        g.b().git.panels[i].view.dialog_up(),
+        "the control: the row's menu once the tree closed"
+    );
+}
+
+/// F-git-listq: a run's end that opens a dialog (its confirmation again; `a_reset_starts`) waits
+/// in its channel while the tree has the keyboard, as for another panel's dialog (X4-menu's rule):
+/// nothing opens beside the tree, whose keys — Enter, a letter and Space in one pass — stay its
+/// own, and the run reads as running. Right after the tree closes the end is heard: the
+/// confirmation opens with the keyboard, the status row says why, and a click on its `[ Run ]`
+/// runs what it shows.
+#[test]
+fn f_git_listq_a_runs_end_waits_for_the_tree() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.wait_for_the_panel();
+    a_tree_that_waits(&mut g);
+    g.key(Key::F10);
+    g.idle(2);
+    assert!(g.b().tree.is_some(), "F10 opened the tree");
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let (head, light) = a_reset_starts(&mut g, i);
+    its_end_sent(&mut g, i);
+    let mut events = pressed(Key::Enter);
+    events.push(egui::Event::Text("x".into()));
+    events.extend(pressed(Key::Space));
+    g.fx.drv.frame(&mut g.fx.b, events, Modifiers::NONE);
+    g.idle(2);
+    let p = &g.b().git.panels[i];
+    assert_eq!(
+        (p.running.len(), p.view.dialog_up()),
+        (1, false),
+        "its end waits in its channel: no dialog beside the tree"
+    );
+    assert_eq!(g.repo.rev("HEAD"), head, "nothing ran");
+    g.key(Key::Escape);
+    g.idle(2);
+    assert!(g.b().tree.is_none(), "Esc closed the tree");
+    let p = &g.b().git.panels[i];
+    assert_eq!(
+        (p.running.len(), p.view.draft().map(Action::id)),
+        (0, Some(ActionId::Reset)),
+        "heard right after the tree closed"
+    );
+    the_confirmation_is_up(&mut g, i);
+    assert_eq!(g.b().git_focused(), Some(i), "with the keyboard");
+    let said = g.view().status_line().text;
+    assert!(
+        said.contains("not run — its plan asks for a confirmation"),
+        "{said}"
+    );
+    g.click("[ Run ]");
+    assert_eq!(
+        after_the_run(&mut g, i),
+        (light, None),
+        "the click ran what the dialog showed, and the dialog closed with it ({})",
+        g.status()
+    );
+}
+
+/// F-git-listq: the same while the list's question has the keyboard (F7's make-folder dialog):
+/// the run's end waits in its channel — no git dialog opens in front of the question, where it
+/// would take the pointer while an Enter answered the question behind it — and is heard right
+/// after the question closes (Esc): the confirmation opens with the keyboard, and its click runs.
+#[test]
+fn f_git_listq_a_runs_end_waits_for_the_lists_question() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.wait_for_the_panel();
+    g.key(Key::F7);
+    g.idle(2);
+    assert!(g.b().ops.holds_keyboard(), "F7's dialog");
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let (head, light) = a_reset_starts(&mut g, i);
+    its_end_sent(&mut g, i);
+    g.idle(2);
+    let p = &g.b().git.panels[i];
+    assert_eq!(
+        (p.running.len(), p.view.dialog_up()),
+        (1, false),
+        "its end waits in its channel: no dialog in front of the question"
+    );
+    assert!(g.b().ops.holds_keyboard(), "F7's dialog stays");
+    assert_eq!(g.repo.rev("HEAD"), head, "nothing ran");
+    g.key(Key::Escape);
+    g.idle(2);
+    assert!(!g.b().ops.holds_keyboard(), "Esc closed F7's dialog");
+    let p = &g.b().git.panels[i];
+    assert_eq!(
+        (p.running.len(), p.view.draft().map(Action::id)),
+        (0, Some(ActionId::Reset)),
+        "heard right after the question closed"
+    );
+    the_confirmation_is_up(&mut g, i);
+    assert_eq!(g.b().git_focused(), Some(i), "with the keyboard");
+    g.click("[ Run ]");
+    assert_eq!(
+        after_the_run(&mut g, i),
+        (light, None),
+        "the click ran what the dialog showed, and the dialog closed with it ({})",
+        g.status()
+    );
+}
+
+/// Where a stand-in copy stands: the thread it asks from, once it is about to ask, and whether
+/// its question is queued for the window — `Link::ask` queues it, then wakes the window from that
+/// thread, which the window's repaint observer sees ([`Asking::watch`]).
+#[derive(Default)]
+struct Asking {
+    thread: Mutex<Option<std::thread::ThreadId>>,
+    queued: AtomicBool,
+}
+
+impl Asking {
+    /// The window's repaint observer marks the question queued at the first wake-up from the
+    /// copy's thread once it is about to ask; no pass is drawn meanwhile.
+    fn watch(this: &Arc<Asking>, ctx: &egui::Context) {
+        let seen = this.clone();
+        ctx.set_repaint_observer(move |_| {
+            if *seen.thread.lock().unwrap() == Some(std::thread::current().id()) {
+                seen.queued.store(true, Ordering::Release);
+            }
+        });
+    }
+
+    /// Waits (at most 10 s, drawing no pass) until the question is queued.
+    fn until_queued(&self) {
+        let t = Instant::now();
+        while !self.queued.load(Ordering::Acquire) {
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "the copy never asked"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// A stand-in copy: held at `gate`, then — its thread noted in `asking` first — asking about its
+/// first name, and done as answered.
+fn a_copy_that_asks(gate: &Gate, asking: &Arc<Asking>) -> ops::Run {
+    let (gate, asking) = (gate.clone(), asking.clone());
+    Arc::new(move |job: ops::Job, link: &ops::Link| {
+        let ops::Job::Transfer { names, .. } = job else {
+            return Report::default();
+        };
+        gate.hold();
+        let name = names[0].clone();
+        *asking.thread.lock().unwrap() = Some(std::thread::current().id());
+        let reply = link.ask(crate::fileops::Clash {
+            name: name.clone(),
+            free: "free.txt".to_string(),
+        });
+        let outcome = match reply.answer {
+            crate::fileops::Answer::Skip => ItemOutcome::Skipped,
+            crate::fileops::Answer::Rename(to) => ItemOutcome::Renamed(to),
+            crate::fileops::Answer::Cancel => ItemOutcome::NotReached,
+        };
+        Report {
+            items: vec![Item { name, outcome }],
+            notes: Vec::new(),
+        }
+    })
+}
+
+/// The copy of `sub` to the repository's parent (F5, Enter) runs, held before its question;
+/// then panel `i`'s confirmation opens — a copy that runs asks nothing yet, so nothing holds it
+/// back — and the keyboard follows it. The panel, HEAD and `light`.
+fn a_dialog_while_a_copy_runs(
+    g: &mut Gx,
+    gate: &Gate,
+    asking: &Arc<Asking>,
+) -> (usize, String, String) {
+    g.fx.b.set_ops_run(a_copy_that_asks(gate, asking));
+    g.wait_for_the_panel();
+    let to = Path::new(g.repo.top()).parent().unwrap();
+    let to = to.to_str().unwrap().to_string();
+    g.fx.b.list(Some(1), to.clone(), None, None);
+    g.until("the other list", move |b| {
+        b.listing.is_empty() && b.panels[1].dir == to
+    });
+    g.fx.select("sub");
+    g.key(Key::F5);
+    g.key(Key::Enter);
+    gate.reached();
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let (head, light) = a_confirmation_opens(g, i);
+    assert_eq!(g.b().git_focused(), Some(i), "the keyboard follows it");
+    assert!(!g.b().ops.holds_keyboard(), "no question yet");
+    (i, head, light)
+}
+
+/// F-git-listq, guarding the residual's boundary (no fix of this row's makes it pass): a git
+/// dialog that was up before the list's question came — a copy's name-in-the-way question arriving
+/// while the panel's confirmation is up — stands behind it: from the pass after the question came,
+/// a click on its `[ Run ]` reaches nothing (egui gives the pointer to the dialog in front), as no
+/// key does. Once the question and its report are
+/// answered, the confirmation is in front again and its click runs.
+#[test]
+fn f_git_listq_a_dialog_behind_the_lists_question_takes_no_click() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    let (gate, asking) = (Gate::default(), Arc::new(Asking::default()));
+    let (i, head, light) = a_dialog_while_a_copy_runs(&mut g, &gate, &asking);
+    gate.release();
+    g.until("the question", |b| b.ops.holds_keyboard());
+    g.idle(2);
+    assert!(g.painted("Name exists"), "the question: {:#?}", g.texts());
+    let run = g.fx.drv.find_text("[ Run ]").expect("[ Run ]").center();
+    g.fx.drv.frame(
+        &mut g.fx.b,
+        clicked_at(run, egui::PointerButton::Primary),
+        Modifiers::NONE,
+    );
+    g.idle(2);
+    let id = g.b().git.panels[i].view.draft().map(Action::id);
+    assert_eq!(
+        (g.repo.rev("HEAD"), id),
+        (head, Some(ActionId::Reset)),
+        "the click behind the question reached nothing"
+    );
+    assert!(g.b().ops.holds_keyboard(), "the question stays");
+    g.key(Key::Escape);
+    g.until("the report", |b| !b.ops.busy());
+    g.key(Key::Enter);
+    g.idle(2);
+    assert!(!g.b().ops.holds_keyboard(), "the question and its report");
+    // The copy's end re-read the panel: the confirmation shows the plan made on the new snapshot.
+    g.until_quiet("the panel after the copy");
+    let runs = g.b().git.runs;
+    g.click("[ Run ]");
+    assert_eq!(
+        after_the_run(&mut g, i),
+        (light, None),
+        "the control: in front again, its click runs ({}; runs {runs} → {})",
+        g.status(),
+        g.b().git.runs
+    );
+}
+
+/// F-git-listq: the one pass in which a click still reaches a git dialog behind the list's
+/// question is the pass the question arrives in — egui gives a pass's pointer by the pass before,
+/// where the git dialog stood in front, and the question is drawn after the panels. A click on its
+/// `[ Run ]` read in that pass runs what the dialog showed; the run's end then waits for the
+/// question and its report, and is heard once they are answered.
+#[test]
+fn f_git_listq_a_click_in_the_pass_the_question_arrives_runs() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    let (gate, asking) = (Gate::default(), Arc::new(Asking::default()));
+    let (i, _, light) = a_dialog_while_a_copy_runs(&mut g, &gate, &asking);
+    let run = g.fx.drv.find_text("[ Run ]").expect("[ Run ]").center();
+    Asking::watch(&asking, &g.fx.drv.ctx);
+    gate.release();
+    // Its question is queued for the window, no pass drawn since: the next pass hears it.
+    asking.until_queued();
+    g.fx.drv.ctx.set_repaint_observer(|_| {});
+    g.fx.drv.frame(
+        &mut g.fx.b,
+        clicked_at(run, egui::PointerButton::Primary),
+        Modifiers::NONE,
+    );
+    assert!(
+        g.b().ops.holds_keyboard(),
+        "the question arrived in the pass of the click"
+    );
+    let t = Instant::now();
+    while g.repo.rev("HEAD") != light {
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "the click ran nothing"
+        );
+        g.idle(1);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        g.b().git.panels[i].view.draft().is_none(),
+        "the dialog closed with its run"
+    );
+    its_end_sent(&mut g, i);
+    assert_eq!(
+        g.b().git.panels[i].running.len(),
+        1,
+        "its end waits for the question"
+    );
+    g.key(Key::Escape);
+    g.until("the report", |b| !b.ops.busy());
+    g.key(Key::Enter);
+    assert_eq!(
+        after_the_run(&mut g, i),
+        (light, None),
+        "heard once the question and its report were answered"
+    );
+}
+
+/// F-git-listq: the keyboard follows a dialog the git pass opens before any key is read (X4-menu
+/// fix-check, rule 1), and the pass's keys are dropped (`Browser::ui`): they were pressed before
+/// the dialog was on screen. A run's end heard in the pass of an F10 and an Enter in the list: F10
+/// opens no tree beside the dialog, and the Enter is neither the list's nor the dialog's. Once its
+/// confirmation shows, Enter runs it.
+#[test]
+fn f_git_listq_a_dialog_heard_in_a_pass_takes_its_keys() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.wait_for_the_panel();
+    a_tree_that_waits(&mut g);
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let (head, light) = a_reset_starts(&mut g, i);
+    // Its end sent, and no pass since: the next pass hears it.
+    let t = Instant::now();
+    while !(g.b().git.panels[i].running.first())
+        .is_some_and(|r| r.worker.as_ref().is_some_and(|w| w.is_finished()))
+    {
+        assert!(t.elapsed() < Duration::from_secs(20), "the run never ended");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let list = (g.b().panels[0].dir.clone(), g.b().panels[0].highlight);
+    let mut events = pressed(Key::F10);
+    events.extend(pressed(Key::Enter));
+    g.fx.drv.frame(&mut g.fx.b, events, Modifiers::NONE);
+    assert!(g.b().tree.is_none(), "F10 opened no tree beside the dialog");
+    assert_eq!(
+        g.b().git.panels[i].view.draft().map(Action::id),
+        Some(ActionId::Reset),
+        "its dialog opened in that pass"
+    );
+    assert_eq!(g.b().git_focused(), Some(i), "with that pass's keyboard");
+    g.idle(2);
+    assert_eq!(
+        (g.b().panels[0].dir.clone(), g.b().panels[0].highlight),
+        list,
+        "the Enter was not the list's"
+    );
+    the_confirmation_is_up(&mut g, i);
+    assert_eq!(g.repo.rev("HEAD"), head, "that Enter ran nothing unseen");
+    g.key(Key::Enter);
+    assert_eq!(
+        after_the_run(&mut g, i),
+        (light, None),
+        "its Enter runs what it shows"
+    );
+    assert!(g.b().tree.is_none());
+}
+
+/// A run of panel `i`'s, as `spawn_run` gives one, whose worker already sent `end`: the next pass
+/// hears it (as `x4_menu_a_runs_end_waits_for_the_other_panels_dialog_and_is_heard` builds one).
+/// Its sender, to keep while it matters.
+fn a_run_that_ended(
+    g: &mut Gx,
+    i: usize,
+    end: git_host::RunEnd,
+) -> std::sync::mpsc::Sender<git_host::RunEnd> {
+    let (_, tx) = a_run_that_runs(g, i);
+    tx.send(end).unwrap();
+    tx
+}
+
+/// A run of panel `i`'s, as `spawn_run` gives one, its end not sent yet: its id and its sender.
+fn a_run_that_runs(g: &mut Gx, i: usize) -> (u64, std::sync::mpsc::Sender<git_host::RunEnd>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    g.fx.b.git.runs += 1;
+    let id = g.fx.b.git.runs;
+    g.fx.b.git.panels[i].running.push(git_host::Running {
+        id,
+        title: "Push".into(),
+        handle: crate::git::runner::Handle::new(),
+        rx,
+        started: Default::default(),
+        since: std::time::Instant::now(),
+        network: Vec::new(),
+        worker: None,
+    });
+    (id, tx)
+}
+
+/// Waits, drawing no pass, until panel `i`'s first run's worker has sent its end: the next pass
+/// hears it.
+fn its_end_sent_unheard(g: &Gx, i: usize) {
+    let t = Instant::now();
+    while !(g.b().git.panels[i].running.first())
+        .is_some_and(|r| r.worker.as_ref().is_some_and(|w| w.is_finished()))
+    {
+        assert!(t.elapsed() < Duration::from_secs(20), "the run never ended");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The list's folder and bar.
+fn the_list(g: &Gx) -> (String, usize) {
+    (g.b().panels[0].dir.clone(), g.b().panels[0].highlight)
+}
+
+/// F-git-listq review, must-fix 1: a run's end heard in the pass of the list's `key` (in `sopen
+/// --tui`, any burst read with the end's wake-up) opens its result in that pass and the keyboard
+/// follows it — but none of that pass's keys: the result was never on screen, so it does not close
+/// on them (its reason would be lost unread), and the list does not move either. The next Esc
+/// closes it.
+fn a_result_heard_with_a_lists(key: Key) {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.wait_for_the_panel();
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    assert_eq!(g.b().git_focused(), None, "the keyboard in the list");
+    let list = the_list(&g);
+    let ended = git_host::RunEnd::NotRun {
+        title: "Push".into(),
+        why: "the remote refused it".into(),
+        line: None,
+    };
+    let tx = a_run_that_ended(&mut g, i, ended);
+    g.fx.drv.frame(&mut g.fx.b, pressed(key), Modifiers::NONE);
+    g.idle(2);
+    let p = &g.b().git.panels[i];
+    assert!(p.running.is_empty(), "its end heard");
+    assert!(p.view.dialog_up(), "its result stays up");
+    assert_eq!(g.b().git_focused(), Some(i), "with the keyboard");
+    assert_eq!(the_list(&g), list, "the list did not move");
+    assert!(g.shows("the remote refused it"), "its reason");
+    g.key(Key::Escape);
+    g.idle(2);
+    assert!(
+        !g.b().git.panels[i].view.dialog_up(),
+        "the next Esc closes it"
+    );
+    drop(tx);
+}
+
+#[test]
+fn f_git_listq_a_result_heard_with_a_lists_enter_stays() {
+    a_result_heard_with_a_lists(Key::Enter);
+}
+
+#[test]
+fn f_git_listq_a_result_heard_with_a_lists_esc_stays() {
+    a_result_heard_with_a_lists(Key::Escape);
+}
+
+/// F-git-listq review, must-fix 1: a run's end that opens its confirmation again, heard in the
+/// pass of the list's Esc, is not cancelled unseen: it stays up with the keyboard, the list as it
+/// was; once it shows, its click runs what it shows.
+#[test]
+fn f_git_listq_a_confirmation_heard_with_a_lists_esc_stays() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.wait_for_the_panel();
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let list = the_list(&g);
+    let (head, light) = a_reset_starts(&mut g, i);
+    its_end_sent_unheard(&g, i);
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Escape), Modifiers::NONE);
+    g.idle(2);
+    assert_eq!(
+        g.b().git.panels[i].view.draft().map(Action::id),
+        Some(ActionId::Reset),
+        "the unseen confirmation stays"
+    );
+    assert_eq!(g.b().git_focused(), Some(i), "with the keyboard");
+    assert_eq!(the_list(&g), list, "the list did not move");
+    the_confirmation_is_up(&mut g, i);
+    assert_eq!(g.repo.rev("HEAD"), head);
+    g.click("[ Run ]");
+    assert_eq!(
+        after_the_run(&mut g, i),
+        (light, None),
+        "its click runs what it shows"
+    );
+}
+
+/// F-git-listq review (paging): a page the graph asks for while the panel is `elsewhere` — here
+/// the tree open beside it — is read. `ask_more` marks the page asked as it asks for it, so the
+/// old clear, which dropped the request, left the graph without its next page until a refresh.
+/// The bar is put on the last loaded row while the tree is open, as a refresh that kept it there
+/// would.
+#[test]
+fn f_git_listq_a_page_asked_beside_the_tree_is_read() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(fixture::big(&git, 1000));
+    g.wait_for_the_panel();
+    let before = g.view().rows().len();
+    assert!(
+        matches!(g.view().paging(), git_panel::Paging::More(_)),
+        "{:?}",
+        g.view().paging()
+    );
+    a_tree_that_waits(&mut g);
+    g.key(Key::F10);
+    g.idle(2);
+    assert!(g.b().tree.is_some(), "F10 opened the tree");
+    let last = git_panel::RowKey::of(&g.view().rows()[before - 1]);
+    assert!(g.panel_mut().view.select(last), "the bar on the last row");
+    let t = Instant::now();
+    while g.view().rows().len() == before && t.elapsed() < Duration::from_secs(10) {
+        g.idle(1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        g.view().rows().len() > before,
+        "the page asked for beside the tree came: {} rows, {:?}",
+        g.view().rows().len(),
+        g.view().paging()
+    );
+    assert!(g.b().tree.is_some(), "the tree stays");
+    g.key(Key::Escape);
+    g.idle(2);
+}
+
+/// F-git-listq review, item 6: Find's `[ ] Aa` takes no click while the panel is `elsewhere` —
+/// here the tree open beside it, its other side frozen — as the rest of the panel takes none. Once
+/// the tree closes, a click turns it.
+#[test]
+fn f_git_listq_finds_toggle_takes_no_click_beside_the_tree() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.ready_in_git();
+    g.fx.typed("t");
+    g.idle(2);
+    assert_eq!(g.view().find_text(), Some("t"), "Find open");
+    // A click on the list's `sub` gives the list the keyboard back; F10 opens the tree.
+    let sub = (g.fx.drv.texts_starting_with("sub").into_iter())
+        .find(|(r, _)| r.left() < 500.0)
+        .expect("sub on the left")
+        .0
+        .center();
+    g.fx.drv.click(&mut g.fx.b, sub);
+    g.idle(2);
+    assert_eq!(g.b().git_focused(), None, "the keyboard in the list");
+    a_tree_that_waits(&mut g);
+    g.key(Key::F10);
+    g.idle(2);
+    assert!(g.b().tree.is_some(), "F10 opened the tree");
+    let aa =
+        g.fx.drv
+            .find_text("[ ] Aa")
+            .expect("Find's toggle beside the tree");
+    g.fx.drv.click(&mut g.fx.b, aa.center());
+    g.idle(2);
+    assert!(
+        g.painted("[ ] Aa") && !g.painted("[X] Aa"),
+        "the toggle stays off: {:#?}",
+        g.texts()
+    );
+    g.key(Key::Escape);
+    g.idle(2);
+    assert!(g.b().tree.is_none(), "Esc closed the tree");
+    g.fx.drv.click(&mut g.fx.b, aa.center());
+    g.idle(2);
+    assert!(g.painted("[X] Aa"), "the control: the click turns it");
+}
+
+/// "Stop git?" up and painted over a running write of panel `i`'s (`ask_stop`, as Esc after
+/// 10 s asks it), the keyboard in the panel: the write's sender, to end it with.
+fn stop_git_is_up(g: &mut Gx, i: usize) -> std::sync::mpsc::Sender<git_host::RunEnd> {
+    let (id, tx) = a_run_that_runs(g, i);
+    g.fx.b.git.panels[i].view.ask_stop("Push".into(), id);
+    g.idle(2);
+    assert!(
+        g.shows("Push is still running."),
+        "Stop git?: {:#?}",
+        g.texts()
+    );
+    assert_eq!(g.b().git_focused(), Some(i), "the keyboard in the panel");
+    tx
+}
+
+/// The details as they stand: a read on its way, one come, the pane open.
+fn details_of(g: &Gx, i: usize) -> (bool, bool, bool) {
+    let p = &g.b().git.panels[i];
+    (
+        p.details.is_some(),
+        p.last_details.is_some(),
+        p.view.details_open(),
+    )
+}
+
+/// F-git-listq fix-check: "Stop git?" is up and painted; its write ends with nothing to say (a
+/// success, no result) in the pass of the owner's Enter, meant for "Stop git?". The dialog goes
+/// with its run, and the Enter is dropped with the pass (its front dialog changed under it): it
+/// does not fall through to the graph, whose Enter opens the bar's details. The next Enter is the
+/// graph's.
+#[test]
+fn f_git_listq_stop_git_gone_with_its_run_leaves_the_enter_to_nothing() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.ready_in_git();
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let details = details_of(&g, i);
+    let tx = stop_git_is_up(&mut g, i);
+    let light = g.repo.rev("light");
+    tx.send(git_host::RunEnd::Ran {
+        outcome: Box::new(crate::git::actions::Outcome {
+            steps: Vec::new(),
+            backup: None,
+        }),
+        title: "Push".into(),
+        what: "pushed".into(),
+        changes_files: false,
+        squash: false,
+        action: Box::new(Action::Reset {
+            to: crate::git::model::Oid::parse(&light).unwrap(),
+            mode: crate::git::actions::ResetMode::Hard,
+        }),
+    })
+    .unwrap();
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
+    g.idle(2);
+    let p = &g.b().git.panels[i];
+    assert!(p.running.is_empty(), "its end heard");
+    assert!(!p.view.dialog_up(), "Stop git? went with its run");
+    assert_eq!(
+        details_of(&g, i),
+        details,
+        "the Enter did not reach the graph"
+    );
+    g.until_quiet("the refresh after the run");
+    g.key(Key::Enter);
+    g.idle(2);
+    assert_ne!(
+        details_of(&g, i),
+        details,
+        "the control: the next Enter is the graph's"
+    );
+    drop(tx);
+}
+
+/// F-git-listq fix-check: "Stop git?" up and painted; its write's end puts its confirmation in
+/// front again (`RunEnd::Confirm`) in the pass of the owner's Esc, meant for "Stop git?" (No). The
+/// confirmation, never on screen, is not cancelled by it; once it shows, its click runs.
+#[test]
+fn f_git_listq_a_confirmation_in_place_of_stop_git_stays_with_its_esc() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.ready_in_git();
+    g.fx.drv.resize(1000.0, 1400.0);
+    g.idle(2);
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let tx = stop_git_is_up(&mut g, i);
+    let (head, light) = (g.repo.rev("HEAD"), g.repo.rev("light"));
+    tx.send(git_host::RunEnd::Confirm {
+        title: "Reset".into(),
+        action: Box::new(Action::Reset {
+            to: crate::git::model::Oid::parse(&light).unwrap(),
+            mode: crate::git::actions::ResetMode::Hard,
+        }),
+    })
+    .unwrap();
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Escape), Modifiers::NONE);
+    g.idle(2);
+    assert_eq!(
+        g.b().git.panels[i].view.draft().map(Action::id),
+        Some(ActionId::Reset),
+        "the unseen confirmation stays"
+    );
+    the_confirmation_is_up(&mut g, i);
+    assert_eq!(g.repo.rev("HEAD"), head);
+    g.click("[ Run ]");
+    assert_eq!(
+        after_the_run(&mut g, i),
+        (light, None),
+        "its click runs what it shows"
+    );
+    drop(tx);
+}
+
+/// F-git-listq fix-check: a confirmation up and painted is replaced by another of its kind — a
+/// run's end puts another action's confirmation in its place — in the pass of the owner's Esc,
+/// meant for the first. The front dialog's serial changed, so the Esc is dropped with the pass:
+/// the new confirmation, never on screen, stays.
+#[test]
+fn f_git_listq_a_confirmation_replaced_by_another_keeps_the_esc_from_it() {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.wait_for_the_panel();
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    a_confirmation_opens(&mut g, i);
+    assert_eq!(g.b().git_focused(), Some(i), "the keyboard in the panel");
+    let first = g.repo.rev("main~3");
+    let other = Action::Reset {
+        to: crate::git::model::Oid::parse(&first).unwrap(),
+        mode: crate::git::actions::ResetMode::Hard,
+    };
+    let tx = a_run_that_ended(
+        &mut g,
+        i,
+        git_host::RunEnd::Confirm {
+            title: "Reset".into(),
+            action: Box::new(other.clone()),
+        },
+    );
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Escape), Modifiers::NONE);
+    g.idle(2);
+    assert_eq!(
+        g.b().git.panels[i].view.draft(),
+        Some(&other),
+        "the unseen confirmation in its place stays"
+    );
+    g.idle(4);
+    g.key(Key::Escape);
+    g.idle(2);
+    assert!(
+        !g.b().git.panels[i].view.dialog_up(),
+        "the control: once shown, Esc cancels it"
+    );
+    drop(tx);
+}
+
+/// F-git-listq fix-check, guarding #181's own rule too: "Stop git?" up and painted; its write's
+/// failure (a result) comes in the pass of the owner's `key`. The result stays, its reason
+/// readable; the next Esc closes it.
+fn a_result_in_place_of_stop_git(key: Key) {
+    let git = git_or_skip!();
+    let mut g = Gx::new(small(&git));
+    g.ready_in_git();
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let tx = stop_git_is_up(&mut g, i);
+    tx.send(git_host::RunEnd::NotRun {
+        title: "Push".into(),
+        why: "the remote refused it".into(),
+        line: None,
+    })
+    .unwrap();
+    g.fx.drv.frame(&mut g.fx.b, pressed(key), Modifiers::NONE);
+    g.idle(2);
+    assert!(g.b().git.panels[i].view.dialog_up(), "its result stays");
+    assert!(g.shows("the remote refused it"), "its reason");
+    g.key(Key::Escape);
+    g.idle(2);
+    assert!(
+        !g.b().git.panels[i].view.dialog_up(),
+        "the next Esc closes it"
+    );
+    drop(tx);
+}
+
+#[test]
+fn f_git_listq_a_result_in_place_of_stop_git_stays_with_its_enter() {
+    a_result_in_place_of_stop_git(Key::Enter);
+}
+
+#[test]
+fn f_git_listq_a_result_in_place_of_stop_git_stays_with_its_esc() {
+    a_result_in_place_of_stop_git(Key::Escape);
+}
+
+/// F-git-listq fix-check 2: every slot counts, not the one first in some order. The planner's
+/// question (a reword's message, the planner's own dialog in the body) is up and painted; a run's
+/// failure comes in the pass of the owner's Enter, meant for that question, and puts a result up
+/// over it. The pass's keys are dropped: the question does not keep the message on an Enter
+/// pressed before the result was there, and the result does not close on it either — both stay.
+#[test]
+fn f_git_listq_a_result_over_the_planners_question_takes_no_key_from_it() {
+    let git = git_or_skip!();
+    let repo = Repo::new(&git);
+    repo.write("a.txt", "a\n");
+    repo.commit("base");
+    repo.write("b.txt", "b\n");
+    repo.commit("one");
+    repo.write("c.txt", "c\n");
+    repo.commit("two");
+    let mut g = Gx::new(repo);
+    g.ready_in_git();
+    g.bar_to("base");
+    g.cmd(Key::E);
+    g.idle(2);
+    g.until_quiet("the planner's range");
+    let i = g.b().git.panel(g.repo.top()).expect("the panel");
+    let message = |g: &Gx| {
+        let model = g.view().planner_model().expect("the planner");
+        model.rows[0].message.clone()
+    };
+    g.fx.typed("r");
+    g.idle(1);
+    g.key(Key::Enter);
+    g.idle(2);
+    assert!(
+        g.shows("Enter keeps it"),
+        "the planner's question: {:#?}",
+        g.texts()
+    );
+    assert_eq!(message(&g), None, "no message kept yet");
+    let tx = a_run_that_ended(
+        &mut g,
+        i,
+        git_host::RunEnd::NotRun {
+            title: "Push".into(),
+            why: "the remote refused it".into(),
+            line: None,
+        },
+    );
+    g.fx.drv
+        .frame(&mut g.fx.b, pressed(Key::Enter), Modifiers::NONE);
+    g.idle(2);
+    assert!(g.b().git.panels[i].running.is_empty(), "its end heard");
+    assert!(g.shows("the remote refused it"), "the result up");
+    assert!(g.shows("Enter keeps it"), "the planner's question stays");
+    assert_eq!(message(&g), None, "the Enter kept no message");
+    drop(tx);
+}

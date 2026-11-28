@@ -250,14 +250,16 @@ impl Placed {
 /// opened anew starts afresh, its caret at its end, nothing to undo from before. On no cells (a
 /// panel too short for its parts) only the engine runs, so typing still lands. The caret's cell,
 /// while it has the keyboard and the key help does not cover it, for the panel's paint (in a
-/// terminal, where its cursor goes).
+/// terminal, where its cursor goes). `dialog`: a dialog of the panel's, or one that has the
+/// keyboard elsewhere (another panel's, the list's question, the tree), is up — then the toggle
+/// takes no click, as nothing of the panel does (F-git-listq review).
 pub(super) fn field(
     ui: &mut egui::Ui,
     grid: &Grid,
     cells: Cells,
     buf: &mut Buffer,
     find: &mut Find,
-    typing: bool,
+    (typing, dialog): (bool, bool),
     panel: egui::Id,
 ) -> Option<Position> {
     let ctx = ui.ctx().clone();
@@ -300,7 +302,7 @@ pub(super) fn field(
     }
     if let Some(toggle) = at.toggle {
         let turned = ui.interact(grid.rect(toggle), case_id(panel), Sense::CLICK);
-        if turned.clicked() {
+        if turned.clicked() && !dialog {
             find.case = !find.case;
         }
         let shown = if find.case { TOGGLE_ON } else { TOGGLE_OFF };
