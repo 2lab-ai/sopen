@@ -799,7 +799,9 @@ impl crate::gui::Window for TwoSides {
                 if let Some(banners) = &self.banners {
                     for (k, (side, b)) in sides.iter().zip(banners).enumerate() {
                         let top = Cells::new(side.x, side.y, side.width, 1);
-                        if let Some(p) = in_progress::draw(ui, &grid, top, &mut buf, b) {
+                        // Each side its own panel's key, as two panels' are.
+                        let panel = egui::Id::unique(("sopen-git-test-panel", k));
+                        if let Some(p) = in_progress::draw(ui, &grid, top, &mut buf, b, panel) {
                             self.pressed.push((k, p));
                         }
                     }
@@ -1054,7 +1056,8 @@ fn the_pane_lines_never_take_the_keyboard() {
         });
         pane
     };
-    let other = pane.clone();
+    // The other side's pane its own panel's key, as two panels' are.
+    let other = (pane.clone()).in_panel(egui::Id::unique(("sopen-git-test-panel", 1)));
     let mut win = TwoSides {
         banners: None,
         panes: Some([pane, other]),

@@ -344,8 +344,10 @@ pub(super) struct List<'a> {
     pub label_cursor: usize,
     /// The bar is the active one: the panel has the keyboard and nothing in it holds it.
     pub active: bool,
-    /// The rows' interaction ids are made from it.
-    pub salt: &'static str,
+    /// The rows' interaction ids and their double clicks' pairs are made from it: the panel's own
+    /// key with the list's name (`GitView::find_key`), which panel it is whatever its column or
+    /// `ui`, so two panels side by side never share one (F-git-ids).
+    pub ids: egui::Id,
 }
 
 /// What a pass of a list did.
@@ -593,14 +595,12 @@ pub(super) fn draw(
         if let Some(at) = cols.commit {
             cells::put(buf, x(at), y, &commit, COMMIT, pen);
         }
-        let resp = ui.interact(
-            grid.rect(row_cells),
-            ui.scope_id().with((list.salt, i)),
-            Sense::click(),
-        );
+        // Clicks alone (`Sense::CLICK`): the keyboard moves the bar by its own keys, and egui's
+        // focusable `Sense::click()` would let Tab reach a row and its Space or Enter click it.
+        let resp = ui.interact(grid.rect(row_cells), list.ids.with(i), Sense::CLICK);
         if resp.clicked() {
             // The row by what it draws: rows come and go above it between two clicks (03 §5).
-            let pair = egui::Id::unique(("sopen-git-row-click", list.salt, RowKey::of(row)));
+            let pair = list.ids.with(("click", RowKey::of(row)));
             clicked = Some((i, super::super::second_click(&resp, pair)));
         }
     }

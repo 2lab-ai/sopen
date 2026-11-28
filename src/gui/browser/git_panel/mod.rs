@@ -45,6 +45,8 @@ mod state;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_f_git_ids;
+#[cfg(test)]
 mod tests_s3;
 #[cfg(test)]
 mod tests_s4;
@@ -414,7 +416,10 @@ pub struct GitView {
     filters: Filters,
     filters_dialog: Option<filters::Dialog>,
     find: Option<find::Find>,
-    /// Find's ids: the panel's own, whatever its column or `ui` (`find::panel_key`, X4-find).
+    /// The panel's own key, whatever its column or `ui` (`find::panel_key`, X4-find): Find's ids,
+    /// the graph's rows' and its paging line's, the banner's (handed to its `draw`), and those of
+    /// the details pane, the log and the Backups list, each given it when made (`in_panel`,
+    /// F-git-ids).
     find_key: egui::Id,
     search_dialog: Option<find::SearchDialog>,
     search: Option<find::Results>,
@@ -1118,7 +1123,7 @@ impl GitView {
         if pane.subject == subject {
             return None;
         }
-        *pane = details::Pane::new(subject.clone(), false, Vec::new());
+        *pane = details::Pane::new(subject.clone(), false, Vec::new()).in_panel(self.find_key);
         Some(GitAction::Details(subject))
     }
 
@@ -1208,7 +1213,7 @@ impl GitView {
             pane.keyboard = true;
             return Vec::new();
         }
-        self.pane = Some(details::Pane::new(subject.clone(), true, header));
+        self.pane = Some(details::Pane::new(subject.clone(), true, header).in_panel(self.find_key));
         vec![GitAction::Details(subject)]
     }
 
@@ -1350,7 +1355,8 @@ impl GitView {
                     return Vec::new();
                 };
                 let subject = Subject::Row(RowKey::of(row));
-                self.pane = Some(details::Pane::new(subject.clone(), true, Vec::new()));
+                let pane = details::Pane::new(subject.clone(), true, Vec::new());
+                self.pane = Some(pane.in_panel(self.find_key));
                 vec![A::Details(subject)]
             }
             Command::Edit => vec![A::Edit(None)],
@@ -1414,7 +1420,8 @@ impl GitView {
                 self.graph_scroll.to(at);
                 self.label_cursor = 0;
                 let subject = Subject::Row(key);
-                self.pane = Some(details::Pane::new(subject.clone(), true, Vec::new()));
+                let pane = details::Pane::new(subject.clone(), true, Vec::new());
+                self.pane = Some(pane.in_panel(self.find_key));
                 vec![A::Details(subject)]
             }
             // A name that is not UTF-8 names nothing: no diff, no file, no folder's listing.
@@ -1691,7 +1698,10 @@ impl GitView {
         self.find = None;
         match &mut self.backups {
             Some(list) => list.set_records(records),
-            None => self.backups = Some(backups::BackupsView::new(records)),
+            None => {
+                let list = backups::BackupsView::new(records).in_panel(self.find_key);
+                self.backups = Some(list);
+            }
         }
         self.log = None;
         self.bump(Front::Entry);
@@ -1706,7 +1716,7 @@ impl GitView {
     pub fn open_log(&mut self, entries: Vec<LogEntry>) {
         // Its keys are its own: Find, which would keep Enter and Esc, closes (X4-find).
         self.find = None;
-        self.log = Some(log_view::LogView::new(entries));
+        self.log = Some(log_view::LogView::new(entries).in_panel(self.find_key));
         self.bump(Front::Entry);
         self.backups = None;
     }
@@ -3142,9 +3152,12 @@ pub fn draw(
     view.geometry = None;
     if let Some(at) = &layout {
         // The banner; at an edit stop with Amend and Split before its steps (03 §8.5, S4).
+        let panel = view.find_key;
         let ended = match (&view.banner, &view.stop) {
-            (Some(b), Some(stop)) => in_progress::draw_stop(ui, grid, at.banner, &mut buf, b, stop),
-            (Some(b), None) => in_progress::draw(ui, grid, at.banner, &mut buf, b)
+            (Some(b), Some(stop)) => {
+                in_progress::draw_stop(ui, grid, at.banner, &mut buf, b, stop, panel)
+            }
+            (Some(b), None) => in_progress::draw(ui, grid, at.banner, &mut buf, b, panel)
                 .map(in_progress::StopEnd::Banner),
             (None, _) => None,
         };
@@ -3267,12 +3280,13 @@ pub fn draw(
                 cells::put_right(&mut buf, inner.right(), at.foot, &right, pen);
             }
         }
-        // A click on the paging line reads more (Enter on it, 03 §4.5).
+        // A click on the paging line reads more (03 §4.5; the bar never stands on it, ↓ on the
+        // last row reads more from the keyboard): clicks alone, its id the panel's own.
         let foot_cells = Cells::new(inner.x, at.foot, inner.width, 1);
         let foot_click = ui.interact(
             grid.rect(foot_cells),
-            ui.scope_id().with("sopen-git-foot"),
-            egui::Sense::click(),
+            view.find_key.with("sopen-git-foot"),
+            egui::Sense::CLICK,
         );
         if foot_click.clicked() && view.search.is_none() && !dialog {
             let more = matches!(view.paging, Paging::More(_) | Paging::Error(_));
@@ -3503,6 +3517,7 @@ fn graph_ui(
         }
     }
     let no_marks = HashSet::new();
+    let key = view.find_key;
     let drawn = match &mut view.search {
         Some(results) => graph_view::draw(
             ui,
@@ -3519,7 +3534,7 @@ fn graph_ui(
                 uncommitted: view.uncommitted,
                 label_cursor: 0,
                 active: list_active,
-                salt: "sopen-git-results",
+                ids: key.with("sopen-git-results"),
             },
         ),
         None => graph_view::draw(
@@ -3537,7 +3552,7 @@ fn graph_ui(
                 uncommitted: view.uncommitted,
                 label_cursor: view.label_cursor,
                 active: list_active,
-                salt: "sopen-git-rows",
+                ids: key.with("sopen-git-rows"),
             },
         ),
     };

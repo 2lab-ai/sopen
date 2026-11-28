@@ -73,6 +73,11 @@ pub struct BackupsView {
     /// The bar's line's [`Ends`] as last made, kept while it is of the same line of the same
     /// records: a pass copies no ref.
     ends: Option<Arc<Ends>>,
+    /// The key its controls' ids and its double click's pair are made from: its panel's
+    /// (`GitView::find_key`, [`BackupsView::in_panel`]), which panel it is whatever its column,
+    /// so another repository's panel drawn where this one stood takes none of its clicks
+    /// (F-git-ids).
+    panel: egui::Id,
 }
 
 /// What the line under the bar asks for: its Restore, its Show and its Delete.
@@ -153,7 +158,15 @@ impl BackupsView {
             revision: 0,
             screen: cells::OnScreen::default(),
             ends: None,
+            panel: super::find::panel_key(),
         }
+    }
+
+    /// The list, its ids made from `panel`, its panel's key (`GitView::find_key`); until then
+    /// its key is its own.
+    pub fn in_panel(mut self, panel: egui::Id) -> BackupsView {
+        self.panel = panel;
+        self
     }
 
     /// The list read again: the bar stays on its group, or its ref, when it is still there.
@@ -347,15 +360,15 @@ pub(super) const PAINTS_CELLS: bool = true;
 /// blank cells apart in the dialog's colours (10 §6's buttons; never focused: the list's keys are
 /// the git context's), then as many of the keys' hint's keys, whole and in order, as fit, dim
 /// ([`hint_in`]). Only the lines on screen are drawn; the wheel scrolls them by `CELL.y`, the bar
-/// stays. Every control is an `interact` rect at its cells, its id salted with the panel's column
-/// (two repositories' panels draw into one `ui`), sensing clicks alone (`Sense::CLICK`: egui's
+/// stays. Every control is an `interact` rect at its cells, its id the list's panel's
+/// ([`BackupsView::in_panel`]: two repositories' panels draw into one `ui`), sensing clicks alone (`Sense::CLICK`: egui's
 /// `Sense::click()` takes the focus, so Tab, then Space, would press a button), over one more under
 /// them all ([`blank_clicks`]: the list's cells, the frame's border either side, egui's reach below),
 /// so a click on a blank presses nothing. A click puts the bar on a line, a double click on one line
-/// Shows it (the browser's `second_click`, the pair the line itself), a button asks for its
-/// action — each of those as the last pass that reached the screen painted the bar's line
-/// ([`BackupsView::as_painted`]), what this pass paints kept for the passes after it
-/// (`cells::OnScreen`). A list of one or two rows has no foot.
+/// Shows it (the browser's `second_click`, the pair the line itself, in the list's panel), a
+/// button asks for its action — each of those as the last pass that reached the screen painted
+/// the bar's line ([`BackupsView::as_painted`]), what this pass paints kept for the passes after
+/// it (`cells::OnScreen`). A list of one or two rows has no foot.
 pub fn draw(
     ui: &mut egui::Ui,
     grid: &Grid,
@@ -411,7 +424,10 @@ pub fn draw(
     view.scroll.settle(visible, len);
     let range = view.scroll.range(len);
     let shown = range.start..range.end.min(range.start + usize::from(list.height));
-    let id = |part: &str, k: usize| ui.scope_id().with(("sopen-git-backups", area.x, part, k));
+    // The list's panel's, never its column's: egui gives a release to the id it pressed, so
+    // another repository's panel drawn where this one stood took a click pressed here (F-git-ids).
+    let panel = view.panel;
+    let id = |part: &str, k: usize| panel.with(("sopen-git-backups", part, k));
     // Whether this pass paints the bar's line (what it asks for made again only where the last
     // made is not of the same line of the same records).
     let mut bar_drawn = false;
@@ -474,7 +490,9 @@ pub fn draw(
         }
         let resp = ui.interact(grid.rect(row), id("line", k), Sense::CLICK);
         if resp.clicked() {
-            let pair = egui::Id::unique(("sopen-git-backups-click", area.x, view.key(line)));
+            // The panel's, not its column's: another repository's panel drawn where this one
+            // stood, between two clicks, may show the same line at the same cells (F-git-ids).
+            let pair = panel.with(("sopen-git-backups-click", view.key(line)));
             clicked = Some((k, super::super::second_click(&resp, pair)));
         }
     }
