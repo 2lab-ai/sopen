@@ -722,3 +722,435 @@ fn the_rename_field_is_a_field_in_its_row_of_cells() {
     assert!(names.iter().any(|t| t == "memo"), "{names:?}");
     assert!(!names.iter().any(|t| t == "notes"), "{names:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// F-menu-own: the list beside a git panel whose menu choice opens a dialog in the pass that
+// chose it. The list, left of the panel, is painted before the panel's draw knows that dialog.
+
+/// A folder of the small fixture with a long Hangul name: the list's frame title, the folder's
+/// path cut from its start, is Hangul glyphs from its `…` to its end.
+const HANGUL: &str = "가나다라마바사아자차카타파하가나다라마바사아자차카타파하";
+
+/// The browser on [`HANGUL`] in the small fixture, `w`×320 points — at 1000 the Tag dialog's box
+/// stands from the list's column 23, half over one of the title's glyphs — the git panel on the
+/// right, the keyboard in it, its bar on `third`.
+fn on_hangul_folder(git: &Path, w: f32) -> super::s2::Gx {
+    let repo = super::s2::small(git);
+    repo.write(&format!("{HANGUL}/x.txt"), "x\n");
+    let mut g = super::s2::Gx::at(repo, Some(HANGUL));
+    g.fx.sized(w, 320.0);
+    g.ready_in_git();
+    g.bar_to("third");
+    g
+}
+
+/// The frame of the last modal box the pass just run in `ctx` painted in cells (egui's
+/// `Foreground` order) but the one over `menu` (its box and shadow; none: any): as it stood on
+/// screen.
+fn painted_frame(ctx: &egui::Context, menu: &[cells::Cells]) -> Option<cells::Cells> {
+    let menu = menu.iter().copied().reduce(|a, c| a.union(c));
+    let layers = cells::layers(ctx);
+    let l = (layers.iter().rev())
+        .find(|l| l.layer.order == egui::Order::Foreground && Some(l.buf.area) != menu)?;
+    let a = l.buf.area;
+    Some(cells::Cells::new(
+        a.x,
+        a.y,
+        a.width.checked_sub(2)?,
+        a.height.checked_sub(1)?,
+    ))
+}
+
+/// The list's cells on the left side of `gr` in the pass just run in `ctx`: its own layer, and
+/// that layer with what was painted over it later in the pass ([`cells::with_later`]).
+fn list_layers(ctx: &egui::Context, gr: &Grid) -> (Arc<cells::Layer>, cells::Layer) {
+    let left = cells::halves(gr.all())[0];
+    let layers = cells::layers(ctx);
+    let at = (layers.iter())
+        .position(|l| l.buf.area == left && l.origin == gr.origin)
+        .expect("the list's cells over its side");
+    (layers[at].clone(), cells::with_later(&layers, at))
+}
+
+/// What `list` holds under the box `frame` and its shadow: the cells with a glyph, as
+/// (x, y, glyph), and the rows where a wide glyph's first cell stands just left of the box, its
+/// second under it (the window would show that glyph's first half).
+fn under_box(list: &cells::Layer, frame: cells::Cells) -> (Vec<(u16, u16, String)>, Vec<u16>) {
+    let seen = list.seen();
+    let a = list.buf.area;
+    let at = |x: u16, y: u16| &seen[usize::from(y - a.y)][usize::from(x - a.x)];
+    let mut covers = vec![frame];
+    covers.extend(crate::gui::browser::ops::dialog::shadow_of(frame));
+    let mut glyphs = Vec::new();
+    for c in covers.iter().map(|c| c.intersection(a)) {
+        for y in c.top()..c.bottom() {
+            for x in c.left()..c.right() {
+                if !at(x, y).symbol.trim().is_empty() {
+                    glyphs.push((x, y, at(x, y).symbol.clone()));
+                }
+            }
+        }
+    }
+    let rows = frame.intersection(a);
+    let inside = frame.x > a.x && frame.x <= a.right();
+    let halves = (rows.top()..rows.bottom())
+        .filter(|&y| inside && cells::width(&at(frame.x - 1, y).symbol) == 2)
+        .collect();
+    (glyphs, halves)
+}
+
+/// Where the window's painting and the terminal's screen (`term::compose` of the pass's layers)
+/// differ in the cell just left of the box `frame` (on `gr`) on each of its rows, as (row, the
+/// window's glyph, the terminal's). The window shows there the last layer at `gr`'s origin, in
+/// egui's painting order (its order, then the calls'), whose cell has a colour of its own inside
+/// its clip — the first half of a glyph whose second the box covers, unless it was blanked; the
+/// terminal erases such a glyph whole. In the box itself both show the box.
+fn edge_unlike_screen(ctx: &egui::Context, gr: &Grid, frame: cells::Cells) -> Unlike {
+    let Some(x) = frame.x.checked_sub(1) else {
+        return Vec::new();
+    };
+    let layers = cells::layers(ctx);
+    let r = ctx.content_rect();
+    let (cols, rows) = ((r.width() / CELL_X) as u16, (r.height() / CELL) as u16);
+    let screen = crate::gui::term::compose(ctx, &layers, cols, rows).buf;
+    let shown = cells::Layer {
+        origin: Pos2::ZERO,
+        layer: egui::LayerId::background(),
+        clip: r,
+        buf: screen,
+        caret: None,
+    }
+    .seen();
+    let mut order: Vec<(usize, &Arc<cells::Layer>)> = layers.iter().enumerate().collect();
+    order.sort_by_key(|&(k, l)| (l.layer.order, k));
+    let (ox, oy) = ((gr.origin.x / CELL_X) as u16, (gr.origin.y / CELL) as u16);
+    let mut unlike = Vec::new();
+    for y in frame.top()..frame.bottom() {
+        let at = cells::Position::new(x, y);
+        let window = (order.iter().rev())
+            .find_map(|(_, l)| {
+                let a = l.buf.area;
+                let centre = l.rect(cells::Cells::new(x, y, 1, 1)).center();
+                if l.origin != gr.origin || !a.contains(at) || !l.clip.contains(centre) {
+                    return None;
+                }
+                let s = &l.seen()[usize::from(y - a.y)][usize::from(x - a.x)];
+                s.bg.map(|_| s.symbol.clone())
+            })
+            .unwrap_or_default();
+        let terminal = shown[usize::from(y + oy)][usize::from(x + ox)]
+            .symbol
+            .clone();
+        if window.trim() != terminal.trim() {
+            unlike.push((y, window, terminal));
+        }
+    }
+    unlike
+}
+
+const CELL_X: f32 = chrome::CELL.x;
+
+/// Enter as one pass's events.
+fn enter() -> Vec<Event> {
+    [true, false]
+        .map(|pressed| Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        })
+        .to_vec()
+}
+
+/// The list on the left, the git panel on the right with a commit's menu up, then Enter on its
+/// first item in one pass: that item's dialog shows in that pass, and the list is blank under its
+/// box and its shadow there — no text of the list's, and no Hangul glyph of a name half under
+/// the box's left column, so the window paints beside the box what the terminal shows. A side
+/// drawn after the panel reads the panel's covers with that dialog in them
+/// (`Browser::git_covered`).
+#[test]
+fn f_menu_own_the_list_is_blank_under_a_dialog_a_menu_choice_opens() {
+    let Some(git) = crate::git::history::fixture::git() else {
+        return;
+    };
+    let mut g = on_hangul_folder(&git, 1000.0);
+    g.key(Key::F10);
+    g.settle();
+    let gr = grid(1000.0, 320.0);
+    let menu = g.b().git_covered(&gr, None);
+    assert!(!menu.is_empty() && g.view().draft().is_none(), "the menu");
+    g.fx.drv.frame(&mut g.fx.b, enter(), Modifiers::NONE);
+    assert!(
+        g.view().draft().is_some(),
+        "a dialog: {:?}",
+        g.view().draft()
+    );
+    let frame = painted_frame(&g.fx.drv.ctx, &menu).expect("drawn in the pass that chose it");
+    let (own, list) = list_layers(&g.fx.drv.ctx, &gr);
+    let (_, straddled) = under_box(&own, frame);
+    let rows: Vec<String> = (0..gr.rows)
+        .map(|y| cells::row_text(&own.buf, y).0)
+        .collect();
+    assert!(
+        !straddled.is_empty(),
+        "the control: a Hangul glyph half under the box's left column {frame:?} in the list's own painting: {rows:#?}"
+    );
+    let unlike = edge_unlike_screen(&g.fx.drv.ctx, &gr, frame);
+    assert_eq!(unlike, [], "the window beside the box, unlike the screen");
+    assert_eq!(
+        under_box(&list, frame),
+        (vec![], vec![]),
+        "left under {frame:?}"
+    );
+    let mut opened = vec![frame];
+    opened.extend(crate::gui::browser::ops::dialog::shadow_of(frame));
+    assert_eq!(
+        g.b().git_covered(&gr, None),
+        opened,
+        "what a side drawn after it reads"
+    );
+}
+
+/// Under `term::Backend` (125×20, recording on): the panel's menu opened in a printed burst, then
+/// Enter in the next. In the pass the dialog is first painted, the browser kept the list's cells
+/// and the panel blanked them: the recorded list is blank under the dialog, and the cells beside
+/// its box are what the screen (`term::compose`) shows. The screen alone could not tell: it lays
+/// the box over the list and erases a glyph the box half covers whatever the list held.
+#[test]
+fn f_menu_own_the_backend_s_list_is_blanked_under_the_dialog_and_matches_its_screen() {
+    use crossterm::event::{Event as CEvent, KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::VecDeque;
+    let Some(git) = crate::git::history::fixture::git() else {
+        return;
+    };
+    let mut g = on_hangul_folder(&git, 1000.0);
+    let press = |code| CEvent::Key(KeyEvent::new(code, KeyModifiers::NONE));
+    let bursts: VecDeque<Vec<CEvent>> = [
+        vec![CEvent::FocusGained],
+        vec![CEvent::FocusGained],
+        vec![press(KeyCode::F(10))],
+        vec![press(KeyCode::Enter)],
+    ]
+    .into();
+    let tty = Paced {
+        bursts,
+        now: VecDeque::new(),
+        asked: 0,
+    };
+    let ctx = egui::Context::default();
+    chrome::install(&ctx);
+    let mut backend = crate::gui::term::Backend::new(tty, std::io::sink(), ctx, true);
+    let top = g.top();
+    let mut win = Watched {
+        b: &mut g.fx.b,
+        top,
+        gr: grid(1000.0, 320.0),
+        menu: Vec::new(),
+        first: None,
+    };
+    let mut no_switch =
+        |_: &mut crate::gui::term::Backend<Paced, std::io::Sink>| panic!("no switch in this test");
+    let end = backend.run(&mut win, &mut no_switch).expect("the run");
+    assert_eq!(end, crate::gui::term::End::Signal(libc::SIGTERM));
+    let (control, left, unlike) = win.first.expect("the dialog was painted");
+    assert!(
+        !control.1.is_empty(),
+        "the control: a glyph half under the box's left column"
+    );
+    assert_eq!(unlike, [], "beside the box, unlike the screen");
+    assert_eq!(left, (vec![], vec![]), "left under the dialog");
+}
+
+/// The window's width for the right click's test: the menu's box then stands half over one of
+/// the list title's glyphs.
+const RIGHT_CLICK_WIDTH: f32 = 1008.0;
+
+/// The list on the left, the git panel on the right with no box up, then a right click on a
+/// graph row in one pass: the row's menu opens in the panel's draw, after the list was painted
+/// with no cover for it. In that pass the window paints beside the menu's box what the terminal
+/// shows — the list title's Hangul glyph half under the box's left column goes whole — and the
+/// list is blank under the box and its shadow (F-menu-own, the right-click sibling).
+#[test]
+fn f_menu_own_a_right_clicks_menu_stands_over_the_list_blanked() {
+    let Some(git) = crate::git::history::fixture::git() else {
+        return;
+    };
+    let w = RIGHT_CLICK_WIDTH;
+    let mut g = on_hangul_folder(&git, w);
+    let gr = grid(w, 320.0);
+    assert!(g.b().git_covered(&gr, None).is_empty(), "no box up");
+    let layers = cells::layers(&g.fx.drv.ctx);
+    let hit = (cells::find(&layers, "third").into_iter())
+        .find(|h| h.cells.x >= gr.cols / 2)
+        .expect("third's row in the panel");
+    let at = layers[hit.layer].rect(hit.cells).center();
+    let button = |pressed| Event::PointerButton {
+        pos: at,
+        button: PointerButton::Secondary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    let click = vec![Event::PointerMoved(at), button(true), button(false)];
+    g.fx.drv.frame(&mut g.fx.b, click, Modifiers::NONE);
+    let menu = g.b().git_covered(&gr, None);
+    assert!(!menu.is_empty(), "the row's menu opened");
+    let frame = painted_frame(&g.fx.drv.ctx, &[]).expect("drawn in the pass of the click");
+    assert_eq!(frame, menu[0], "the menu's box");
+    let (own, list) = list_layers(&g.fx.drv.ctx, &gr);
+    let (_, straddled) = under_box(&own, frame);
+    assert!(
+        !straddled.is_empty(),
+        "the control: a Hangul glyph half under the box's left column {frame:?} in the list's own painting: {:#?}",
+        (0..gr.rows).map(|y| cells::row_text(&own.buf, y).0).collect::<Vec<_>>()
+    );
+    let unlike = edge_unlike_screen(&g.fx.drv.ctx, &gr, frame);
+    assert_eq!(unlike, [], "the window beside the menu, unlike the screen");
+    assert_eq!(
+        under_box(&list, frame),
+        (vec![], vec![]),
+        "left under {frame:?}"
+    );
+}
+
+/// The same through Find: the panel's Find open with `t`, then `h`, Esc and F10 in one pass —
+/// Find types `h` in the draw, its Esc hands the rest to the graph's keys there, and F10 opens
+/// the bar's row's menu in the draw, after the list was painted. The window paints beside the
+/// menu's box what the terminal shows, and the list is blank under it.
+#[test]
+fn f_menu_own_a_menu_after_finds_esc_stands_over_the_list_blanked() {
+    let Some(git) = crate::git::history::fixture::git() else {
+        return;
+    };
+    let w = RIGHT_CLICK_WIDTH;
+    let mut g = on_hangul_folder(&git, w);
+    let gr = grid(w, 320.0);
+    g.fx.typed("t");
+    g.idle(2);
+    assert!(g.b().git_covered(&gr, None).is_empty(), "no box up");
+    let key = |key, pressed| Event::Key {
+        key,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+    let events = vec![
+        Event::Text("h".into()),
+        key(Key::Escape, true),
+        key(Key::Escape, false),
+        key(Key::F10, true),
+        key(Key::F10, false),
+    ];
+    g.fx.drv.frame(&mut g.fx.b, events, Modifiers::NONE);
+    let menu = g.b().git_covered(&gr, None);
+    assert!(!menu.is_empty(), "the bar's row's menu opened");
+    let frame = painted_frame(&g.fx.drv.ctx, &[]).expect("drawn in the pass of the keys");
+    assert_eq!(frame, menu[0], "the menu's box");
+    let (own, list) = list_layers(&g.fx.drv.ctx, &gr);
+    let (_, straddled) = under_box(&own, frame);
+    assert!(
+        !straddled.is_empty(),
+        "the control: a Hangul glyph half under the box's left column {frame:?}"
+    );
+    let unlike = edge_unlike_screen(&g.fx.drv.ctx, &gr, frame);
+    assert_eq!(unlike, [], "the window beside the menu, unlike the screen");
+    assert_eq!(
+        under_box(&list, frame),
+        (vec![], vec![]),
+        "left under {frame:?}"
+    );
+}
+
+/// A terminal of 125×20 cells sending its bursts back to back, one once the backend has asked
+/// three times since the last (its passes done and printed), then ending the run
+/// (`tests_x4_dialogs.rs`' stand-in).
+struct Paced {
+    bursts: std::collections::VecDeque<Vec<crossterm::event::Event>>,
+    now: std::collections::VecDeque<crossterm::event::Event>,
+    asked: usize,
+}
+
+impl crate::gui::term::Tty for Paced {
+    fn raw(&mut self, _on: bool) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn size(&mut self) -> std::io::Result<(u16, u16)> {
+        Ok((125, 20))
+    }
+    fn probe(&mut self) -> crate::gui::term::Probed {
+        crate::gui::term::Probed::default()
+    }
+    fn drop_input(&mut self) {}
+    fn next(
+        &mut self,
+        _wait: std::time::Duration,
+    ) -> std::io::Result<Option<crossterm::event::Event>> {
+        if let Some(ev) = self.now.pop_front() {
+            return Ok(Some(ev));
+        }
+        self.asked += 1;
+        assert!(self.asked < 20_000, "the script ran out without an end");
+        if self.asked >= 3 {
+            if let Some(burst) = self.bursts.pop_front() {
+                self.asked = 0;
+                self.now.extend(burst);
+                return Ok(self.now.pop_front());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        Ok(None)
+    }
+    fn pending(&mut self) -> std::io::Result<bool> {
+        Ok(!self.now.is_empty())
+    }
+    fn stopped(&self) -> Option<i32> {
+        (self.bursts.is_empty() && self.now.is_empty() && self.asked >= 3).then_some(libc::SIGTERM)
+    }
+}
+
+/// What the list showed under a box ([`under_box`]).
+type Under = (Vec<(u16, u16, String)>, Vec<u16>);
+
+/// Where the cells beside a box differ from the screen ([`edge_unlike_screen`]).
+type Unlike = Vec<(u16, String, String)>;
+
+/// The browser in the terminal, keeping, for the first pass that painted the dialog the panel's
+/// menu choice opened, what the list held under it: in its own painting, and as the pass left it.
+struct Watched<'a> {
+    b: &'a mut Browser,
+    top: String,
+    gr: Grid,
+    /// The menu's box and shadow, while it was up.
+    menu: Vec<cells::Cells>,
+    /// What the list held under the dialog (its own painting's, the pass's) and where the cells
+    /// beside the box differ from the screen ([`edge_unlike_screen`]).
+    first: Option<(Under, Under, Unlike)>,
+}
+
+impl crate::gui::Window for Watched<'_> {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        self.b.ui(ui);
+        let ctx = ui.ctx().clone();
+        let git = &self.b.git;
+        let Some(i) = git.panel(&self.top) else {
+            return;
+        };
+        if git.panels[i].view.draft().is_none() {
+            self.menu = self.b.git_covered(&self.gr, None);
+            return;
+        }
+        if self.first.is_some() || self.menu.is_empty() {
+            return;
+        }
+        if let Some(frame) = painted_frame(&ctx, &self.menu) {
+            let (own, list) = list_layers(&ctx, &self.gr);
+            let unlike = edge_unlike_screen(&ctx, &self.gr, frame);
+            self.first = Some((under_box(&own, frame), under_box(&list, frame), unlike));
+        }
+    }
+
+    fn ready(&self) -> bool {
+        true
+    }
+}
